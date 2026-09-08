@@ -107,6 +107,10 @@ async function checkCdpCommandLifecycle() {
   vm.runInNewContext(source.slice(source.indexOf('class CdpConnection'), source.indexOf('async function fetchJson')) +
     '\nthis.CdpConnection = CdpConnection;', context);
   const connection = new context.CdpConnection('ws://fixture');
+  const expectedManifest = { name: 'fixture', version: '1.0.0', manifest_version: 3, background: { service_worker: 'background.js' } };
+  assert(context.matchesExtensionManifest(expectedManifest, expectedManifest));
+  assert(!context.matchesExtensionManifest({ ...expectedManifest, name: 'built-in browser extension' }, expectedManifest));
+  assert(!context.matchesExtensionManifest({ ...expectedManifest, version: '0.9.0' }, expectedManifest));
   connection.ws = { readyState: 1, send: function() {}, close: function() {} };
   const timeoutResult = connection.send('Runtime.evaluate').then(() => null, e => e.message);
   assert.strictEqual(timers.size, 1, 'each CDP command needs a deadline');

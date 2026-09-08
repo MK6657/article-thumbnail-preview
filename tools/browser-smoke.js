@@ -353,6 +353,12 @@ class CdpConnection {
   }
 }
 
+function matchesExtensionManifest(actual, expected) {
+  return !!(actual && actual.name === expected.name && actual.version === expected.version &&
+    actual.manifest_version === expected.manifest_version && actual.background &&
+    actual.background.service_worker === expected.background.service_worker);
+}
+
 async function fetchJson(url, options) {
   var response = await fetch(url, Object.assign({}, options, { signal: AbortSignal.timeout(DEVTOOLS_TIMEOUT_MS) }));
   if (!response.ok) throw new Error(response.status + ' ' + response.statusText + ' for ' + url);
@@ -542,14 +548,24 @@ async function main() {
     var expectedWorkerPath = '/' + String(packagedManifest.background && packagedManifest.background.service_worker || 'background.js').replace(/^\/+/, '');
     var extensionTarget = await waitFor('unpacked extension service worker', async function() {
       var targets = await listTargets(devtoolsPort);
-      return targets.find(function(target) {
-        if (target.type !== 'service_worker' || !/^chrome-extension:\/\//.test(target.url || '')) return false;
+      for (var target of targets) {
+        if (target.type !== 'service_worker' || !/^chrome-extension:\/\//.test(target.url || '')) continue;
+        var workerConnection = null;
         try {
-          return new URL(target.url).pathname === expectedWorkerPath;
+          if (new URL(target.url).pathname !== expectedWorkerPath || !target.webSocketDebuggerUrl) continue;
+          workerConnection = await new CdpConnection(target.webSocketDebuggerUrl).connect();
+          var workerResult = await workerConnection.send('Runtime.evaluate', {
+            expression: 'chrome.runtime.getManifest()', returnByValue: true
+          });
+          var workerManifest = workerResult.result && workerResult.result.value;
+          if (matchesExtensionManifest(workerManifest, packagedManifest)) return target;
         } catch (error) {
-          return false;
+          // A worker may disappear while its target is being inspected; retry.
+        } finally {
+          if (workerConnection) workerConnection.close();
         }
-      }) || null;
+      }
+      return null;
     }, DEVTOOLS_TIMEOUT_MS, 120);
     var extensionMatch = /^chrome-extension:\/\/([a-p]{32})/.exec(extensionTarget.url || '');
     assert(extensionMatch, 'Could not read the unpacked extension id from ' + extensionTarget.url);
