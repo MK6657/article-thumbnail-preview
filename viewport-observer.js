@@ -3177,9 +3177,14 @@
       return resetScrollPreload(root);
     },
 
-    retryVisiblePending: function() {
+    retryActualVisiblePending: function() {
+      return ATPViewport.retryVisiblePending(true);
+    },
+
+    retryVisiblePending: function(actualOnly) {
       var totalStarted = 0;
       if (isLoaderPaused() || shouldPausePendingRetryWhenHidden()) return totalStarted;
+      if (actualOnly && !actualVisiblePendingWrappers.size) return totalStarted;
       prunePendingWrappers(true, true);
       var available = getAvailableSlotCount();
       if (available <= 0) {
@@ -3201,6 +3206,8 @@
         if (!visibleData.inViewportAt) visibleData.inViewportAt = visibleData.actualInViewportAt || Date.now();
         if (ATPViewport.loadWrapper(visibleWrapper, visibleData, false)) totalStarted++;
       }
+
+      if (actualOnly) return totalStarted;
 
       available = getAvailableSlotCount();
       if (available <= 0) return totalStarted;

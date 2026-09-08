@@ -25,7 +25,7 @@ function runtimeForVerify(file) {
   let source = read(file);
   if (file === 'loader.js') {
     source = source.replace('  window.ATPLoader = ATPLoader;',
-      '  ATPLoader.getBgTasks = function() { return BG_TASKS; };\n  ATPLoader.getActive = function() { return GLOBAL_ACTIVE; };\n  window.ATPLoader = ATPLoader;');
+      '  ATPLoader.getBgTasks = function() { return BG_TASKS; };\n  ATPLoader.getActive = function() { return GLOBAL_ACTIVE; };\n  ATPLoader._getQueueSnapshotForVerify = getQueueSnapshotFields;\n  window.ATPLoader = ATPLoader;');
   }
   if (file === 'resource-panel.js') {
     source = source.replace('  window.ATPResourcePanel = ATPResourcePanel;',
@@ -8292,6 +8292,33 @@ function checkLoaderDiagnosticGate() {
 }
 
 function checkLoaderViewportImagePriority() {
+  const snapshotRun = createLoaderCompletedRecoverySandbox();
+  snapshotRun.addThread('snapshot-fixture', 'https://image.example/fixture.jpg');
+  let candidateReads = 0;
+  for (let i = 0; i < 750; i++) {
+    snapshotRun.sandbox.ATPLoader.getBgTasks().push({
+      threadId: 'snapshot-fixture', generation: 0, idx: 0,
+      get candidates() { candidateReads++; return [{ src: 'https://image.example/fixture.jpg' }]; }
+    });
+  }
+  const firstSnapshot = snapshotRun.sandbox.ATPLoader._getQueueSnapshotForVerify();
+  const initialReads = candidateReads;
+  assert(firstSnapshot.bgOrdinaryQueue === 750 && initialReads >= 750, 'queue reuse fixture must exercise the full large background queue');
+  for (let i = 0; i < 20; i++) snapshotRun.sandbox.ATPLoader._getQueueSnapshotForVerify();
+  assert(candidateReads === initialReads, 'unchanged background queue diagnostics must reuse the snapshot instead of rescanning 750 tasks per event');
+  snapshotRun.sandbox.ATPLoader.clearBgTasks();
+  assert(snapshotRun.sandbox.ATPLoader._getQueueSnapshotForVerify().bgOrdinaryQueue === 0, 'queue mutation must invalidate the cached diagnostic snapshot');
+
+  const orderingRun = createLoaderCompletedRecoverySandbox();
+  const order = [];
+  orderingRun.sandbox.ATPViewport.retryActualVisiblePending = function() {
+    order.push('visible');
+    orderingRun.sandbox.ATPLoader.globalSchedule();
+  };
+  orderingRun.sandbox.ATPLoader.roundRobinSchedule = function() { order.push('queued'); };
+  orderingRun.sandbox.ATPLoader.globalSchedule();
+  assert(order.join(',') === 'visible,queued', 'free slots must be offered to actual visible pending images before queued work without reentrant scheduling');
+
   const run = createLoaderCompletedRecoverySandbox();
   const offscreenFirst = createVerifyImageElement();
   run.sandbox.ATPLoader.prepareThumbnailImage(offscreenFirst, { isFirstScreen: true }, 110, 82);
@@ -10274,6 +10301,16 @@ function createViewportRetrySandbox(options) {
 }
 
 function checkViewportPendingRetryBounds() {
+  const actualOnly = createViewportRetrySandbox({ availableSlots: 2 });
+  actualOnly.observeWrapper(1100);
+  actualOnly.sandbox.ATPViewport.retryActualVisiblePending();
+  assert(actualOnly.getAcquireCount() === 0, 'actual-only retry must not let near/offscreen pending tasks compete for a freshly released slot');
+  const actuallyVisible = actualOnly.observeWrapper(100);
+  actualOnly.setPaused(true);
+  actualOnly.observers[1].callback([{ target: actuallyVisible, isIntersecting: true }]);
+  actualOnly.setPaused(false);
+  actualOnly.sandbox.ATPViewport.retryActualVisiblePending();
+  assert(actualOnly.getAcquireMarkers().join(',') === '100', 'actual-only retries must attempt the true viewport entry without scanning offscreen wrappers');
   const scanSandbox = createViewportRetrySandbox({ availableSlots: 2 });
   for (let i = 0; i < 500; i++) {
     scanSandbox.observeWrapper(1300 + i);
@@ -14611,7 +14648,7 @@ function checkCriticalStaticRules() {
   assert(loader.indexOf('function drainHiddenViewportPending(settings, bgSnapshot)') !== -1, 'hidden viewport pending drain must accept the background channel snapshot');
   assert(loader.indexOf('var available = getAvailableBackgroundSlots(bgSnapshot);') !== -1, 'hidden viewport pending drain must reuse the background channel snapshot for available slots');
   assert(loader.indexOf('function getQueueSnapshotFields(existingBgSnapshot)') !== -1, 'scheduler diagnostics must accept a reusable background channel snapshot');
-  assert(loader.indexOf('var bgCounts = existingBgSnapshot || getTaskChannelSnapshot(BG_TASKS);') !== -1, 'scheduler diagnostics must reuse provided background channel snapshots');
+  assert(loader.indexOf('var bgCounts = existingBgSnapshot || getCachedBgSnapshot();') !== -1, 'scheduler diagnostics must reuse provided or version-cached background channel snapshots');
   assert(loader.indexOf('var bgHeavyTask = bgCounts.firstHeavyTask;') !== -1, 'scheduler diagnostics must reuse the first heavy task from channel snapshots');
   assert(/var bgSnapshot = \(!promotedVisible && existingBgSnapshot\) \|\| getTaskChannelSnapshot\(BG_TASKS\);[\s\S]*?drainHiddenViewportPending\(settings, bgSnapshot\);/.test(loader), "background task processing must pass the channel snapshot into hidden pending drain");
   assert(loader.indexOf('var hasNonHighFanoutWaiting = bgSnapshot.ordinary > 0;') !== -1, 'background task processing must cache ordinary background queue presence per round');
@@ -15073,7 +15110,7 @@ function checkCriticalStaticRules() {
   assert(viewport.indexOf('var pendingEntries = pendingWrappers.entries();') !== -1, 'hidden pending loading must iterate pending wrappers with a breakable iterator');
   assert(viewport.includes('if ((limit > 0 && started >= limit) || attempted >= attemptLimit) {'), "hidden pending loading must stop scanning after reaching the requested max loads");
   assert(viewport.indexOf('pendingWrappers.forEach(function(data, wrapper) {\n        if (limit > 0 && started >= limit) return;') === -1, 'hidden pending loading must not keep scanning after max loads through Map.forEach');
-  assert(/retryVisiblePending: function\(\) \{[\s\S]*?var totalStarted = 0;[\s\S]*?if \(isLoaderPaused\(\) \|\| shouldPausePendingRetryWhenHidden\(\)\) return totalStarted;[\s\S]*?prunePendingWrappers\(true, true\);[\s\S]*?var available = getAvailableSlotCount\(\);/.test(viewport), "scroll-idle visible pending retry must pause before pruning and scanning pending wrappers");
+  assert(/retryVisiblePending: function\(actualOnly\) \{[\s\S]*?var totalStarted = 0;[\s\S]*?if \(isLoaderPaused\(\) \|\| shouldPausePendingRetryWhenHidden\(\)\) return totalStarted;[\s\S]*?prunePendingWrappers\(true, true\);[\s\S]*?var available = getAvailableSlotCount\(\);/.test(viewport), "scroll-idle visible pending retry must pause before pruning and scanning pending wrappers");
   assert(viewport.indexOf('if (available <= 0) {\n        markVisiblePendingSlotRetries(PENDING_SLOT_RETRY_SCAN_LIMIT);\n        return totalStarted;\n      }') !== -1, 'scroll-idle visible pending retry must mark visible pending slot retries instead of dropping no-slot recovery scans');
   assert(viewport.indexOf('var actualVisiblePendingWrappers = new Set();') !== -1, 'viewport retries must keep a direct zero-margin queue for actually visible pending wrappers');
   assert(viewport.indexOf('var actualWrappers = actualVisiblePendingWrappers.values();') !== -1, 'visible retries must drain the direct actual-viewport queue before scanning near-viewport entries');
@@ -15198,7 +15235,7 @@ function checkCriticalStaticRules() {
   assert(loader.includes('summary.visiblePreviewGrace++') && loader.includes('visiblePreviewStuck'), "diagnostic summaries must track preview grace and stuck previews");
   assert(loader.indexOf('visiblePreviewStuck') !== -1, 'diagnostic summaries must expose stuck visible preview backlog');
   assert(viewport.indexOf("logHeavyRender('render_restore_error'") !== -1, 'heavy thumbnail restore errors must keep diagnostics while preserving the preview fallback');
-  assert(viewport.indexOf('retryVisiblePending: function()') !== -1, 'viewport pending heavy loads must retry when scrolling goes idle');
+  assert(viewport.indexOf('retryVisiblePending: function(actualOnly)') !== -1, 'viewport pending heavy loads must retry when scrolling goes idle');
   assert(viewport.indexOf('HEAVY_LIGHTWEIGHT_PRELOAD_MARGIN_PX = 2400') !== -1, 'lightweight heavy viewport loads must prewarm before reaching the visible viewport');
   assert(viewport.indexOf('HEAVY_LIGHTWEIGHT_PRELOAD_VIEWPORT_MULTIPLIER = 4') !== -1, 'lightweight heavy prewarm margin must scale with viewport height');
   assert(viewport.indexOf('function getLightweightHeavyPreloadMarginPx') !== -1, 'lightweight heavy prewarm margin must be computed dynamically');

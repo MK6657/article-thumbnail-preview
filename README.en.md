@@ -4,7 +4,9 @@ English | [简体中文](README.md)
 
 A Chrome / Edge Manifest V3 extension that adds image previews and copyable resource links to supported Discuz! forum listing pages.
 
-Current version: **1.17.2**. No server, npm installation, or build is required to use the extension.
+Current version: **1.17.3**. No server, npm installation, or build is required to use the extension.
+
+Version 1.17.3 offers free slots to registered, actually visible pending images before ordinary queued work, instead of relying solely on a later wake callback. Diagnostic snapshots reuse unchanged background-queue counts to avoid repeated scans. Concurrency, image limits, and user settings are unchanged.
 
 Version 1.17.2 fixes a conflict between JS admission and native image lazy loading. Images holding timed active slots now start eagerly, while offscreen fetch priority remains low. This prevents deferred requests from consuming slots until false timeouts trigger host throttling. Unadmitted images still wait; concurrency, user settings, and cache formats are unchanged.
 

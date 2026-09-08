@@ -3,6 +3,7 @@
 
   var GLOBAL_ACTIVE = 0;
   var GLOBAL_PAUSED = false;
+  var GLOBAL_SCHEDULING = false;
   var GLOBAL_BG_TIMER = null;
   var GLOBAL_BG_TIMER_KIND = '';
   var GLOBAL_BG_RETRY_TIMER = null;
@@ -1423,7 +1424,7 @@
     var threads = window.ATPState && window.ATPState.threads;
     var activeThreadIds = getActiveFirstThreadIds(threads);
     var firstCounts = getFirstTaskChannelSnapshot(activeThreadIds, threads || {});
-    var bgCounts = existingBgSnapshot || getTaskChannelSnapshot(BG_TASKS);
+    var bgCounts = existingBgSnapshot || getCachedBgSnapshot();
     var settings = getCurrentSettings();
     var ordinaryActive = getActiveOrdinaryCount();
     var firstHasOrdinaryWork = firstCounts.ordinary > 0 || ordinaryActive > 0;
@@ -3878,7 +3879,18 @@
     },
 
     globalSchedule: function() {
-      ATPLoader.roundRobinSchedule();
+      if (GLOBAL_PAUSED || GLOBAL_SCHEDULING) return;
+      GLOBAL_SCHEDULING = true;
+      try {
+        // A released slot must not be taken by queued prefetch work before the
+        // asynchronous slot-wake callback can reach already-visible wrappers.
+        if (window.ATPViewport && ATPViewport.retryActualVisiblePending) {
+          ATPViewport.retryActualVisiblePending();
+        }
+        ATPLoader.roundRobinSchedule();
+      } finally {
+        GLOBAL_SCHEDULING = false;
+      }
     },
 
     globalLoadImage: function(task) {

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "文章缩略图预览",
-  "version": "1.17.2",
+  "version": "1.17.3",
   "description": "在文章列表页自动抓取文章内图片，显示缩略图，避免被标题党欺骗。",
   "permissions": [
     "storage"
