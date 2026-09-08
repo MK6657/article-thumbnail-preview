@@ -104,6 +104,7 @@
     try {
       var response = await fetch(request.url, {
         signal: controller.signal,
+        mode: 'same-origin',
         credentials: 'include',
         headers: { 'Accept': 'text/plain, application/octet-stream;q=0.9, */*;q=0.5' },
         referrer: getSafeReferrer(request.referrer),
@@ -132,6 +133,8 @@
       });
     } finally {
       clearTimeout(timer);
+      // Also stop unread bodies on header-size, HTTP, or redirect rejection.
+      controller.abort();
     }
   });
 })();

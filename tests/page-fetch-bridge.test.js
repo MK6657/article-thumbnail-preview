@@ -81,6 +81,7 @@ async function runFetcherBridgeIntegration(text) {
     fetch: async function(url, options) {
       fetchCalls++;
       assert.strictEqual(options.credentials, 'include');
+      assert.strictEqual(options.mode, 'same-origin', 'page bridge must reject cross-origin redirects at the network boundary');
       return {
         ok: true,
         status: 200,
@@ -165,6 +166,7 @@ async function run() {
       fetchCalls++;
       assert.strictEqual(url, 'https://www.sehuatang.org/forum.php?mod=attachment&aid=signed');
       assert.strictEqual(options.credentials, 'include');
+      assert.strictEqual(options.mode, 'same-origin');
       assert.strictEqual(options.referrer, 'https://www.sehuatang.org/thread-3632512-1-2.html');
       return {
         ok: true,
@@ -211,6 +213,25 @@ async function run() {
   });
   assert.strictEqual(fetchCalls, 1, 'cross-origin page bridge requests must be rejected before fetch');
   assert.strictEqual(posted[0].message.error, 'url_not_allowed', 'cross-origin rejection must be explicit');
+
+  let limitedSignal = null;
+  let bodyRead = false;
+  sandbox.fetch = async function(url, options) {
+    limitedSignal = options.signal;
+    return {
+      ok: true, status: 200, url: url,
+      headers: makeHeaders({ 'content-length': 1024 * 1024 }),
+      arrayBuffer: async function() { bodyRead = true; return new ArrayBuffer(0); }
+    };
+  };
+  posted.length = 0;
+  await listener({ source: contextWindow, origin: sandbox.location.origin, data: {
+    type: 'ATP_PAGE_TEXT_FETCH_REQUEST_V1', id: 'request_large_body',
+    url: sandbox.location.origin + '/oversized.txt', timeoutMs: 1000
+  } });
+  assert.strictEqual(posted[0].message.error, 'response_too_large');
+  assert.strictEqual(bodyRead, false, 'oversized declared body must not be buffered');
+  assert.strictEqual(limitedSignal.aborted, true, 'rejected response must cancel the unread network body');
 
   await runFetcherBridgeIntegration(text);
 

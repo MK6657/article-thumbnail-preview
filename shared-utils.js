@@ -876,7 +876,7 @@ const SharedUtils = {
 
   normalizePasswords: function(passwords) {
     var out = [];
-    var seen = {};
+    var seen = Object.create(null);
     passwords = Array.isArray(passwords) ? passwords : [];
     for (var i = 0; i < passwords.length; i++) {
       var value = this.cleanPasswordValue(passwords[i]);
@@ -1390,44 +1390,51 @@ const SharedUtils = {
     return this.normalizeResources(resources);
   },
 
-  // 线性扫描 <a ...>正文</a>：与惰性正则 /<a\b([^>]*)>([\s\S]*?)<\/a>/ 同语义
-  // （正文取到最近的 </a>，匹配后从闭合标签之后继续），但对含大量未闭合 <a 的
-  // 病理输入保持 O(n) —— 正则版会对每个未闭合位置反复扫尾部，实测 1MB 可拖到分钟级
+  findHtmlTagEnd: function(html, start) {
+    var quote = '';
+    for (var end = start; end < html.length; end++) {
+      var ch = html.charAt(end);
+      if (quote) {
+        if (ch === quote) quote = '';
+      } else if (ch === '"' || ch === "'") {
+        quote = ch;
+      } else if (ch === '>') {
+        return end;
+      }
+    }
+    return -1;
+  },
+
+  // 扫描锚点时每段只走一次；属性引号中的 > 不是标签结束，未闭合标签不重复扫尾。
   forEachAnchorTag: function(html, callback) {
     html = String(html || '');
-    var lower = html.toLowerCase();
-    var openRegex = /<a\b([^>]*)>/gi;
+    var openRegex = /<a(?=[\t\n\f\r />])/gi;
+    var closeRegex = /<\/a[\t\n\f\r ]*>/gi;
     var m;
     while ((m = openRegex.exec(html)) !== null) {
-      var bodyStart = openRegex.lastIndex;
-      var close = lower.indexOf('</a>', bodyStart);
-      if (close === -1) return; // 其后再无闭合标签，不可能有完整锚点
-      var proceed = callback(m[1] || '', html.slice(bodyStart, close), m.index, close + 4);
-      openRegex.lastIndex = close + 4;
+      var attrsStart = openRegex.lastIndex;
+      var end = SharedUtils.findHtmlTagEnd(html, attrsStart);
+      if (end === -1) return;
+      var bodyStart = end + 1;
+      closeRegex.lastIndex = bodyStart;
+      var close = closeRegex.exec(html);
+      if (!close) return;
+      var proceed = callback(html.slice(attrsStart, end), html.slice(bodyStart, close.index), m.index, closeRegex.lastIndex);
+      openRegex.lastIndex = closeRegex.lastIndex;
       if (proceed === false) return;
     }
   },
 
   decodeHtmlEntities: function(text) {
-    // 注意：&amp; 必须最后解码，否则 &amp;lt; 会被二次解码成 <（既是正确性问题也是注入面）
-    return String(text || '')
-      .replace(/&nbsp;/gi, ' ')
-      .replace(/&commat;/gi, '@')
-      .replace(/&quot;/gi, '"')
-      .replace(/&#39;/gi, "'")
-      .replace(/&lt;/gi, '<')
-      .replace(/&gt;/gi, '>')
-      .replace(/&#(\d+);/g, function(_, n) {
-        var cp = parseInt(n, 10);
-        if (!isFinite(cp) || cp < 0 || cp > 0x10FFFF) return _;
-        try { return String.fromCodePoint ? String.fromCodePoint(cp) : String.fromCharCode(cp); } catch (e) { return _; }
-      })
-      .replace(/&#x([0-9a-f]+);/gi, function(_, n) {
-        var cp = parseInt(n, 16);
-        if (!isFinite(cp) || cp < 0 || cp > 0x10FFFF) return _;
-        try { return String.fromCodePoint ? String.fromCodePoint(cp) : String.fromCharCode(cp); } catch (e) { return _; }
-      })
-      .replace(/&amp;/gi, '&');
+    // 单次替换只读取输入实体，不再次解码刚生成的 &（包括数字形式的 &）。
+    var named = { nbsp: ' ', commat: '@', quot: '"', lt: '<', gt: '>', amp: '&' };
+    return String(text || '').replace(/&(?:(nbsp|commat|quot|lt|gt|amp)|#(\d+)|#x([0-9a-f]+));/gi,
+      function(entity, name, decimal, hex) {
+        if (name) return named[name.toLowerCase()];
+        var cp = parseInt(hex || decimal, hex ? 16 : 10);
+        if (!isFinite(cp) || cp < 0 || cp > 0x10FFFF) return entity;
+        try { return String.fromCodePoint ? String.fromCodePoint(cp) : String.fromCharCode(cp); } catch (e) { return entity; }
+      });
   },
 
   htmlToText: function(html) {
@@ -1600,7 +1607,7 @@ const SharedUtils = {
 
   extractArchivePasswords: function(text) {
     var result = [];
-    var seen = {};
+    var seen = Object.create(null);
     var regex = /[【\[\(（「『]?\s*(?:解压密码|压缩密码|解压码|解压口令|解壓密碼|解壓碼)\s*[】\]\)）」』]?\s*[:：=]?\s*/gi;
     var m;
     while ((m = regex.exec(text)) !== null) {
@@ -1618,7 +1625,7 @@ const SharedUtils = {
 
   extractArchivePasswordsFromHtml: function(html) {
     var result = [];
-    var seen = {};
+    var seen = Object.create(null);
     var fieldRegex = /[【\[\(（「『]?\s*(?:解压密码|压缩密码|解压码|解压口令|解壓密碼|解壓碼)\s*[】\]\)）」』]?\s*[:：=]?\s*/gi;
     var m;
     while ((m = fieldRegex.exec(html)) !== null) {
@@ -1722,7 +1729,7 @@ const SharedUtils = {
 
   mergeUnique: function(primary, secondary) {
     var result = [];
-    var seen = {};
+    var seen = Object.create(null);
     var primaryList = primary || [];
     function conflictsPrimary(v) {
       for (var j = 0; j < primaryList.length; j++) {
@@ -1747,7 +1754,7 @@ const SharedUtils = {
 
   mergeUniqueLimited: function(primary, secondary, limit) {
     var result = [];
-    var seen = {};
+    var seen = Object.create(null);
     var primaryList = primary || [];
     limit = Math.max(0, limit || 0);
     function conflictsPrimary(v) {
@@ -1796,39 +1803,33 @@ const SharedUtils = {
     return v.slice(0, 80);
   },
 
-  // 线性剔除注释/textarea/noscript/title 区域（这些内容不会被渲染，DOM 提取路径天然不含它们）。
-  // 不用惰性正则做剔除：大量未闭合 <!-- 会让每次匹配尝试扫到串尾，退化为 O(n²)
+  // 合并起始标记扫描，避免每个注释都为不存在的其他标签反复扫描剩余全文。
   stripNonRenderedHtmlRegions: function(html) {
     html = String(html || '');
-    var lower = html.toLowerCase();
-    var markers = [
-      { open: '<!--', close: '-->' },
-      { open: '<textarea', close: '</textarea>' },
-      { open: '<noscript', close: '</noscript>' },
-      { open: '<title', close: '</title>' }
-    ];
-    var out = '';
+    var opening = /<!--|<\/?([a-z][a-z0-9:-]*)(?=[\t\n\f\r />])/gi;
+    var out = [];
     var pos = 0;
-    while (pos < html.length) {
-      var nextIdx = -1;
-      var nextMarker = null;
-      for (var i = 0; i < markers.length; i++) {
-        var idx = lower.indexOf(markers[i].open, pos);
-        if (idx !== -1 && (nextIdx === -1 || idx < nextIdx)) {
-          nextIdx = idx;
-          nextMarker = markers[i];
-        }
+    var match;
+    while ((match = opening.exec(html)) !== null) {
+      var end;
+      if (!match[1]) {
+        var commentEnd = html.indexOf('-->', opening.lastIndex);
+        end = commentEnd === -1 ? html.length : commentEnd + 3;
+      } else {
+        var tagEnd = SharedUtils.findHtmlTagEnd(html, opening.lastIndex);
+        if (tagEnd === -1) break;
+        opening.lastIndex = tagEnd + 1;
+        if (match[0].charAt(1) === '/' || !/^(?:textarea|noscript|title|script|style)$/i.test(match[1])) continue;
+        var closing = new RegExp('</' + match[1] + '[\\t\\n\\f\\r ]*>', 'gi');
+        closing.lastIndex = opening.lastIndex;
+        end = closing.exec(html) ? closing.lastIndex : html.length;
       }
-      if (nextIdx === -1) {
-        out += pos === 0 ? html : html.slice(pos);
-        break;
-      }
-      out += html.slice(pos, nextIdx) + ' ';
-      var closeIdx = lower.indexOf(nextMarker.close, nextIdx + nextMarker.open.length);
-      if (closeIdx === -1) break; // 未闭合：其后内容按非渲染处理（与 DOM 解析吞并行为一致）
-      pos = closeIdx + nextMarker.close.length;
+      out.push(html.slice(pos, match.index), ' ');
+      pos = opening.lastIndex = end;
     }
-    return out || html.slice(0, 0);
+    if (!out.length) return html;
+    out.push(html.slice(pos));
+    return out.join('');
   },
 
   extractImagesByRegex: function(html, baseUrl, maxCount, options) {
@@ -2107,7 +2108,7 @@ const SharedUtils = {
       '\u2026': true,
       '\u2026\u2026': true
     };
-    if (explicitPlaceholders[v]) return true;
+    if (Object.prototype.hasOwnProperty.call(explicitPlaceholders, v)) return true;
     return /^(?:\.{1,}|…+|-+|暂无|无|无密码|見圖|见图|看图|见截图|\[emailprotected\])$/.test(v);
   },
 

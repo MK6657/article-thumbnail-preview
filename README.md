@@ -4,7 +4,9 @@
 
 Chrome / Edge Manifest V3 扩展，在支持的 Discuz! 论坛列表页显示帖子图片缩略图，并汇总可复制的资源链接。
 
-当前版本：**1.16.9**。无需服务器、npm 安装或构建即可使用。
+当前版本：**1.16.10**。无需服务器、npm 安装或构建即可使用。
+
+1.16.10 修复实体重复解码、特殊密码丢失及 HTML 标签识别边界，并将大量注释的预处理改为单次顺序扫描。TXT 页面桥接在请求层限制同源重定向，拒绝响应时及时取消未读取的数据流；图片并发与用户设置不变。
 
 ## 安装与启动
 
@@ -88,7 +90,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/package-maintainer-han
 
 [CHANGELOG.md](CHANGELOG.md) 记录版本变化。[PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md)、[技术总览](插件技术总览.md)、[维护者指南](维护者交接指南.md) 和 [旧版使用说明](使用说明.md) 保留架构及历史材料；当前安装与验证以本 README 为准，具体参数以 `settings-schema.js` 为准。
 
-验证通过不代表对真实论坛所有页面、当前网络或未来浏览器版本的兼容保证。本地 Chromium 合成回归覆盖首屏、滚动续载、并发、TXT、弹窗消息、多标签与 BFCache；尚未完成真实论坛实测。
+验证通过不代表对真实论坛所有页面、当前网络或未来浏览器版本的兼容保证。本地 Chromium 合成回归覆盖首屏、滚动续载、并发、TXT、重定向网络边界、弹窗消息、多标签与 BFCache；尚未完成真实论坛实测。
 
 ## 许可证
 

@@ -184,6 +184,22 @@ function createFixtureServer(pfxPath) {
     metrics.requestsByHost[host] = (metrics.requestsByHost[host] || 0) + 1;
     metrics.requestsByPath[pathname] = (metrics.requestsByPath[pathname] || 0) + 1;
 
+    if (pathname === '/bridge-redirect.txt') {
+      var redirectHost = requestUrl.searchParams.get('target') === 'cross' ? CROSS_HOST : SMOKE_HOST;
+      res.writeHead(302, { location: 'https://' + redirectHost + ':' + server.address().port + '/bridge-target.txt' });
+      res.end();
+      return;
+    }
+    if (pathname === '/bridge-target.txt') {
+      res.writeHead(200, {
+        'content-type': 'text/plain',
+        'access-control-allow-origin': 'https://' + SMOKE_HOST + ':' + server.address().port,
+        'access-control-allow-credentials': 'true'
+      });
+      res.end('bridge redirect fixture');
+      return;
+    }
+
     if (pathname === '/forum.php' && requestUrl.searchParams.get('mod') === 'attachment') {
       res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
       res.end('ed2k://|file|www.98T.la@妃妃宝贝.zip|2945409455|43B5B13B95A9187A3BF041CC0A94FFC2|/');
@@ -602,6 +618,32 @@ async function main() {
     assert(ordinaryItems.some(function(item) { return item.type === 'other' && /smoke\.zip/.test(item.url) && !item.code; }), 'Ordinary ZIP link inherited a cloud access code');
     assert((fixture.metrics.requestsByHost[CROSS_HOST] || 0) > 0, 'Cross-origin article did not pass through the background fetch path');
 
+    // Exercise the real MAIN-world bridge, including a cross-origin endpoint
+    // that would explicitly allow credentialed CORS without the same-origin mode.
+    async function requestBridgeRedirect(kind) {
+      return evaluate(pageOne, `(kind => new Promise((resolve, reject) => {
+        const id = 'bridge_smoke_' + kind;
+        const timer = setTimeout(() => { window.removeEventListener('message', listener); reject(new Error('bridge smoke timeout')); }, 3000);
+        function listener(event) {
+          if (event.source !== window || event.origin !== location.origin || !event.data ||
+              event.data.type !== 'ATP_PAGE_TEXT_FETCH_RESPONSE_V1' || event.data.id !== id) return;
+          clearTimeout(timer);
+          window.removeEventListener('message', listener);
+          resolve(event.data);
+        }
+        window.addEventListener('message', listener);
+        window.postMessage({ type: 'ATP_PAGE_TEXT_FETCH_REQUEST_V1', id,
+          url: location.origin + '/bridge-redirect.txt?target=' + kind, timeoutMs: 2000 }, location.origin);
+      }))(${JSON.stringify(kind)})`);
+    }
+    var sameRedirect = await requestBridgeRedirect('same');
+    assert.strictEqual(sameRedirect.ok, true, 'Page bridge must preserve allowed same-origin redirects');
+    var targetsBeforeCrossRedirect = fixture.metrics.requestsByPath['/bridge-target.txt'] || 0;
+    var crossRedirect = await requestBridgeRedirect('cross');
+    assert.strictEqual(crossRedirect.ok, false, 'Page bridge must reject a cross-origin redirect');
+    assert.strictEqual(fixture.metrics.requestsByPath['/bridge-target.txt'] || 0, targetsBeforeCrossRedirect,
+      'Cross-origin redirect destination must not receive a network request');
+
     var openedResourcePanel = await evaluate(pageOne, `(() => {
       const thread = Object.values(window.ATPState.threads).find((item) => item.link.includes('/thread-200-1-1.html'));
       const trigger = thread && thread.panel && thread.panel.querySelector('[data-resource-trigger]');
@@ -757,6 +799,7 @@ async function main() {
         combinedObservedMax: fixture.metrics.maxCombinedImages
       },
       popupBackgroundMessage: true,
+      pageBridgeRedirectBoundary: true,
       multiTab: true,
       bfcache: {
         persisted: bfcachePersisted,

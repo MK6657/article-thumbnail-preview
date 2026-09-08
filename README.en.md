@@ -4,7 +4,9 @@ English | [简体中文](README.md)
 
 A Chrome / Edge Manifest V3 extension that adds image previews and copyable resource links to supported Discuz! forum listing pages.
 
-Current version: **1.16.9**. No server, npm installation, or build is required to use the extension.
+Current version: **1.16.10**. No server, npm installation, or build is required to use the extension.
+
+Version 1.16.10 fixes repeated entity decoding, lost prototype-named passwords, and HTML tag boundary handling. Comment-heavy preprocessing now scans forward once. The page TXT bridge enforces same-origin redirects at the request layer and cancels unread rejected response bodies. Image concurrency and user settings are unchanged.
 
 ## Install and start
 
@@ -88,7 +90,7 @@ This repository restores the available **1.16.8 release runtime** and integrates
 
 [CHANGELOG.md](CHANGELOG.md) and [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md) retain Chinese release and architecture history. Other Chinese technical/maintainer documents are historical references, not fully revised descriptions of every current detail. Use this README for current installation and verification, and `settings-schema.js` for exact parameter defaults and limits.
 
-Passing tests is not a guarantee of compatibility with every live forum page, network condition, or future browser. Local Chromium synthetic regressions cover initial loading, scroll loading, concurrency, TXT parsing, popup messaging, multiple tabs, and BFCache. Live-forum testing has not been completed.
+Passing tests is not a guarantee of compatibility with every live forum page, network condition, or future browser. Local Chromium synthetic regressions cover initial loading, scroll loading, concurrency, TXT parsing, redirect network boundaries, popup messaging, multiple tabs, and BFCache. Live-forum testing has not been completed.
 
 ## License
 
