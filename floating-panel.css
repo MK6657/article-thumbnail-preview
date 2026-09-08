@@ -1,0 +1,468 @@
+/* ====== bfp: Browser Floating Panel ====== */
+.bfp-launcher {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  /* 必须低于 .bfp-panel(…645) 与 .bfp-help-panel(…644)：面板可以被拖到右下角与启动器重叠，
+     启动器在上会吃掉面板控件的点击并把面板关掉，且该坐标会被持久化，此后每次都复现 */
+  z-index: 2147483643;
+  width: 44px;
+  height: 44px;
+  border: 0;
+  padding: 0;
+  border-radius: 50%;
+  background: #4a90d9;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.25);
+  color: #fff;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font: inherit;
+  transition: transform 0.2s, box-shadow 0.2s;
+  user-select: none;
+  appearance: none;
+}
+.bfp-launcher:hover {
+  transform: scale(1.1);
+  box-shadow: 0 4px 18px rgba(74,144,217,0.4);
+}
+.bfp-launcher:focus-visible {
+  outline: 3px solid #143152;
+  outline-offset: 4px;
+  box-shadow: 0 0 0 6px rgba(255,255,255,0.85), 0 4px 18px rgba(20,49,82,0.38);
+}
+.bfp-launcher-icon {
+  font-size: 20px;
+  line-height: 1;
+}
+.bfp-launcher-dot {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  background: #4a90d9;
+}
+
+.bfp-panel {
+  position: fixed;
+  bottom: 80px;
+  right: 24px;
+  z-index: 2147483645;
+  width: min(280px, calc(100vw - 16px));
+  max-height: min(520px, calc(100vh - 16px));
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.18);
+  border: 1px solid #ddd;
+  overflow: hidden;
+  font-size: 12px;
+  color: #333;
+  transition: opacity 0.2s, transform 0.2s;
+}
+.bfp-panel.bfp-hidden {
+  opacity: 0;
+  transform: translateY(10px);
+  pointer-events: none;
+  visibility: hidden;
+}
+
+.bfp-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  background: #4a90d9;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: move;
+  user-select: none;
+  touch-action: none;
+}
+.bfp-header-btn {
+  background: none;
+  border: none;
+  color: #fff;
+  font-size: 14px;
+  cursor: pointer;
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0 4px;
+  line-height: 1;
+  border-radius: 3px;
+}
+.bfp-header-btn:hover { opacity: 0.7; }
+.bfp-header-btn-help {
+  border: 1px solid rgba(255,255,255,0.5);
+  font-size: 12px;
+  font-weight: 700;
+  padding: 1px 7px;
+  margin-right: 6px;
+}
+.bfp-header-btn-help:hover { background: rgba(255,255,255,0.15); border-color: #fff; }
+
+.bfp-body {
+  max-height: min(460px, calc(100vh - 76px));
+  overflow-y: auto;
+  padding: 8px 10px;
+}
+.bfp-body::-webkit-scrollbar { width: 4px; }
+.bfp-body::-webkit-scrollbar-thumb { background: #ccc; border-radius: 2px; }
+
+.bfp-view { display: none; }
+.bfp-view.bfp-active { display: block; }
+
+.bfp-loading {
+  padding: 12px 4px;
+  color: #666;
+  font-size: 12px;
+  text-align: center;
+}
+
+.bfp-section {
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #eee;
+}
+.bfp-section:last-child { border-bottom: none; margin-bottom: 0; }
+.bfp-section-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: #4a90d9;
+  margin-bottom: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.bfp-section-summary {
+  cursor: pointer;
+  list-style-position: inside;
+  padding: 2px 0 4px;
+  user-select: none;
+}
+
+.bfp-section-summary:focus-visible {
+  outline: 2px solid #4a90d9;
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+.bfp-section-collapsible[open] .bfp-section-summary {
+  margin-bottom: 2px;
+}
+
+.bfp-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 4px 8px;
+  flex-wrap: wrap;
+  padding: 3px 0;
+}
+.bfp-row-label {
+  font-size: 11px;
+  color: #555;
+  display: flex;
+  align-items: center;
+  flex: 1 1 120px;
+  flex-wrap: wrap;
+  gap: 4px;
+  line-height: 1.3;
+  min-width: 0;
+}
+.bfp-row-hint {
+  font-size: 10px;
+  color: #aaa;
+  font-weight: normal;
+}
+.bfp-row-input-wrap {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 3px;
+  max-width: 100%;
+}
+.bfp-row input[type="number"] {
+  width: 64px;
+  max-width: calc(100% - 28px);
+  box-sizing: border-box;
+  font-size: 11px;
+  padding: 2px 4px;
+  border: 1px solid #ddd;
+  border-radius: 3px;
+  background: #fff;
+  color: #333;
+  text-align: center;
+}
+.bfp-row input[type="number"]:focus { border-color: #4a90d9; }
+.bfp-row select {
+  max-width: 150px;
+  min-width: 0;
+  font-size: 11px;
+  padding: 2px 4px;
+  border: 1px solid #ddd;
+  border-radius: 3px;
+  background: #fff;
+  color: #333;
+  cursor: pointer;
+}
+.bfp-row select:focus { border-color: #4a90d9; }
+.bfp-row input[type="number"]:focus-visible,
+.bfp-row select:focus-visible,
+.bfp-reset:focus-visible,
+.bfp-ordinary-preset:focus-visible,
+.bfp-heavy-preset:focus-visible,
+.bfp-panel button:focus-visible,
+.bfp-help-body:focus-visible {
+  outline: 2px solid #4a90d9;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 3px rgba(74,144,217,0.18);
+}
+
+.bfp-header .bfp-header-btn:focus-visible,
+.bfp-help-header button:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px rgba(20,49,82,0.65);
+}
+.bfp-row input[type="checkbox"] {
+  width: 13px; height: 13px;
+  accent-color: #4a90d9;
+  cursor: pointer;
+  margin: 0;
+}
+.bfp-check-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 3px 0;
+}
+.bfp-check-row-action {
+  justify-content: space-between;
+}
+.bfp-check-row label {
+  font-size: 11px;
+  color: #555;
+  cursor: pointer;
+  flex: 1;
+  min-width: 0;
+}
+
+.bfp-preset-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  padding: 3px 0;
+}
+
+.bfp-preset-label {
+  color: #555;
+  font-size: 11px;
+  line-height: 24px;
+}
+
+.bfp-preset-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 3px;
+}
+
+.bfp-reset {
+  width: 24px;
+  height: 24px;
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+  border: 1px solid #ddd;
+  border-radius: 3px;
+  background: #f5f5f5;
+  color: #999;
+  font-size: 11px;
+  cursor: pointer;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.bfp-reset:not(:disabled):not([aria-disabled="true"]):hover { background: #e8e8e8; color: #4a90d9; border-color: #4a90d9; }
+
+.bfp-heavy-preset,
+.bfp-ordinary-preset {
+  flex: 0 0 auto;
+  min-width: 24px;
+  min-height: 24px;
+  padding: 2px 6px;
+  border: 1px solid #d7e7f8;
+  border-radius: 3px;
+  background: #f4f9ff;
+  color: #2f72b7;
+  font-size: 10px;
+  line-height: 1.3;
+  cursor: pointer;
+}
+.bfp-heavy-preset:not(:disabled):not([aria-disabled="true"]):hover,
+.bfp-ordinary-preset:not(:disabled):not([aria-disabled="true"]):hover { background: #e9f3ff; border-color: #4a90d9; }
+.bfp-heavy-preset[aria-disabled="true"],
+.bfp-ordinary-preset[aria-disabled="true"],
+.bfp-reset[aria-disabled="true"],
+.bfp-heavy-preset:disabled,
+.bfp-ordinary-preset:disabled,
+.bfp-reset:disabled,
+.bfp-row input:disabled,
+.bfp-row select:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.bfp-input-err {
+  border-color: #e74c3c !important;
+  box-shadow: 0 0 0 2px rgba(231,76,60,0.2);
+  animation: bfp-shake 0.3s;
+}
+@keyframes bfp-shake {
+  0%,100% { transform: translateX(0); }
+  25% { transform: translateX(-3px); }
+  75% { transform: translateX(3px); }
+}
+
+.bfp-message {
+  text-align: center;
+  font-size: 11px;
+  padding: 4px 10px;
+  min-height: 0;
+  /* 只过渡配色：transition:all 会把 padding/min-height 的切换变成 200ms 布局动画 */
+  transition: background-color 0.2s, color 0.2s;
+}
+.bfp-message.bfp-msg-ok { color: #27ae60; background: #eafaf1; }
+.bfp-message.bfp-msg-warn { color: #e67e22; background: #fef5e7; }
+.bfp-message.bfp-msg-err { color: #e74c3c; background: #fdedec; }
+.bfp-message.bfp-msg-empty { padding: 0; min-height: 0; background: transparent; }
+
+.bfp-help-section {
+  margin-bottom: 10px;
+}
+.bfp-help-section:last-child { margin-bottom: 0; }
+.bfp-help-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #8e44ad;
+  margin-bottom: 4px;
+  padding-bottom: 2px;
+  border-bottom: 1px solid #e0e0e0;
+}
+.bfp-help-item {
+  font-size: 11px;
+  line-height: 1.55;
+  color: #555;
+  padding: 2px 0;
+}
+.bfp-help-item b { color: #333; }
+
+.bfp-help-panel {
+  position: fixed;
+  z-index: 2147483644;
+  width: min(300px, calc(100vw - 16px));
+  max-height: min(480px, calc(100vh - 16px));
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.18);
+  border: 1px solid #ddd;
+  overflow: hidden;
+  font-size: 12px;
+  color: #333;
+  transition: opacity 0.2s, transform 0.2s;
+}
+.bfp-help-panel.bfp-help-stacked {
+  width: min(280px, calc(100vw - 16px));
+  max-height: min(320px, calc(100vh - 16px));
+}
+.bfp-panel.bfp-help-docked-open .bfp-header,
+.bfp-panel.bfp-help-docked-open .bfp-body,
+.bfp-panel.bfp-help-docked-open .bfp-message {
+  visibility: hidden;
+}
+.bfp-help-panel.bfp-help-docked {
+  position: absolute;
+  inset: 0;
+  width: auto;
+  max-height: none;
+  border: 0;
+  border-radius: 8px;
+  box-shadow: none;
+  display: flex;
+  flex-direction: column;
+}
+.bfp-help-panel.bfp-help-docked .bfp-help-header {
+  flex: 0 0 auto;
+}
+.bfp-help-panel.bfp-help-docked .bfp-help-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+}
+.bfp-help-panel.bfp-hidden {
+  opacity: 0;
+  transform: translateY(10px);
+  pointer-events: none;
+  visibility: hidden;
+}
+
+.bfp-help-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  background: #8e44ad;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: default;
+  user-select: none;
+}
+.bfp-help-header button {
+  background: none;
+  border: none;
+  color: #fff;
+  font-size: 14px;
+  cursor: pointer;
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0 4px;
+  line-height: 1;
+  border-radius: 3px;
+}
+.bfp-help-header button:hover { opacity: 0.7; }
+
+.bfp-help-body {
+  max-height: min(430px, calc(100vh - 66px));
+  overflow-y: auto;
+  padding: 10px 12px;
+}
+.bfp-help-panel.bfp-help-stacked .bfp-help-body {
+  max-height: min(270px, calc(100vh - 66px));
+}
+.bfp-help-body::-webkit-scrollbar { width: 4px; }
+.bfp-help-body::-webkit-scrollbar-thumb { background: #ccc; border-radius: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .bfp-launcher,
+  .bfp-panel,
+  .bfp-help-panel,
+  .bfp-message,
+  .bfp-input-err {
+    transition: none !important;
+    animation: none !important;
+  }
+
+  .bfp-launcher:hover {
+    transform: none;
+  }
+}

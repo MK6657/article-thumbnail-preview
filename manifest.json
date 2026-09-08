@@ -1,0 +1,56 @@
+{
+  "manifest_version": 3,
+  "name": "文章缩略图预览",
+  "version": "1.16.9",
+  "description": "在文章列表页自动抓取文章内图片，显示缩略图，避免被标题党欺骗。",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://*.sehuatang.org/*",
+    "https://*.sehuatang.net/*",
+    "https://dl.ldkms.la/*",
+    "https://xia.ewrewej.la/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.sehuatang.org/*",
+        "https://*.sehuatang.net/*"
+      ],
+      "js": ["page-fetch-bridge.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://*.sehuatang.org/*",
+        "https://*.sehuatang.net/*"
+      ],
+      "js": ["settings-schema.js", "defaults.js", "shared-utils.js", "loading-policy.js", "logger.js", "cache.js", "config.js", "scanner.js", "fetcher.js", "viewport-observer.js", "loader.js", "resource-panel.js", "renderer.js", "previewer.js", "floating-panel.js", "content.js"],
+      "css": ["content.css"],
+      "run_at": "document_end"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "文章缩略图预览",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "web_accessible_resources": [{
+    "resources": ["floating-panel.css"],
+    "matches": ["https://*.sehuatang.org/*", "https://*.sehuatang.net/*"]
+  }],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

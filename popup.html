@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>文章缩略图预览 - 设置</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="popup-container">
+    <header class="popup-header">
+      <h1>文章缩略图预览</h1>
+      <label class="toggle-switch">
+        <input type="checkbox" id="toggleEnabled" aria-label="启用文章缩略图预览">
+        <span class="toggle-slider"></span>
+      </label>
+    </header>
+
+    <div class="site-info">
+      <span class="site-label">当前站点：</span>
+      <span id="currentSite">--</span>
+      <span class="site-label"> | 首屏：</span>
+      <span id="firstScreenInfo">10 张</span>
+    </div>
+
+    <div id="popupStatus" class="popup-status popup-status-empty" role="status" aria-live="polite"></div>
+
+    <div id="settingsContainer"></div>
+
+    <section class="settings-section">
+      <h2>维护</h2>
+      <button id="clearImageCache" class="btn">清除文章/图片缓存</button>
+      <button id="clearFailCache" class="btn">清除失败缓存</button>
+      <button id="clearAllCache" class="btn">清除全部缓存</button>
+      <button id="clearTestCache" class="btn btn-secondary">一键清空缓存和日志</button>
+      <button id="resetSettings" class="btn btn-secondary">恢复默认设置</button>
+    </section>
+
+    <section class="settings-section">
+      <h2 id="helpHeading"><span id="helpTitle">使用说明</span> <button id="toggleHelp" class="btn-toggle" aria-expanded="false" aria-controls="helpPanel" aria-label="展开使用说明">展开</button></h2>
+      <div id="helpPanel" class="help-panel hidden" role="region" aria-labelledby="helpTitle" aria-hidden="true" tabindex="0"></div>
+    </section>
+
+    <section class="settings-section">
+      <h2 id="logHeading"><span id="logTitle">诊断日志</span> <span id="logCount" class="log-count" aria-live="polite" aria-atomic="true">0</span><button id="toggleLogs" class="btn-toggle" aria-expanded="false" aria-controls="logPanel" aria-label="展开诊断日志">展开</button></h2>
+      <div id="logPanel" class="log-panel hidden" role="region" aria-labelledby="logTitle" aria-hidden="true">
+        <div class="log-tools">
+          <select id="logFilter" aria-label="日志筛选">
+            <option value="all">全部日志</option>
+            <option value="session">最近会话</option>
+            <option value="warn">告警/错误</option>
+            <option value="image">图片调度</option>
+            <option value="heavy">重图相关</option>
+          </select>
+          <input id="logSearch" type="search" placeholder="host/type" aria-label="搜索日志">
+        </div>
+        <div id="logViewer" class="log-viewer" role="region" aria-live="off" aria-busy="false" aria-label="诊断日志内容" tabindex="0"></div>
+        <div class="log-actions">
+          <button id="exportLogs" class="btn btn-sm">导出日志</button>
+          <button id="clearLogs" class="btn btn-sm btn-secondary">清空日志</button>
+        </div>
+      </div>
+    </section>
+
+    <footer class="popup-footer"><span id="versionFooter"></span></footer>
+  </div>
+  <script src="settings-schema.js"></script>
+  <script src="defaults.js"></script>
+  <script src="shared-utils.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

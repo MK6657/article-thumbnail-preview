@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.crx
+credentials.json
+
+# Logs
+*.log
+
+# Temp
+*.tmp
+*.temp
+
+# Generated release outputs
+dist/
+artifacts/
+output/
+
+# Local agent tooling
+.agents/
+.claude/
+.opencode/
+.codex/

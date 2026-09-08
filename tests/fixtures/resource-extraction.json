@@ -1,0 +1,83 @@
+{
+  "resourceCases": [
+    {
+      "name": "baidu-query-code",
+      "html": "<a href=\"https://pan.baidu.com/s/1fixture?pwd=ab12&amp;utm_source=list\">Baidu</a>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1fixture?utm_source=list", "code": "ab12" }
+        ]
+      }
+    },
+    {
+      "name": "anchor-local-codes",
+      "html": "<p><a href=\"https://pan.baidu.com/s/1local\">Baidu</a> \u63d0\u53d6\u7801: 1111</p><p><a href=\"https://pan.quark.cn/s/qlocal\">Quark</a> \u63d0\u53d6\u7801: 2222</p>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1local", "code": "1111" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qlocal", "code": "2222" }
+        ]
+      }
+    },
+    {
+      "name": "protocol-links",
+      "html": "<a href=\"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&amp;dn=Fixture\">Magnet</a><a href=\"ed2k://|file|fixture.zip|123|0123456789ABCDEF0123456789ABCDEF|/\">ED2K</a>",
+      "expected": {
+        "magnet": [
+          { "url": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Fixture" }
+        ],
+        "ed2k": [
+          { "url": "ed2k://|file|fixture.zip|123|0123456789ABCDEF0123456789ABCDEF|/" }
+        ]
+      }
+    },
+    {
+      "name": "bare-pan-links",
+      "html": "www.aliyundrive.com/s/alifixture //www.pan.baidu.com/s/1bare",
+      "expected": {
+        "aliyun": [
+          { "url": "https://aliyundrive.com/s/alifixture" }
+        ],
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1bare" }
+        ]
+      }
+    },
+    {
+      "name": "punctuation-and-password",
+      "html": "Quark https://pan.quark.cn/s/qfixture\uff0c\u63d0\u53d6\u7801 qwer 115 https://115.com/s/f115\uff09\u8bbf\u95ee\u7801\uff1a115x https://files.example/archive.torrent\u3002 \u89e3\u538b\u5bc6\u7801: pass-123",
+      "expected": {
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qfixture", "code": "qwer" }
+        ],
+        "pan115": [
+          { "url": "https://115.com/s/f115", "code": "115x" }
+        ],
+        "other": [
+          { "url": "https://files.example/archive.torrent" }
+        ]
+      },
+      "passwords": ["pass-123"]
+    }
+  ],
+  "attachmentCases": [
+    {
+      "name": "transient-and-persistent-txt",
+      "html": "<a href=\"forum.php?mod=attachment&amp;aid=7\">bundle.txt</a><a href=\"https://xia.ewrewej.la/download?id=fixture&amp;sign=abc\">download</a><a href=\"https://dl.ldkms.la/list.txt\">list.txt</a>",
+      "expectedUrls": [
+        "https://www.sehuatang.org/forum.php?mod=attachment&aid=7",
+        "https://xia.ewrewej.la/download?id=fixture&sign=abc",
+        "https://dl.ldkms.la/list.txt"
+      ]
+    },
+    {
+      "name": "equivalent-txt-deduplication",
+      "html": "<a href=\"https://dl.ldkms.la/dup.txt?b=2&amp;a=1#first\">a.txt</a><a href=\"https://dl.ldkms.la/dup.txt?a=1&amp;b=2\">b.txt</a>",
+      "expectedUrls": [
+        "https://dl.ldkms.la/dup.txt?b=2&a=1#first"
+      ]
+    }
+  ]
+}
