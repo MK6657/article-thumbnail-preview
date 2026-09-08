@@ -3230,7 +3230,7 @@
     task.viewportPriority = visible;
     var img = wrapper && wrapper.querySelector ? wrapper.querySelector('.atp-thumbnail-img') : null;
     if (img) {
-      img.loading = visible || task.manualRetry ? 'eager' : 'lazy';
+      img.loading = shouldLoadImageEagerly(task) ? 'eager' : 'lazy';
       img.fetchPriority = visible || task.manualRetry ? 'high' : 'low';
     }
     return visible;
@@ -3241,7 +3241,10 @@
   }
 
   function shouldLoadImageEagerly(task) {
-    return shouldUseHighFetchPriority(task) || !!(task && (task.forceEager || task.forcePreload));
+    // JS admission owns concurrency and starts the timeout clock. Once a slot
+    // is held, native lazy loading must not defer the actual network request.
+    // Eager starts the request; fetchPriority still keeps offscreen work low.
+    return shouldUseHighFetchPriority(task) || !!(task && (task.slotActive || task.forceEager || task.forcePreload));
   }
 
   function prepareThumbnailImage(img, task, w, h) {

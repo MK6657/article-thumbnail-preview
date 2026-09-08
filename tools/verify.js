@@ -8297,6 +8297,16 @@ function checkLoaderViewportImagePriority() {
   run.sandbox.ATPLoader.prepareThumbnailImage(offscreenFirst, { isFirstScreen: true }, 110, 82);
   assert(offscreenFirst.loading === 'lazy' && offscreenFirst.fetchPriority === 'low', 'offscreen first-screen quota images must not claim eager/high network priority');
 
+  const admittedImage = createVerifyImageElement();
+  const admittedTask = { isFirstScreen: true, currentlyVisible: false, slotActive: true };
+  run.sandbox.ATPLoader.prepareThumbnailImage(admittedImage, admittedTask, 110, 82);
+  assert(admittedImage.loading === 'eager' && admittedImage.fetchPriority === 'low', 'admitted offscreen images must bypass native lazy deferral without taking high network priority');
+  const admittedWrapper = { querySelector: function() { return admittedImage; } };
+  run.sandbox.ATPLoader.updateTaskViewportPriority(admittedTask, admittedWrapper, false);
+  assert(admittedImage.loading === 'eager' && admittedImage.fetchPriority === 'low', 'visibility updates must not re-lazify images holding a timed active slot');
+  run.sandbox.ATPLoader.updateTaskViewportPriority(admittedTask, admittedWrapper, true);
+  assert(admittedImage.loading === 'eager' && admittedImage.fetchPriority === 'high', 'visible admitted images must still receive high request priority');
+
   const visibleFirst = createVerifyImageElement();
   run.sandbox.ATPLoader.prepareThumbnailImage(visibleFirst, { isFirstScreen: true, viewportPriority: true }, 110, 82);
   assert(visibleFirst.loading === 'eager' && visibleFirst.fetchPriority === 'high', 'actually visible first-screen images must use eager/high network priority');

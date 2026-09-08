@@ -185,6 +185,12 @@ function createFixtureServer(pfxPath) {
     metrics.requestsByHost[host] = (metrics.requestsByHost[host] || 0) + 1;
     metrics.requestsByPath[pathname] = (metrics.requestsByPath[pathname] || 0) + 1;
 
+    if (pathname === '/admitted-image-probe.png') {
+      res.writeHead(200, { 'content-type': 'image/png', 'content-length': pixel.length });
+      res.end(pixel);
+      return;
+    }
+
     if (pathname === '/bridge-redirect.txt') {
       var redirectHost = requestUrl.searchParams.get('target') === 'cross' ? CROSS_HOST : SMOKE_HOST;
       res.writeHead(302, { location: 'https://' + redirectHost + ':' + server.address().port + '/bridge-target.txt' });
@@ -653,6 +659,35 @@ async function main() {
     assert(mixedHeavyState && mixedHeavyState.heavyMode && mixedHeavyState.sourceCandidates === 20, 'Mixed page must classify and retain the heavy channel beside ordinary work');
     assert(crossState && crossState.textAttachmentCount >= 1, 'Cross-origin article must preserve the detected TXT attachment count while automatic parsing progresses');
     var ordinaryItems = flattenResourceItems(ordinaryState.resources);
+    var admittedOffscreenImage = await evaluate(pageOne, `new Promise(resolve => {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'atp-regression-probe';
+      wrapper.style.cssText = 'position:absolute;top:100000px;left:0;width:110px;height:82px';
+      const img = document.createElement('img');
+      const task = { slotActive: true, currentlyVisible: false, isFirstScreen: true };
+      ATPLoader.prepareThumbnailImage(img, task, 110, 82);
+      wrapper.appendChild(img);
+      document.body.appendChild(wrapper);
+      ATPLoader.updateTaskViewportPriority(task, wrapper, false);
+      let settled = false;
+      const finish = loaded => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        const result = { loaded, loading: img.loading, priority: img.fetchPriority };
+        img.onload = img.onerror = null;
+        img.removeAttribute('src');
+        wrapper.remove();
+        resolve(result);
+      };
+      const timer = setTimeout(() => finish(false), 3000);
+      img.onload = () => finish(true);
+      img.onerror = () => finish(false);
+      img.src = location.origin + '/admitted-image-probe.png';
+    })`, pageOneContext.id);
+    assert(admittedOffscreenImage.loaded && admittedOffscreenImage.loading === 'eager' && admittedOffscreenImage.priority === 'low',
+      'An admitted offscreen request must start without scrolling and retain low priority: ' + JSON.stringify(admittedOffscreenImage));
+    assert.strictEqual(fixture.metrics.requestsByPath['/admitted-image-probe.png'], 1, 'Admitted request must actually reach the fixture server');
     var fixtureRoot = path.join(PROJECT_ROOT, 'tests/fixtures/pages');
     var pageCases = JSON.parse(fs.readFileSync(path.join(fixtureRoot, 'cases.json'), 'utf8')).cases;
     for (var pageCase of pageCases) {
@@ -899,6 +934,7 @@ async function main() {
       pageBridgeRedirectBoundary: true,
       signedImageUrlParity: true,
       nativePopupStableWidth: 320,
+      admittedOffscreenRequest: true,
       syntheticPageFixtureCount: pageCases.length + 1,
       multiTab: true,
       bfcache: {
