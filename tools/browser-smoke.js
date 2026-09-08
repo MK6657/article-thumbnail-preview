@@ -320,18 +320,40 @@ class CdpConnection {
     var self = this;
     var id = this.nextId++;
     return new Promise(function(resolve, reject) {
-      self.pending.set(id, { resolve: resolve, reject: reject });
-      self.ws.send(JSON.stringify({ id: id, method: method, params: params || {} }));
+      var settled = false;
+      var timer;
+      function finish(callback, value) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        self.pending.delete(id);
+        callback(value);
+      }
+      var pending = {
+        resolve: function(value) { finish(resolve, value); },
+        reject: function(error) { finish(reject, error); }
+      };
+      timer = setTimeout(function() {
+        pending.reject(new Error('CDP command timed out: ' + method));
+      }, DEVTOOLS_TIMEOUT_MS);
+      self.pending.set(id, pending);
+      try {
+        self.ws.send(JSON.stringify({ id: id, method: method, params: params || {} }));
+      } catch (error) {
+        pending.reject(error);
+      }
     });
   }
 
   close() {
+    this.pending.forEach(function(pending) { pending.reject(new Error('CDP websocket closed')); });
+    this.pending.clear();
     if (this.ws && this.ws.readyState < 2) this.ws.close();
   }
 }
 
 async function fetchJson(url, options) {
-  var response = await fetch(url, options);
+  var response = await fetch(url, Object.assign({}, options, { signal: AbortSignal.timeout(DEVTOOLS_TIMEOUT_MS) }));
   if (!response.ok) throw new Error(response.status + ' ' + response.statusText + ' for ' + url);
   return response.json();
 }
@@ -613,6 +635,20 @@ async function main() {
     assert(mixedHeavyState && mixedHeavyState.heavyMode && mixedHeavyState.sourceCandidates === 20, 'Mixed page must classify and retain the heavy channel beside ordinary work');
     assert(crossState && crossState.textAttachmentCount >= 1, 'Cross-origin article must preserve the detected TXT attachment count while automatic parsing progresses');
     var ordinaryItems = flattenResourceItems(ordinaryState.resources);
+    var signedImageUrls = await evaluate(pageOne, `(() => {
+      const url = 'https://img.example/photo.jpg?sig=a&amp;b;part2,';
+      const encoded = url.replace(/&/g, '&amp;');
+      return ['<img src="' + encoded + '">', '<a href="' + encoded + '">image</a>',
+        '<meta property="og:image" content="' + encoded + '">'].map(html => ({
+          expected: url,
+          dom: SharedUtils.extractImagesByDom(html, location.href, 10)[0].src,
+          fallback: SharedUtils.extractImagesByRegex(html, location.href, 10)[0].src
+        }));
+    })()`, pageOneContext.id);
+    signedImageUrls.forEach(function(result) {
+      assert.strictEqual(result.dom, result.expected, 'DOM extraction must preserve signed query values');
+      assert.strictEqual(result.fallback, result.expected, 'fallback extraction must preserve signed query values');
+    });
     assert(ordinaryItems.some(function(item) { return item.type === 'magnet' && /1111111111/.test(item.url); }), 'Main magnet link was not extracted');
     assert(ordinaryItems.some(function(item) { return item.type === 'baidu' && item.code === 'abcd'; }), 'Baidu access code was not bound to its link');
     assert(ordinaryItems.some(function(item) { return item.type === 'other' && /smoke\.zip/.test(item.url) && !item.code; }), 'Ordinary ZIP link inherited a cloud access code');
@@ -800,6 +836,7 @@ async function main() {
       },
       popupBackgroundMessage: true,
       pageBridgeRedirectBoundary: true,
+      signedImageUrlParity: true,
       multiTab: true,
       bfcache: {
         persisted: bfcachePersisted,

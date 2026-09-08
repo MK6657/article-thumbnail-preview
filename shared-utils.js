@@ -380,9 +380,9 @@ const SharedUtils = {
 
   IMAGE_DIRECT_PARAM_NAMES: ['url', 'src', 'img', 'image', 'pic', 'path', 'file'],
 
-  resolveUrl: function(baseUrl, relativeUrl) {
+  resolveUrl: function(baseUrl, relativeUrl, alreadyDecoded) {
     if (!relativeUrl) return null;
-    relativeUrl = SharedUtils.decodeHtmlEntities(String(relativeUrl)).trim().replace(/\\\//g, '/');
+    relativeUrl = (alreadyDecoded ? String(relativeUrl) : SharedUtils.decodeHtmlEntities(String(relativeUrl))).trim().replace(/\\\//g, '/');
     if (/^(?:data|blob|javascript|mailto|tel):/i.test(relativeUrl)) return null;
     try { return new URL(relativeUrl, baseUrl).href; } catch(e) { return null; }
   },
@@ -721,10 +721,13 @@ const SharedUtils = {
   },
 
   extractOgImage: function(html, baseUrl) {
-    var og = html.match(/<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["'][^>]*\/?>/i)
-      || html.match(/<meta[^>]*content=["']([^"']+)["'][^>]*property=["']og:image["'][^>]*\/?>/i);
-    if (og) return this.resolveUrl(baseUrl, og[1]);
-    return null;
+    var image = null;
+    SharedUtils.forEachHtmlTag(SharedUtils.stripNonRenderedHtmlRegions(html), function(name, attrs) {
+      if (name !== 'meta' || SharedUtils.extractHtmlAttr(attrs, 'property').toLowerCase() !== 'og:image') return;
+      image = SharedUtils.resolveUrl(baseUrl, SharedUtils.extractHtmlAttr(attrs, 'content'));
+      if (image) return false;
+    });
+    return image;
   },
 
   emptyResources: function() {
@@ -1405,6 +1408,18 @@ const SharedUtils = {
     return -1;
   },
 
+  forEachHtmlTag: function(html, callback) {
+    var opening = /<([a-z][a-z0-9:-]*)(?=[\t\n\f\r />])/gi;
+    var match;
+    while ((match = opening.exec(html)) !== null) {
+      var attrsStart = opening.lastIndex;
+      var end = SharedUtils.findHtmlTagEnd(html, attrsStart);
+      if (end === -1) return;
+      opening.lastIndex = end + 1;
+      if (callback(match[1].toLowerCase(), html.slice(attrsStart, end)) === false) return;
+    }
+  },
+
   // 扫描锚点时每段只走一次；属性引号中的 > 不是标签结束，未闭合标签不重复扫尾。
   forEachAnchorTag: function(html, callback) {
     html = String(html || '');
@@ -1531,6 +1546,12 @@ const SharedUtils = {
       cleaned = cleaned.replace(/(btih:[A-Fa-f0-9]{32,40})(?:[。；;，,、\s]*)?(?:提取码|提取密码|访问码|取件码|解压密码|压缩密码|解压码|解压口令|解壓密碼|解壓碼|密码)\s*[:：=]?.*$/i, '$1');
       cleaned = cleaned.replace(/[。；;，,、\s]+(?:(?:提取码|提取密码|访问码|取件码|解压密码|压缩密码|解压码|解压口令|解壓密碼|解壓碼)\s*[:：=]?|密码\s*[:：=]).*$/i, '');
       return cleaned.replace(trailingPunctuation, '');
+    }
+    // ASCII punctuation is legal inside query/fragment values, including at
+    // their end. Keep signed URLs byte-for-byte unless explicit prose follows.
+    var queryStart = cleaned.search(/[?#]/);
+    if (queryStart !== -1 && !/(?:提取码|提取密码|访问码|取件码|解压密码|压缩密码|密码)\s*[:：=]/i.test(cleaned.slice(queryStart))) {
+      return cleaned.replace(/[」』“”】）》〉。；，、？！…][\s\S]*$/g, '');
     }
     if (/(?:pan\.baidu\.com|yun\.baidu\.com|pan\.quark\.cn|115\.com\/s\/|(?:aliyundrive|alipan)\.com\/s\/|drive\.uc\.cn\/s\/|pan\.xunlei\.com\/s\/)/i.test(cleaned)) {
       cleaned = cleaned.replace(/(?:[。；;，,、\s]*)?(?:提取码|提取密码|访问码|取件码|解压密码|压缩密码|密码)\s*[:：=]?.*$/i, '');
@@ -1842,7 +1863,7 @@ const SharedUtils = {
     var canContinue = SharedUtils.createImageCollectionGuard(images, maxCount, options, 250);
     function resolveImageUrl(url) {
       url = SharedUtils.cleanResourceUrl(SharedUtils.decodeHtmlEntities(url));
-      var r = SharedUtils.resolveUrl(baseUrl, url);
+      var r = SharedUtils.resolveUrl(baseUrl, url, true);
       if (!r || !SharedUtils.isMeaningfulImage(r)) return '';
       return r;
     }
@@ -1922,33 +1943,43 @@ const SharedUtils = {
       addCandidate(displayCandidates, candidates, 'img/regex');
     }
 
-    // class 按空白分隔的完整 token 匹配 zoom（对齐 DOM 的 .zoom 选择器；子串匹配会误中 zoombie 等）
-    var zoomRegex = /<(?:img|a|span|ignore_js_op)[^>]*class\s*=\s*["'](?:[^"']*\s)?zoom(?:\s[^"']*)?["'][^>]*(?:file|zoomfile)\s*=\s*["']([^"']+)["'][^>]*>/gi;
-    var zoomRevRegex = /<(?:img|a|span|ignore_js_op)[^>]*(?:file|zoomfile)\s*=\s*["']([^"']+)["'][^>]*class\s*=\s*["'](?:[^"']*\s)?zoom(?:\s[^"']*)?["'][^>]*>/gi;
-    var zoomFileOnlyRegex = /<[^>]*\szoomfile\s*=\s*["']([^"']+)["'][^>]*>/gi;
-    var m;
-    while (canContinue() && (m = zoomRegex.exec(html)) !== null) { add(m[1], 'zoom/regex'); }
-    while (canContinue() && (m = zoomRevRegex.exec(html)) !== null) { add(m[1], 'zoomfile/regex'); }
-    while (canContinue() && (m = zoomFileOnlyRegex.exec(html)) !== null) { add(m[1], 'zoomfile/standalone'); }
-
-    var fileRegex = /<(?:img|a)[^>]*\sfile\s*=\s*["']([^"']+)["'][^>]*>/gi;
-    while (canContinue() && (m = fileRegex.exec(html)) !== null) { add(m[1], 'file/regex'); }
-
-    var imgTagRegex = /<img\b[^>]*>/gi;
-    while (canContinue() && (m = imgTagRegex.exec(html)) !== null) {
-      addBestFromImgTag(m[0]);
-    }
-
-    SharedUtils.forEachHrefValue(html, function(href) {
-      if (SharedUtils.isDirectImageUrl(href)) add(href, 'link-href');
+    // Tokenize once instead of retrying whole-tail regex matches at every '<'.
+    // Keep the existing priority: zoom, standalone zoomfile, file, img, href, OG.
+    var tags = [];
+    SharedUtils.forEachHtmlTag(html, function(name, attrs) {
       if (!canContinue()) return false;
+      // Do not allocate records or repeatedly parse attributes for layout-only tags.
+      if (name !== 'img' && name !== 'meta' && !/(?:^|\s)(?:zoomfile|file|href)\s*=/i.test(attrs)) return;
+      tags.push({ name: name, attrs: attrs,
+        zoomfile: SharedUtils.extractHtmlAttr(attrs, 'zoomfile'),
+        file: SharedUtils.extractHtmlAttr(attrs, 'file') });
     });
-
-    var linkRegex = /<a[^>]+href\s*=\s*["']([^"']+\.(?:jpg|jpeg|png|gif|webp)(?:[?#][^"']*)?)["'][^>]*>/gi;
-    while (canContinue() && (m = linkRegex.exec(html)) !== null) { add(m[1], 'link'); }
-
-    var og = SharedUtils.extractOgImage(html, baseUrl);
-    if (og && canContinue()) { add(og, 'og:image'); }
+    for (var zi = 0; zi < tags.length && canContinue(); zi++) {
+      var zoomTag = tags[zi];
+      if (/^(?:img|a|span|ignore_js_op)$/.test(zoomTag.name) &&
+          /(?:^|\s)zoom(?:\s|$)/.test(SharedUtils.extractHtmlAttr(zoomTag.attrs, 'class'))) {
+        add(zoomTag.file || zoomTag.zoomfile, 'zoom/regex');
+      }
+    }
+    for (var zfi = 0; zfi < tags.length && canContinue(); zfi++) {
+      if (tags[zfi].zoomfile) add(tags[zfi].zoomfile, 'zoomfile/standalone');
+    }
+    for (var fi = 0; fi < tags.length && canContinue(); fi++) {
+      if (/^(?:img|a)$/.test(tags[fi].name) && tags[fi].file) add(tags[fi].file, 'file/regex');
+    }
+    for (var ii = 0; ii < tags.length && canContinue(); ii++) {
+      if (tags[ii].name === 'img') addBestFromImgTag(tags[ii].attrs);
+    }
+    for (var hi = 0; hi < tags.length && canContinue(); hi++) {
+      var href = SharedUtils.extractHtmlAttr(tags[hi].attrs, 'href');
+      if (href && SharedUtils.isDirectImageUrl(href)) add(href, 'link-href');
+    }
+    for (var oi = 0; oi < tags.length && canContinue(); oi++) {
+      if (tags[oi].name === 'meta' && SharedUtils.extractHtmlAttr(tags[oi].attrs, 'property').toLowerCase() === 'og:image') {
+        add(SharedUtils.extractHtmlAttr(tags[oi].attrs, 'content'), 'og:image');
+        break;
+      }
+    }
 
     return SharedUtils.limitImageResults(images, maxCount);
   },
@@ -1971,8 +2002,9 @@ const SharedUtils = {
 
     function resolveImageUrl(src) {
       if (!src) return false;
-      src = SharedUtils.cleanResourceUrl(SharedUtils.decodeHtmlEntities(src));
-      var url = SharedUtils.resolveUrl(baseUrl, src);
+      // DOM attributes have already been entity-decoded by DOMParser.
+      src = SharedUtils.cleanResourceUrl(src);
+      var url = SharedUtils.resolveUrl(baseUrl, src, true);
       if (!url) return false;
       if (!SharedUtils.isMeaningfulImage(url)) return false;
       return url;

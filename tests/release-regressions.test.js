@@ -21,6 +21,19 @@ for (const encoder of [TextEncoder, undefined, class { encode() { throw new Erro
 }
 
 const shared = loadShared(TextEncoder);
+for (const suffix of ['?signature=part1;part2', '?signature=part1;', '?transform=w_100,h_100', '?sig=a&amp;b']) {
+  const url = 'https://img.example/photo.jpg' + suffix;
+  assert.strictEqual(shared.cleanResourceUrl(url), url, 'URL query punctuation must remain intact');
+  const htmlUrl = url.replace(/&/g, '&amp;');
+  const result = shared.extractImagesByRegex('<img src="' + htmlUrl + '">', 'https://example.test/', 10);
+  assert.strictEqual(result[0].src, url, 'image extraction must decode attributes exactly once');
+}
+vm.runInNewContext(`
+  for (const tag of ['<img ', '<span ', '<meta ']) {
+    if (shared.extractImagesByRegex(tag.repeat(40000), 'https://example.test/', 10).length) throw Error('malformed image');
+    if (shared.extractOgImage(tag.repeat(40000), 'https://example.test/')) throw Error('malformed OG');
+  }
+`, { shared }, { timeout: 2000 });
 const srcset = shared.getSrcsetUrls('https://cdn.example/c_fill,w_300/a.jpg 300w, https://cdn.example/c_fill,w_900/a.jpg 900w');
 assert.strictEqual(srcset.smallest, 'https://cdn.example/c_fill,w_300/a.jpg');
 assert.strictEqual(srcset.best, 'https://cdn.example/c_fill,w_900/a.jpg');
@@ -72,4 +85,46 @@ const images = shared.extractImagesByRegex(
 );
 assert.strictEqual(images.length, 1);
 assert.strictEqual(images[0].src, 'https://cdn.example/visible.jpg');
-console.log('release regressions ok');
+async function checkCdpCommandLifecycle() {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'tools', 'browser-smoke.js'), 'utf8');
+  const timers = new Map();
+  let timerId = 0;
+  const context = {
+    DEVTOOLS_TIMEOUT_MS: 50,
+    setTimeout: function(callback) { timers.set(++timerId, callback); return timerId; },
+    clearTimeout: function(id) { timers.delete(id); }
+  };
+  vm.runInNewContext(source.slice(source.indexOf('class CdpConnection'), source.indexOf('async function fetchJson')) +
+    '\nthis.CdpConnection = CdpConnection;', context);
+  const connection = new context.CdpConnection('ws://fixture');
+  connection.ws = { readyState: 1, send: function() {}, close: function() {} };
+  const timeoutResult = connection.send('Runtime.evaluate').then(() => null, e => e.message);
+  assert.strictEqual(timers.size, 1, 'each CDP command needs a deadline');
+  Array.from(timers.values())[0]();
+  assert((await timeoutResult).includes('Runtime.evaluate'));
+  assert.strictEqual(connection.pending.size, 0);
+  assert.strictEqual(timers.size, 0);
+
+  const success = connection.send('Runtime.enable');
+  Array.from(connection.pending.values())[0].resolve({ ok: true });
+  assert.strictEqual((await success).ok, true);
+  assert.strictEqual(timers.size, 0, 'successful CDP response must clear its deadline');
+  assert.strictEqual(connection.pending.size, 0);
+
+  connection.ws.send = function() { throw new Error('send failed'); };
+  await assert.rejects(connection.send('Runtime.disable'), /send failed/);
+  assert.strictEqual(timers.size, 0);
+  assert.strictEqual(connection.pending.size, 0);
+
+  connection.ws.send = function() {};
+  const closing = connection.send('Page.navigate');
+  connection.close();
+  await assert.rejects(closing, /closed/);
+  assert.strictEqual(timers.size, 0, 'closing must clear command deadlines even without a socket close event');
+  assert.strictEqual(connection.pending.size, 0);
+}
+
+checkCdpCommandLifecycle().then(function() { console.log('release regressions ok'); }).catch(function(error) {
+  console.error(error);
+  process.exitCode = 1;
+});
