@@ -1,0 +1,8 @@
+{
+  "provenance": "synthetic; modeled on Discuz markup, not downloaded live pages",
+  "cases": [
+    { "file": "gallery.html", "images": ["https://cdn.example/thumb.jpg"], "previews": ["https://cdn.example/full.jpg?sig=a&amp;b;tail,"], "resourceType": "baidu", "code": "x7y9", "passwords": ["constructor"], "attachments": 0 },
+    { "file": "resources.html", "images": [], "resourceType": "quark", "code": "q123", "passwords": [], "attachments": 1 },
+    { "file": "login.html", "images": [], "passwords": [], "attachments": 0, "unavailable": true }
+  ]
+}

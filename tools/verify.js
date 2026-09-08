@@ -98,7 +98,7 @@ function checkJsSyntax() {
 }
 
 function checkExternalTestSuites() {
-  const suites = ['tests/resource-extraction.test.js', 'tests/loading-policy.test.js', 'tests/page-fetch-bridge.test.js', 'tests/release-regressions.test.js'];
+  const suites = ['tests/resource-extraction.test.js', 'tests/loading-policy.test.js', 'tests/page-fetch-bridge.test.js', 'tests/release-regressions.test.js', 'tests/text-queue.test.js', 'tests/page-fixtures.test.js'];
   suites.forEach(function(file) {
     const result = spawnSync(process.execPath, [path.join(root, file)], {
       cwd: root,
@@ -13457,7 +13457,7 @@ function checkCriticalStaticRules() {
   assert(background.indexOf('var cached = await getCachedTextResources(attachment.url);\n    if (cached) {\n      clearTextFailCache(attachment.url);') !== -1, 'background TXT positive cache must be checked before stale TEXT_FAIL entries');
   assert(background.indexOf('if (!manualRetry) {\n      var failCached = await getTextFailCache(attachment.url);') !== -1, 'manual background TXT retry must bypass fail-cache reads');
   assert(background.indexOf('const TEXT_RESOURCE_MESSAGE_CONCURRENCY = 2;') !== -1 && background.indexOf('function enqueueTextResourceMessage(attachments, deadline, options)') !== -1, 'background TXT messages must share an extension-level concurrency cap of two');
-  assert(background.indexOf('enqueueTextResourceMessage(attachments, textDeadline, { manualRetry: manualRetry })') !== -1, 'background TXT message handler must enqueue work while forwarding manual retry state');
+  assert(background.indexOf('enqueueTextResourceMessage(attachments, textDeadline, { manualRetry: manualRetry, owner: sender && sender.tab && sender.tab.id })') !== -1, 'background TXT message handler must enqueue work with trusted tab ownership and manual retry state');
   assert(!/if \(status === 429\) \{[\s\S]*?setTextFailCache\(attachment\.url\);[\s\S]*?\n        \}/.test(background), 'background TXT HTTP 429 must not write TEXT_FAIL cache');
   assert(background.indexOf('TXT附件异常，不写失败缓存') !== -1, 'background TXT unexpected exceptions must remain retryable instead of writing TEXT_FAIL cache');
   assert(background.indexOf('(msg.attachments || []).filter(function(a)') === -1, 'background TXT message handler must not allocate filtered attachment arrays');
@@ -15264,7 +15264,7 @@ function checkCriticalStaticRules() {
   assert(background.indexOf("BGLOG.info('提取'") === -1, 'background article fetches must not log successful extraction totals per article');
   assert(/function\(r\) \{ sendResponse\(Object\.assign\(deniedImageResponses, r \|\| \{\}\)\); BGLOG\.flushSoon\(\); \}/.test(background), 'background FETCH_IMAGES success path must merge denied URL responses and respond before scheduling log flush');
   assert(background.indexOf('BGLOG.flush(); sendResponse(r);') === -1, 'background FETCH_IMAGES success path must not force a log storage write before responding');
-  assert(/sendResponse\(\{\s+resources: SharedUtils\.normalizeResources\(status\.resources\),\s+attemptedCount: status\.attemptedCount,\s+unresolvedCount: status\.unresolvedCount,\s+retryableCount: status\.retryableCount\s+\}\);\n      BGLOG\.flushSoon\(\);/.test(background), 'background FETCH_TEXT_RESOURCES success path must respond with TXT status before scheduling log flush');
+  assert(/sendResponse\(\{\s+resources: SharedUtils\.normalizeResources\(status\.resources\),\s+attemptedCount: status\.attemptedCount,\s+unresolvedCount: status\.unresolvedCount,\s+retryableCount: status\.retryableCount,\s+queueStatus: status\.queueStatus \|\| 'completed'\s+\}\);\n      BGLOG\.flushSoon\(\);/.test(background), 'background FETCH_TEXT_RESOURCES success path must respond with TXT and queue status before scheduling log flush');
   assert(loader.indexOf('HEAVY_BG_STOP_LOSS_MIN_HOST_FAILURES') === -1, 'loader must not retain a hidden cooled background stop-loss threshold');
   assert(loader.indexOf('function isHeavyCoolingBackgroundStopLossThread') === -1, 'loader must defer open-host background work instead of discarding it through stop-loss');
   assert(loader.indexOf('LIGHTWEIGHT_HEAVY_ORDINARY_PRESSURE_LIMIT = 3') === -1, 'lightweight heavy mode must not retain the old hidden mixed-page limit of 3');

@@ -1,0 +1,43 @@
+name: Verify extension
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Syntax and regression suites
+        run: node tools/verify.js
+      - name: Verify installation and maintainer archives
+        shell: powershell
+        run: |
+          & ./tools/package-extension.ps1 -Zip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./tools/package-maintainer-handoff.ps1
+      - name: Install pinned test browser
+        run: npx --yes --package=playwright@1.63.0 playwright install chromium
+      - name: Browser integration and page fixtures
+        run: node tools/browser-smoke.js
+      - name: Upload verified installation
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: extension-installation
+          path: |
+            dist/article-thumbnail-preview-v*.zip
+            dist/article-thumbnail-preview-v*.zip.sha256
+          if-no-files-found: error
+          retention-days: 14

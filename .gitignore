@@ -32,6 +32,7 @@ credentials.json
 dist/
 artifacts/
 output/
+.local-fixtures/
 
 # Local agent tooling
 .agents/

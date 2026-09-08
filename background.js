@@ -410,16 +410,41 @@ const TEXT_FAIL_CACHE_PREFIX = SharedUtils.CACHE_PREFIXES.TEXT_FAIL;
 const CACHE_GENERATION_KEY = SharedUtils.CACHE_GENERATION_KEY || 'atp_cache_generation_v1';
 const TEXT_FAIL_TTL_MS = 5 * 60 * 1000;
 const TEXT_RESOURCE_MESSAGE_CONCURRENCY = 2;
+const TEXT_RESOURCE_QUEUE_LIMIT = 32;
+const TEXT_RESOURCE_QUEUE_PER_OWNER = 4;
+const TEXT_RESOURCE_QUEUE_MAX_WAIT_MS = 30000;
 var SETTINGS_WRITE_CHAIN = Promise.resolve();
 var ARTICLE_FETCH_IN_FLIGHT = {};
 var textResourceMessageQueue = [];
 var textResourceMessageActive = 0;
 
+function makeQueuedTextResourceStatus(attachments, reason) {
+  var count = attachments.length;
+  var status = makeTextResourceFetchStatus(SharedUtils.emptyResources(), count, count, count);
+  status.queueStatus = reason;
+  return status;
+}
+
+function expireQueuedTextResourceJob(job) {
+  var index = textResourceMessageQueue.indexOf(job);
+  if (index === -1) return;
+  textResourceMessageQueue.splice(index, 1);
+  clearTimeout(job.timer);
+  job.resolve(makeQueuedTextResourceStatus(job.attachments, 'expired'));
+}
+
 function drainTextResourceMessageQueue() {
   while (textResourceMessageActive < TEXT_RESOURCE_MESSAGE_CONCURRENCY && textResourceMessageQueue.length) {
     (function(job) {
+      clearTimeout(job.timer);
+      if (job.expiresAt <= Date.now()) {
+        job.resolve(makeQueuedTextResourceStatus(job.attachments, 'expired'));
+        return;
+      }
       textResourceMessageActive++;
-      fetchTextAttachmentResourcesWithStatus(job.attachments, job.deadline, job.options).then(function(status) {
+      Promise.resolve().then(function() {
+        return fetchTextAttachmentResourcesWithStatus(job.attachments, job.deadline, job.options);
+      }).then(function(status) {
         textResourceMessageActive = Math.max(0, textResourceMessageActive - 1);
         job.resolve(status);
         drainTextResourceMessageQueue();
@@ -434,7 +459,27 @@ function drainTextResourceMessageQueue() {
 
 function enqueueTextResourceMessage(attachments, deadline, options) {
   return new Promise(function(resolve, reject) {
-    textResourceMessageQueue.push({ attachments: attachments, deadline: deadline, options: options, resolve: resolve, reject: reject });
+    options = options || {};
+    var now = Date.now();
+    // Evict expired jobs before admission; do not wait for a throttled timer.
+    textResourceMessageQueue.slice().forEach(function(job) {
+      if (job.expiresAt <= now) expireQueuedTextResourceJob(job);
+    });
+    var owner = options.owner === undefined ? 'extension' : String(options.owner);
+    var ownPending = textResourceMessageQueue.filter(function(job) { return job.owner === owner; }).length;
+    if (textResourceMessageQueue.length >= TEXT_RESOURCE_QUEUE_LIMIT || ownPending >= TEXT_RESOURCE_QUEUE_PER_OWNER) {
+      resolve(makeQueuedTextResourceStatus(attachments, 'busy'));
+      return;
+    }
+    var expiresAt = Math.min(Number.isFinite(deadline) ? deadline : Infinity, now + TEXT_RESOURCE_QUEUE_MAX_WAIT_MS);
+    if (expiresAt <= now || !attachments.length) {
+      resolve(makeQueuedTextResourceStatus(attachments, expiresAt <= now ? 'expired' : 'empty'));
+      return;
+    }
+    var job = { attachments: attachments, deadline: deadline, options: options, owner: owner,
+      expiresAt: expiresAt, resolve: resolve, reject: reject, timer: null };
+    textResourceMessageQueue.push(job);
+    job.timer = setTimeout(function() { expireQueuedTextResourceJob(job); }, expiresAt - now);
     drainTextResourceMessageQueue();
   });
 }
@@ -1629,12 +1674,13 @@ chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
     }
     var textDeadline = Number(msg.deadline) || (Date.now() + SharedUtils.getTextAttachmentBackgroundTimeout(attachments.length));
     var manualRetry = !!msg.manualRetry;
-    enqueueTextResourceMessage(attachments, textDeadline, { manualRetry: manualRetry }).then(function(status) {
+    enqueueTextResourceMessage(attachments, textDeadline, { manualRetry: manualRetry, owner: sender && sender.tab && sender.tab.id }).then(function(status) {
       sendResponse({
         resources: SharedUtils.normalizeResources(status.resources),
         attemptedCount: status.attemptedCount,
         unresolvedCount: status.unresolvedCount,
-        retryableCount: status.retryableCount
+        retryableCount: status.retryableCount,
+        queueStatus: status.queueStatus || 'completed'
       });
       BGLOG.flushSoon();
     }).catch(function(e) {

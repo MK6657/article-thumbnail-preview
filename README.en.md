@@ -4,7 +4,9 @@ English | [简体中文](README.md)
 
 A Chrome / Edge Manifest V3 extension that adds image previews and copyable resource links to supported Discuz! forum listing pages.
 
-Current version: **1.16.11**. No server, npm installation, or build is required to use the extension.
+Current version: **1.17.0**. No server, npm installation, or build is required to use the extension.
+
+Version 1.17.0 adds TXT queue backpressure, continuous integration, and page-structure fixtures without changing image concurrency, permissions, or cache formats.
 
 Version 1.16.11 preserves legal ASCII punctuation in image URL queries and prevents repeated entity decoding across DOM and fallback extraction. Image/OG tags use bounded forward scanning. Browser-test commands and HTTP requests now have independent deadlines and pending-request cleanup.
 
@@ -42,7 +44,7 @@ Node.js is required for verification; the current validation environment uses No
 node tools/verify.js
 ```
 
-This checks JavaScript syntax, Manifest references and permissions, documentation versions, sandbox behavior regressions, and four external test suites. Internal test hooks are injected into sandboxes only, not shipped in the extension.
+This checks JavaScript syntax, Manifest references and permissions, documentation versions, sandbox behavior regressions, and six external test suites. Internal test hooks are injected into sandboxes only, not shipped in the extension.
 
 Package on Windows using PowerShell and Node.js:
 
@@ -75,6 +77,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/package-maintainer-han
 ```
 
 ## Troubleshooting
+
+### TXT backpressure
+
+The background still runs at most 2 TXT jobs concurrently. At most 32 jobs may wait, with 4 waiting slots per tab. Waiting expires after 30 seconds or the caller deadline, whichever comes first; this limit does not truncate already running jobs. Busy/expired results remain retryable and do not write permanent failure caches. Retry later using the existing TXT action. Pending timers and expired entries are cleaned up.
+
+### CI and fixtures
+
+GitHub Actions runs on pushes, pull requests, and manual dispatch: Windows / Node.js 22 checks, installation and handoff packaging, and Chromium integration using pinned Playwright 1.63.0. Jobs time out after 15 minutes; newer runs cancel older runs on the same branch. Verified installation ZIPs/checksums are retained for 14 days. Repository permissions are read-only, Action dependencies are pinned to commit SHAs, and CI does not publish releases or modify code.
+
+Four Discuz-shaped cases cover listings, image posts, resource-only posts, and login barriers. **These are synthetic fixtures, not live captures.** See [fixture provenance and sanitization](tests/fixtures/pages/README.md). Raw captures belong only in ignored `.local-fixtures/` and must not be uploaded.
+
+### Manual acceptance
+
+Reload the extension and test mixed ordinary/heavy lists, long scrolling lists, concurrent TXT parsing in several tabs, retry after busy results, hidden-tab recovery, and back/forward navigation. Check continued image progress, copyable TXT resources, and absence of duplicate panels. Reports should contain the version, browser version, reproduction steps, and privacy-reviewed logs, not cookies or full authenticated pages.
+
+### Common issues
 
 - **No thumbnails:** check the domain, listing-page type, global/site enable switches, then reload the extension and refresh the tab.
 - **Some images fail:** the image host may be unavailable, rate-limited, or restricted. Reduce concurrency and retry; temporarily enable debug logging if needed.

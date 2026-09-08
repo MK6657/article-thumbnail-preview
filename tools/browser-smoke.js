@@ -125,9 +125,10 @@ function forumPage(port, mode) {
   if (mode === 'heavy') {
     rows = '<tbody id="normalthread_300"><tr><th><a class="xst" href="https://' + SMOKE_HOST + ':' + port + '/thread-300-1-1.html">Heavy gallery</a></th></tr></tbody>';
   } else {
-    rows = '<tbody id="normalthread_100"><tr><th><a class="xst" href="https://' + SMOKE_HOST + ':' + port + '/thread-100-1-1.html">Ordinary gallery</a></th></tr></tbody>' +
-      '<tbody id="normalthread_300"><tr><th><a class="xst" href="https://' + SMOKE_HOST + ':' + port + '/thread-300-1-1.html">Heavy gallery</a></th></tr></tbody>' +
-      '<tbody id="normalthread_200"><tr><th><a class="xst" href="https://' + CROSS_HOST + ':' + port + '/thread-200-1-1.html">Cross-origin resources</a></th></tr></tbody>';
+    var listing = fs.readFileSync(path.join(PROJECT_ROOT, 'tests/fixtures/pages/listing.html'), 'utf8')
+      .replaceAll('{{ORIGIN}}', 'https://' + SMOKE_HOST + ':' + port)
+      .replaceAll('{{CROSS}}', 'https://' + CROSS_HOST + ':' + port);
+    return htmlPage(listing + '<div class="smoke-note"></div>', 'ATP smoke forum');
   }
   return htmlPage('<h1>ATP browser smoke</h1><div id="threadlist" class="threadlist"><table id="threadlisttable">' + rows + '</table></div><div class="smoke-note"></div>', 'ATP smoke forum');
 }
@@ -635,6 +636,25 @@ async function main() {
     assert(mixedHeavyState && mixedHeavyState.heavyMode && mixedHeavyState.sourceCandidates === 20, 'Mixed page must classify and retain the heavy channel beside ordinary work');
     assert(crossState && crossState.textAttachmentCount >= 1, 'Cross-origin article must preserve the detected TXT attachment count while automatic parsing progresses');
     var ordinaryItems = flattenResourceItems(ordinaryState.resources);
+    var fixtureRoot = path.join(PROJECT_ROOT, 'tests/fixtures/pages');
+    var pageCases = JSON.parse(fs.readFileSync(path.join(fixtureRoot, 'cases.json'), 'utf8')).cases;
+    for (var pageCase of pageCases) {
+      assert(/^[a-z-]+\.html$/.test(pageCase.file), 'Unsafe fixture path');
+      var fixtureHtml = fs.readFileSync(path.join(fixtureRoot, pageCase.file), 'utf8');
+      var fixtureResult = await evaluate(pageOne, `(html => {
+        const base = 'https://www.sehuatang.org/thread-100-1-1.html';
+        const images = SharedUtils.extractImagesByDom(html, base, 100);
+        const resources = SharedUtils.extractResources(html, base, 'html');
+        return { images: images.map(i => i.src), previews: images.map(i => i.previewSrc),
+          resourceCount: SharedUtils.countResources(resources), passwords: resources.passwords,
+          attachments: SharedUtils.extractTextAttachments(html, base, 8).length };
+      })(${JSON.stringify(fixtureHtml)})`, pageOneContext.id);
+      assert.deepStrictEqual(fixtureResult.images, pageCase.images, pageCase.file + ': browser images');
+      if (pageCase.previews) assert.deepStrictEqual(fixtureResult.previews, pageCase.previews);
+      assert.strictEqual(fixtureResult.resourceCount, pageCase.resourceType ? 1 : 0);
+      assert.deepStrictEqual(fixtureResult.passwords, pageCase.passwords);
+      assert.strictEqual(fixtureResult.attachments, pageCase.attachments);
+    }
     var signedImageUrls = await evaluate(pageOne, `(() => {
       const url = 'https://img.example/photo.jpg?sig=a&amp;b;part2,';
       const encoded = url.replace(/&/g, '&amp;');
@@ -837,6 +857,7 @@ async function main() {
       popupBackgroundMessage: true,
       pageBridgeRedirectBoundary: true,
       signedImageUrlParity: true,
+      syntheticPageFixtureCount: pageCases.length + 1,
       multiTab: true,
       bfcache: {
         persisted: bfcachePersisted,

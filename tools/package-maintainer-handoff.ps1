@@ -28,6 +28,7 @@ $GuidePath = Join-Path $ProjectRoot $MaintainerGuideName
 
 $SourceFiles = @(
   '.gitignore',
+  '.github/workflows/verify.yml',
   '.gitattributes',
   'README.md',
   'README.en.md',
@@ -68,6 +69,14 @@ $SourceFiles = @(
   'tests/loading-policy.test.js',
   'tests/page-fetch-bridge.test.js',
   'tests/release-regressions.test.js',
+  'tests/text-queue.test.js',
+  'tests/page-fixtures.test.js',
+  'tests/fixtures/pages/cases.json',
+  'tests/fixtures/pages/README.md',
+  'tests/fixtures/pages/listing.html',
+  'tests/fixtures/pages/gallery.html',
+  'tests/fixtures/pages/resources.html',
+  'tests/fixtures/pages/login.html',
   'tests/fixtures/resource-extraction.json',
   'tools/verify.js',
   'tools/browser-smoke.js',
