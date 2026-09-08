@@ -70,14 +70,14 @@ function findBrowserExecutable() {
   throw new Error('No Chromium browser found. Set ATP_BROWSER_PATH to chrome.exe or msedge.exe.');
 }
 
-function removeSmokeRunRoot(runRoot) {
+async function removeSmokeRunRoot(runRoot) {
   var resolvedRoot = path.resolve(runRoot);
   var tempPrefix = path.resolve(os.tmpdir()) + path.sep;
   assert(
     resolvedRoot.startsWith(tempPrefix) && path.basename(resolvedRoot).startsWith('atp-browser-smoke-'),
     'Refusing to remove an unexpected browser smoke directory: ' + resolvedRoot
   );
-  fs.rmSync(resolvedRoot, { recursive: true, force: true });
+  await fs.promises.rm(resolvedRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 }
 
 function createCertificate(pfxPath) {
@@ -523,6 +523,7 @@ async function main() {
 
   var sessions = [];
   var browserConnection = null;
+  var smokeFailure = null;
   try {
     var devtoolsFile = path.join(profileDir, 'DevToolsActivePort');
     var devtoolsText = await waitFor('DevToolsActivePort', async function() {
@@ -887,6 +888,9 @@ async function main() {
     } catch (error) {}
     browserConnection.close();
     browserConnection = null;
+  } catch (error) {
+    smokeFailure = error;
+    throw error;
   } finally {
     sessions.forEach(function(session) { session.cdp.close(); });
     if (browserConnection) {
@@ -903,7 +907,12 @@ async function main() {
       sleep(3000)
     ]);
     if (process.env.ATP_BROWSER_SMOKE_KEEP !== '1') {
-      removeSmokeRunRoot(runRoot);
+      try {
+        await removeSmokeRunRoot(runRoot);
+      } catch (cleanupError) {
+        if (!smokeFailure) throw cleanupError;
+        console.error('Cleanup also failed: ' + cleanupError.message);
+      }
     } else {
       console.log('browser smoke artifacts: ' + runRoot);
     }

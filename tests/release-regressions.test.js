@@ -87,6 +87,16 @@ assert.strictEqual(images.length, 1);
 assert.strictEqual(images[0].src, 'https://cdn.example/visible.jpg');
 async function checkCdpCommandLifecycle() {
   const source = fs.readFileSync(path.join(__dirname, '..', 'tools', 'browser-smoke.js'), 'utf8');
+  const os = require('os');
+  const removals = [];
+  const cleanup = { path, os, assert, fs: { promises: { rm: async (target, options) => removals.push({ target, options }) } } };
+  vm.runInNewContext(source.slice(source.indexOf('async function removeSmokeRunRoot'), source.indexOf('function createCertificate')) +
+    '\nthis.removeRoot = removeSmokeRunRoot;', cleanup);
+  await cleanup.removeRoot(path.join(os.tmpdir(), 'atp-browser-smoke-fixture'));
+  assert.strictEqual(removals[0].options.maxRetries, 10);
+  assert.strictEqual(removals[0].options.retryDelay, 200);
+  await assert.rejects(cleanup.removeRoot(os.tmpdir()), /unexpected/);
+  assert.strictEqual(removals.length, 1, 'unsafe cleanup targets must be rejected before filesystem access');
   const timers = new Map();
   let timerId = 0;
   const context = {
