@@ -4,9 +4,15 @@
   box-sizing: border-box;
 }
 
+/* Browser-action popups auto-size their viewport from the document. A vw cap
+   feeds that changing viewport back into layout and can oscillate indefinitely. */
+html,
 body {
   width: 320px;
-  max-width: 100vw;
+  min-width: 320px;
+}
+
+body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
   font-size: 14px;
   color: #333;

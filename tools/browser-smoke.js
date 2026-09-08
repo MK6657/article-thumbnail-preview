@@ -796,6 +796,30 @@ async function main() {
     await waitFor('popup settings UI', async function() {
       return evaluate(popup, 'document.querySelector("#settingsContainer").children.length > 0 && document.querySelector("#versionFooter").textContent.includes("' + EXPECTED_VERSION + '")');
     });
+    // A full tab cannot reproduce browser-action auto-size feedback loops.
+    await evaluate(popup, 'chrome.action.openPopup()');
+    var actionTarget = await waitFor('native action popup', async function() {
+      return (await listTargets(devtoolsPort)).find(function(target) {
+        return target.url === 'chrome-extension://' + extensionId + '/popup.html' && target.id !== popup.target.id;
+      });
+    });
+    var actionPopup = { target: actionTarget, cdp: await new CdpConnection(actionTarget.webSocketDebuggerUrl).connect() };
+    sessions.push(actionPopup);
+    await actionPopup.cdp.send('Runtime.enable');
+    await waitFor('native popup settings layout', async function() {
+      return evaluate(actionPopup, 'document.querySelector("#settingsContainer").children.length > 0 && document.body.getBoundingClientRect().width === 320');
+    });
+    await sleep(300);
+    var actionPopupSizes = [];
+    for (var sizeSample = 0; sizeSample < 20; sizeSample++) {
+      actionPopupSizes.push(await evaluate(actionPopup, '({ viewport: innerWidth, body: document.body.getBoundingClientRect().width })'));
+      await sleep(100);
+    }
+    assert(actionPopupSizes.every(function(size) { return size.body === 320 && size.viewport === actionPopupSizes[0].viewport; }),
+      'Native popup must keep a stable 320px layout without user input: ' + JSON.stringify(actionPopupSizes));
+    actionPopup.cdp.close();
+    await closeTarget(devtoolsPort, actionTarget.id);
+    sessions.splice(sessions.indexOf(actionPopup), 1);
     var messageResult = await evaluate(popup, `new Promise((resolve) => {
       chrome.runtime.sendMessage({ type: 'SAVE_SETTINGS_PATCH', settingsPatch: { debugLogging: false } }, (response) => {
         resolve({ response, error: chrome.runtime.lastError && chrome.runtime.lastError.message });
@@ -874,6 +898,7 @@ async function main() {
       popupBackgroundMessage: true,
       pageBridgeRedirectBoundary: true,
       signedImageUrlParity: true,
+      nativePopupStableWidth: 320,
       syntheticPageFixtureCount: pageCases.length + 1,
       multiTab: true,
       bfcache: {

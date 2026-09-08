@@ -4,7 +4,9 @@ English | [简体中文](README.md)
 
 A Chrome / Edge Manifest V3 extension that adds image previews and copyable resource links to supported Discuz! forum listing pages.
 
-Current version: **1.17.0**. No server, npm installation, or build is required to use the extension.
+Current version: **1.17.1**. No server, npm installation, or build is required to use the extension.
+
+Version 1.17.1 fixes idle toolbar-popup flicker by using a stable 320px document width instead of feeding the auto-sized viewport back into layout. Browser tests now sample an actual action popup over time. Image scheduling and user settings are unchanged.
 
 Version 1.17.0 adds TXT queue backpressure, continuous integration, and page-structure fixtures without changing image concurrency, permissions, or cache formats.
 

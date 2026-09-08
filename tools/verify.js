@@ -14693,7 +14693,7 @@ function checkCriticalStaticRules() {
   assert(popup.indexOf('function setDisclosureState(button, panel, expanded)') !== -1, 'popup must centralize disclosure aria state');
   assert(popup.indexOf("button.setAttribute('aria-expanded', expanded ? 'true' : 'false')") !== -1, 'popup disclosure buttons must update aria-expanded');
   assert(popup.indexOf("panel.setAttribute('aria-hidden', expanded ? 'false' : 'true')") !== -1, 'popup disclosure panels must update aria-hidden');
-  assert(popupCss.indexOf('max-width: 100vw;') !== -1, 'popup body must avoid horizontal overflow in narrow hosts');
+  assert(popupCss.indexOf('max-width: 100vw;') === -1 && /html,\s*body\s*\{[^}]*min-width: 320px;/.test(popupCss), 'native popup must use a stable document width instead of a viewport-dependent auto-size feedback loop');
   assert(popup.indexOf('function setLogViewerBusy(busy, text)') !== -1, 'popup log loading must centralize aria-busy updates');
   assert(/setLogViewerBusy\(true,[\s\S]*?\)/.test(popup), 'popup log expansion must show a loading state before storage reads');
   assert(popup.indexOf("setPopupStatus('保存中...', 'info', true)") !== -1, 'popup must show an in-progress settings save state');
