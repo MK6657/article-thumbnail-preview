@@ -66,7 +66,10 @@
   function readCachedArticle(result, articleKey, now) {
     var article = result && result[articleKey];
     if (article && now - article.ts < getArticleCacheTTLMS() && article.complete && article.data) {
-      return ATPCache.normalizeArticleData(article.data);
+      var data = ATPCache.normalizeArticleData(article.data);
+      // When the thread itself was read: a cache hit is not a fresh read.
+      if (!data.readAt && Number(article.ts) > 0) data.readAt = Number(article.ts);
+      return data;
     }
     return null;
   }
@@ -253,7 +256,7 @@
     cacheWriteCheckInProgress = true;
     cacheWritesSinceCheck = 0;
     lastCacheWriteCheckAt = Date.now();
-    chrome.storage.local.getBytesInUse(null, function(bytesUsed) {
+    SharedUtils.getCacheBytesInUse(function(bytesUsed) {
       cacheWriteCheckInProgress = false;
       if (consumeStorageError('storage用量读取失败')) return;
       if (bytesUsed >= HIGH_WATERMARK) {
@@ -558,7 +561,7 @@
           finish(false);
           return;
         }
-        chrome.storage.local.getBytesInUse(null, function(bytesUsed) {
+        SharedUtils.getCacheBytesInUse(function(bytesUsed) {
           if (consumeStorageError('storage用量读取失败')) {
             finish(false);
             return;
@@ -724,6 +727,8 @@
           );
           existingData.loadedUrls = nextData.loadedUrls;
           existingData.resources = SharedUtils.mergeResources(existingData.resources, nextData.resources);
+          if (nextData.textResourcesImported) existingData.textResourcesImported = true;
+          if (nextData.textAttachmentsLimited) existingData.textAttachmentsLimited = true;
           existingData.textAttachments = mergeCachedTextAttachments(existingData.textAttachments, nextData.textAttachments);
           existingData.hasTextAttachments = existingData.hasTextAttachments || nextData.hasTextAttachments || existingData.textAttachments.length > 0;
           existingData.textResourcesComplete = (discoveredAdditionalTextWork || explicitUnresolvedTextWork)
@@ -1069,7 +1074,7 @@
       var markerCount = Math.max(transientAttachmentCount, parseInt(data.textAttachmentCount || 0, 10) || 0);
       var hasTextAttachments = textAttachments.length > 0 || !!data.hasTextAttachments || transientAttachmentCount > 0;
       var textAttachmentCount = deriveTextAttachmentCount(textAttachments, hasTextAttachments, markerCount);
-      return {
+      var normalized = {
         images: normalizeCachedImages(data.images),
         resources: SharedUtils.normalizeResources(data.resources),
         textAttachments: textAttachments,
@@ -1085,6 +1090,11 @@
         emptyReason: data.emptyReason || '',
         retryAfter: Math.max(0, Number(data.retryAfter || 0) || 0)
       };
+      var readAt = Number(data.readAt) || 0;
+      if (readAt > 0) normalized.readAt = readAt;
+      if (data.textResourcesImported === true) normalized.textResourcesImported = true;
+      if (data.textAttachmentsLimited === true) normalized.textAttachmentsLimited = true;
+      return normalized;
     },
 
     clearFlushTimer: function() {

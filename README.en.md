@@ -4,7 +4,9 @@ English | [简体中文](README.md)
 
 A Chrome / Edge Manifest V3 extension that adds image previews and copyable resource links to supported Discuz! forum listing pages.
 
-Current version: **1.18.4**. No server, npm installation, or build is required to use the extension.
+Current version: **1.18.5**. No server, npm installation, or build is required to use the extension.
+
+Version 1.18.5 adds resource marking: mark threads on a list page (「标记」) to keep their title, links, share codes and archive passwords, then export them from the popup as a TXT file. Every export or copy is also kept in a dated daily backup. Share codes no longer get paired with a neighbouring link.
 
 From version 1.18.4 the reset button works from the popup on any page and resets every forum domain at once.
 

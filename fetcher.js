@@ -993,6 +993,7 @@
             textAttachments: filteredAttachments,
             hasTextAttachments: hasTransientAttachment || !!filteredAttachments.length,
             textAttachmentCount: rawTextAttachments.length,
+            textAttachmentsLimited: !!rawTextAttachments.limited,
             partial: htmlTruncated
           });
           // The short-lived Discuz attachment links this fetch just read are

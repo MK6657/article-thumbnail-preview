@@ -6,7 +6,9 @@
     var ids = ['toggleEnabled','settingsContainer',
       'clearImageCache','clearFailCache','clearAllCache','clearTestCache','resetSettings','resetForumPacer','forumPacerInfo',
       'toggleLogs','logPanel','logViewer','logCount','logFilter','logSearch','exportLogs','clearLogs',
-      'currentSite','firstScreenInfo','popupStatus','toggleHelp','helpPanel'];
+      'currentSite','firstScreenInfo','popupStatus','toggleHelp','helpPanel',
+      'marksSection','marksCount','marksSummary','marksList','exportMarks','copyMarks','clearExportedMarks','clearAllMarks',
+      'backupSection','backupCount','backupList','downloadAllBackups'];
     for (var i = 0; i < ids.length; i++) { els[ids[i]] = document.getElementById(ids[i]); }
   })();
 
@@ -35,7 +37,7 @@
   var settingsLoadFailed = false;
   var DESTRUCTIVE_CONFIRM_MS = 3000;
   var pendingDestructiveButton = null;
-  var CACHE_PREFIXES = (typeof SharedUtils !== 'undefined' && SharedUtils.CACHE_PREFIXES) || { IMAGE: 'thumb_cache_v2_', ARTICLE: 'article_cache_v11_', TEXT_RESOURCE: 'txt_resource_cache_v2_', TEXT_FAIL: 'atp_text_fail_v1_', NEGATIVE: 'atp_empty_v9_', IMAGE_BASE: 'thumb_cache_', ARTICLE_BASE: 'article_cache_', TEXT_RESOURCE_BASE: 'txt_resource_cache_', TEXT_FAIL_BASE: 'atp_text_fail_', NEGATIVE_BASE: 'atp_empty_' };
+  var CACHE_PREFIXES = (typeof SharedUtils !== 'undefined' && SharedUtils.CACHE_PREFIXES) || { IMAGE: 'thumb_cache_v2_', ARTICLE: 'article_cache_v12_', TEXT_RESOURCE: 'txt_resource_cache_v3_', TEXT_FAIL: 'atp_text_fail_v1_', NEGATIVE: 'atp_empty_v9_', IMAGE_BASE: 'thumb_cache_', ARTICLE_BASE: 'article_cache_', TEXT_RESOURCE_BASE: 'txt_resource_cache_', TEXT_FAIL_BASE: 'atp_text_fail_', NEGATIVE_BASE: 'atp_empty_' };
   var HEAVY_ORIGINAL_PRESET = ATPGetSettingsPreset('heavyOriginal', SETTINGS_SCHEMA);
 
   var settings = null;
@@ -1971,6 +1973,307 @@
     });
   }
   refreshForumPacerInfo();
+
+  // ---- Marked resources and the daily backup ----
+  // The worker stores the marks; the popup reads them, builds the files here
+  // (never inside a forum page) and tells the worker what it exported or
+  // copied, which also goes into that day's backup. Nothing here deletes a
+  // backup.
+  var MARKS = typeof ATPMarks !== 'undefined' ? ATPMarks : null;
+  var MARKS_LIST_LIMIT = 50;
+  var MARKS_ERROR_TEXT = {
+    stale: '标记刚刚有变化，请确认列表后再清空',
+    not_allowed: '操作被拒绝',
+    storage_write_failed: '存储写入失败',
+    storage_read_failed: '存储读取失败'
+  };
+  var marksIndex = null;
+  var marksRefreshTimer = null;
+
+  function marksErrorText(code) {
+    return MARKS_ERROR_TEXT[code] || '操作失败';
+  }
+
+  function sendMarksMutation(payload) {
+    return new Promise(function(resolve, reject) {
+      try {
+        chrome.runtime.sendMessage(Object.assign({ type: SharedUtils.MESSAGE_TYPES.MARKS_MUTATION }, payload), function(response) {
+          if (chrome.runtime.lastError) {
+            reject(new Error('后台未响应'));
+            return;
+          }
+          if (!response || !response.ok) {
+            reject(new Error(marksErrorText(response && response.error)));
+            return;
+          }
+          resolve(response);
+        });
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+
+  function describeMarksSummary(index) {
+    var items = index.items;
+    if (!items.length) return '尚未标记帖子。在论坛列表页帖子缩略图上方点「标记」即可保存标题、链接和密码。';
+    var unexported = 0;
+    var attention = 0;
+    items.forEach(function(item) {
+      if (!MARKS.isExported(item)) unexported++;
+      if (item.attention) attention++;
+    });
+    return '共 ' + items.length + ' 帖' + (unexported ? '，未导出 ' + unexported + ' 帖' : '，均已导出') +
+      (attention ? '，' + attention + ' 帖需注意（导出文件中有说明）' : '') + '。';
+  }
+
+  function renderMarksList(index) {
+    if (!els.marksList) return;
+    els.marksList.textContent = '';
+    var items = index.items.slice().reverse();
+    items.slice(0, MARKS_LIST_LIMIT).forEach(function(item) {
+      var li = document.createElement('li');
+      li.className = 'marks-item';
+      var title = document.createElement('span');
+      title.className = 'marks-item-title';
+      title.textContent = item.title || '（未读取到标题）';
+      title.title = item.title || '';
+      var meta = document.createElement('span');
+      meta.className = 'marks-item-meta';
+      meta.textContent = '链接 ' + (item.links || 0) + (item.passwords ? ' · 密码 ' + item.passwords : '') +
+        ' · ' + (MARKS.isExported(item) ? '已导出' : (item.exportedAt ? '导出后有更新' : '未导出')) + (item.attention ? ' · 需注意' : '');
+      var remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'btn-link marks-item-remove';
+      remove.setAttribute('data-mark-remove', item.id);
+      remove.setAttribute('aria-label', '取消标记：' + (item.title || item.id));
+      remove.textContent = '移除';
+      li.appendChild(title);
+      li.appendChild(meta);
+      li.appendChild(remove);
+      els.marksList.appendChild(li);
+    });
+    if (items.length > MARKS_LIST_LIMIT) {
+      var more = document.createElement('li');
+      more.className = 'marks-item marks-item-more';
+      more.textContent = '…另有 ' + (items.length - MARKS_LIST_LIMIT) + ' 帖（导出文件中完整列出）';
+      els.marksList.appendChild(more);
+    }
+  }
+
+  function renderBackupDays(days) {
+    if (!els.backupList) return;
+    var dates = Object.keys(days.days).sort().reverse();
+    if (els.backupCount) els.backupCount.textContent = dates.length;
+    els.backupList.textContent = '';
+    dates.forEach(function(date) {
+      var info = days.days[date] || {};
+      var li = document.createElement('li');
+      li.className = 'marks-item';
+      var label = document.createElement('span');
+      label.className = 'marks-item-title';
+      label.textContent = date + ' · ' + (info.threads || 0) + ' 帖 · ' + (info.links || 0) + ' 条链接';
+      var download = document.createElement('button');
+      download.type = 'button';
+      download.className = 'btn-link';
+      download.setAttribute('data-backup-day', date);
+      download.setAttribute('aria-label', '下载 ' + date + ' 的备份');
+      download.textContent = '下载';
+      li.appendChild(label);
+      li.appendChild(download);
+      els.backupList.appendChild(li);
+    });
+    if (els.downloadAllBackups) els.downloadAllBackups.disabled = !dates.length;
+  }
+
+  async function refreshMarks() {
+    if (!MARKS || !els.marksSection) return null;
+    var items = await storageGet([MARKS.KEYS.INDEX, MARKS.KEYS.DAYS], '读取标记');
+    marksIndex = MARKS.readIndex(items && items[MARKS.KEYS.INDEX]);
+    var days = MARKS.readDays(items && items[MARKS.KEYS.DAYS]);
+    if (els.marksCount) els.marksCount.textContent = marksIndex.items.length;
+    if (els.marksSummary) els.marksSummary.textContent = describeMarksSummary(marksIndex);
+    renderMarksList(marksIndex);
+    renderBackupDays(days);
+    var hasMarks = marksIndex.items.length > 0;
+    [els.exportMarks, els.copyMarks, els.clearAllMarks].forEach(function(btn) {
+      if (btn) btn.disabled = !hasMarks;
+    });
+    if (els.clearExportedMarks) els.clearExportedMarks.disabled = !marksIndex.items.some(MARKS.isExported);
+    return marksIndex;
+  }
+
+  function scheduleMarksRefresh() {
+    if (marksRefreshTimer) clearTimeout(marksRefreshTimer);
+    marksRefreshTimer = setTimeout(function() {
+      marksRefreshTimer = null;
+      refreshMarks().catch(function() {});
+    }, 150);
+  }
+
+  async function readMarkRecords(index) {
+    var keys = index.items.map(function(item) { return MARKS.itemKey(item.id); });
+    var stored = keys.length ? await storageGet(keys, '读取标记') : {};
+    var records = [];
+    index.items.forEach(function(item) {
+      var record = stored && stored[MARKS.itemKey(item.id)];
+      if (record && typeof record === 'object' && Array.isArray(record.links)) records.push(record);
+    });
+    return records;
+  }
+
+  function downloadTextFile(text, filename) {
+    var blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    // Revoking at once can cancel the download in some browsers.
+    setTimeout(function() { URL.revokeObjectURL(url); }, 10000);
+  }
+
+  function handedOut(records) {
+    return records.map(function(record) { return { id: record.id, updatedAt: record.updatedAt }; });
+  }
+
+  async function exportMarks() {
+    var index = await refreshMarks();
+    if (!index || !index.items.length) return { count: 0 };
+    var records = await readMarkRecords(index);
+    if (!records.length) return { count: 0 };
+    var now = new Date();
+    var text = MARKS.formatExport(records, { version: chrome.runtime.getManifest().version, now: now.getTime() });
+    downloadTextFile(text, 'thumbnail-preview-marked-' + formatLocalFilenameTimestamp(now) + '.txt');
+    await sendMarksMutation({ op: 'exported', marks: handedOut(records) });
+    await refreshMarks();
+    return { count: records.length };
+  }
+
+  async function copyMarks() {
+    var index = await refreshMarks();
+    if (!index || !index.items.length) return { count: 0 };
+    var records = await readMarkRecords(index);
+    if (!records.length) return { count: 0 };
+    var text = MARKS.formatExport(records, { version: chrome.runtime.getManifest().version, now: Date.now() }).replace(/^\ufeff/, '').replace(/\r\n/g, '\n');
+    await navigator.clipboard.writeText(text);
+    await sendMarksMutation({ op: 'copiedMarks', marks: handedOut(records) });
+    await refreshMarks();
+    return { count: records.length };
+  }
+
+  async function readBackupDays(dates) {
+    var keys = dates.map(MARKS.dayKey);
+    var stored = keys.length ? await storageGet(keys, '读取备份') : {};
+    var days = [];
+    dates.forEach(function(date) {
+      var value = stored && stored[MARKS.dayKey(date)];
+      if (value) days.push(MARKS.readDay(value, date));
+    });
+    return days;
+  }
+
+  async function downloadBackups(dates, filename) {
+    var days = await readBackupDays(dates);
+    if (!days.length) throw new Error('没有可下载的备份');
+    var text = MARKS.formatDayBackup(days, { version: chrome.runtime.getManifest().version, now: Date.now() });
+    downloadTextFile(text, filename);
+    return days.length;
+  }
+
+  function countSuccess(verb) {
+    return function(result) {
+      var count = result && result.count;
+      return count ? { text: '已' + verb + ' ' + count + ' 帖', type: 'ok' } : { text: '没有标记', type: 'info' };
+    };
+  }
+
+  if (MARKS && els.marksSection) {
+    if (els.exportMarks) {
+      els.exportMarks.addEventListener('click', function() {
+        runButtonAction(els.exportMarks, '导出中...', countSuccess('导出'), '导出 TXT', exportMarks);
+      });
+    }
+    if (els.copyMarks) {
+      els.copyMarks.addEventListener('click', function() {
+        runButtonAction(els.copyMarks, '复制中...', countSuccess('复制'), '复制全部', copyMarks);
+      });
+    }
+    if (els.clearExportedMarks) {
+      els.clearExportedMarks.addEventListener('click', function() {
+        runDestructiveButtonAction(els.clearExportedMarks, '再次点击清空', '再次点击确认：移除已导出且之后没有更新的标记（备份保留）', '清空中...', function(result) {
+          return { text: '已移除 ' + ((result && result.removed) || 0) + ' 帖', type: 'ok' };
+        }, '清空已导出', async function() {
+          var result = await sendMarksMutation({ op: 'clearExported' });
+          await refreshMarks();
+          return result;
+        });
+      });
+    }
+    if (els.clearAllMarks) {
+      els.clearAllMarks.addEventListener('click', function() {
+        var unexported = marksIndex ? MARKS.countUnexported(marksIndex) : 0;
+        runDestructiveButtonAction(els.clearAllMarks, '再次点击清空', '再次点击确认清空全部标记' + (unexported ? '（其中 ' + unexported + ' 帖未导出）' : '') + '；每日备份保留', '清空中...', function(result) {
+          return { text: '已移除 ' + ((result && result.removed) || 0) + ' 帖', type: 'ok' };
+        }, '清空全部标记', async function() {
+          var index = marksIndex || await refreshMarks();
+          try {
+            return await sendMarksMutation({ op: 'clearAll', rev: index ? index.rev : -1 });
+          } finally {
+            await refreshMarks();
+          }
+        });
+      });
+    }
+    if (els.marksList) {
+      els.marksList.addEventListener('click', function(e) {
+        var btn = e.target && e.target.closest ? e.target.closest('[data-mark-remove]') : null;
+        if (!btn) return;
+        var id = btn.getAttribute('data-mark-remove');
+        runButtonAction(btn, '移除中...', null, '移除', async function() {
+          await sendMarksMutation({ op: 'remove', ids: [id] });
+          await refreshMarks();
+        });
+      });
+    }
+    if (els.backupList) {
+      els.backupList.addEventListener('click', function(e) {
+        var btn = e.target && e.target.closest ? e.target.closest('[data-backup-day]') : null;
+        if (!btn) return;
+        var date = btn.getAttribute('data-backup-day');
+        runButtonAction(btn, '下载中...', '已下载', '下载', function() {
+          return downloadBackups([date], 'thumbnail-preview-backup-' + date + '.txt');
+        });
+      });
+    }
+    if (els.downloadAllBackups) {
+      els.downloadAllBackups.addEventListener('click', function() {
+        runButtonAction(els.downloadAllBackups, '下载中...', function(count) {
+          return { text: '已下载 ' + count + ' 天的备份', type: 'ok' };
+        }, '下载全部备份', async function() {
+          var stored = await storageGet(MARKS.KEYS.DAYS, '读取备份');
+          var dates = Object.keys(MARKS.readDays(stored && stored[MARKS.KEYS.DAYS]).days).sort();
+          return downloadBackups(dates, 'thumbnail-preview-backup-all-' + formatLocalFilenameTimestamp(new Date()) + '.txt');
+        });
+      });
+    }
+    // Turning the extension off with marks not yet exported: say so.
+    if (els.toggleEnabled) {
+      els.toggleEnabled.addEventListener('change', function() {
+        if (els.toggleEnabled.checked || !marksIndex) return;
+        var unexported = MARKS.countUnexported(marksIndex);
+        if (unexported) setPopupStatus('还有 ' + unexported + ' 个已标记的帖子未导出，可在上方「已标记资源」中导出。', 'info', true);
+      });
+    }
+    if (chrome.storage && chrome.storage.onChanged && chrome.storage.onChanged.addListener) {
+      chrome.storage.onChanged.addListener(function(changes, areaName) {
+        if (areaName === 'local' && changes && (changes[MARKS.KEYS.INDEX] || changes[MARKS.KEYS.DAYS])) scheduleMarksRefresh();
+      });
+    }
+    refreshMarks().catch(function(e) {
+      if (els.marksSummary) els.marksSummary.textContent = '读取标记失败：' + errorMessage(e);
+    });
+  }
 
   // liveSession (optional) receives the flushed tab's log key so export
   // pruning keeps that shard.

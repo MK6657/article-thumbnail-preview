@@ -675,3 +675,93 @@ input:checked + .toggle-slider::before {
   font-weight: normal;
   color: #999;
 }
+
+/* Marked resources and the daily backup. */
+.marks-list {
+  list-style: none;
+  max-height: 180px;
+  overflow-y: auto;
+  margin: 6px 0;
+}
+
+.marks-item {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  column-gap: 8px;
+  padding: 5px 0;
+  border-top: 1px solid #f0f0f0;
+  font-size: 12px;
+}
+
+.marks-item-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #333;
+}
+
+.marks-item-meta {
+  grid-column: 1;
+  color: #888;
+  font-size: 11px;
+}
+
+.marks-item-remove,
+.marks-item .btn-link {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+}
+
+.marks-item-more {
+  display: block;
+  color: #999;
+}
+
+.btn-link {
+  padding: 3px 8px;
+  border: 1px solid #c9d7e6;
+  border-radius: 4px;
+  background: #fff;
+  color: #23527c;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn-link:hover {
+  background: #eef5fc;
+}
+
+.btn-link:focus-visible {
+  outline: 2px solid #4a90d9;
+  outline-offset: 2px;
+}
+
+.marks-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.marks-actions .btn {
+  width: 100%;
+  margin-bottom: 0;
+}
+
+.marks-actions .btn:disabled,
+.marks-backup .btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.marks-backup {
+  margin-top: 8px;
+}
+
+.marks-backup summary {
+  cursor: pointer;
+  font-size: 13px;
+  color: #555;
+}

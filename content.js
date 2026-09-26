@@ -1484,6 +1484,7 @@
       loadedUrls: data.loadedUrls,
       hasTextAttachments: hasTransientAttachment || cachedAttachments.length > 0,
       textAttachmentCount: data.textAttachmentCount || data.textAttachments.length,
+      textAttachmentsLimited: data.textAttachmentsLimited === true,
       textResourcesComplete: data.textResourcesComplete,
       textResourcesAttemptedCount: data.textResourcesAttemptedCount,
       textResourcesUnresolvedCount: data.textResourcesUnresolvedCount,

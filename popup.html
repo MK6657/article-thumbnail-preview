@@ -25,6 +25,24 @@
 
     <div id="popupStatus" class="popup-status popup-status-empty" role="status" aria-live="polite"></div>
 
+    <section id="marksSection" class="settings-section marks-section" aria-labelledby="marksHeading">
+      <h2 id="marksHeading">已标记资源 <span id="marksCount" class="mirror-count">0</span></h2>
+      <p id="marksSummary" class="maintenance-hint" aria-live="polite">尚未标记帖子。在论坛列表页帖子缩略图上方点「标记」即可保存标题、链接和密码。</p>
+      <ul id="marksList" class="marks-list" aria-label="已标记的帖子"></ul>
+      <div class="marks-actions">
+        <button id="exportMarks" class="btn" type="button">导出 TXT</button>
+        <button id="copyMarks" class="btn" type="button">复制全部</button>
+        <button id="clearExportedMarks" class="btn btn-secondary" type="button">清空已导出</button>
+        <button id="clearAllMarks" class="btn btn-secondary" type="button">清空全部标记</button>
+      </div>
+      <details id="backupSection" class="marks-backup">
+        <summary>每日备份（导出/复制过的资源）<span id="backupCount" class="mirror-count">0</span></summary>
+        <p class="maintenance-hint">每次导出或复制都会按日期自动保存一份（含标题、链接和密码），不会自动删除。</p>
+        <ul id="backupList" class="marks-list" aria-label="每日备份"></ul>
+        <button id="downloadAllBackups" class="btn btn-sm" type="button">下载全部备份</button>
+      </details>
+    </section>
+
     <details id="mirrorSection" class="settings-section settings-section-collapsible mirror-section">
       <summary class="settings-section-summary">镜像站点 <span id="mirrorCount" class="mirror-count">0</span></summary>
       <div class="settings-section-body">
@@ -84,6 +102,7 @@
   <script src="settings-schema.js"></script>
   <script src="defaults.js"></script>
   <script src="shared-utils.js"></script>
+  <script src="resource-marks.js"></script>
   <script src="popup-mirrors.js"></script>
   <script src="popup.js"></script>
 </body>

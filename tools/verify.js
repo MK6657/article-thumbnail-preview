@@ -98,7 +98,7 @@ function checkJsSyntax() {
 }
 
 function checkExternalTestSuites() {
-  const suites = ['tests/resource-extraction.test.js', 'tests/loading-policy.test.js', 'tests/page-fetch-bridge.test.js', 'tests/release-regressions.test.js', 'tests/text-queue.test.js', 'tests/page-fixtures.test.js', 'tests/mirror-sites.test.js'];
+  const suites = ['tests/resource-extraction.test.js', 'tests/loading-policy.test.js', 'tests/page-fetch-bridge.test.js', 'tests/release-regressions.test.js', 'tests/text-queue.test.js', 'tests/page-fixtures.test.js', 'tests/mirror-sites.test.js', 'tests/resource-marks.test.js'];
   suites.forEach(function(file) {
     const result = spawnSync(process.execPath, [path.join(root, file)], {
       cwd: root,
@@ -152,8 +152,10 @@ function assertExactStringArray(actual, expected, label) {
 
 function checkManifestPermissionBoundary(manifest) {
   // scripting registers content scripts on user-approved mirror sites;
-  // activeTab lets the popup offer the current tab as a mirror.
-  assertExactStringArray(manifest.permissions || [], ['storage', 'scripting', 'activeTab'], 'manifest permissions');
+  // activeTab lets the popup offer the current tab as a mirror;
+  // unlimitedStorage keeps the reader's marks and daily backups for good
+  // (it carries no install warning and grants no site access).
+  assertExactStringArray(manifest.permissions || [], ['storage', 'scripting', 'activeTab', 'unlimitedStorage'], 'manifest permissions');
   assertExactStringArray(manifest.host_permissions || [], [
     'https://*.sehuatang.org/*',
     'https://*.sehuatang.net/*',
@@ -195,6 +197,7 @@ function checkManifestContentScriptOrder(manifest) {
     'settings-schema.js',
     'defaults.js',
     'shared-utils.js',
+    'resource-marks.js',
     'loading-policy.js',
     'logger.js',
     'cache.js',
@@ -536,8 +539,13 @@ function loadBackgroundSandbox(options) {
     chrome: {
       runtime: {
         lastError: null,
+        getURL: function(path) { return 'chrome-extension://verify/' + (path || ''); },
         onMessage: { addListener: function(listener) { sandbox.__onMessage = listener; } },
         onInstalled: { addListener: function(listener) { sandbox.__onInstalled = listener; } }
+      },
+      action: {
+        setBadgeText: function(details) { sandbox.__badgeText = details && details.text; },
+        setBadgeBackgroundColor: function() {}
       },
       storage: {
         onChanged: {
@@ -578,6 +586,12 @@ function loadBackgroundSandbox(options) {
             if (callback) callback();
           },
           getBytesInUse: function(keys, callback) {
+            if (Array.isArray(keys)) {
+              callback(keys.reduce(function(total, key) {
+                return total + (Object.prototype.hasOwnProperty.call(storage, key) ? key.length + JSON.stringify(storage[key]).length : 0);
+              }, 0));
+              return;
+            }
             callback(JSON.stringify(storage).length);
           }
         }
@@ -599,7 +613,7 @@ function loadBackgroundSandbox(options) {
 function loadPopupSandbox(initialStorage, options) {
   options = options || {};
   const elements = {};
-  const storage = Object.assign({}, initialStorage || {});
+  const storage = options.sharedStorage || Object.assign({}, initialStorage || {});
   const timers = [];
   const storageGets = [];
   const storageSets = [];
@@ -697,6 +711,11 @@ function loadPopupSandbox(initialStorage, options) {
       querySelector: function() { return null; },
       querySelectorAll: function() { return []; },
       closest: function() { return null; },
+      children: [],
+      appendChild: function(child) {
+        this.children.push(child);
+        return child;
+      },
       matches: function(selector) {
         if (selector === 'input[type="number"]') return this.tagName === 'INPUT' && this.type === 'number';
         if (selector === 'select') return this.tagName === 'SELECT';
@@ -747,7 +766,7 @@ function loadPopupSandbox(initialStorage, options) {
   }
   const sandbox = {
     console: { log: function(){}, warn: function(){}, error: function(){} },
-    URL: URL,
+    URL: options.URL || URL,
     Intl: Intl,
     Blob: Blob,
     setTimeout: function(callback, delay) {
@@ -772,6 +791,7 @@ function loadPopupSandbox(initialStorage, options) {
         getManifest: function() { return { version: 'verify' }; },
         lastError: null,
         sendMessage: function(message, callback) {
+          if (options.runtimeMessageHandler && options.runtimeMessageHandler(message, callback)) return;
           if (message && message.type === 'SAVE_SETTINGS_PATCH') {
             if (options.saveMessageLastError) {
               sandbox.chrome.runtime.lastError = { message: options.saveMessageLastError };
@@ -897,8 +917,8 @@ function loadPopupSandbox(initialStorage, options) {
       },
       CACHE_PREFIXES: {
         IMAGE: 'thumb_cache_v2_',
-        ARTICLE: 'article_cache_v11_',
-        TEXT_RESOURCE: 'txt_resource_cache_v2_',
+        ARTICLE: 'article_cache_v12_',
+        TEXT_RESOURCE: 'txt_resource_cache_v3_',
         TEXT_FAIL: 'atp_text_fail_v1_',
         NEGATIVE: 'atp_empty_v9_',
         IMAGE_BASE: 'thumb_cache_',
@@ -913,6 +933,16 @@ function loadPopupSandbox(initialStorage, options) {
   vm.createContext(sandbox);
   vm.runInContext(read('settings-schema.js') + '\nthis.SETTINGS_SCHEMA = SETTINGS_SCHEMA;', sandbox, { filename: 'settings-schema.js' });
   vm.runInContext(read('defaults.js'), sandbox, { filename: 'defaults.js' });
+  if (options.withMarks) {
+    // The real resource helpers behind the popup's stubbed ones, and the
+    // marks module the popup builds its files with.
+    const realSharedUtils = loadSharedUtils();
+    Object.keys(realSharedUtils).forEach(function(key) {
+      if (!Object.prototype.hasOwnProperty.call(sandbox.SharedUtils, key)) sandbox.SharedUtils[key] = realSharedUtils[key];
+    });
+    sandbox.SharedUtils.MESSAGE_TYPES = realSharedUtils.MESSAGE_TYPES;
+    vm.runInContext(read('resource-marks.js') + '\nthis.ATPMarks = ATPMarks;', sandbox, { filename: 'resource-marks.js' });
+  }
   if (options.enableGetKeys) {
     sandbox.chrome.storage.local.getKeys = function(callback) {
       const keys = Object.keys(storage);
@@ -4267,7 +4297,7 @@ async function checkBackgroundMessageSafety() {
     type: 'CACHE_INDEX_MUTATION',
     action: 'updateEntries',
     updates: {
-      article_cache_v11_bg_proxy: { t: sandbox.SharedUtils.cacheIndex.TYPE.ARTICLE, ts: 123, b: 10 }
+      article_cache_v12_bg_proxy: { t: sandbox.SharedUtils.cacheIndex.TYPE.ARTICLE, ts: 123, b: 10 }
     }
   }, undefined, function(response) {
     cacheIndexUpdateResponse = response;
@@ -4277,7 +4307,7 @@ async function checkBackgroundMessageSafety() {
   assert(
     sandbox.__storage.atp_cache_index_v1 &&
       sandbox.__storage.atp_cache_index_v1.entries &&
-      sandbox.__storage.atp_cache_index_v1.entries.article_cache_v11_bg_proxy,
+      sandbox.__storage.atp_cache_index_v1.entries.article_cache_v12_bg_proxy,
     'background cacheIndex updateEntries messages must write through the owner queue'
   );
   let malformedCacheIndexResponse = null;
@@ -4318,13 +4348,13 @@ async function checkBackgroundMessageSafety() {
   const cacheIndexRemoveResult = sandbox.__onMessage({
     type: 'CACHE_INDEX_MUTATION',
     action: 'removeEntries',
-    keys: ['article_cache_v11_bg_proxy', 'article_cache_legacy_proxy']
+    keys: ['article_cache_v12_bg_proxy', 'article_cache_legacy_proxy']
   }, undefined, function(response) {
     cacheIndexRemoveResponse = response;
   });
   assert(cacheIndexRemoveResult === true, 'background cacheIndex removeEntries messages must preserve async response semantics');
   assert(cacheIndexRemoveResponse && cacheIndexRemoveResponse.ok === true, 'background cacheIndex removeEntries messages must report success');
-  assert(!sandbox.__storage.atp_cache_index_v1.entries.article_cache_v11_bg_proxy, 'background cacheIndex removeEntries messages must remove requested index keys');
+  assert(!sandbox.__storage.atp_cache_index_v1.entries.article_cache_v12_bg_proxy, 'background cacheIndex removeEntries messages must remove requested index keys');
   assert(!sandbox.__storage.atp_cache_index_v1.entries.article_cache_legacy_proxy, 'background cacheIndex removeEntries messages must accept legacy/base-prefix cleanup keys');
 
   let blockedResponse = null;
@@ -5232,7 +5262,7 @@ function checkTextAttachmentAllowlistPermissions() {
 function checkManifestPermissionBoundaryBehavior() {
   function makeManifest() {
     return {
-      permissions: ['storage', 'scripting', 'activeTab'],
+      permissions: ['storage', 'scripting', 'activeTab', 'unlimitedStorage'],
       optional_host_permissions: ['https://*/*'],
       host_permissions: [
         'https://*.sehuatang.org/*',
@@ -12536,8 +12566,8 @@ async function checkPopupRetainsRolloverEvidence() {
 async function checkPopupStorageKeyDiscoveryUsesGetKeys() {
   const sandbox = loadPopupSandbox({
     thumb_cache_v2_image: { ts: 1 },
-    article_cache_v11_article: { ts: 2 },
-    txt_resource_cache_v2_text: { ts: 3 },
+    article_cache_v12_article: { ts: 2 },
+    txt_resource_cache_v3_text: { ts: 3 },
     atp_empty_v9_negative: { ts: 4 },
     atp_logs_content_1000: [
       { ts: '2026-05-26 12:18:00.000', src: 'CONTENT', lv: 'INFO', msg: 'log key' }
@@ -12548,8 +12578,8 @@ async function checkPopupStorageKeyDiscoveryUsesGetKeys() {
   assert(popupHelpers && typeof popupHelpers.getCacheKeysByTypes === 'function', 'popup must expose cache key discovery in verify mode');
   const cacheKeys = await popupHelpers.getCacheKeysByTypes([0, 2]);
   assert(cacheKeys.indexOf('thumb_cache_v2_image') !== -1, 'popup cache discovery must include image cache keys from storage key names');
-  assert(cacheKeys.indexOf('article_cache_v11_article') !== -1, 'popup cache discovery must include article cache keys from storage key names');
-  assert(cacheKeys.indexOf('txt_resource_cache_v2_text') === -1, 'popup cache discovery must filter cache keys by requested types');
+  assert(cacheKeys.indexOf('article_cache_v12_article') !== -1, 'popup cache discovery must include article cache keys from storage key names');
+  assert(cacheKeys.indexOf('txt_resource_cache_v3_text') === -1, 'popup cache discovery must filter cache keys by requested types');
   assert(cacheKeys.indexOf('atp_logs_content_1000') === -1, 'popup cache discovery must not mix log keys into cache cleanup');
   assert(sandbox.__storageGetKeys.length === 1, 'popup cache discovery must use storage.getKeys when available');
   assert(
@@ -13313,6 +13343,411 @@ async function checkPopupForumPacerReset() {
     'without any recorded forum page the popup must say so');
 }
 
+// ---- Marked resources ----
+
+function makeMarksTestSnapshot(ATPMarks, tid, title, groups, passwords) {
+  const identity = ATPMarks.getThreadIdentity('https://www.sehuatang.org/thread-' + tid + '-1-1.html', 'normalthread_' + tid);
+  assert(identity.ok, 'the marks test thread must be identifiable');
+  return ATPMarks.buildSnapshot({ title: title, resources: { groups: groups, passwords: passwords || [] }, contentReadAt: 1000 }, identity, 'all');
+}
+
+function sendMarksMessageForVerify(bg, message, sender) {
+  return new Promise(function(resolve) {
+    bg.__onMessage(Object.assign({ type: 'MARKS_MUTATION' }, message), sender, resolve);
+  });
+}
+
+async function checkBackgroundMarksStore() {
+  let storageSets = 0;
+  const bg = loadBackgroundSandbox({ enableDebug: false, afterStorageSet: function() { storageSets++; } });
+  const M = bg.ATPMarks;
+  const pageSender = { url: 'https://www.sehuatang.org/forum-2-1.html', tab: { id: 7 } };
+  const popupSender = { url: 'chrome-extension://verify/popup.html' };
+  const send = function(message, sender) { return sendMarksMessageForVerify(bg, message, sender); };
+  const a = makeMarksTestSnapshot(M, '101', '帖子 A', { baidu: [{ url: 'https://pan.baidu.com/s/1aaa', code: 'aaaa' }] }, ['pw-a']);
+  const b = makeMarksTestSnapshot(M, '102', '帖子 B', { magnet: [{ url: 'magnet:?xt=urn:btih:' + '1'.repeat(40) }] }, ['pw-b']);
+
+  // Two tabs marking at the same moment both end up stored.
+  const both = await Promise.all([send({ op: 'mark', snapshot: a }, pageSender), send({ op: 'mark', snapshot: b }, pageSender)]);
+  assert(both[0].ok && both[1].ok && both[0].created && both[1].created, 'two marks at once must both be saved: ' + JSON.stringify(both));
+  const index = bg.__storage[M.KEYS.INDEX];
+  assert(index.items.length === 2 && index.rev === 2, 'the index must list both marks: ' + JSON.stringify(index));
+  const storedA = bg.__storage[M.itemKey('builtin|101')];
+  assert(storedA && storedA.title === '帖子 A' && storedA.links[0].code === 'aaaa' && storedA.passwords[0] === 'pw-a',
+    'a mark must keep the title, the link with its code and the passwords: ' + JSON.stringify(storedA));
+  assert(bg.__badgeText === '2', 'the toolbar badge must count marks not yet exported: ' + bg.__badgeText);
+
+  // The same content again writes nothing; a thread that is not marked is
+  // not marked by an update.
+  const setsBefore = storageSets;
+  const same = await send({ op: 'update', snapshot: a }, pageSender);
+  assert(same.ok && same.unchanged && storageSets === setsBefore, 'an unchanged mark must not be written again');
+  const c = makeMarksTestSnapshot(M, '103', '帖子 C', {}, []);
+  const notMarked = await send({ op: 'update', snapshot: c }, pageSender);
+  assert(notMarked.ok && notMarked.marked === false && !bg.__storage[M.itemKey('builtin|103')], 'an update must never mark a thread');
+
+  // Only a page of the thread's own site may mark it; the popup never adds.
+  const forged = JSON.parse(JSON.stringify(a));
+  forged.site = 'mirror:evil.example';
+  assert((await send({ op: 'mark', snapshot: forged }, pageSender)).error === 'invalid_thread', 'a snapshot whose site and host disagree must be refused');
+  assert((await send({ op: 'mark', snapshot: a }, { url: 'https://evil.example/', tab: { id: 2 } })).error === 'not_allowed', 'a page outside the forum must not mark');
+  assert((await send({ op: 'unmark', id: 'mirror:x|101' }, pageSender)).error === 'site_mismatch', 'a page must not unmark another site\'s thread');
+  assert((await send({ op: 'clearAll', rev: 2 }, pageSender)).error === 'not_allowed', 'a forum page must not clear marks');
+  assert((await send({ op: 'mark', snapshot: a }, popupSender)).error === 'not_allowed', 'the popup must not add marks');
+  assert((await send({ op: 'clearExported' }, { url: 'chrome-extension://other/popup.html', id: 'other' })).error === 'not_allowed', 'a page of another extension must not change marks');
+  bg.SharedUtils.setMirrorSites([bg.SharedUtils.makeMirrorSite('mirror.example', true)]);
+  assert((await send({ op: 'mark', snapshot: a }, { url: 'https://mirror.example/forum-2-1.html', tab: { id: 3 } })).error === 'site_mismatch',
+    'a mirror page must not mark a thread of another site');
+
+  // A copy on the page goes into today's backup: that group only, with the title.
+  const copied = await send({ op: 'copied', scope: 'type:baidu', snapshot: a }, pageSender);
+  assert(copied.ok && /^\d{4}-\d\d-\d\d$/.test(copied.date), 'a copy must be backed up under its local date: ' + JSON.stringify(copied));
+  const dayKey = M.dayKey(copied.date);
+  let day = bg.__storage[dayKey];
+  assert(day.threads.length === 1 && day.threads[0].title === '帖子 A' && day.threads[0].events[0].scope === 'type:baidu' && day.threads[0].links.length === 1,
+    'the backup must keep the copied thread with its title: ' + JSON.stringify(day));
+  assert(bg.__storage[M.KEYS.DAYS].days[copied.date].threads === 1, 'the backup list must count the day');
+  assert((await send({ op: 'copied', scope: 'everything', snapshot: a }, pageSender)).error === 'invalid_scope', 'an unknown copy scope must be refused');
+
+  // Export: a mark unchanged since the popup read it counts as exported;
+  // every exported mark goes into today's backup.
+  const seen = bg.__storage[M.KEYS.INDEX].items.map(function(item) { return { id: item.id, updatedAt: item.updatedAt }; });
+  const bLater = makeMarksTestSnapshot(M, '102', '帖子 B', {
+    magnet: [{ url: 'magnet:?xt=urn:btih:' + '1'.repeat(40) }],
+    quark: [{ url: 'https://pan.quark.cn/s/qnew', code: 'qqqq' }]
+  }, ['pw-b']);
+  const bUpdated = await send({ op: 'update', snapshot: bLater }, pageSender);
+  assert(bUpdated.ok && !bUpdated.unchanged, 'a marked thread that grew must be updated');
+  const exported = await send({ op: 'exported', marks: seen }, { url: 'chrome-extension://verify/popup.html', tab: { id: 9 } });
+  assert(exported.ok && exported.exported === 1 && exported.backedUp === 2, 'only marks unchanged since the export read may count as exported: ' + JSON.stringify(exported));
+  const afterExport = bg.__storage[M.KEYS.INDEX].items;
+  assert(M.isExported(afterExport.find(function(item) { return item.id === 'builtin|101'; })) &&
+    !M.isExported(afterExport.find(function(item) { return item.id === 'builtin|102'; })), 'a mark changed after the read must still need an export');
+  assert(bg.__badgeText === '1', 'the badge must follow the export: ' + bg.__badgeText);
+  // Reading an exported thread again, unchanged, keeps it exported.
+  const revBeforeReread = bg.__storage[M.KEYS.INDEX].rev;
+  const aReread = JSON.parse(JSON.stringify(a));
+  aReread.readAt = a.readAt + 3600000;
+  const reread = await send({ op: 'update', snapshot: aReread }, pageSender);
+  assert(reread.ok && M.isExported(bg.__storage[M.KEYS.INDEX].items.find(function(item) { return item.id === 'builtin|101'; })) &&
+    bg.__badgeText === '1' && bg.__storage[M.itemKey('builtin|101')].readAt === aReread.readAt,
+    'reading an exported thread again unchanged must keep it exported and store the new read time');
+  assert(bg.__storage[M.KEYS.INDEX].rev === revBeforeReread, 'an unchanged re-read must not rewrite the index every tab listens to');
+  day = bg.__storage[dayKey];
+  assert(day.threads.length === 2 && day.threads[0].events.length === 2 && day.threads[1].links.length === 2,
+    'the export must be added to today\'s backup, one entry per thread: ' + JSON.stringify(day));
+
+  // Clearing never touches the backup, and "clear all" needs the list the
+  // popup showed.
+  const clearedExported = await send({ op: 'clearExported' }, popupSender);
+  assert(clearedExported.ok && clearedExported.removed === 1 && !bg.__storage[M.itemKey('builtin|101')] && bg.__storage[M.itemKey('builtin|102')],
+    'clearing exported marks must remove only exported, unchanged ones: ' + JSON.stringify(clearedExported));
+  assert((await send({ op: 'clearAll', rev: 0 }, popupSender)).error === 'stale', 'clearing all must be refused when the marks changed since the popup read them');
+  const clearedAll = await send({ op: 'clearAll', rev: bg.__storage[M.KEYS.INDEX].rev }, popupSender);
+  assert(clearedAll.ok && clearedAll.removed === 1 && bg.__storage[M.KEYS.INDEX].items.length === 0 && bg.__badgeText === '', 'clearing all must empty the marks');
+  assert(bg.__storage[dayKey].threads.length === 2, 'clearing marks must never remove backups');
+
+  // The mark limit refuses new marks and keeps the old ones.
+  bg.__storage[M.KEYS.INDEX] = { v: 1, rev: 9, items: Array.from({ length: M.LIMITS.MARKS }, function(_, i) { return { id: 'builtin|' + (5000 + i), updatedAt: 1, exportedAt: 0, bytes: 10 }; }) };
+  assert((await send({ op: 'mark', snapshot: a }, pageSender)).error === 'limit_count', 'a mark past the limit must be refused');
+  assert(bg.__storage[M.KEYS.INDEX].items.length === M.LIMITS.MARKS, 'no mark may be dropped to make room');
+
+  // Marks and backups are not cache bytes: the caches must not evict for them.
+  const total = JSON.stringify(bg.__storage).length;
+  const cacheBytes = await new Promise(function(resolve) { bg.SharedUtils.getCacheBytesInUse(resolve); });
+  const keptKeys = bg.SharedUtils.getMarksStorageKeys(bg.__storage);
+  assert(keptKeys.indexOf(dayKey) !== -1 && keptKeys.indexOf(M.KEYS.INDEX) !== -1, 'the kept keys must include the backup days and the index');
+  const kept = keptKeys.reduce(function(sum, key) { return sum + (bg.__storage[key] ? key.length + JSON.stringify(bg.__storage[key]).length : 0); }, 0);
+  assert(cacheBytes === total - kept && cacheBytes < total, 'cache usage must leave out marks and backups: ' + cacheBytes + ' of ' + total);
+}
+
+async function checkPopupMarksExport() {
+  const shared = {};
+  const bg = loadBackgroundSandbox({ storage: shared, enableDebug: false });
+  const M = bg.ATPMarks;
+  const pageSender = { url: 'https://www.sehuatang.org/forum-2-1.html', tab: { id: 7 } };
+  const baidu = 'https://pan.baidu.com/s/1popup';
+  await sendMarksMessageForVerify(bg, { op: 'mark', snapshot: makeMarksTestSnapshot(M, '301', '导出测试 A', { baidu: [{ url: baidu, code: 'bd12' }] }, ['Pass123', 'pass123']) }, pageSender);
+  await sendMarksMessageForVerify(bg, { op: 'mark', snapshot: makeMarksTestSnapshot(M, '302', '导出测试 B', { magnet: [{ url: 'magnet:?xt=urn:btih:' + '2'.repeat(40) }] }, []) }, pageSender);
+  const blobs = [];
+  class VerifyURL extends URL {}
+  VerifyURL.createObjectURL = function(blob) { blobs.push(blob); return 'blob:verify/' + blobs.length; };
+  VerifyURL.revokeObjectURL = function() {};
+  const popup = loadPopupSandbox({}, {
+    sharedStorage: shared,
+    withMarks: true,
+    URL: VerifyURL,
+    runtimeMessageHandler: function(message, callback) {
+      if (!message || message.type !== 'MARKS_MUTATION') return false;
+      bg.__onMessage(message, { url: 'chrome-extension://verify/popup.html' }, callback);
+      return true;
+    }
+  });
+  const created = [];
+  const createElement = popup.document.createElement;
+  popup.document.createElement = function(tag) {
+    const el = createElement(tag);
+    el.tagName = String(tag).toUpperCase();
+    created.push(el);
+    return el;
+  };
+  await popup.__flushPromises(20);
+  const els = popup.__elements;
+  assert(String(els.marksCount.textContent) === '2' && /未导出 2 帖/.test(els.marksSummary.textContent),
+    'the popup must list the marks on any page: ' + els.marksCount.textContent + ' / ' + els.marksSummary.textContent);
+  assert(els.marksList.children.length === 2 && els.marksList.children[0].children[0].textContent === '导出测试 B',
+    'the popup list must show marked threads by title, newest first');
+
+  els.exportMarks.click();
+  for (let i = 0; i < 10; i++) await popup.__flushPromises(20);
+  assert(blobs.length === 1, 'exporting must produce one file');
+  // Blob.text() drops the byte-order mark while decoding: check the bytes.
+  const bytes = new Uint8Array(await blobs[0].arrayBuffer());
+  const text = await blobs[0].text();
+  const lines = text.split('\r\n');
+  assert(bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf && lines.indexOf('#1 标题: 导出测试 A') !== -1 && lines.indexOf('#2 标题: 导出测试 B') !== -1,
+    'the export file must list every marked thread by title: ' + text.slice(0, 400));
+  assert(lines[lines.indexOf(baidu) + 1] === '提取码: bd12', 'the export must keep each code under its own link');
+  const passwordsAt = lines.indexOf('[解压密码]（本帖候选）');
+  assert(lines[passwordsAt + 1] === 'Pass123' && lines[passwordsAt + 2] === 'pass123', 'the export must keep every password candidate of the thread');
+  const anchor = created.find(function(el) { return el.tagName === 'A' && el.download; });
+  assert(anchor && /^thumbnail-preview-marked-\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d\.txt$/.test(anchor.download), 'the export file must be named with its local time: ' + (anchor && anchor.download));
+  assert(shared[M.KEYS.INDEX].items.every(M.isExported) && bg.__badgeText === '', 'an export must mark the exported marks as exported');
+  const date = Object.keys(shared[M.KEYS.DAYS].days)[0];
+  assert(date && shared[M.dayKey(date)].threads.length === 2, 'an export must be kept in that day\'s backup');
+  assert(/均已导出/.test(els.marksSummary.textContent), 'the popup must show that everything is exported: ' + els.marksSummary.textContent);
+
+  // A day's backup downloads as one file with the titles.
+  const dayButton = created.find(function(el) { return el.getAttribute && el.getAttribute('data-backup-day') === date; });
+  assert(dayButton, 'the backup list must offer each day for download');
+  els.backupList.dispatch('click', { target: { closest: function() { return dayButton; } } });
+  for (let i = 0; i < 6; i++) await popup.__flushPromises(20);
+  assert(blobs.length === 2, 'downloading a day must produce one file');
+  const backupText = await blobs[1].text();
+  assert(backupText.indexOf('#1 标题: 导出测试 A') !== -1 && backupText.indexOf('#2 标题: 导出测试 B') !== -1 && backupText.indexOf(date) !== -1,
+    'a day backup must list its threads by title');
+}
+
+function loadMarkTogglePanelSandbox(respond) {
+  const SharedUtils = loadSharedUtils();
+  const sent = [];
+  const timers = [];
+  function makeNode(tag) {
+    const attrs = {};
+    const node = {
+      tagName: String(tag || 'div').toUpperCase(),
+      className: '',
+      textContent: '',
+      innerHTML: '',
+      style: {},
+      title: '',
+      type: '',
+      children: [],
+      parentNode: null,
+      listeners: {},
+      setAttribute: function(name, value) { attrs[name] = String(value); },
+      getAttribute: function(name) { return Object.prototype.hasOwnProperty.call(attrs, name) ? attrs[name] : null; },
+      hasAttribute: function(name) { return Object.prototype.hasOwnProperty.call(attrs, name); },
+      removeAttribute: function(name) { delete attrs[name]; },
+      addEventListener: function(type, listener) { (this.listeners[type] = this.listeners[type] || []).push(listener); },
+      appendChild: function(child) { child.parentNode = this; this.children.push(child); return child; },
+      removeChild: function(child) { this.children = this.children.filter(function(item) { return item !== child; }); child.parentNode = null; return child; },
+      remove: function() { if (this.parentNode) this.parentNode.removeChild(this); },
+      contains: function() { return false; },
+      querySelector: function(selector) {
+        const all = [];
+        (function walk(list) { list.forEach(function(child) { all.push(child); walk(child.children); }); })(this.children);
+        return all.find(function(child) {
+          if (selector === '.atp-toolbar') return child.className === 'atp-toolbar';
+          if (selector === '[data-mark-toggle]') return child.hasAttribute('data-mark-toggle');
+          return false;
+        }) || null;
+      },
+      querySelectorAll: function() { return []; },
+      closest: function(selector) {
+        let current = this.parentNode;
+        while (current) {
+          if (selector === '.atp-thread-panel' && current.className === 'atp-thread-panel') return current;
+          current = current.parentNode;
+        }
+        return null;
+      },
+      click: function() { (this.listeners.click || []).forEach(function(listener) { listener({ stopPropagation: function() {} }); }); }
+    };
+    return node;
+  }
+  const buttons = [];
+  const sandbox = {
+    console: console,
+    URL: URL,
+    SharedUtils: SharedUtils,
+    setTimeout: function(callback) { timers.push(callback); return timers.length; },
+    clearTimeout: function() {},
+    navigator: { clipboard: { writeText: function() { return Promise.resolve(); } } },
+    document: {
+      body: { appendChild: function() {} },
+      activeElement: null,
+      contains: function() { return true; },
+      getElementById: function() { return null; },
+      querySelectorAll: function(selector) { return selector === '[data-mark-toggle]' ? buttons.slice() : []; },
+      createElement: function(tag) {
+        const node = makeNode(tag);
+        if (tag === 'button') buttons.push(node);
+        return node;
+      }
+    },
+    chrome: {
+      runtime: {
+        id: 'verify',
+        lastError: null,
+        sendMessage: function(message, callback) {
+          sent.push(message);
+          callback(respond(message));
+        }
+      },
+      storage: {
+        local: { get: function(keys, callback) { callback({}); } },
+        onChanged: { addListener: function(listener) { sandbox.__marksListener = listener; } }
+      }
+    },
+    window: {
+      __ATP_VERIFY_RESOURCE_PANEL__: true,
+      ATPConfig: { loaded: true, isEnabled: function() { return true; } },
+      ATPState: { settings: { showResourcePanel: false, copyPasswordsWithLinks: false } },
+      addEventListener: function() {},
+      removeEventListener: function() {}
+    }
+  };
+  sandbox.ATPConfig = sandbox.window.ATPConfig;
+  vm.createContext(sandbox);
+  vm.runInContext(read('resource-marks.js') + '\nthis.ATPMarks = ATPMarks;', sandbox, { filename: 'resource-marks.js' });
+  sandbox.window.ATPMarks = sandbox.ATPMarks;
+  vm.runInContext(runtimeForVerify('resource-panel.js'), sandbox, { filename: 'resource-panel.js' });
+  sandbox.__sent = sent;
+  sandbox.__runTimers = function() {
+    while (timers.length) timers.shift()();
+  };
+  sandbox.__makePanel = function() {
+    const panel = makeNode('div');
+    panel.className = 'atp-thread-panel';
+    const toolbar = makeNode('div');
+    toolbar.className = 'atp-toolbar';
+    panel.appendChild(toolbar);
+    return panel;
+  };
+  return sandbox;
+}
+
+async function checkResourcePanelMarkToggle() {
+  let reply = { ok: true };
+  const sandbox = loadMarkTogglePanelSandbox(function() { return reply; });
+  const panelApi = sandbox.window.ATPResourcePanel;
+  const M = sandbox.ATPMarks;
+  function thread(tid, title, groups) {
+    return {
+      id: 't_' + tid,
+      title: title,
+      link: 'https://www.sehuatang.org/thread-' + tid + '-1-1.html',
+      markIdentity: M.getThreadIdentity('https://www.sehuatang.org/thread-' + tid + '-1-1.html', 'normalthread_' + tid),
+      resources: { groups: groups, passwords: ['pw-' + tid] },
+      textAttachments: [],
+      contentReadAt: 1000
+    };
+  }
+  const threadA = thread('201', '标题 A', { baidu: [{ url: 'https://pan.baidu.com/s/1pa', code: 'aaaa' }] });
+  const threadB = thread('202', '标题 B', { magnet: [{ url: 'magnet:?xt=urn:btih:' + '3'.repeat(40) }] });
+  const panelA = sandbox.__makePanel();
+  const panelB = sandbox.__makePanel();
+  panelApi.attachThread(panelA, threadA);
+  panelApi.attachThread(panelB, threadB);
+  sandbox.__runTimers();
+  const toggleA = panelA.querySelector('[data-mark-toggle]');
+  const toggleB = panelB.querySelector('[data-mark-toggle]');
+  assert(toggleA && toggleB && toggleA.textContent === '标记' && toggleA.getAttribute('aria-pressed') === 'false',
+    'every thread panel must offer its own mark toggle');
+
+  // The sidebar may show another thread; the click is still about its own panel.
+  panelApi._verifySetCurrentThread(threadB);
+  toggleA.click();
+  await Promise.resolve();
+  await Promise.resolve();
+  panelApi._verifySetCurrentThread(null);
+  const markMessage = sandbox.__sent[sandbox.__sent.length - 1];
+  assert(markMessage.type === 'MARKS_MUTATION' && markMessage.op === 'mark' && markMessage.snapshot.id === 'builtin|201' &&
+    markMessage.snapshot.title === '标题 A' && markMessage.snapshot.links[0].code === 'aaaa' && markMessage.snapshot.passwords[0] === 'pw-201',
+    'a click must mark the panel\'s own thread with its title, links and passwords: ' + JSON.stringify(markMessage));
+  assert(toggleA.textContent === '已标记' && toggleA.getAttribute('aria-pressed') === 'true' && toggleB.textContent === '标记',
+    'only the clicked thread may show as marked');
+
+  // Marks made in other tabs show up here.
+  sandbox.__marksListener({ atp_marks_v1_index: { newValue: { v: 1, rev: 3, items: [{ id: 'builtin|202' }] } } }, 'local');
+  assert(toggleA.textContent === '标记' && toggleB.textContent === '已标记', 'the toggles must follow the stored marks');
+
+  // A marked thread that grows sends only what changed, once.
+  const sentBefore = sandbox.__sent.length;
+  threadB.resources.groups.quark = [{ url: 'https://pan.quark.cn/s/qb', code: 'qqqq' }];
+  panelApi.updateThread(threadB);
+  sandbox.__runTimers();
+  const update = sandbox.__sent[sandbox.__sent.length - 1];
+  assert(sandbox.__sent.length === sentBefore + 1 && update.op === 'update' && update.snapshot.id === 'builtin|202' &&
+    update.snapshot.links.some(function(link) { return link.code === 'qqqq'; }), 'a marked thread that grew must send an update');
+  panelApi.updateThread(threadB);
+  sandbox.__runTimers();
+  assert(sandbox.__sent.length === sentBefore + 1, 'an unchanged marked thread must not be sent again');
+
+  // Failures say why and leave the toggle as it was.
+  reply = { ok: false, error: 'limit_count' };
+  toggleA.click();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert(toggleA.textContent === '已达 300 帖上限，请先导出并清空' && toggleA.getAttribute('role') === 'alert', 'a refused mark must say why: ' + toggleA.textContent);
+  sandbox.__runTimers();
+  assert(toggleA.textContent === '标记' && toggleA.getAttribute('aria-pressed') === 'false', 'a refused mark must not show as marked');
+  sandbox.chrome.runtime.id = undefined;
+  toggleA.click();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert(toggleA.textContent === '扩展已更新，请刷新页面', 'a page left behind by an extension reload must ask for a refresh');
+  sandbox.__runTimers();
+  sandbox.chrome.runtime.id = 'verify';
+
+  // A copy is backed up with the thread it came from, that part only.
+  reply = { ok: true };
+  await panelApi._verifyCopyAndRecord(threadA, 'text', null, 'type:baidu');
+  const copied = sandbox.__sent[sandbox.__sent.length - 1];
+  assert(copied.op === 'copied' && copied.scope === 'type:baidu' && copied.snapshot.id === 'builtin|201' && copied.snapshot.title === '标题 A' &&
+    copied.snapshot.links.length === 1 && copied.snapshot.passwords[0] === 'pw-201', 'a copy must be recorded with its thread and scope: ' + JSON.stringify(copied));
+
+  // A copy whose backup fails says so where the copy was made.
+  const messageEl = { className: '', texts: [], setAttribute: function() {}, set textContent(value) { this.texts.push(value); }, get textContent() { return this.texts[this.texts.length - 1] || ''; } };
+  const copySource = { querySelector: function() { return messageEl; } };
+  sandbox.chrome.runtime.id = undefined;
+  await panelApi._verifyCopyAndRecord(threadA, 'text', copySource, 'all');
+  sandbox.__runTimers();
+  sandbox.chrome.runtime.id = 'verify';
+  assert(messageEl.texts.indexOf('已复制，但未能备份：扩展已更新，请刷新页面') !== -1, 'a copy whose backup failed must say so: ' + JSON.stringify(messageEl.texts));
+  // A thread that cannot be identified is copied, and nothing is sent.
+  const sentBeforeUnknown = sandbox.__sent.length;
+  const unknownThread = Object.assign({}, threadA, { markIdentity: null });
+  assert(await panelApi._verifyCopyAndRecord(unknownThread, 'text', null, 'all') === true && sandbox.__sent.length === sentBeforeUnknown,
+    'a copy of an unidentifiable thread must still copy and send nothing');
+  const panelSource = read('resource-panel.js');
+  assert(panelSource.indexOf("showMessage('已复制，但未能备份：' + why, sourceEl, true);") !== -1, 'a copy whose backup failed must say so');
+  assert(panelSource.indexOf("copyAndRecord(currentThread, formatTypeText(currentThread.resources, type), sourceEl, 'type:' + type);") !== -1 &&
+    panelSource.indexOf("copyAndRecord(currentThread, formatAllText(currentThread.resources), sourceEl, 'all');") !== -1 &&
+    panelSource.indexOf("copyAndRecord(currentThread, formatPasswordsOnly(currentThread.resources), sourceEl, 'passwords');") !== -1,
+    'every copy button must go into the daily backup with its scope');
+  const renderer = read('renderer.js');
+  assert(renderer.indexOf('threadState.markIdentity = identity.ok ? identity : null;') !== -1 &&
+    renderer.indexOf("threadState.title = ATPMarks.findThreadTitle(container, link, identity.ok ? identity.tid : '');") !== -1,
+    'each thread must carry its identity and list title for marking');
+  const cacheSource = read('cache.js');
+  const backgroundSource = read('background.js');
+  assert(cacheSource.split('SharedUtils.getCacheBytesInUse(function(bytesUsed)').length === 3 &&
+    backgroundSource.split('SharedUtils.getCacheBytesInUse(function(bytesUsed)').length === 3,
+    'cache eviction must measure usage without the marks and backups');
+}
+
 async function checkPopupSaveRefreshFailureFeedback() {
   const sandbox = loadPopupSandbox({}, {
     activeTabs: [{ id: 37, url: 'https://www.sehuatang.org/thread-1-1-1.html' }],
@@ -13463,7 +13898,7 @@ async function checkCacheIndexErrorHandling() {
       local: {
         get: function(keys, callback) {
           if (keys === null) {
-            callback({ article_cache_v11_rebuild: { ts: 123, images: [] } });
+            callback({ article_cache_v12_rebuild: { ts: 123, images: [] } });
             return;
           }
           callback({});
@@ -13484,7 +13919,7 @@ async function checkCacheIndexErrorHandling() {
   assert(rebuildWriteSetCalls === 1, 'cacheIndex rebuild write-failure test must exercise the index write path');
 
   const updateOk = await new Promise(function(resolve) {
-    SharedUtils.cacheIndex.updateEntries({ 'article_cache_v11_test': { t: SharedUtils.cacheIndex.TYPE.ARTICLE, ts: 123, b: 10 } }, resolve);
+    SharedUtils.cacheIndex.updateEntries({ 'article_cache_v12_test': { t: SharedUtils.cacheIndex.TYPE.ARTICLE, ts: 123, b: 10 } }, resolve);
   });
   assert(updateOk === false, 'cacheIndex updateEntry must report read failure');
   assert(setCalls === 0, 'cacheIndex updateEntry must not write an incomplete index after read failure');
@@ -13512,7 +13947,7 @@ async function checkCacheIndexErrorHandling() {
   };
 
   const writeOk = await new Promise(function(resolve) {
-    WriteSharedUtils.cacheIndex.updateEntries({ 'article_cache_v11_test': { t: WriteSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 123, b: 10 } }, resolve);
+    WriteSharedUtils.cacheIndex.updateEntries({ 'article_cache_v12_test': { t: WriteSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 123, b: 10 } }, resolve);
   });
   assert(writeOk === false, 'cacheIndex updateEntry must report index write failures');
 
@@ -13543,7 +13978,7 @@ async function checkCacheIndexErrorHandling() {
   };
   const batchOk = await new Promise(function(resolve) {
     BatchSharedUtils.cacheIndex.updateEntries({
-      article_cache_v11_a: { t: BatchSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 111, b: 12 },
+      article_cache_v12_a: { t: BatchSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 111, b: 12 },
       image_cache_v9_b: { t: BatchSharedUtils.cacheIndex.TYPE.IMAGE, ts: 222, b: 34 }
     }, resolve);
   });
@@ -13552,7 +13987,7 @@ async function checkCacheIndexErrorHandling() {
   assert(batchGetCalls === 1 && batchSetCalls === 1, 'cacheIndex updateEntries must merge multiple index updates through one read/write cycle');
   assert(
     batchEntries &&
-      batchEntries.article_cache_v11_a &&
+      batchEntries.article_cache_v12_a &&
       batchEntries.image_cache_v9_b &&
       batchEntries.image_cache_v9_b.b === 34,
     'cacheIndex updateEntries must persist every merged index entry'
@@ -13593,14 +14028,14 @@ async function checkCacheIndexErrorHandling() {
   });
   const adjacentUpdatesPromise = Promise.all([
     new Promise(function(resolve) {
-      AdjacentBatchSharedUtils.cacheIndex.updateEntries({ 'article_cache_v11_dupe': { t: AdjacentBatchSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 111, b: 12 } }, function(ok) {
+      AdjacentBatchSharedUtils.cacheIndex.updateEntries({ 'article_cache_v12_dupe': { t: AdjacentBatchSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 111, b: 12 } }, function(ok) {
         adjacentCallbacks.push(ok);
         resolve(ok);
       });
     }),
     new Promise(function(resolve) {
       AdjacentBatchSharedUtils.cacheIndex.updateEntries({
-        article_cache_v11_dupe: { t: AdjacentBatchSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 222, b: 24 },
+        article_cache_v12_dupe: { t: AdjacentBatchSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 222, b: 24 },
         image_cache_v9_adjacent: { t: AdjacentBatchSharedUtils.cacheIndex.TYPE.IMAGE, ts: 333, b: 36 }
       }, function(ok) {
         adjacentCallbacks.push(ok);
@@ -13622,8 +14057,8 @@ async function checkCacheIndexErrorHandling() {
   assert(adjacentBatchGetCalls === 1 && adjacentBatchSetCalls === 2, 'cacheIndex must coalesce adjacent updateEntries queue items into one read/write cycle after the queue barrier');
   assert(
     adjacentBatchEntries &&
-      adjacentBatchEntries.article_cache_v11_dupe &&
-      adjacentBatchEntries.article_cache_v11_dupe.ts === 222 &&
+      adjacentBatchEntries.article_cache_v12_dupe &&
+      adjacentBatchEntries.article_cache_v12_dupe.ts === 222 &&
       adjacentBatchEntries.image_cache_v9_adjacent &&
       adjacentBatchEntries.text_resource_cache_v9_adjacent,
     'cacheIndex adjacent merged updates must persist all entries and let later duplicate keys win'
@@ -13664,10 +14099,10 @@ async function checkCacheIndexErrorHandling() {
   const barrierResults = await Promise.all([
     barrierGate,
     new Promise(function(resolve) {
-      BarrierSharedUtils.cacheIndex.updateEntries({ 'article_cache_v11_barrier': { t: BarrierSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 111, b: 12 } }, resolve);
+      BarrierSharedUtils.cacheIndex.updateEntries({ 'article_cache_v12_barrier': { t: BarrierSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 111, b: 12 } }, resolve);
     }),
     new Promise(function(resolve) {
-      BarrierSharedUtils.cacheIndex.removeEntries(['article_cache_v11_barrier'], function() {
+      BarrierSharedUtils.cacheIndex.removeEntries(['article_cache_v12_barrier'], function() {
         resolve(true);
       });
     }),
@@ -13680,7 +14115,7 @@ async function checkCacheIndexErrorHandling() {
   assert(barrierGetCalls === 3 && barrierSetCalls === 4, 'cacheIndex must not coalesce updateEntries across write/remove barriers');
   assert(
     barrierEntries &&
-      !barrierEntries.article_cache_v11_barrier &&
+      !barrierEntries.article_cache_v12_barrier &&
       barrierEntries.image_cache_v9_barrier,
     'cacheIndex removeEntries must remain a barrier between adjacent update batches'
   );
@@ -13699,7 +14134,7 @@ async function checkCacheIndexErrorHandling() {
           if (keys === null) {
             rebuildBatchGetAllCalls++;
             const allItems = {};
-            allItems.article_cache_v11_old = { ts: 99, images: [] };
+            allItems.article_cache_v12_old = { ts: 99, images: [] };
             callback(allItems);
             return;
           }
@@ -13715,7 +14150,7 @@ async function checkCacheIndexErrorHandling() {
   };
   const rebuildBatchOk = await new Promise(function(resolve) {
     RebuildBatchSharedUtils.cacheIndex.updateEntries({
-      article_cache_v11_new: { t: RebuildBatchSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 111, b: 12 }
+      article_cache_v12_new: { t: RebuildBatchSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 111, b: 12 }
     }, resolve);
   });
   const rebuildBatchEntries = rebuildBatchStorage[RebuildBatchSharedUtils.CACHE_INDEX_KEY] && rebuildBatchStorage[RebuildBatchSharedUtils.CACHE_INDEX_KEY].entries;
@@ -13723,8 +14158,8 @@ async function checkCacheIndexErrorHandling() {
   assert(rebuildBatchGetAllCalls === 1 && rebuildBatchSetCalls === 1, 'cacheIndex updateEntries must rebuild once before merging into a missing index');
   assert(
     rebuildBatchEntries &&
-      rebuildBatchEntries.article_cache_v11_old &&
-      rebuildBatchEntries.article_cache_v11_new,
+      rebuildBatchEntries.article_cache_v12_old &&
+      rebuildBatchEntries.article_cache_v12_new,
     'cacheIndex updateEntries must preserve rebuilt cache entries while merging new updates'
   );
 
@@ -13734,8 +14169,8 @@ async function checkCacheIndexErrorHandling() {
   const removeStorage = {};
   removeStorage[RemoveSharedUtils.CACHE_INDEX_KEY] = {
     entries: {
-      article_cache_v11_keep: { t: RemoveSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 1, b: 10 },
-      article_cache_v11_remove_a: { t: RemoveSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 2, b: 20 },
+      article_cache_v12_keep: { t: RemoveSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 1, b: 10 },
+      article_cache_v12_remove_a: { t: RemoveSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 2, b: 20 },
       image_cache_v9_remove_b: { t: RemoveSharedUtils.cacheIndex.TYPE.IMAGE, ts: 3, b: 30 }
     }
   };
@@ -13761,15 +14196,15 @@ async function checkCacheIndexErrorHandling() {
     }
   };
   const removeOk = await new Promise(function(resolve) {
-    RemoveSharedUtils.cacheIndex.removeEntries(['article_cache_v11_remove_a', 'image_cache_v9_remove_b'], resolve);
+    RemoveSharedUtils.cacheIndex.removeEntries(['article_cache_v12_remove_a', 'image_cache_v9_remove_b'], resolve);
   });
   const removeEntries = removeStorage[RemoveSharedUtils.CACHE_INDEX_KEY] && removeStorage[RemoveSharedUtils.CACHE_INDEX_KEY].entries;
   assert(removeOk === true, 'cacheIndex removeEntries must report successful index writes');
   assert(removeGetCalls === 1 && removeSetCalls === 1, 'cacheIndex removeEntries must delete multiple keys through one read/write cycle');
   assert(
     removeEntries &&
-      removeEntries.article_cache_v11_keep &&
-      !removeEntries.article_cache_v11_remove_a &&
+      removeEntries.article_cache_v12_keep &&
+      !removeEntries.article_cache_v12_remove_a &&
       !removeEntries.image_cache_v9_remove_b,
     'cacheIndex removeEntries must remove every requested key while preserving other entries'
   );
@@ -13784,7 +14219,7 @@ async function checkCacheIndexErrorHandling() {
       local: {
         get: function(keys, callback) {
           const result = {};
-          result[RemoveFailSharedUtils.CACHE_INDEX_KEY] = { entries: { article_cache_v11_remove: { t: RemoveFailSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 1, b: 1 } } };
+          result[RemoveFailSharedUtils.CACHE_INDEX_KEY] = { entries: { article_cache_v12_remove: { t: RemoveFailSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 1, b: 1 } } };
           callback(result);
         },
         set: function(items, callback) {
@@ -13796,7 +14231,7 @@ async function checkCacheIndexErrorHandling() {
     }
   };
   const removeFailOk = await new Promise(function(resolve) {
-    RemoveFailSharedUtils.cacheIndex.removeEntries(['article_cache_v11_remove'], resolve);
+    RemoveFailSharedUtils.cacheIndex.removeEntries(['article_cache_v12_remove'], resolve);
   });
   assert(removeFailOk === false, 'cacheIndex removeEntries must report index write failures');
 
@@ -13822,7 +14257,7 @@ async function checkCacheIndexErrorHandling() {
     }
   };
   const removeReadFailArgs = await new Promise(function(resolve) {
-    RemoveReadFailSharedUtils.cacheIndex.removeEntries(['article_cache_v11_missing'], function() {
+    RemoveReadFailSharedUtils.cacheIndex.removeEntries(['article_cache_v12_missing'], function() {
       resolve(Array.prototype.slice.call(arguments));
     });
   });
@@ -13846,7 +14281,7 @@ async function checkCacheIndexErrorHandling() {
     }
   };
   const removeMissingArgs = await new Promise(function(resolve) {
-    RemoveMissingSharedUtils.cacheIndex.removeEntries(['article_cache_v11_missing'], function() {
+    RemoveMissingSharedUtils.cacheIndex.removeEntries(['article_cache_v12_missing'], function() {
       resolve(Array.prototype.slice.call(arguments));
     });
   });
@@ -13863,7 +14298,7 @@ async function checkCacheIndexErrorHandling() {
       sendMessage: function(message, callback) {
         proxyMessages.push(message);
         if (message.action === 'rebuild') {
-          callback({ ok: true, entries: { article_cache_v11_proxy_rebuilt: { t: ProxySharedUtils.cacheIndex.TYPE.ARTICLE, ts: 1, b: 1 } } });
+          callback({ ok: true, entries: { article_cache_v12_proxy_rebuilt: { t: ProxySharedUtils.cacheIndex.TYPE.ARTICLE, ts: 1, b: 1 } } });
           return;
         }
         callback({ ok: true });
@@ -13882,21 +14317,21 @@ async function checkCacheIndexErrorHandling() {
   assert(proxyEmptyOk === true && proxyMessages.length === 0, 'cacheIndex empty updateEntries must not proxy or touch storage');
   const proxyUpdateOk = await new Promise(function(resolve) {
     ProxySharedUtils.cacheIndex.updateEntries({
-      article_cache_v11_proxy: { t: ProxySharedUtils.cacheIndex.TYPE.ARTICLE, ts: 123, b: 10 }
+      article_cache_v12_proxy: { t: ProxySharedUtils.cacheIndex.TYPE.ARTICLE, ts: 123, b: 10 }
     }, resolve);
   });
   const proxyRemoveOk = await new Promise(function(resolve) {
-    ProxySharedUtils.cacheIndex.removeEntries(['article_cache_v11_proxy'], resolve);
+    ProxySharedUtils.cacheIndex.removeEntries(['article_cache_v12_proxy'], resolve);
   });
   const proxyRebuildEntries = await new Promise(function(resolve) {
     ProxySharedUtils.cacheIndex.rebuild(resolve);
   });
   assert(proxyUpdateOk === true && proxyRemoveOk === true, 'cacheIndex proxy mutations must return background success');
-  assert(proxyRebuildEntries && proxyRebuildEntries.article_cache_v11_proxy_rebuilt, 'cacheIndex proxy rebuild must return background entries');
+  assert(proxyRebuildEntries && proxyRebuildEntries.article_cache_v12_proxy_rebuilt, 'cacheIndex proxy rebuild must return background entries');
   assert(proxyStorageTouched === false, 'cacheIndex proxied mutations must not write through local storage');
   assert(proxyMessages.length === 3, 'cacheIndex proxy test must send one message per non-empty mutation');
   assert(proxyMessages[0].type === 'CACHE_INDEX_MUTATION' && proxyMessages[0].action === 'updateEntries', 'cacheIndex updateEntries must proxy to the background owner');
-  assert(proxyMessages[1].action === 'removeEntries' && proxyMessages[1].keys[0] === 'article_cache_v11_proxy', 'cacheIndex removeEntries must proxy requested keys');
+  assert(proxyMessages[1].action === 'removeEntries' && proxyMessages[1].keys[0] === 'article_cache_v12_proxy', 'cacheIndex removeEntries must proxy requested keys');
   assert(proxyMessages[2].action === 'rebuild', 'cacheIndex rebuild must proxy to the background owner');
 
   const proxyFailSandbox = loadSharedUtilsSandbox({ backgroundOwner: false });
@@ -13908,7 +14343,7 @@ async function checkCacheIndexErrorHandling() {
     }
   };
   const proxyFailOk = await new Promise(function(resolve) {
-    ProxyFailSharedUtils.cacheIndex.removeEntries(['article_cache_v11_proxy_fail'], resolve);
+    ProxyFailSharedUtils.cacheIndex.removeEntries(['article_cache_v12_proxy_fail'], resolve);
   });
   assert(proxyFailOk === false, 'cacheIndex proxy mutations must report background failures');
 
@@ -13930,11 +14365,11 @@ async function checkCacheIndexErrorHandling() {
   });
   const noProxyUpdateOk = await new Promise(function(resolve) {
     NoProxySharedUtils.cacheIndex.updateEntries({
-      article_cache_v11_no_proxy: { t: NoProxySharedUtils.cacheIndex.TYPE.ARTICLE, ts: 1, b: 1 }
+      article_cache_v12_no_proxy: { t: NoProxySharedUtils.cacheIndex.TYPE.ARTICLE, ts: 1, b: 1 }
     }, resolve);
   });
   const noProxyRemoveOk = await new Promise(function(resolve) {
-    NoProxySharedUtils.cacheIndex.removeEntries(['article_cache_v11_no_proxy'], resolve);
+    NoProxySharedUtils.cacheIndex.removeEntries(['article_cache_v12_no_proxy'], resolve);
   });
   const noProxyRebuildEntries = await new Promise(function(resolve) {
     NoProxySharedUtils.cacheIndex.rebuild(resolve);
@@ -13968,7 +14403,7 @@ async function checkCacheIndexErrorHandling() {
     }
   };
   let throwingCallbackCalled = false;
-  ThrowingSharedUtils.cacheIndex.updateEntries({ 'article_cache_v11_throw': { t: ThrowingSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 1, b: 1 } }, function() {
+  ThrowingSharedUtils.cacheIndex.updateEntries({ 'article_cache_v12_throw': { t: ThrowingSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 1, b: 1 } }, function() {
     throwingCallbackCalled = true;
     throw new Error('intentional callback failure');
   });
@@ -15183,8 +15618,10 @@ function checkCriticalStaticRules() {
   assert(/requestIdleCallback\(function\(\)[\s\S]*?ATPLoader\.processBgTasks\(\);[\s\S]*?\}, \{ timeout: getBackgroundIdleTimeout\(delay\) \}\)/.test(loader), 'background idle callback must process one bounded background batch with a speed-aligned idle timeout');
   assert(loader.indexOf('Math.max(1000, delay)') === -1, 'background idle callback must not restore the old fixed 1000ms timeout floor');
   assert(loader.indexOf('while (deadline.timeRemaining() > 0') === -1, 'background idle callback must not run repeated global schedules in one idle tick');
-  assert(sharedUtils.indexOf('function addResourceCandidateWithText(raw, contextText, linkIndex)') !== -1, 'resource extraction must use anchor-local context for access codes');
-  assert(sharedUtils.indexOf('function scanResourceText(scanText, contextText, offset)') !== -1, 'resource extraction must scan text and href values without building one large scan string');
+  assert(sharedUtils.indexOf('function addResourceCandidate(raw)') !== -1, 'resource extraction must collect links first and pair their share codes afterwards');
+  assert(sharedUtils.indexOf('collectAccessCodePairs: function(rawHtml, baseUrl, source)') !== -1 && sharedUtils.split('this.collectAccessCodePairs(rawHtml, baseUrl, source)').length === 2,
+    'share codes must be paired once per page, over one text that holds every link');
+  assert(sharedUtils.indexOf('function scanResourceText(scanText)') !== -1, 'resource extraction must scan text and href values without building one large scan string');
   assert(sharedUtils.indexOf('forEachHrefValue: function(html, callback)') !== -1, 'shared utils must expose streaming href iteration for hot extraction paths');
   assert(sharedUtils.indexOf('this.forEachHrefValue(decoded, function(href)') !== -1, 'resource and TXT extraction must iterate href values without building arrays first');
   assert(sharedUtils.indexOf('mergeUniqueLimited: function(primary, secondary, limit)') !== -1, 'resource password extraction must support bounded password merging');
@@ -15221,11 +15658,19 @@ function checkCriticalStaticRules() {
   assert(sharedUtils.indexOf("var parts = String(srcset || '').split(',');") === -1, 'srcset parsing must not allocate comma-split candidate arrays');
   assert(sharedUtils.indexOf('var tokens = item.split(/\\s+/);') === -1, 'srcset parsing must not allocate per-candidate token arrays');
   assert(sharedUtils.indexOf("text + '\\n' + this.extractHrefValues(decoded).join('\\n')") === -1, 'resource extraction must not concatenate full text and href values into a large scan string');
-  assert(sharedUtils.indexOf('var nearbyStart = Math.max(0, start - 100)') !== -1, 'resource extraction must search before resource links for access codes');
-  assert(sharedUtils.indexOf('currentLinkEnd') !== -1, 'resource access-code matching must not treat the current resource URL as a crossing link');
-  assert(sharedUtils.indexOf('crossesAnotherResource') !== -1, 'resource access-code matching must avoid crossing adjacent pan links');
-  assert(sharedUtils.indexOf('var bestCandidate = null') !== -1, 'resource access-code extraction must keep only the current best candidate');
-  assert(sharedUtils.indexOf('bestCandidate = { code: m[1], score: score };') !== -1, 'resource access-code extraction must update the best candidate during scanning');
+  assert(sharedUtils.indexOf('ACCESS_CODE_PAIR_MAX_GAP: 220') !== -1 && sharedUtils.indexOf('ACCESS_CODE_PAIR_MAX_LINES: 3') !== -1, 'share codes must only pair with a nearby link');
+  assert(sharedUtils.indexOf('ACCESS_CODE_UNPAIRED_COST: 4') !== -1 && sharedUtils.indexOf('best[i - 2] + cost < best[i]') !== -1,
+    'share-code pairing must weigh leaving a link without a code against every neighbouring pair');
+  assert(sharedUtils.indexOf("var chosen = better(before, after) ? before : after;") !== -1 && sharedUtils.indexOf("if (x.crossings !== y.crossings) return x.crossings < y.crossings;") !== -1,
+    'each block must be paired both ways and the way that pairs more codes kept, so one stray code cannot flip a block');
+  assert(sharedUtils.indexOf('isNonShareCodePasswordLabel(lineBefore)') !== -1 && sharedUtils.indexOf("var blockRe = /(?:magnet:\\?|ed2k:\\/\\/|thunder:\\/\\/)") !== -1,
+    'archive and login passwords must not be share codes, and no code may pair across a magnet or ed2k link');
+  assert(sharedUtils.indexOf('var foreign = !pan && !blocking && (fileDrive || (SharedUtils.isForeignShareLink(href, baseUrl) &&') !== -1 &&
+    sharedUtils.indexOf("if (!SharedUtils.isForeignShareLink('https://' + m[2], baseUrl)) continue;") !== -1,
+    'links of other drives, with or without a scheme, must take part in pairing so they keep their own codes');
+  assert(sharedUtils.indexOf('} else if (ch === 10) {') !== -1 && sharedUtils.indexOf('if (ch === PARA_CODE) {') !== -1 &&
+    sharedUtils.indexOf(".replace(/[\\r\\n]+/g, ' ')") !== -1,
+    'share-code pairing must count lines as the reader sees them (blank lines and CR/LF are one break) and know paragraphs');
   assert(sharedUtils.indexOf('var candidates = collect(/(?:提取码') === -1, 'resource access-code extraction must not allocate and concatenate candidate arrays');
   assert(sharedUtils.indexOf('candidates.sort(function(a, b) { return a.score - b.score; })') === -1, 'resource access-code extraction must not sort all nearby candidates');
   assert(sharedUtils.indexOf('(?:www\\.)?pan\\.baidu\\.com') !== -1, 'resource extraction must support common www pan host variants');
@@ -19436,6 +19881,9 @@ async function main() {
   await checkPopupActiveTabQueryFailureFeedback();
   await checkPopupSaveRefreshFailureFeedback();
   await checkPopupForumPacerReset();
+  await checkBackgroundMarksStore();
+  await checkPopupMarksExport();
+  await checkResourcePanelMarkToggle();
   await checkPopupHotReloadAvoidsPageReload();
   await checkPopupSaveFailureRollback();
   checkScannerCursorState();

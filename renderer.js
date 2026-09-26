@@ -533,8 +533,15 @@
         if (container.classList) container.classList.add(CONTAINER_CLASS);
       }
 
-      threadState = ATPRenderer.registerThread(allCandidates, resources, grid, statusEl, container, link.href, outerRow, panel, textAttachments, sourceCandidates, heavyPlan, data.hasTextAttachments, data.textAttachmentCount, data.partial, cacheWriteStartedAt, data.textResourcesComplete, data.textResourcesAttemptedCount, data.textResourcesUnresolvedCount, data.textResourcesRetryableCount);
+      threadState = ATPRenderer.registerThread(allCandidates, resources, grid, statusEl, container, link.href, outerRow, panel, textAttachments, sourceCandidates, heavyPlan, data.hasTextAttachments, data.textAttachmentCount, data.partial, cacheWriteStartedAt, data.textResourcesComplete, data.textResourcesAttemptedCount, data.textResourcesUnresolvedCount, data.textResourcesRetryableCount, { readAt: data.readAt, textResourcesImported: data.textResourcesImported, textAttachmentsLimited: data.textAttachmentsLimited });
       threadState.cacheImages = cacheImages;
+      // Which thread this is and what the list calls it, for marking and the
+      // copy backup.
+      if (window.ATPMarks) {
+        var identity = ATPMarks.getThreadIdentity(link.href, container.id);
+        threadState.markIdentity = identity.ok ? identity : null;
+        threadState.title = ATPMarks.findThreadTitle(container, link, identity.ok ? identity.tid : '');
+      }
       if (articleData && Array.isArray(articleData.freshTextAttachments) && articleData.freshTextAttachmentsAt) {
         threadState.freshTextAttachments = articleData.freshTextAttachments;
         threadState.freshTextAttachmentsAt = articleData.freshTextAttachmentsAt;
@@ -553,7 +560,7 @@
       }
     },
 
-    registerThread: function(allCandidates, resources, grid, statusEl, container, linkUrl, outerRow, panel, textAttachments, sourceCandidates, heavyPlan, hasTextAttachments, textAttachmentCount, partial, cacheWriteStartedAt, textResourcesComplete, textResourcesAttemptedCount, textResourcesUnresolvedCount, textResourcesRetryableCount) {
+    registerThread: function(allCandidates, resources, grid, statusEl, container, linkUrl, outerRow, panel, textAttachments, sourceCandidates, heavyPlan, hasTextAttachments, textAttachmentCount, partial, cacheWriteStartedAt, textResourcesComplete, textResourcesAttemptedCount, textResourcesUnresolvedCount, textResourcesRetryableCount, extra) {
       var settings = ATPRenderer.getSettings();
       var cols = settings.gridCols || 5;
       var visRows = settings.visibleRows || 2;
@@ -630,6 +637,11 @@
         panel: panel,
         total: allCandidates.length
       };
+      // When the thread's content was actually read: a cache hit is not a
+      // fresh read.
+      threadState.contentReadAt = Number(extra && extra.readAt) || threadState.cacheWriteStartedAt;
+      threadState.textResourcesImported = !!(extra && extra.textResourcesImported);
+      threadState.textAttachmentsLimited = !!(extra && extra.textAttachmentsLimited);
 
       if (typeof Logger !== 'undefined' && Logger.event && (!Logger.isEnabled || Logger.isEnabled('DEBUG'))) {
         Logger.event('thread_registered', {
@@ -682,7 +694,10 @@
           textResourcesAttemptedCount: threadState.textResourcesAttemptedCount,
           textResourcesUnresolvedCount: threadState.textResourcesUnresolvedCount,
           textResourcesRetryableCount: threadState.textResourcesRetryableCount,
-          partial: threadState.partial
+          partial: threadState.partial,
+          readAt: threadState.contentReadAt,
+          textResourcesImported: threadState.textResourcesImported,
+          textAttachmentsLimited: threadState.textAttachmentsLimited
         }, !threadState.partial, threadState.cacheWriteStartedAt);
         return threadState;
       }
@@ -815,7 +830,10 @@
             textResourcesAttemptedCount: threadState.textResourcesAttemptedCount,
             textResourcesUnresolvedCount: threadState.textResourcesUnresolvedCount,
             textResourcesRetryableCount: threadState.textResourcesRetryableCount,
-            partial: threadState.partial
+            partial: threadState.partial,
+            readAt: threadState.contentReadAt,
+            textResourcesImported: threadState.textResourcesImported,
+            textAttachmentsLimited: threadState.textAttachmentsLimited
           }, imageDone && !threadState.partial, writeStartedAt);
           Logger.debug('TXT资源补齐', threadState.link + ' 资源' + SharedUtils.countResources(threadState.resources));
         }, function(e) {
@@ -924,6 +942,10 @@
       for (var i = 0; i < imports.length; i++) {
         var normalized = SharedUtils.normalizeResources(imports[i] && imports[i].resources);
         if (!SharedUtils.hasResourcePayload(normalized)) continue;
+        // Links from a local file stay labelled as such wherever they are kept.
+        SharedUtils.RESOURCE_GROUP_ORDER.forEach(function(type) {
+          normalized.groups[type].forEach(function(item) { item.source = SharedUtils.mergeResourceSource(item.source, 'import'); });
+        });
         usable.push({ name: String(imports[i].name || ''), resources: normalized });
         merged = SharedUtils.mergeResources(merged, normalized);
       }
@@ -952,6 +974,7 @@
         importUnresolvedCount ? '，仍有 ' + importUnresolvedCount + ' 个附件待补齐' : ''
       );
       threadState.textResourcesAutoAttempted = true;
+      threadState.textResourcesImported = true;
       if (!threadState.candidates.length && threadState.statusEl) threadState.statusEl.textContent = '资源链接';
 
       function normalizeFileName(name) {
@@ -991,7 +1014,10 @@
         textResourcesAttemptedCount: threadState.textResourcesAttemptedCount,
         textResourcesUnresolvedCount: threadState.textResourcesUnresolvedCount,
         textResourcesRetryableCount: threadState.textResourcesRetryableCount,
-        partial: threadState.partial
+        partial: threadState.partial,
+        readAt: threadState.contentReadAt,
+        textResourcesImported: true,
+        textAttachmentsLimited: threadState.textAttachmentsLimited
       }, imageDone && !threadState.partial, writeStartedAt);
       if (window.ATPResourcePanel) ATPResourcePanel.updateThread(threadState);
       Logger.debug('本地TXT资源导入', threadState.link + ' 资源' + SharedUtils.countResources(merged));

@@ -5,6 +5,7 @@
 importScripts('settings-schema.js');
 importScripts('defaults.js');
 importScripts('shared-utils.js');
+importScripts('resource-marks.js');
 importScripts('loading-policy.js');
 
 if (typeof SharedUtils !== 'undefined' && SharedUtils.cacheIndex) {
@@ -855,6 +856,258 @@ function queueSettingsPatch(patch) {
   return SETTINGS_WRITE_CHAIN;
 }
 
+// ---- Marked resources and the daily backup ----
+// The worker is the only writer. Marks from forum pages and the popup's
+// export and clear actions run here one at a time, so two tabs never
+// overwrite each other. A page may only mark threads of its own site; the
+// popup may export, copy, remove and clear, never add.
+var MARKS_WRITE_CHAIN = Promise.resolve();
+var MARKS_COPY_SCOPE_RE = /^(?:all|passwords|type:[a-z0-9]{1,16})$/;
+
+function queueMarksWrite(task) {
+  var run = MARKS_WRITE_CHAIN.catch(function() {}).then(task);
+  MARKS_WRITE_CHAIN = run.catch(function() {});
+  return run;
+}
+
+function marksError(code) {
+  var error = new Error(code);
+  error.code = code;
+  return error;
+}
+
+function marksStorageGet(keys) {
+  return new Promise(function(resolve, reject) {
+    chrome.storage.local.get(keys, function(items) {
+      if (chrome.runtime.lastError) {
+        reject(marksError('storage_read_failed'));
+        return;
+      }
+      resolve(items || {});
+    });
+  });
+}
+
+function marksStorageSet(items) {
+  return new Promise(function(resolve, reject) {
+    chrome.storage.local.set(items, function() {
+      if (chrome.runtime.lastError) {
+        reject(marksError('storage_write_failed'));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+function marksStorageRemove(keys) {
+  return new Promise(function(resolve, reject) {
+    if (!keys.length) {
+      resolve();
+      return;
+    }
+    chrome.storage.local.remove(keys, function() {
+      if (chrome.runtime.lastError) {
+        reject(marksError('storage_write_failed'));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+function updateMarksBadge(index) {
+  if (!chrome.action || typeof chrome.action.setBadgeText !== 'function') return;
+  var count = ATPMarks.countUnexported(index);
+  try {
+    chrome.action.setBadgeText({ text: count ? (count > 999 ? '999+' : String(count)) : '' });
+    if (typeof chrome.action.setBadgeBackgroundColor === 'function') chrome.action.setBadgeBackgroundColor({ color: '#c0392b' });
+  } catch (e) {}
+}
+
+function refreshMarksBadge() {
+  marksStorageGet(ATPMarks.KEYS.INDEX).then(function(items) {
+    updateMarksBadge(ATPMarks.readIndex(items[ATPMarks.KEYS.INDEX]));
+  }).catch(function() {});
+}
+
+function putMarksIndexEntry(index, record, bytes) {
+  var entry = ATPMarks.makeIndexEntry(record);
+  entry.bytes = bytes;
+  for (var i = 0; i < index.items.length; i++) {
+    if (index.items[i].id === record.id) {
+      index.items[i] = entry;
+      return;
+    }
+  }
+  index.items.push(entry);
+}
+
+async function saveMarkSnapshot(op, snapshot, now) {
+  var INDEX = ATPMarks.KEYS.INDEX;
+  var key = ATPMarks.itemKey(snapshot.id);
+  var stored = await marksStorageGet([INDEX, key]);
+  var index = ATPMarks.readIndex(stored[INDEX]);
+  var existing = stored[key] && typeof stored[key] === 'object' ? stored[key] : null;
+  if (op === 'update' && !existing) return { ok: true, marked: false };
+  if (!existing && index.items.length >= ATPMarks.LIMITS.MARKS) throw marksError('limit_count');
+  var merged = ATPMarks.mergeRecord(existing, snapshot, now);
+  if (existing && !merged.changed) return { ok: true, marked: true, unchanged: true };
+  var record = merged.record;
+  var bytes = JSON.stringify(record).length;
+  if (existing && !merged.contentChanged) {
+    // Only the read times moved: keep them, and the mark stays exported.
+    var touched = {};
+    touched[key] = record;
+    await marksStorageSet(touched);
+    return { ok: true, marked: true, unchanged: true };
+  }
+  var totalBytes = bytes;
+  index.items.forEach(function(item) {
+    if (item.id !== record.id) totalBytes += Number(item.bytes) || 0;
+  });
+  if (totalBytes > ATPMarks.LIMITS.MARKS_BYTES) throw marksError('limit_bytes');
+  putMarksIndexEntry(index, record, bytes);
+  index.rev++;
+  var out = {};
+  out[key] = record;
+  out[INDEX] = index;
+  await marksStorageSet(out);
+  updateMarksBadge(index);
+  return { ok: true, marked: true, created: !existing, links: ATPMarks.makeIndexEntry(record).links };
+}
+
+async function removeMarks(filter, expectedRev) {
+  var INDEX = ATPMarks.KEYS.INDEX;
+  var stored = await marksStorageGet(INDEX);
+  var index = ATPMarks.readIndex(stored[INDEX]);
+  if (typeof expectedRev === 'number' && expectedRev !== index.rev) throw marksError('stale');
+  var removed = [];
+  index.items = index.items.filter(function(item) {
+    if (!filter(item)) return true;
+    removed.push(item.id);
+    return false;
+  });
+  if (!removed.length) return { ok: true, removed: 0 };
+  index.rev++;
+  var out = {};
+  out[INDEX] = index;
+  await marksStorageSet(out);
+  await marksStorageRemove(removed.map(ATPMarks.itemKey)).catch(function() {});
+  updateMarksBadge(index);
+  return { ok: true, removed: removed.length };
+}
+
+async function addToDailyBackup(snapshots, event) {
+  if (!snapshots.length) return { ok: true, added: 0 };
+  var date = ATPMarks.formatDate(event.at);
+  var DAYS = ATPMarks.KEYS.DAYS;
+  var dayKey = ATPMarks.dayKey(date);
+  var stored = await marksStorageGet([DAYS, dayKey]);
+  var day = ATPMarks.readDay(stored[dayKey], date);
+  var days = ATPMarks.readDays(stored[DAYS]);
+  snapshots.forEach(function(snapshot) { ATPMarks.addToDay(day, snapshot, event); });
+  days.days[date] = Object.assign({ updatedAt: event.at }, ATPMarks.summarizeDay(day));
+  var out = {};
+  out[dayKey] = day;
+  out[DAYS] = days;
+  await marksStorageSet(out);
+  return { ok: true, added: snapshots.length, date: date };
+}
+
+// The popup exported or copied these marks ({ id, updatedAt } as it read
+// them): each goes into today's backup, and a mark unchanged since that read
+// counts as exported.
+async function recordMarksHandedOut(seen, kind) {
+  var INDEX = ATPMarks.KEYS.INDEX;
+  var now = Date.now();
+  var keys = [INDEX];
+  var wanted = {};
+  seen.forEach(function(entry) {
+    if (!entry || typeof entry.id !== 'string' || wanted[entry.id]) return;
+    wanted[entry.id] = Number(entry.updatedAt) || 0;
+    keys.push(ATPMarks.itemKey(entry.id));
+  });
+  var stored = await marksStorageGet(keys);
+  var index = ATPMarks.readIndex(stored[INDEX]);
+  var snapshots = [];
+  var out = {};
+  var exported = 0;
+  Object.keys(wanted).forEach(function(id) {
+    var record = stored[ATPMarks.itemKey(id)];
+    if (!record || typeof record !== 'object' || !Array.isArray(record.links)) return;
+    snapshots.push(ATPMarks.recordToSnapshot(record));
+    if (kind === 'export' && Number(record.updatedAt) === wanted[id]) {
+      record = Object.assign({}, record, { exportedAt: now });
+      out[ATPMarks.itemKey(id)] = record;
+      putMarksIndexEntry(index, record, JSON.stringify(record).length);
+      exported++;
+    }
+  });
+  if (exported) {
+    index.rev++;
+    out[INDEX] = index;
+    await marksStorageSet(out);
+    updateMarksBadge(index);
+  }
+  var backup = await addToDailyBackup(snapshots, { at: now, kind: kind, scope: kind === 'copy' ? 'marks' : 'all' });
+  return { ok: true, exported: exported, backedUp: backup.added, date: backup.date || '' };
+}
+
+// The popup, or the popup page opened in a tab: this extension's own page.
+function isOwnExtensionPageSender(sender) {
+  if (!sender || typeof sender.url !== 'string') return false;
+  if (sender.id && chrome.runtime.id && sender.id !== chrome.runtime.id) return false;
+  try {
+    return sender.url.indexOf(chrome.runtime.getURL('')) === 0;
+  } catch (e) {
+    return false;
+  }
+}
+
+function handleMarksMutation(msg, sender) {
+  var op = String(msg.op || '');
+  var now = Date.now();
+  if (isOwnExtensionPageSender(sender)) {
+    if (op === 'exported' || op === 'copiedMarks') {
+      var seen = Array.isArray(msg.marks) ? msg.marks.slice(0, ATPMarks.LIMITS.MARKS) : [];
+      return queueMarksWrite(function() { return recordMarksHandedOut(seen, op === 'exported' ? 'export' : 'copy'); });
+    }
+    if (op === 'remove') {
+      var ids = Array.isArray(msg.ids) ? msg.ids.filter(function(id) { return typeof id === 'string'; }) : [];
+      return queueMarksWrite(function() { return removeMarks(function(item) { return ids.indexOf(item.id) !== -1; }); });
+    }
+    if (op === 'clearExported') {
+      return queueMarksWrite(function() { return removeMarks(ATPMarks.isExported); });
+    }
+    if (op === 'clearAll') {
+      var rev = Number(msg.rev);
+      if (!isFinite(rev)) return Promise.reject(marksError('stale'));
+      return queueMarksWrite(function() { return removeMarks(function() { return true; }, rev); });
+    }
+    return Promise.reject(marksError('not_allowed'));
+  }
+  var zone = getSenderForumZone(sender);
+  if (!zone) return Promise.reject(marksError('not_allowed'));
+  if (op === 'unmark') {
+    var id = typeof msg.id === 'string' ? msg.id : '';
+    if (id.indexOf(zone + '|') !== 0) return Promise.reject(marksError('site_mismatch'));
+    return queueMarksWrite(function() { return removeMarks(function(item) { return item.id === id; }); });
+  }
+  if (op !== 'mark' && op !== 'update' && op !== 'copied') return Promise.reject(marksError('not_allowed'));
+  var snapshot = ATPMarks.sanitizeSnapshot(msg.snapshot);
+  if (!snapshot) return Promise.reject(marksError('invalid_thread'));
+  if (snapshot.site !== zone) return Promise.reject(marksError('site_mismatch'));
+  if (op === 'copied') {
+    var scope = String(msg.scope || 'all');
+    if (!MARKS_COPY_SCOPE_RE.test(scope)) return Promise.reject(marksError('invalid_scope'));
+    return queueMarksWrite(function() { return addToDailyBackup([snapshot], { at: now, kind: 'copy', scope: scope }); });
+  }
+  return queueMarksWrite(function() { return saveMarkSnapshot(op, snapshot, now); });
+}
+
+refreshMarksBadge();
+
 function removeCacheIndexEntriesAfterStorageRemove(keys, action, callback) {
   SharedUtils.cacheIndex.removeEntries(keys, function(success) {
     if (success === false) {
@@ -1138,7 +1391,7 @@ function setStorageWithEviction(d, warnMsg, onSuccess, writeStartedAt) {
   chrome.storage.local.set(d, function() {
     if (chrome.runtime.lastError) {
       console.warn('[BGLOG] ' + warnMsg + '，尝试淘汰后重试:', chrome.runtime.lastError.message);
-      chrome.storage.local.getBytesInUse(null, function(bytesUsed) {
+      SharedUtils.getCacheBytesInUse(function(bytesUsed) {
         if (consumeStorageError('storage用量读取失败')) return;
         var baseline = bytesUsed + estimateWriteBatchBytes(d);
         checkAndEvict(function() {
@@ -1249,7 +1502,7 @@ function checkAndEvict(callback, baselineBytes) {
     runBackgroundEviction(callback, baselineBytes);
     return;
   }
-  chrome.storage.local.getBytesInUse(null, function(bytesUsed) {
+  SharedUtils.getCacheBytesInUse(function(bytesUsed) {
     if (consumeStorageError('storage用量读取失败')) {
       if (callback) callback();
       return;
@@ -1548,6 +1801,7 @@ function makeBackgroundArticleResponse(item) {
     textAttachments: textState.textAttachments,
     hasTextAttachments: textState.hasTextAttachments,
     textAttachmentCount: textState.textAttachmentCount,
+    textAttachmentsLimited: item.textAttachmentsLimited === true,
     textResourcesComplete: item.textResourcesComplete === true,
     textResourcesAttemptedCount: Math.max(0, Number(item.textResourcesAttemptedCount || 0) || 0),
     textResourcesUnresolvedCount: Math.max(0, Number(item.textResourcesUnresolvedCount || 0) || 0),
@@ -1680,7 +1934,7 @@ async function fetchArticle(url, imageSettings, deadline, control) {
           return { ok: false, reason: emptyPage.reason, images: [], retryableEmpty: true };
         }
       }
-      return { ok: true, images: images, resources: resources, textAttachments: textAttachments, partial: htmlTruncated };
+      return { ok: true, images: images, resources: resources, textAttachments: textAttachments, textAttachmentsLimited: !!textAttachments.limited, partial: htmlTruncated };
     } finally {
       if (ownsControl) clearArticleFetchControl(control);
       // Early exits leave the body unread; abort so it stops downloading.
@@ -1806,6 +2060,7 @@ MIRROR_GATED_MESSAGE_TYPES[SharedUtils.MESSAGE_TYPES.FETCH_IMAGES] = true;
 MIRROR_GATED_MESSAGE_TYPES[SharedUtils.MESSAGE_TYPES.FETCH_TEXT_ATTACHMENTS_FRESH] = true;
 MIRROR_GATED_MESSAGE_TYPES[SharedUtils.MESSAGE_TYPES.FETCH_TEXT_RESOURCES] = true;
 MIRROR_GATED_MESSAGE_TYPES[SharedUtils.MESSAGE_TYPES.GET_FLOATING_PANEL_CSS] = true;
+MIRROR_GATED_MESSAGE_TYPES[SharedUtils.MESSAGE_TYPES.MARKS_MUTATION] = true;
 
 chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
   if (!msg || typeof msg !== 'object') return false;
@@ -1841,6 +2096,16 @@ function handleRuntimeMessage(msg, sender, sendResponse) {
     }).catch(function(e) {
       BGLOG.warn('浮窗样式读取失败', e && e.message ? e.message : String(e));
       sendResponse({ ok: false });
+    });
+    return true;
+  }
+  if (msg.type === SharedUtils.MESSAGE_TYPES.MARKS_MUTATION) {
+    handleMarksMutation(msg, sender).then(function(result) {
+      sendResponse(result);
+    }, function(e) {
+      var code = e && e.code ? e.code : 'failed';
+      if (!e || !e.code) BGLOG.warn('标记资源保存失败', e && e.message ? e.message : String(e));
+      sendResponse({ ok: false, error: code });
     });
     return true;
   }
