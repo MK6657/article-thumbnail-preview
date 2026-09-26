@@ -312,9 +312,22 @@ const BGLOG = (function() {
   };
 })();
 
+var bgCacheTtlMs = 30 * 60 * 1000;
+
 function syncBackgroundDebugLogging(rawSettings) {
   var normalized = ATPNormalizeSettings(rawSettings);
   BGLOG.setDebugEnabled(normalized.debugLogging === true);
+  bgCacheTtlMs = (Number(normalized.cacheTTL) || 30) * 60 * 1000;
+}
+
+// Entries past the cache TTL go first (oldest first): they can never be read
+// again, yet type priority alone evicted every live article before them.
+function compareEvictionOrder(a, b, expiredBefore) {
+  var aExpired = a.ts < expiredBefore;
+  var bExpired = b.ts < expiredBefore;
+  if (aExpired !== bExpired) return aExpired ? -1 : 1;
+  if (a.priority !== b.priority) return b.priority - a.priority;
+  return a.ts - b.ts;
 }
 
 try {
@@ -343,7 +356,7 @@ if (chrome.storage.onChanged && typeof chrome.storage.onChanged.addListener === 
 }
 
 function isAllowedOriginHost(host) {
-  return host === 'sehuatang.org' || host === 'sehuatang.net' || host.endsWith('.sehuatang.org') || host.endsWith('.sehuatang.net');
+  return SharedUtils.isSupportedForumHost(host);
 }
 
 function originAllowed(url) {
@@ -354,13 +367,189 @@ function originAllowed(url) {
 }
 
 function textAttachmentAllowed(url) {
+  return SharedUtils.isAllowedTextAttachmentUrl(url);
+}
+
+function textAttachmentAllowedInZone(url, zone) {
+  return SharedUtils.isTextAttachmentUrlAllowedInZone(url, zone);
+}
+
+// The zone of the forum page that sent a message; '' for anything else.
+function getSenderForumZone(sender) {
+  var url = (sender && sender.url) || '';
+  return originAllowed(url) ? SharedUtils.getForumUrlZone(url) : '';
+}
+
+function forumUrlAllowedInZone(url, zone) {
+  return !!zone && originAllowed(url) && SharedUtils.getForumUrlZone(url) === zone;
+}
+
+// ---- Forum mirror sites ----
+// Mirrors are optional host permissions granted from the popup prompt or the
+// browser's site-access settings. Chrome's grant list is the only source of
+// truth: the worker mirrors it into SharedUtils for host checks, stores it
+// for content scripts, and registers the manifest content scripts on it.
+const MIRROR_CONTENT_SCRIPT_ID_PREFIX = 'atp-mirror-';
+var mirrorSitesLoaded = !canManageMirrorSites();
+var mirrorSitesChain = Promise.resolve();
+var mirrorSitesReady = Promise.resolve();
+
+function canManageMirrorSites() {
+  return !!(chrome.permissions && typeof chrome.permissions.getAll === 'function');
+}
+
+function getGrantedPermissionOrigins() {
+  return new Promise(function(resolve, reject) {
+    chrome.permissions.getAll(function(result) {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+      resolve(result && Array.isArray(result.origins) ? result.origins : []);
+    });
+  });
+}
+
+function readStoredMirrorSites() {
+  return new Promise(function(resolve) {
+    chrome.storage.local.get(SharedUtils.MIRROR_SITES_STORAGE_KEY, function(result) {
+      if (chrome.runtime.lastError) {
+        resolve(null);
+        return;
+      }
+      var stored = result && result[SharedUtils.MIRROR_SITES_STORAGE_KEY];
+      resolve(stored && Array.isArray(stored.sites) ? SharedUtils.normalizeMirrorSites(stored.sites) : null);
+    });
+  });
+}
+
+function storeMirrorSites(sites) {
+  return new Promise(function(resolve) {
+    var items = {};
+    items[SharedUtils.MIRROR_SITES_STORAGE_KEY] = { sites: sites, updatedAt: Date.now() };
+    chrome.storage.local.set(items, function() {
+      consumeStorageError('镜像站点保存失败');
+      resolve();
+    });
+  });
+}
+
+function getMirrorSitePatternKey(sites) {
+  return sites.map(function(site) { return site.pattern; }).join('\n');
+}
+
+// One dynamic script per manifest content_scripts entry, so mirrors always
+// get the exact files, order, world and timing the built-in sites get.
+function buildMirrorContentScripts(patterns) {
+  var manifest = chrome.runtime.getManifest();
+  return (manifest.content_scripts || []).map(function(script, index) {
+    var registration = {
+      id: MIRROR_CONTENT_SCRIPT_ID_PREFIX + index,
+      matches: patterns.slice(),
+      js: (script.js || []).slice(),
+      runAt: script.run_at || 'document_idle',
+      allFrames: script.all_frames === true,
+      persistAcrossSessions: true
+    };
+    if (script.css && script.css.length) registration.css = script.css.slice();
+    if (script.world) registration.world = script.world;
+    return registration;
+  });
+}
+
+async function syncMirrorContentScripts(sites) {
+  if (!chrome.scripting || typeof chrome.scripting.getRegisteredContentScripts !== 'function') return false;
+  var wanted = sites.length ? buildMirrorContentScripts(sites.map(function(site) { return site.pattern; })) : [];
+  var wantedIds = {};
+  wanted.forEach(function(script) { wantedIds[script.id] = true; });
+  var existing = {};
+  var stale = [];
+  (await chrome.scripting.getRegisteredContentScripts() || []).forEach(function(script) {
+    if (!script || typeof script.id !== 'string' || script.id.indexOf(MIRROR_CONTENT_SCRIPT_ID_PREFIX) !== 0) return;
+    existing[script.id] = true;
+    if (!wantedIds[script.id]) stale.push(script.id);
+  });
+  if (stale.length) await chrome.scripting.unregisterContentScripts({ ids: stale });
+  var updates = wanted.filter(function(script) { return existing[script.id]; });
+  var additions = wanted.filter(function(script) { return !existing[script.id]; });
+  if (updates.length) await chrome.scripting.updateContentScripts(updates);
+  if (additions.length) await chrome.scripting.registerContentScripts(additions);
+  return true;
+}
+
+// force: re-apply registrations even when the grant list is unchanged
+// (install, update, browser start, permission events). A plain worker wake
+// only compares against the stored list, so it stays cheap.
+function refreshMirrorSites(reason, force) {
+  var run = mirrorSitesChain.then(async function() {
+    var sites = SharedUtils.getMirrorSitesFromOrigins(await getGrantedPermissionOrigins());
+    SharedUtils.setMirrorSites(sites);
+    mirrorSitesLoaded = true;
+    var stored = await readStoredMirrorSites();
+    var changed = !stored || getMirrorSitePatternKey(stored) !== getMirrorSitePatternKey(sites);
+    if (changed) await storeMirrorSites(sites);
+    var registered = true;
+    if (changed || force) {
+      try {
+        registered = await syncMirrorContentScripts(sites);
+      } catch (e) {
+        registered = false;
+        BGLOG.warn('镜像站点脚本注册失败', e && e.message ? e.message : String(e));
+      }
+      if (changed) BGLOG.info('镜像站点', reason + ' ' + sites.length + '个');
+    }
+    return { sites: sites, registered: registered };
+  });
+  mirrorSitesChain = run.catch(function() {});
+  return run;
+}
+
+function refreshMirrorSitesInBackground(reason, force) {
+  if (!canManageMirrorSites()) return;
+  refreshMirrorSites(reason, force).catch(function(e) {
+    mirrorSitesLoaded = true;
+    BGLOG.warn('镜像站点读取失败', e && e.message ? e.message : String(e));
+  });
+}
+
+if (canManageMirrorSites()) {
+  mirrorSitesReady = refreshMirrorSites('worker_start', false).catch(function(e) {
+    mirrorSitesLoaded = true;
+    BGLOG.warn('镜像站点读取失败', e && e.message ? e.message : String(e));
+  });
+  if (chrome.permissions.onAdded && typeof chrome.permissions.onAdded.addListener === 'function') {
+    chrome.permissions.onAdded.addListener(function() { refreshMirrorSitesInBackground('permission_added', true); });
+    chrome.permissions.onRemoved.addListener(function() { refreshMirrorSitesInBackground('permission_removed', true); });
+  }
+  if (chrome.runtime.onStartup && typeof chrome.runtime.onStartup.addListener === 'function') {
+    chrome.runtime.onStartup.addListener(function() { refreshMirrorSitesInBackground('browser_start', true); });
+  }
+}
+
+function isExtensionPageSender(sender) {
+  if (!sender || sender.tab || typeof sender.url !== 'string') return false;
   try {
-    var u = new URL(url);
-    if (u.protocol !== 'https:') return false;
-    if (isAllowedOriginHost(u.hostname)) return true;
-    if (u.hostname === 'xia.ewrewej.la') return true;
-    return u.hostname === 'dl.ldkms.la' && /\.txt$/i.test(u.pathname);
-  } catch (e) { return false; }
+    return sender.url.indexOf(chrome.runtime.getURL('')) === 0;
+  } catch (e) {
+    return false;
+  }
+}
+
+var floatingPanelCssPromise = null;
+
+// Mirror pages cannot load the web-accessible stylesheet (its matches stay
+// limited to the built-in sites), so the panel asks the worker for the text.
+function getFloatingPanelCss() {
+  if (!floatingPanelCssPromise) {
+    floatingPanelCssPromise = fetch(chrome.runtime.getURL('floating-panel.css')).then(function(resp) {
+      if (!resp || !resp.ok) throw new Error('floating-panel.css HTTP ' + (resp && resp.status));
+      return resp.text();
+    }).catch(function(e) {
+      floatingPanelCssPromise = null;
+      throw e;
+    });
+  }
+  return floatingPanelCssPromise;
 }
 
 function makeTextResourceFetchStatus(resources, attemptedCount, unresolvedCount, retryableCount) {
@@ -541,7 +730,8 @@ function clearArticleFetchControl(control) {
   }
 }
 
-const BG_QUOTA_BYTES = 10485760;
+// storage.local is 10 MB from Chrome 114 but 5 MB on 111-113.
+const BG_QUOTA_BYTES = (chrome.storage && chrome.storage.local && chrome.storage.local.QUOTA_BYTES) || 10485760;
 const BG_HIGH_WATERMARK = Math.floor(BG_QUOTA_BYTES * 0.85);
 const BG_TARGET_WATERMARK = Math.floor(BG_QUOTA_BYTES * 0.75);
 var bgEvictionCheckTimer = null;
@@ -981,7 +1171,10 @@ function scheduleBgEvictionCheck() {
   }, 500);
 }
 
+// Discuz attachment URLs carry a per-render aid token, so an entry keyed by one
+// is never read again; the article cache keeps those threads' TXT results.
 function setCachedTextResources(url, resources, writeStartedAt) {
+  if (SharedUtils.isDiscuzAttachmentUrl(url, url)) return;
   var keys = getTextCacheKeys(TEXT_RESOURCE_CACHE_PREFIX, url);
   if (!keys.length) return;
   var primaryKey = keys[0];
@@ -1030,6 +1223,7 @@ function getTextFailCache(url) {
 }
 
 function setTextFailCache(url, writeStartedAt) {
+  if (SharedUtils.isDiscuzAttachmentUrl(url, url)) return;
   var keys = getTextCacheKeys(TEXT_FAIL_CACHE_PREFIX, url);
   if (!keys.length) return;
   var primaryKey = keys[0];
@@ -1089,9 +1283,9 @@ function _bgEvictFromEntries(entries, callback, baseline) {
     if (callback) callback();
     return;
   }
+  var expiredBefore = Date.now() - bgCacheTtlMs;
   cacheEntries.sort(function(a, b) {
-    if (a.priority !== b.priority) return b.priority - a.priority;
-    return a.ts - b.ts;
+    return compareEvictionOrder(a, b, expiredBefore);
   });
   var removeKeys = [];
   var freed = 0;
@@ -1126,7 +1320,7 @@ async function fetchTextAttachmentResource(attachment, depth, deadline, options)
   var manualRetry = !!(options.manualRetry || options.force);
   depth = depth || 0;
   try {
-    if (!textAttachmentAllowed(attachment.url)) return SharedUtils.emptyResources();
+    if (!textAttachmentAllowedInZone(attachment.url, options.zone)) return SharedUtils.emptyResources();
 
     var cached = await getCachedTextResources(attachment.url);
     if (cached) {
@@ -1164,7 +1358,7 @@ async function fetchTextAttachmentResource(attachment, depth, deadline, options)
       }
       var resp = await fetch(attachment.url, fetchOptions);
       var finalAttachmentUrl = resp.url || attachment.url;
-      if (!textAttachmentAllowed(finalAttachmentUrl)) {
+      if (!textAttachmentAllowedInZone(finalAttachmentUrl, options.zone)) {
         BGLOG.debug('TXT附件重定向已拒绝', shortUrl(finalAttachmentUrl));
         return SharedUtils.emptyResources();
       }
@@ -1212,7 +1406,7 @@ async function fetchTextAttachmentResource(attachment, depth, deadline, options)
       if ((htmlLike || downloadLike) && depth < 2) {
         var downloadUrls = SharedUtils.extractTextDownloadUrls(text, resp.url || attachment.url, TEXT_ATTACHMENT_MAX_COUNT);
         for (var d = 0; d < downloadUrls.length; d++) {
-          if (!textAttachmentAllowed(downloadUrls[d]) || downloadUrls[d] === attachment.url) continue;
+          if (!textAttachmentAllowedInZone(downloadUrls[d], options.zone) || downloadUrls[d] === attachment.url) continue;
           var redirectedResources = await fetchTextAttachmentResource({
             url: downloadUrls[d],
             name: attachment.name,
@@ -1242,6 +1436,8 @@ async function fetchTextAttachmentResource(attachment, depth, deadline, options)
       return normalizedResources;
     } finally {
       clearTimeout(t);
+      // Early exits leave the body unread; abort so it stops downloading.
+      if (resp && !resp.bodyUsed) ctrl.abort();
     }
   } catch (e) {
     var isTransient = e.name === 'AbortError' || e.name === 'TypeError';
@@ -1433,9 +1629,13 @@ async function fetchArticle(url, imageSettings, deadline, control) {
     try {
       var resp = await fetch(url, { signal: control.controller.signal, credentials: 'include', headers: { 'Accept': 'text/html' } });
       var finalUrl = resp.url || url;
-      if (!originAllowed(finalUrl)) {
+      if (!originAllowed(finalUrl) || !SharedUtils.isSameForumZoneUrl(finalUrl, url)) {
         BGLOG.warn('文章重定向已拒绝', shortUrl(finalUrl));
         return { ok: false, reason: 'redirect_disallowed', images: [], retryableEmpty: false };
+      }
+      if (SharedUtils.isCloudflareChallengeResponse(resp)) {
+        BGLOG.warn('文章返回 Cloudflare 验证', 'HTTP' + resp.status + ' ' + shortUrl(url));
+        return { ok: false, reason: 'cloudflare', images: [], retryableEmpty: true, retryAfter: SharedUtils.parseRetryAfterHeader(resp.headers) };
       }
       if (!resp.ok) {
         var retryableHttp = resp.status === 401 || resp.status === 403 || resp.status === 429 || (resp.status >= 500 && resp.status <= 599);
@@ -1473,9 +1673,18 @@ async function fetchArticle(url, imageSettings, deadline, control) {
       var extractionContext = SharedUtils.prepareArticleExtractionContext(html);
       var resources = SharedUtils.extractResources(html, finalUrl, 'html', extractionContext);
       var textAttachments = SharedUtils.extractTextAttachments(html, finalUrl, TEXT_ATTACHMENT_MAX_COUNT, extractionContext);
+      if (!images.length && !SharedUtils.hasResourcePayload(resources) && !textAttachments.length) {
+        var emptyPage = SharedUtils.classifyEmptyArticlePage(html);
+        if (emptyPage && emptyPage.retryable) {
+          BGLOG.warn('正文返回非帖子页', emptyPage.reason + ' title="' + SharedUtils.getHtmlPageTitle(html) + '" ' + html.length + '字符 ' + shortUrl(url));
+          return { ok: false, reason: emptyPage.reason, images: [], retryableEmpty: true };
+        }
+      }
       return { ok: true, images: images, resources: resources, textAttachments: textAttachments, partial: htmlTruncated };
     } finally {
       if (ownsControl) clearArticleFetchControl(control);
+      // Early exits leave the body unread; abort so it stops downloading.
+      if (resp && !resp.bodyUsed) control.controller.abort();
     }
   } catch (e) {
     var retryableError = e.name === 'AbortError' || e.name === 'TypeError';
@@ -1590,8 +1799,51 @@ function handleCacheIndexMutationMessage(msg, sendResponse) {
   sendResponse({ ok: false });
 }
 
+// Host checks for these messages depend on the mirror grant list, which a
+// freshly woken worker is still reading; hold them instead of denying.
+var MIRROR_GATED_MESSAGE_TYPES = {};
+MIRROR_GATED_MESSAGE_TYPES[SharedUtils.MESSAGE_TYPES.FETCH_IMAGES] = true;
+MIRROR_GATED_MESSAGE_TYPES[SharedUtils.MESSAGE_TYPES.FETCH_TEXT_ATTACHMENTS_FRESH] = true;
+MIRROR_GATED_MESSAGE_TYPES[SharedUtils.MESSAGE_TYPES.FETCH_TEXT_RESOURCES] = true;
+MIRROR_GATED_MESSAGE_TYPES[SharedUtils.MESSAGE_TYPES.GET_FLOATING_PANEL_CSS] = true;
+
 chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
   if (!msg || typeof msg !== 'object') return false;
+  if (!mirrorSitesLoaded && MIRROR_GATED_MESSAGE_TYPES[msg.type] === true) {
+    mirrorSitesReady.then(function() {
+      handleRuntimeMessage(msg, sender, sendResponse);
+    });
+    return true;
+  }
+  return handleRuntimeMessage(msg, sender, sendResponse);
+});
+
+function handleRuntimeMessage(msg, sender, sendResponse) {
+  if (msg.type === SharedUtils.MESSAGE_TYPES.MIRROR_SITES_SYNC) {
+    if (!isExtensionPageSender(sender) || !canManageMirrorSites()) {
+      sendResponse({ ok: false, error: 'mirror_sync_not_allowed' });
+      return true;
+    }
+    refreshMirrorSites('popup', true).then(function(result) {
+      sendResponse({ ok: true, sites: result.sites, registered: result.registered });
+    }).catch(function(e) {
+      sendResponse({ ok: false, error: e && e.message ? e.message : String(e) });
+    });
+    return true;
+  }
+  if (msg.type === SharedUtils.MESSAGE_TYPES.GET_FLOATING_PANEL_CSS) {
+    if (!getSenderForumZone(sender)) {
+      sendResponse({ ok: false });
+      return true;
+    }
+    getFloatingPanelCss().then(function(css) {
+      sendResponse({ ok: true, css: css });
+    }).catch(function(e) {
+      BGLOG.warn('浮窗样式读取失败', e && e.message ? e.message : String(e));
+      sendResponse({ ok: false });
+    });
+    return true;
+  }
   if (msg.type === SharedUtils.MESSAGE_TYPES.CACHE_INDEX_MUTATION) {
     handleCacheIndexMutationMessage(msg, sendResponse);
     return true;
@@ -1607,12 +1859,13 @@ chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
   }
   if (msg.type === SharedUtils.MESSAGE_TYPES.FETCH_IMAGES) {
     if (!originAllowed((sender && sender.url) || '')) { sendResponse({}); return true; }
+    var imageSenderZone = getSenderForumZone(sender);
     var sourceUrls = Array.isArray(msg.urls) ? msg.urls : [];
     var maxSourceUrls = Math.max(0, Number(SharedUtils.BG_FETCH_MAX_URLS) || 60);
     var urls = [];
     var deniedImageResponses = {};
     for (var ui = 0; ui < sourceUrls.length && ui < maxSourceUrls; ui++) {
-      if (originAllowed(sourceUrls[ui])) urls.push(sourceUrls[ui]);
+      if (forumUrlAllowedInZone(sourceUrls[ui], imageSenderZone)) urls.push(sourceUrls[ui]);
       else if (sourceUrls[ui]) deniedImageResponses[sourceUrls[ui]] = makeOriginDisallowedArticleResponse();
     }
     if (!urls.length) { sendResponse(deniedImageResponses); return true; }
@@ -1627,7 +1880,7 @@ chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
   }
   if (msg.type === SharedUtils.MESSAGE_TYPES.FETCH_TEXT_ATTACHMENTS_FRESH) {
     var freshUrl = typeof msg.url === 'string' ? msg.url : '';
-    if (!originAllowed((sender && sender.url) || '') || !originAllowed(freshUrl)) {
+    if (!originAllowed((sender && sender.url) || '') || !forumUrlAllowedInZone(freshUrl, getSenderForumZone(sender))) {
       sendResponse({ ok: false, textAttachments: [] });
       return true;
     }
@@ -1660,13 +1913,14 @@ chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
       sendResponse(makeTextResourceFetchStatus(SharedUtils.emptyResources(), deniedTextAttempted, deniedTextAttempted, deniedTextAttempted));
       return true;
     }
+    var textSenderZone = getSenderForumZone(sender);
     var sourceAttachments = Array.isArray(msg.attachments) ? msg.attachments : [];
     var maxSourceAttachments = Math.max(0, Number(SharedUtils.BG_FETCH_MAX_TEXT_ATTACHMENTS) || 30);
     var attachments = [];
     var seenAttachments = {};
     for (var ai = 0; ai < sourceAttachments.length && ai < maxSourceAttachments && attachments.length < TEXT_ATTACHMENT_MAX_COUNT; ai++) {
       var attachment = sourceAttachments[ai];
-      if (!attachment || !attachment.url || !textAttachmentAllowed(attachment.url)) continue;
+      if (!attachment || !attachment.url || !textAttachmentAllowedInZone(attachment.url, textSenderZone)) continue;
       var attachmentKey = SharedUtils.normalizeTextAttachmentUrl(attachment.url);
       if (!attachmentKey || seenAttachments[attachmentKey]) continue;
       seenAttachments[attachmentKey] = true;
@@ -1674,7 +1928,7 @@ chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
     }
     var textDeadline = Number(msg.deadline) || (Date.now() + SharedUtils.getTextAttachmentBackgroundTimeout(attachments.length));
     var manualRetry = !!msg.manualRetry;
-    enqueueTextResourceMessage(attachments, textDeadline, { manualRetry: manualRetry, owner: sender && sender.tab && sender.tab.id }).then(function(status) {
+    enqueueTextResourceMessage(attachments, textDeadline, { manualRetry: manualRetry, owner: sender && sender.tab && sender.tab.id, zone: textSenderZone }).then(function(status) {
       sendResponse({
         resources: SharedUtils.normalizeResources(status.resources),
         attemptedCount: status.attemptedCount,
@@ -1696,7 +1950,7 @@ chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
   }
   sendResponse({});
   return false;
-});
+}
 
 async function handleFetch(urls, imageSettings, deadline) {
   imageSettings = normalizeImageExtractionSettings(imageSettings);

@@ -20,7 +20,9 @@ const SharedUtils = {
     SAVE_SETTINGS_PATCH: 'SAVE_SETTINGS_PATCH',
     FETCH_IMAGES: 'FETCH_IMAGES',
     FETCH_TEXT_RESOURCES: 'FETCH_TEXT_RESOURCES',
-    FETCH_TEXT_ATTACHMENTS_FRESH: 'FETCH_TEXT_ATTACHMENTS_FRESH'
+    FETCH_TEXT_ATTACHMENTS_FRESH: 'FETCH_TEXT_ATTACHMENTS_FRESH',
+    MIRROR_SITES_SYNC: 'MIRROR_SITES_SYNC',
+    GET_FLOATING_PANEL_CSS: 'GET_FLOATING_PANEL_CSS'
   }),
 
   effectiveImageLimit: function(settings) {
@@ -69,6 +71,26 @@ const SharedUtils = {
     } catch (e) {
       result = false;
     }
+    if (cache.size >= 8000) cache.delete(cache.keys().next().value);
+    cache.set(url, result);
+    return result;
+  },
+
+  _isAnimatedGifUrlCache: null,
+
+  // 论坛图床上的动图常有几 MB 到十几 MB：图床慢时十几张并发会把带宽占满、
+  // 全部卡到任务截止被判失败，还挤掉同屏静态图的槽位。按 URL 路径识别，
+  // 供加载器单独限流、放宽截止时间，以及首屏先排静态图。
+  isAnimatedGifUrl: function(url) {
+    if (!url) return false;
+    var cache = SharedUtils._isAnimatedGifUrlCache;
+    if (!cache) cache = SharedUtils._isAnimatedGifUrlCache = new Map();
+    var hit = cache.get(url);
+    if (hit !== undefined) return hit;
+    var path = String(url);
+    var cut = path.search(/[?#]/);
+    if (cut !== -1) path = path.slice(0, cut);
+    var result = /\.gif$/i.test(path);
     if (cache.size >= 8000) cache.delete(cache.keys().next().value);
     cache.set(url, result);
     return result;
@@ -262,11 +284,11 @@ const SharedUtils = {
 
   CACHE_PREFIXES: {
     IMAGE: 'thumb_cache_v2_',
-    ARTICLE: 'article_cache_v9_',
+    ARTICLE: 'article_cache_v11_',
     TEXT_RESOURCE: 'txt_resource_cache_v2_',
     TEXT_FAIL: 'atp_text_fail_v1_',
     TEXT_FAIL_BASE: 'atp_text_fail_',
-    NEGATIVE: 'atp_empty_v8_',
+    NEGATIVE: 'atp_empty_v9_',
     IMAGE_BASE: 'thumb_cache_',
     ARTICLE_BASE: 'article_cache_',
     TEXT_RESOURCE_BASE: 'txt_resource_cache_',
@@ -289,6 +311,7 @@ const SharedUtils = {
 
   IMAGE_KEEP_PARAM_MAP: {
     id: true,
+    page: true,
     name: true,
     filename: true,
     aid: true,
@@ -375,7 +398,14 @@ const SharedUtils = {
   ARTICLE_KEEP_PARAM_MAP: {
     mod: true,
     tid: true,
-    page: true
+    page: true,
+    authorid: true,
+    cp: true,
+    viewpid: true,
+    ordertype: true,
+    stand: true,
+    checkrush: true,
+    action: true
   },
 
   IMAGE_DIRECT_PARAM_NAMES: ['url', 'src', 'img', 'image', 'pic', 'path', 'file'],
@@ -511,7 +541,7 @@ const SharedUtils = {
       var params = u.searchParams;
       var newParams = [];
       params.forEach(function(v, k) {
-        if (keepParamMap[k]) newParams.push(k + '=' + encodeURIComponent(v));
+        if (keepParamMap[k] || (k === 'from' && v === 'album')) newParams.push(k + '=' + encodeURIComponent(v));
       });
       newParams.sort();
       u.search = newParams.length ? '?' + newParams.join('&') : '';
@@ -590,8 +620,8 @@ const SharedUtils = {
   isSignedTextDownloadUrl: function(url, baseUrl) {
     try {
       var u = new URL(url, baseUrl || 'https://example.invalid/');
-      var host = u.hostname;
-      return u.protocol === 'https:' && host === 'xia.ewrewej.la';
+      return u.protocol === 'https:' && SharedUtils.SIGNED_TEXT_DOWNLOAD_HOSTS.indexOf(u.hostname) !== -1 &&
+        (/(?:^|\/)download(?:\/|$)/i.test(u.pathname) || /\.txt$/i.test(u.pathname));
     } catch (e) {
       return false;
     }
@@ -602,9 +632,24 @@ const SharedUtils = {
       var u = new URL(url, baseUrl || undefined);
       if (u.protocol !== 'https:') return false;
       var host = u.hostname;
-      if (host === 'sehuatang.org' || host === 'sehuatang.net' || host.endsWith('.sehuatang.org') || host.endsWith('.sehuatang.net')) return true;
+      if (SharedUtils.isSupportedForumHost(host)) {
+        return /\.txt$/i.test(u.pathname) || SharedUtils.isDiscuzAttachmentUrl(u.href, u.href);
+      }
       if (SharedUtils.isSignedTextDownloadUrl(url, baseUrl)) return true;
-      return host === 'dl.ldkms.la' && /\.txt$/i.test(u.pathname);
+      return SharedUtils.TEXT_DIRECT_DOWNLOAD_HOSTS.indexOf(host) !== -1 && /\.txt$/i.test(u.pathname);
+    } catch (e) {
+      return false;
+    }
+  },
+
+  // Zone-aware TXT allowlist for work requested by a forum page: the
+  // attachment must live on that page's own site or on a download relay.
+  isTextAttachmentUrlAllowedInZone: function(url, zone, baseUrl) {
+    if (!SharedUtils.isAllowedTextAttachmentUrl(url, baseUrl)) return false;
+    if (!zone) return true;
+    try {
+      var host = new URL(url, baseUrl || undefined).hostname;
+      return SharedUtils.isTextDownloadRelayHost(host) || SharedUtils.getForumSiteZone(host) === zone;
     } catch (e) {
       return false;
     }
@@ -650,15 +695,194 @@ const SharedUtils = {
     }
   },
 
-  getSupportedForumRoot: function(host) {
+  // ---- Forum site registry ----
+  // Built-in forum roots ship in the manifest. Mirror sites are forum mirrors
+  // or reverse proxies the user approved as optional host permissions
+  // (https://*.<root>/*); background.js registers content scripts for them.
+  // Every forum-host decision goes through the functions below.
+  BUILTIN_FORUM_ROOTS: Object.freeze(['sehuatang.org', 'sehuatang.net']),
+  TEXT_DIRECT_DOWNLOAD_HOSTS: Object.freeze(['dl.ldkms.la']),
+  SIGNED_TEXT_DOWNLOAD_HOSTS: Object.freeze(['xia.ewrewej.la']),
+  MIRROR_SITES_STORAGE_KEY: 'atp_mirror_sites_v1',
+  MIRROR_SITE_MAX_COUNT: 20,
+  _mirrorSites: [],
+
+  isHostWithinRoot: function(host, root) {
     host = String(host || '').toLowerCase();
-    if (host === 'sehuatang.org' || host.endsWith('.sehuatang.org')) return 'sehuatang.org';
-    if (host === 'sehuatang.net' || host.endsWith('.sehuatang.net')) return 'sehuatang.net';
+    root = String(root || '').toLowerCase();
+    if (!host || !root) return false;
+    return host === root || (host.length > root.length + 1 && host.slice(-(root.length + 1)) === '.' + root);
+  },
+
+  getBuiltinForumRoot: function(host) {
+    var roots = SharedUtils.BUILTIN_FORUM_ROOTS;
+    for (var i = 0; i < roots.length; i++) {
+      if (SharedUtils.isHostWithinRoot(host, roots[i])) return roots[i];
+    }
     return '';
+  },
+
+  isBuiltinForumHost: function(host) {
+    return !!SharedUtils.getBuiltinForumRoot(host);
+  },
+
+  isTextDownloadRelayHost: function(host) {
+    host = String(host || '').toLowerCase();
+    return SharedUtils.TEXT_DIRECT_DOWNLOAD_HOSTS.indexOf(host) !== -1 ||
+      SharedUtils.SIGNED_TEXT_DOWNLOAD_HOSTS.indexOf(host) !== -1;
+  },
+
+  // '' when root may become a mirror, otherwise the rejection reason.
+  getMirrorRootRejection: function(root) {
+    root = String(root || '');
+    if (root.length < 3 || root.length > 253) return 'invalid';
+    if (/^[0-9.]+$/.test(root) || root.indexOf(':') !== -1 || root.charAt(0) === '[') return 'reserved';
+    var labels = root.split('.');
+    if (labels.length < 2) return 'invalid';
+    for (var i = 0; i < labels.length; i++) {
+      if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(labels[i])) return 'invalid';
+    }
+    var tld = labels[labels.length - 1];
+    if (/^[0-9]+$/.test(tld)) return 'invalid';
+    if (tld === 'localhost') return 'reserved';
+    if (SharedUtils.getBuiltinForumRoot(root)) return 'builtin';
+    var relays = SharedUtils.TEXT_DIRECT_DOWNLOAD_HOSTS.concat(SharedUtils.SIGNED_TEXT_DOWNLOAD_HOSTS);
+    for (var r = 0; r < relays.length; r++) {
+      if (SharedUtils.isHostWithinRoot(relays[r], root) || SharedUtils.isHostWithinRoot(root, relays[r])) return 'reserved';
+    }
+    return '';
+  },
+
+  makeMirrorSite: function(root, subdomains) {
+    subdomains = subdomains !== false;
+    return { root: root, pattern: 'https://' + (subdomains ? '*.' : '') + root + '/*', subdomains: subdomains };
+  },
+
+  // Accepts a bare domain, host:port or a full https URL. A leading www. folds
+  // into the wildcard so www.mirror.example and mirror.example both match.
+  parseMirrorSiteInput: function(input) {
+    var raw = String(input == null ? '' : input).trim();
+    if (!raw) return { ok: false, reason: 'empty' };
+    if (raw.length > 2048) return { ok: false, reason: 'invalid' };
+    var hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) || /^(?:https?|ftp|file|data|javascript|about|chrome|edge|blob):/i.test(raw);
+    var url;
+    try {
+      url = new URL(hasScheme ? raw : 'https://' + raw);
+    } catch (e) {
+      return { ok: false, reason: 'invalid' };
+    }
+    if (url.protocol !== 'https:') return { ok: false, reason: 'not_https' };
+    if (url.username || url.password) return { ok: false, reason: 'invalid' };
+    var host = url.hostname.toLowerCase();
+    if (host.charAt(host.length - 1) === '.') host = host.slice(0, -1);
+    if (host.indexOf('www.') === 0) host = host.slice(4);
+    var rejection = SharedUtils.getMirrorRootRejection(host);
+    if (rejection) return { ok: false, reason: rejection };
+    return { ok: true, site: SharedUtils.makeMirrorSite(host, true) };
+  },
+
+  getMirrorSiteFromPattern: function(pattern) {
+    var match = /^https:\/\/(\*\.)?([a-z0-9.-]+)\/\*$/.exec(String(pattern || '').toLowerCase());
+    if (!match || SharedUtils.getMirrorRootRejection(match[2])) return null;
+    return SharedUtils.makeMirrorSite(match[2], !!match[1]);
+  },
+
+  normalizeMirrorSites: function(list) {
+    var valid = [];
+    var seen = {};
+    if (!Array.isArray(list)) return valid;
+    for (var i = 0; i < list.length && i < 1000; i++) {
+      var item = list[i];
+      var site = null;
+      if (typeof item === 'string') {
+        site = SharedUtils.getMirrorSiteFromPattern(item);
+      } else if (item && typeof item === 'object' && typeof item.root === 'string') {
+        var root = item.root.toLowerCase();
+        if (!SharedUtils.getMirrorRootRejection(root)) site = SharedUtils.makeMirrorSite(root, item.subdomains !== false);
+      }
+      if (!site || seen[site.pattern]) continue;
+      seen[site.pattern] = true;
+      valid.push(site);
+    }
+    valid.sort(function(a, b) {
+      if (a.root !== b.root) return a.root < b.root ? -1 : 1;
+      return a.subdomains === b.subdomains ? 0 : (a.subdomains ? -1 : 1);
+    });
+    return valid.slice(0, SharedUtils.MIRROR_SITE_MAX_COUNT);
+  },
+
+  getMirrorSitesFromOrigins: function(origins) {
+    return SharedUtils.normalizeMirrorSites(Array.isArray(origins) ? origins : []);
+  },
+
+  setMirrorSites: function(list) {
+    SharedUtils._mirrorSites = SharedUtils.normalizeMirrorSites(list);
+    return SharedUtils.getMirrorSites();
+  },
+
+  getMirrorSites: function() {
+    return SharedUtils._mirrorSites.map(function(site) {
+      return { root: site.root, pattern: site.pattern, subdomains: site.subdomains };
+    });
+  },
+
+  isHostInMirrorSite: function(host, site) {
+    if (!site || !site.root) return false;
+    host = String(host || '').toLowerCase();
+    return site.subdomains ? SharedUtils.isHostWithinRoot(host, site.root) : host === site.root;
+  },
+
+  // The broadest matching grant defines the site, so www.* and bbs.* under
+  // one wildcard share a zone even when a narrower grant also exists.
+  getMirrorForumRoot: function(host) {
+    var best = '';
+    var mirrorSites = SharedUtils._mirrorSites;
+    for (var i = 0; i < mirrorSites.length; i++) {
+      if (!SharedUtils.isHostInMirrorSite(host, mirrorSites[i])) continue;
+      if (!best || mirrorSites[i].root.length < best.length) best = mirrorSites[i].root;
+    }
+    return best;
+  },
+
+  // Content scripts only run on built-in or granted mirror hosts, so the
+  // current page is trusted even while the stored mirror list lags behind.
+  ensureCurrentForumSite: function(host) {
+    host = String(host || '').toLowerCase();
+    if (!host || SharedUtils.getSupportedForumRoot(host)) return;
+    var root = host.indexOf('www.') === 0 ? host.slice(4) : host;
+    if (SharedUtils.getMirrorRootRejection(root)) return;
+    SharedUtils.setMirrorSites(SharedUtils._mirrorSites.concat([SharedUtils.makeMirrorSite(root, true)]));
+  },
+
+  getSupportedForumRoot: function(host) {
+    return SharedUtils.getBuiltinForumRoot(host) || SharedUtils.getMirrorForumRoot(host);
   },
 
   isSupportedForumHost: function(host) {
     return !!SharedUtils.getSupportedForumRoot(host);
+  },
+
+  // Built-in roots share one operator and one zone; every mirror is its own
+  // zone. A page may only have forum URLs from its own zone fetched, parsed
+  // or served from cache, so a mirror never reads another site's session data.
+  getForumSiteZone: function(host) {
+    if (SharedUtils.getBuiltinForumRoot(host)) return 'builtin';
+    var mirrorRoot = SharedUtils.getMirrorForumRoot(host);
+    return mirrorRoot ? 'mirror:' + mirrorRoot : '';
+  },
+
+  getForumUrlZone: function(url) {
+    try {
+      var u = new URL(url);
+      return u.protocol === 'https:' ? SharedUtils.getForumSiteZone(u.hostname) : '';
+    } catch (e) {
+      return '';
+    }
+  },
+
+  isSameForumZoneUrl: function(url, otherUrl) {
+    var zone = SharedUtils.getForumUrlZone(url);
+    return !!zone && zone === SharedUtils.getForumUrlZone(otherUrl);
   },
 
   isSameSupportedSiteHost: function(host, baseHost) {
@@ -680,7 +904,11 @@ const SharedUtils = {
         baseHost = location.hostname;
       }
       if (baseHost && !SharedUtils.isSameSupportedSiteHost(u.hostname, baseHost)) return false;
-      return /(?:mod=attachment|attachment\.php|attach(?:ment)?id=|[?&]aid=|misc\.php\?(?:.*&)?(?:mod=attach|action=attach))/.test((u.pathname + u.search).toLowerCase());
+      var path = u.pathname.toLowerCase();
+      var query = u.search.slice(1).toLowerCase();
+      if (/\/attachment\.php$/.test(path)) return true;
+      if (/\/forum\.php$/.test(path)) return /(?:^|&)mod=attachment(?:&|$)/.test(query);
+      return /\/misc\.php$/.test(path) && /(?:^|&)(?:mod|action)=attach(?:ment)?(?:&|$)/.test(query);
     } catch (e) { return false; }
   },
 
@@ -699,25 +927,166 @@ const SharedUtils = {
 
   isBlockedPage: function(html) {
     var h = String(html || '').substring(0, 20000);
-    if (/cf-mitigated|cf-chl|challenge-platform|Just a moment/i.test(h)) return 'cloudflare';
+    // A Cloudflare interstitial itself, not a thread that mentions the phrase
+    // in its title or a page that merely loads Cloudflare's page script.
+    if (!SharedUtils.looksLikeThreadPage(h) && /cf-chl|<title[^<>]*>\s*(?:Just a moment|Attention Required)/i.test(h)) return 'cloudflare';
 
     var messagePage = /id=["']messagetext["']|class=["'][^"']*(?:alert_error|showmessage)[^"']*["']|<title[^>]*>[^<]*(?:提示信息|错误信息|访问受限)[^<]*<\/title>/i.test(h);
     var text = h
       .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
       .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
-      .replace(/<[^>]+>/g, ' ')
+      .replace(/<[^<>]+>/g, ' ')
       .replace(/&(?:nbsp|#160);/gi, ' ')
       .replace(/\s+/g, ' ');
 
     if (messagePage) {
-      if (/请先登录|尚未登录|需要登录|必须登录|登录后(?:才|方|可)|not logged in|sign in to continue/i.test(text)) return 'login_page';
-      if (/没有权限|无权访问|权限不足|用户组.{0,16}(?:无权|无法|不能)|access denied|forbidden/i.test(text)) return 'permission_page';
+      if (/请先登录|尚未登录|需要登录|需要先登录|必须登录|登录后(?:才|方|可)|not logged in|sign in to continue/i.test(text)) return 'login_page';
+      if (/没有权限|无权访问|权限不足|阅读权限|用户组.{0,16}(?:无权|无法|不能)|access denied|forbidden/i.test(text)) return 'permission_page';
       if (/(?:下载|附件).{0,24}(?:无权|权限不足|需要登录|请先登录|需要购买)/i.test(text)) return 'download_blocked';
     }
 
     var purchaseAction = /(?:action|href)=["'][^"']*(?:buythread|pay(?:thread|topic)|action=buy)[^"']*["']/i.test(h);
     if (purchaseAction && /购买(?:主题|帖子)|付费(?:主题|帖子)|支付.{0,20}(?:金币|金钱)|售价.{0,20}(?:金币|金钱)/i.test(text)) return 'purchase_page';
     return null;
+  },
+
+  // Linear scans that replace the old optional-prefix URL regexes, which
+  // backtracked cubically on long unbroken runs (a post repeating
+  // "https://x/forum.php?" froze every viewer's page). Tokens are maximal
+  // runs without quotes, angle brackets or whitespace, like [^"'<>\s]+.
+  forEachUrlToken: function(text, callback) {
+    var tokenRegex = /[^"'<>\s]+/g;
+    var match;
+    text = String(text || '');
+    while ((match = tokenRegex.exec(text)) !== null) {
+      if (match[0].length > 4096) continue;
+      if (callback(match[0], match.index) === false) return;
+    }
+  },
+
+  // Same matches as /(?:https?:\/\/[^"'<>\s]+)?(?:forum\.php\?[^"'<>\s]*mod=attachment
+  // [^"'<>\s]*|attachment\.php\?[^"'<>\s]*|misc\.php\?[^"'<>\s]*(?:mod=attach|
+  // action=attach)[^"'<>\s]*)/gi: from the earliest scheme (or keyword) to
+  // the end of the token. callback(url, start, end) may return false to stop.
+  forEachRawAttachmentUrl: function(text, callback) {
+    SharedUtils.forEachUrlToken(text, function(token, tokenIndex) {
+      var lower = token.toLowerCase();
+      var keyAt = -1;
+      var forumAt = lower.indexOf('forum.php?');
+      if (forumAt !== -1 && lower.indexOf('mod=attachment', forumAt + 10) !== -1) keyAt = forumAt;
+      var attachAt = lower.indexOf('attachment.php?');
+      if (attachAt !== -1 && (keyAt === -1 || attachAt < keyAt)) keyAt = attachAt;
+      var miscAt = lower.indexOf('misc.php?');
+      if (miscAt !== -1 && (keyAt === -1 || miscAt < keyAt) &&
+          (lower.indexOf('mod=attach', miscAt + 9) !== -1 || lower.indexOf('action=attach', miscAt + 9) !== -1)) {
+        keyAt = miscAt;
+      }
+      if (keyAt === -1) return;
+      var start = keyAt;
+      // The optional scheme prefix may run past earlier keywords, so the match
+      // starts at the first scheme whenever any qualifying keyword begins at
+      // least one character after it.
+      var schemeAt = lower.search(/https?:\/\//);
+      if (schemeAt !== -1 && schemeAt < keyAt) {
+        var lastKeyAt = lower.lastIndexOf('attachment.php?');
+        var lastModAt = lower.lastIndexOf('mod=attachment');
+        if (lastModAt >= 10) lastKeyAt = Math.max(lastKeyAt, lower.lastIndexOf('forum.php?', lastModAt - 10));
+        var lastParamAt = Math.max(lower.lastIndexOf('mod=attach'), lower.lastIndexOf('action=attach'));
+        if (lastParamAt >= 9) lastKeyAt = Math.max(lastKeyAt, lower.lastIndexOf('misc.php?', lastParamAt - 9));
+        if (lastKeyAt > schemeAt + (lower.charAt(schemeAt + 4) === 's' ? 8 : 7)) start = schemeAt;
+      }
+      return callback(token.slice(start), tokenIndex + start, tokenIndex + token.length);
+    });
+  },
+
+  // Same matches as /https?:\/\/[^"'<>\s]+?\.txt(?:[?#][^"'<>\s]*)?/gi.
+  forEachRawTextFileUrl: function(text, callback) {
+    SharedUtils.forEachUrlToken(text, function(token, tokenIndex) {
+      var lower = token.toLowerCase();
+      var pos = 0;
+      while (pos < lower.length) {
+        var schemeAt = lower.indexOf('http', pos);
+        if (schemeAt === -1) return;
+        var afterScheme = lower.startsWith('https://', schemeAt) ? schemeAt + 8 :
+          (lower.startsWith('http://', schemeAt) ? schemeAt + 7 : -1);
+        if (afterScheme === -1) {
+          pos = schemeAt + 4;
+          continue;
+        }
+        var txtAt = lower.indexOf('.txt', afterScheme + 1);
+        if (txtAt === -1) return;
+        var end = txtAt + 4;
+        if (lower.charAt(end) === '?' || lower.charAt(end) === '#') end = lower.length;
+        if (callback(token.slice(schemeAt, end), tokenIndex + schemeAt, tokenIndex + end) === false) return false;
+        pos = end;
+      }
+    });
+  },
+
+  // Every Discuz thread view renders its post list.
+  looksLikeThreadPage: function(html) {
+    return /\bid=["'](?:postlist|thread_subject)["']|\bid=["']post(?:message)?_\d+["']|\bclass=["'][^"'<>]*\bt_f\b/i.test(String(html || ''));
+  },
+
+  getHtmlPageTitle: function(html) {
+    var match = /<title[^<>]*>([^<]{0,200})/i.exec(String(html || '').slice(0, 20000));
+    return match ? SharedUtils.decodeHtmlEntities(match[1]).replace(/\s+/g, ' ').trim().slice(0, 60) : '';
+  },
+
+  // For an HTML 200 page that produced no images, resources or TXT links.
+  // null: a real thread page with nothing to show (safe to negative-cache).
+  // Otherwise the page is an interstitial such as an anti-flood notice, so
+  // the thread must be retried later instead of being cached as empty.
+  classifyEmptyArticlePage: function(html) {
+    html = String(html || '');
+    if (SharedUtils.looksLikeThreadPage(html)) return null;
+    var text = SharedUtils.htmlToText(SharedUtils.stripNonRenderedHtmlRegions(html.slice(0, 20000))).replace(/\s+/g, ' ');
+    if (/主题不存在|帖子不存在|已被删除|已删除|正在被审核|does not exist|has been deleted/i.test(text)) {
+      return { reason: 'thread_missing', retryable: false };
+    }
+    if (/过于频繁|太频繁|访问频率|刷新过快|访问过快|速度过快|稍后再试|稍候再试|请求过多|too many requests|rate limit|slow down/i.test(text)) {
+      return { reason: 'rate_limited', retryable: true };
+    }
+    // Any other Discuz notice (read permission, moderation, …) is the forum
+    // answering normally about this thread, not pushing back on the rate.
+    if (SharedUtils.isDiscuzMessagePage(html)) return { reason: 'forum_message', retryable: true };
+    if (SharedUtils.isForumChallengePage(html)) return { reason: 'challenge_page', retryable: true };
+    return { reason: 'unrecognized_page', retryable: true };
+  },
+
+  // Cloudflare marks its challenge responses (usually HTTP 403) with this
+  // header; the body may be in any language.
+  isCloudflareChallengeResponse: function(resp) {
+    var headers = resp && resp.headers;
+    if (!headers || typeof headers.get !== 'function') return false;
+    return String(headers.get('cf-mitigated') || '').toLowerCase() === 'challenge';
+  },
+
+  isDiscuzMessagePage: function(html) {
+    return /\bid=["']messagetext["']|\bclass=["'][^"'<>]*\balert_(?:error|info|right)\b/i.test(String(html || '').slice(0, 60000));
+  },
+
+  // Empty-result reasons that mean the forum pushed back on the request rate,
+  // as opposed to something about the thread itself. An unrecognized page is
+  // not one: pausing the whole forum for a single odd thread costs more than
+  // retrying that thread a few times.
+  isForumFloodReason: function(reason) {
+    return reason === 'rate_limited' ||
+      reason === 'challenge_page' ||
+      reason === 'cloudflare' ||
+      reason === 'http_429' ||
+      reason === 'http_503';
+  },
+
+  // The forum's anti-crawler answer to a burst of requests: a page of a
+  // kilobyte or so, titled with a random quote author, that only carries a
+  // script (or a refresh) and none of the Discuz page frame. Recognized so it
+  // is waited out, never run.
+  isForumChallengePage: function(html) {
+    html = String(html || '');
+    if (!html || html.length > 6144 || SharedUtils.looksLikeThreadPage(html)) return false;
+    if (/\bid=["'](?:wp|hd|ft|toptb|messagetext)["']|Powered by Discuz|discuz_uid|STYLEID|\balert_(?:error|info|right)\b/i.test(html)) return false;
+    return /<script\b|<meta[^<>]*http-equiv=["']?refresh/i.test(html);
   },
 
   extractOgImage: function(html, baseUrl) {
@@ -845,6 +1214,14 @@ const SharedUtils = {
     return result;
   },
 
+  // ed2k/magnet groups hold their own schemes; every other group is a web
+  // link, so a javascript:/data: href must never become a copyable item.
+  isCopyableResourceUrl: function(type, url) {
+    if (type === 'ed2k') return /^ed2k:\/\//i.test(url);
+    if (type === 'magnet') return /^magnet:\?/i.test(url);
+    return SharedUtils.isHttpLikeUrl(url);
+  },
+
   normalizeResources: function(resources) {
     var normalized = this.emptyResources();
     if (!resources) return normalized;
@@ -861,7 +1238,7 @@ const SharedUtils = {
         item.url = normalizedPan.url;
         if (normalizedPan.code) item.code = normalizedPan.code;
         if (!item.source) item.source = 'html';
-        if (!item.url) continue;
+        if (!item.url || !this.isCopyableResourceUrl(type, item.url)) continue;
         var dedupKey = this.getResourceDedupKey(type, item.url);
         if (seen[dedupKey]) {
           var existing = seen[dedupKey];
@@ -994,7 +1371,7 @@ const SharedUtils = {
     var MAX_SCAN_MS = 250;
     var decoded = (context && typeof context.decoded === 'string')
       ? context.decoded
-      : SharedUtils.decodeHtmlEntities(SharedUtils.restoreProtectedEmails(SharedUtils.limitArticleHtml(html)));
+      : SharedUtils.decodeHtmlEntities(SharedUtils.stripNonRenderedHtmlRegions(SharedUtils.restoreProtectedEmails(SharedUtils.limitArticleHtml(html))));
     if (decoded.length > MAX_HTML_LENGTH) decoded = decoded.slice(0, MAX_HTML_LENGTH);
     var startedAt = Date.now();
 
@@ -1016,7 +1393,7 @@ const SharedUtils = {
     }
 
     function isAttachmentHref(href) {
-      return /(?:mod=attachment|attachment\.php|attach(?:ment)?id=|[?&]aid=)/i.test(href);
+      return SharedUtils.isDiscuzAttachmentUrl(href, baseUrl);
     }
 
     function isBlockedProtocol(href) {
@@ -1114,23 +1491,22 @@ const SharedUtils = {
     }
 
     // Raw URL fallback: standalone attachment URLs in text
-    var rawUrlRegex = /(?:https?:\/\/[^"'<>\s]+)?(?:forum\.php\?[^"'<>\s]*mod=attachment[^"'<>\s]*|attachment\.php\?[^"'<>\s]*|misc\.php\?[^"'<>\s]*(?:mod=attach|action=attach)[^"'<>\s]*)/gi;
-    while (attachments.length < maxCount && (m = rawUrlRegex.exec(decoded)) !== null) {
-      if (Date.now() - startedAt > MAX_SCAN_MS) break;
-      var rawUrl = m[0].replace(/\\\//g, '/');
-      var rawCtxStart = Math.max(0, m.index - 1500);
-      var rawCtxEnd = Math.min(decoded.length, rawUrlRegex.lastIndex + 1500);
+    SharedUtils.forEachRawAttachmentUrl(decoded, function(matchedUrl, matchStart, matchEnd) {
+      if (attachments.length >= maxCount || Date.now() - startedAt > MAX_SCAN_MS) return false;
+      var rawUrl = matchedUrl.replace(/\\\//g, '/');
+      var rawCtxStart = Math.max(0, matchStart - 1500);
+      var rawCtxEnd = Math.min(decoded.length, matchEnd + 1500);
       var rawSlice = decoded.slice(rawCtxStart, rawCtxEnd);
-      if (!/\.txt/i.test(rawSlice) && !/(?:filetype|attach(?:ment)?)[^>]{0,160}(?:txt|text)/i.test(rawSlice)) continue;
+      if (!/\.txt/i.test(rawSlice) && !/(?:filetype|attach(?:ment)?)[^>]{0,160}(?:txt|text)/i.test(rawSlice)) return;
 
       // Raw name: narrow window first, then block, then full window (same as context)
-      var rawNarrowStart = Math.max(0, m.index - 200);
-      var rawNarrowEnd = Math.min(decoded.length, rawUrlRegex.lastIndex + 200);
+      var rawNarrowStart = Math.max(0, matchStart - 200);
+      var rawNarrowEnd = Math.min(decoded.length, matchEnd + 200);
       var rawNarrowText = SharedUtils.htmlToText(decoded.slice(rawNarrowStart, rawNarrowEnd)).trim();
       var rawNameMatch = rawNarrowText.match(/[^\s<>"'：:，,。；;（）()【】\[\]]{1,120}\.txt/i);
       if (!rawNameMatch) {
-        var rawBlockStart = Math.max(0, m.index - 800);
-        var rawBlockEnd = Math.min(decoded.length, rawUrlRegex.lastIndex + 800);
+        var rawBlockStart = Math.max(0, matchStart - 800);
+        var rawBlockEnd = Math.min(decoded.length, matchEnd + 800);
         var rawBlockText = SharedUtils.htmlToText(decoded.slice(rawBlockStart, rawBlockEnd)).trim();
         rawNameMatch = rawBlockText.match(/[^\s<>"'：:，,。；;（）()【】\[\]]{1,120}\.txt/i);
       }
@@ -1140,7 +1516,7 @@ const SharedUtils = {
       }
       var rawCand = makeCandidate(rawUrl, (rawNameMatch && rawNameMatch[0]) || rawUrl, 'txt-attachment-raw');
       if (rawCand) addCandidate(rawCand);
-    }
+    });
 
     return attachments;
   },
@@ -1165,7 +1541,7 @@ const SharedUtils = {
     }
 
     function looksLikeAttachmentUrl(raw) {
-      return /(?:mod=attachment|attachment\.php|attach(?:ment)?id=|[?&]aid=|misc\.php\?[^"'<>\s]*(?:mod=attach|action=attach))/i.test(raw);
+      return SharedUtils.isDiscuzAttachmentUrl(raw, baseUrl);
     }
 
     function looksLikeSignedTextDownloadUrl(raw) {
@@ -1178,6 +1554,7 @@ const SharedUtils = {
       if (!looksLikeTextUrl(raw) && !looksLikeAttachmentUrl(raw) && !looksLikeSignedTextDownloadUrl(raw)) return;
       var url = SharedUtils.resolveUrl(baseUrl, raw);
       if (!url) return;
+      if (!SharedUtils.isAllowedTextAttachmentUrl(url, baseUrl)) return;
       var key = SharedUtils.normalizeTextAttachmentUrl(url);
       if (!key) return;
       if (baseKey && key === baseKey) return;
@@ -1191,21 +1568,21 @@ const SharedUtils = {
       if (urls.length >= maxCount) return false;
     });
 
-    var rawRegex = /https?:\/\/[^"'<>\s]+?\.txt(?:[?#][^"'<>\s]*)?/gi;
     var m;
-    while (urls.length < maxCount && (m = rawRegex.exec(decoded)) !== null) {
-      add(m[0]);
-    }
+    SharedUtils.forEachRawTextFileUrl(decoded, function(url) {
+      if (urls.length >= maxCount) return false;
+      add(url);
+    });
 
     var signedDownloadRegex = /https:\/\/xia\.ewrewej\.la\/[^"'<>\s]+/gi;
     while (urls.length < maxCount && (m = signedDownloadRegex.exec(decoded)) !== null) {
       add(m[0]);
     }
 
-    var rawAttachmentRegex = /(?:https?:\/\/[^"'<>\s]+)?(?:forum\.php\?[^"'<>\s]*mod=attachment[^"'<>\s]*|attachment\.php\?[^"'<>\s]*|misc\.php\?[^"'<>\s]*(?:mod=attach|action=attach)[^"'<>\s]*)/gi;
-    while (urls.length < maxCount && (m = rawAttachmentRegex.exec(decoded)) !== null) {
-      add(m[0]);
-    }
+    SharedUtils.forEachRawAttachmentUrl(decoded, function(url) {
+      if (urls.length >= maxCount) return false;
+      add(url);
+    });
 
     return urls;
   },
@@ -1261,7 +1638,7 @@ const SharedUtils = {
   // 一次性生成三个提取器共用的整文派生串（原始→还原邮箱→解实体→纯文本），
   // 供 extractResources / extractTextAttachments 复用，避免同一篇 1MB 文章重复整文解码
   prepareArticleExtractionContext: function(html) {
-    var rawHtml = this.restoreProtectedEmails(this.limitArticleHtml(html));
+    var rawHtml = this.stripNonRenderedHtmlRegions(this.restoreProtectedEmails(this.limitArticleHtml(html)));
     var decoded = this.decodeHtmlEntities(rawHtml);
     return {
       rawHtml: rawHtml,
@@ -1280,7 +1657,9 @@ const SharedUtils = {
       decoded = context.decoded;
       text = context.text;
     } else {
-      rawHtml = this.restoreProtectedEmails(this.limitArticleHtml(html));
+      rawHtml = source === 'txt'
+        ? this.restoreProtectedEmails(this.limitArticleHtml(html))
+        : this.stripNonRenderedHtmlRegions(this.restoreProtectedEmails(this.limitArticleHtml(html)));
       decoded = this.decodeHtmlEntities(rawHtml);
       text = this.htmlToText(decoded);
     }
@@ -1321,6 +1700,7 @@ const SharedUtils = {
       var type = SharedUtils.classifyResourceUrl(raw);
       if (!type) return;
       var url = normalizeResourceCandidate(raw);
+      if (!SharedUtils.isCopyableResourceUrl(type, url)) return;
       contextText = contextText || text;
       var code = '';
       if (SharedUtils.isPanResourceType(type)) {
@@ -1375,15 +1755,23 @@ const SharedUtils = {
       }
     }
 
+    var resourceAnchors = [];
     SharedUtils.forEachAnchorTag(rawHtml, function(attrs, body, openIndex, endIndex) {
       var href = SharedUtils.decodeHtmlEntities(SharedUtils.extractHtmlAttr(attrs, 'href'));
       if (!href || !SharedUtils.classifyResourceUrl(href)) return;
-      var ctxStart = Math.max(0, openIndex - 220);
-      var ctxEnd = Math.min(rawHtml.length, endIndex + 220);
-      var contextText = SharedUtils.htmlToText(SharedUtils.decodeHtmlEntities(rawHtml.slice(ctxStart, ctxEnd)));
-      var contextIndex = SharedUtils.htmlToText(SharedUtils.decodeHtmlEntities(rawHtml.slice(ctxStart, openIndex))).length;
-      addResourceCandidateWithText(href, contextText, Math.max(0, contextIndex));
+      resourceAnchors.push({ href: href, openIndex: openIndex, endIndex: endIndex });
     });
+    for (var ai = 0; ai < resourceAnchors.length; ai++) {
+      var anchor = resourceAnchors[ai];
+      // Prefer a code after this link, stopping before the next resource link.
+      // A code before the first link can still belong to that link.
+      var ctxStart = ai === 0 ? Math.max(0, anchor.openIndex - 220) : anchor.openIndex;
+      var ctxEnd = Math.min(rawHtml.length, anchor.endIndex + 220);
+      if (ai + 1 < resourceAnchors.length) ctxEnd = Math.min(ctxEnd, resourceAnchors[ai + 1].openIndex);
+      var contextText = SharedUtils.htmlToText(SharedUtils.decodeHtmlEntities(rawHtml.slice(ctxStart, ctxEnd)));
+      var contextIndex = SharedUtils.htmlToText(SharedUtils.decodeHtmlEntities(rawHtml.slice(ctxStart, anchor.openIndex))).length;
+      addResourceCandidateWithText(anchor.href, contextText, Math.max(0, contextIndex));
+    }
 
     resources.passwords = this.mergeUniqueLimited(
       this.extractArchivePasswordsFromHtml(decoded),
@@ -1453,10 +1841,12 @@ const SharedUtils = {
   },
 
   htmlToText: function(html) {
+    // [^<>] (not [^>]) keeps a run of '<' without '>' linear instead of
+    // rescanning to the end from every '<'.
     return String(html || '')
       .replace(/<\s*br\s*\/?\s*>/gi, '\n')
       .replace(/<\/(?:p|div|li|tr|td|th|table|section)>/gi, '\n')
-      .replace(/<[^>]+>/g, ' ')
+      .replace(/<[^<>]+>/g, ' ')
       .replace(/\r/g, '\n')
       .replace(/[ \t]+/g, ' ')
       .replace(/\n[ \t]+/g, '\n');
@@ -1472,9 +1862,13 @@ const SharedUtils = {
   },
 
   restoreProtectedEmails: function(html) {
-    return String(html || '').replace(/<[^>]*class\s*=\s*["'][^"']*__cf_email__[^"']*["'][^>]*data-cfemail\s*=\s*["']([0-9a-f]+)["'][^>]*>[\s\S]*?<\/[^>]+>/gi, function(match, hex) {
+    html = String(html || '');
+    if (!/data-cfemail/i.test(html)) return html;
+    // Tag parts stop at '<' and the wrapped text is bounded, so crafted runs
+    // of '<' or unclosed tags stay linear.
+    return html.replace(/<[^<>]*class\s*=\s*["'][^"']*__cf_email__[^"']*["'][^<>]*data-cfemail\s*=\s*["']([0-9a-f]+)["'][^<>]*>[\s\S]{0,300}?<\/[^<>]+>/gi, function(match, hex) {
       return SharedUtils.decodeCloudflareEmail(hex) || match;
-    }).replace(/<[^>]*data-cfemail\s*=\s*["']([0-9a-f]+)["'][^>]*class\s*=\s*["'][^"']*__cf_email__[^"']*["'][^>]*>[\s\S]*?<\/[^>]+>/gi, function(match, hex) {
+    }).replace(/<[^<>]*data-cfemail\s*=\s*["']([0-9a-f]+)["'][^<>]*class\s*=\s*["'][^"']*__cf_email__[^"']*["'][^<>]*>[\s\S]{0,300}?<\/[^<>]+>/gi, function(match, hex) {
       return SharedUtils.decodeCloudflareEmail(hex) || match;
     });
   },
@@ -1534,7 +1928,9 @@ const SharedUtils = {
     var cleaned = String(url || '')
       .trim()
       .replace(/^[「『“”"'(\[【（《〈]+/, '');
-    var trailingPunctuation = /[」』“”"'\])】）》〉>。；;，,、？！…]+$/g;
+    // The lookbehind anchors the trim at the start of the trailing run; a
+    // plain [..]+$ retried from every character of a long run (quadratic).
+    var trailingPunctuation = /(?<![」』“”"'\])】）》〉>。；;，,、？！…])[」』“”"'\])】）》〉>。；;，,、？！…]+$/g;
     if (/^ed2k:\/\//i.test(cleaned)) {
       // 深度防御：无论来源如何，最终链接内不允许残留换行（防复制内容注入伪造行）
       cleaned = cleaned.replace(/[\r\n]+/g, ' ');
@@ -1544,7 +1940,7 @@ const SharedUtils = {
     }
     if (/^magnet:\?/i.test(cleaned)) {
       cleaned = cleaned.replace(/(btih:[A-Fa-f0-9]{32,40})(?:[。；;，,、\s]*)?(?:提取码|提取密码|访问码|取件码|解压密码|压缩密码|解压码|解压口令|解壓密碼|解壓碼|密码)\s*[:：=]?.*$/i, '$1');
-      cleaned = cleaned.replace(/[。；;，,、\s]+(?:(?:提取码|提取密码|访问码|取件码|解压密码|压缩密码|解压码|解压口令|解壓密碼|解壓碼)\s*[:：=]?|密码\s*[:：=]).*$/i, '');
+      cleaned = cleaned.replace(/(?<![。；;，,、\s])[。；;，,、\s]+(?:(?:提取码|提取密码|访问码|取件码|解压密码|压缩密码|解压码|解压口令|解壓密碼|解壓碼)\s*[:：=]?|密码\s*[:：=]).*$/i, '');
       return cleaned.replace(trailingPunctuation, '');
     }
     // ASCII punctuation is legal inside query/fragment values, including at
@@ -1554,7 +1950,7 @@ const SharedUtils = {
       return cleaned.replace(/[」』“”】）》〉。；，、？！…][\s\S]*$/g, '');
     }
     if (/(?:pan\.baidu\.com|yun\.baidu\.com|pan\.quark\.cn|115\.com\/s\/|(?:aliyundrive|alipan)\.com\/s\/|drive\.uc\.cn\/s\/|pan\.xunlei\.com\/s\/)/i.test(cleaned)) {
-      cleaned = cleaned.replace(/(?:[。；;，,、\s]*)?(?:提取码|提取密码|访问码|取件码|解压密码|压缩密码|密码)\s*[:：=]?.*$/i, '');
+      cleaned = cleaned.replace(/(?<![。；;，,、\s])[。；;，,、\s]*(?:提取码|提取密码|访问码|取件码|解压密码|压缩密码|密码)\s*[:：=]?.*$/i, '');
       return cleaned.replace(/[」』“”"'\])】）》〉>。；;，,、？！…][\s\S]*$/g, '');
     }
     if (/^(?:https?:)?\/\/xia\.ewrewej\.la\//i.test(cleaned) || /(?:forum\.php\?|attachment\.php\?|misc\.php\?)/i.test(cleaned)) {
@@ -1632,7 +2028,9 @@ const SharedUtils = {
     var regex = /[【\[\(（「『]?\s*(?:解压密码|压缩密码|解压码|解压口令|解壓密碼|解壓碼)\s*[】\]\)）」』]?\s*[:：=]?\s*/gi;
     var m;
     while ((m = regex.exec(text)) !== null) {
-      var rest = text.slice(regex.lastIndex).replace(/^[\s\u00a0]+/, '');
+      // A password sits right after its label; rescanning the whole remaining
+      // text for every label was quadratic on label-heavy TXT files.
+      var rest = text.slice(regex.lastIndex, regex.lastIndex + 500).replace(/^[\s\u00a0]+/, '');
       var stop = rest.search(/\n|(?:链接|下载链接|提取码|提取密码|访问码|ed2k:\/\/|magnet:\?|https?:\/\/)\s*/i);
       var raw = stop === -1 ? rest : rest.slice(0, stop);
       var val = this.cleanPasswordValue(raw);
@@ -1813,7 +2211,7 @@ const SharedUtils = {
     var v = String(value || '').trim();
     if (!v) return '';
     v = v.replace(/^[\s:：=】\]\)）」』>》]+/, '').trim();
-    v = v.replace(/[。；;，,、\s]+$/g, '');
+    v = v.replace(/(?<![。；;，,、\s])[。；;，,、\s]+$/g, '');
     if (!v) return '';
     if (this.isInvalidPasswordValue(v)) return '';
     if (this.isProtectedEmailPlaceholder(v)) return '';
@@ -1877,6 +2275,7 @@ const SharedUtils = {
     }
     function shouldPreferDisplay(next, existing) {
       if (!next || !existing) return false;
+      if (/^(?:zoom\/regex|zoomfile\/standalone|file\/regex)$/.test(existing.source || '')) return false;
       var existingPreview = SharedUtils.getImagePreviewSrc(existing);
       var nextPreview = SharedUtils.getImagePreviewSrc(next);
       if (SharedUtils.normalizeImageUrl(existingPreview) !== SharedUtils.normalizeImageUrl(nextPreview)) return false;
@@ -2019,6 +2418,7 @@ const SharedUtils = {
     }
     function shouldPreferDisplay(next, existing) {
       if (!next || !existing) return false;
+      if (existing.source === 'zoom/file') return false;
       var existingPreview = SharedUtils.getImagePreviewSrc(existing);
       var nextPreview = SharedUtils.getImagePreviewSrc(next);
       if (SharedUtils.normalizeImageUrl(existingPreview) !== SharedUtils.normalizeImageUrl(nextPreview)) return false;
@@ -2122,7 +2522,7 @@ const SharedUtils = {
 
   isInvalidPasswordValue: function(value) {
     var v = String(value || '')
-      .replace(/<[^>]+>/g, '')
+      .replace(/<[^<>]+>/g, '')
       .replace(/[\s\u00a0\u200b-\u200d\ufeff]/g, '')
       .replace(/[。；;，,、:：=]/g, '')
       .toLowerCase();

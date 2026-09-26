@@ -58,6 +58,54 @@ fixtures.attachmentCases.forEach(function(testCase) {
   );
 });
 
+const threadBase = 'https://www.sehuatang.org/forum.php?mod=viewthread&tid=77&page=1';
+const threadBaseKey = SharedUtils.normalizeArticleUrl(threadBase);
+for (const [param, value] of Object.entries({ authorid: '7', cp: '2', viewpid: '99', ordertype: '1', stand: '1', checkrush: '1', action: 'printable' })) {
+  assert.notStrictEqual(SharedUtils.normalizeArticleUrl(threadBase + '&' + param + '=' + value), threadBaseKey, param + ' must keep distinct article content out of the same cache key');
+}
+assert.notStrictEqual(SharedUtils.normalizeArticleUrl(threadBase + '&from=album'), threadBaseKey, 'album view must have its own article key');
+assert.strictEqual(SharedUtils.normalizeArticleUrl(threadBase + '&from=list#top'), SharedUtils.normalizeArticleUrl(threadBase + '&from=next'), 'navigation-only query and hash must still dedupe');
+assert(SharedUtils.isAllowedTextAttachmentUrl('https://www.sehuatang.org/misc.php?mod=attach&aid=7'), 'valid misc.php attachment must remain fetchable');
+
+const zoomAtLimit = SharedUtils.extractImagesByRegex(
+  '<img class="zoom" file="https://image.imx.to/full.jpg" src="https://cdn.example/thumb.jpg">',
+  baseUrl,
+  1
+);
+assert.strictEqual(zoomAtLimit.length, 1, 'one-image limit must still keep the zoom candidate');
+assert.strictEqual(zoomAtLimit[0].src, 'https://image.imx.to/full.jpg', 'one-image limit must keep the Discuz file URL as the load source');
+const zoomBelowLimit = SharedUtils.extractImagesByRegex(
+  '<img class="zoom" file="https://image.imx.to/full.jpg" src="https://cdn.example/thumb.jpg">',
+  baseUrl,
+  100
+);
+assert.strictEqual(zoomBelowLimit[0].src, 'https://image.imx.to/full.jpg', 'later img scanning must not replace the Discuz file URL with an unverified src');
+const domZoomImage = {
+  tagName: 'IMG',
+  getAttribute: function(name) {
+    return ({ class: 'zoom', file: 'https://image.imx.to/full.jpg', src: 'https://cdn.example/thumb.jpg' })[name] || null;
+  }
+};
+sandbox.DOMParser = function() {};
+sandbox.DOMParser.prototype.parseFromString = function() {
+  return {
+    querySelectorAll: function(selector) {
+      if (selector.indexOf('.zoom[file]') === 0 || selector === 'img') return [domZoomImage];
+      return [];
+    }
+  };
+};
+const domZoomAtLimit = SharedUtils.extractImagesByDom('<img class="zoom" file="https://image.imx.to/full.jpg" src="https://cdn.example/thumb.jpg">', baseUrl, 1);
+assert.strictEqual(domZoomAtLimit[0].src, 'https://image.imx.to/full.jpg', 'DOM one-image limit must keep the Discuz file URL as the load source');
+const domZoomBelowLimit = SharedUtils.extractImagesByDom('<img class="zoom" file="https://image.imx.to/full.jpg" src="https://cdn.example/thumb.jpg">', baseUrl, 100);
+assert.strictEqual(domZoomBelowLimit[0].src, 'https://image.imx.to/full.jpg', 'DOM later img scanning must not replace the Discuz file URL');
+const pagedImages = SharedUtils.extractImagesByRegex(
+  '<img src="https://cdn.example/image.php?page=1"><img src="https://cdn.example/image.php?page=2">',
+  baseUrl,
+  100
+);
+assert.strictEqual(pagedImages.length, 2, 'image page query must not collapse different image links');
+
 const downloadedTxt = 'ed2k://|file|www.98T.la@妃妃宝贝.zip|2945409455|43B5B13B95A9187A3BF041CC0A94FFC2|/';
 const downloadedTxtBytes = Buffer.from(downloadedTxt, 'utf8');
 assert.strictEqual(downloadedTxtBytes.length, 86, 'real downloaded TXT fixture must stay byte-for-byte representative');

@@ -105,4 +105,21 @@ const auto = normalize({
 assert.strictEqual(policy.getGlobalImageConcurrency(auto, 14, 20), 34, 'automatic global concurrency must preserve both ordinary and heavy channel ceilings');
 assert(policy.getViewportPendingLimit(auto, 11) >= 88, 'automatic pending limit must scale with the public background setting');
 
+assert.strictEqual(policy.getLargeImageTaskDeadline({ imageTaskDeadline: 16000 }), 48000, 'GIFs must get three times the task deadline');
+assert.strictEqual(policy.getLargeImageTaskDeadline({ imageTaskDeadline: 8000 }), 45000, 'the GIF task deadline must not drop below 45s');
+assert.strictEqual(policy.getLargeImageTaskDeadline({ imageTaskDeadline: 0 }), 0, 'GIFs must have no task deadline when none is configured');
+assert.strictEqual(policy.getLargeImageTimeout({ imageTimeout: 8000 }), 30000, 'the GIF per-attempt timeout must not drop below 30s');
+assert.strictEqual(policy.getLargeImageTimeout({ imageTimeout: 15000 }), 45000, 'GIFs must get three times the per-attempt timeout');
+assert.strictEqual(policy.getLargeImageTimeout({ imageTimeout: 0 }), 45000, 'a zero image timeout must fall back to the default before scaling');
+assert.strictEqual(policy.getLargeImageHostConcurrency({}), 2, 'the GIF lane must start at two GIFs per ordinary host');
+assert.strictEqual(policy.getLargeImageFastMs({ imageTimeout: 8000 }), 3200, 'a GIF within 40% of the image timeout counts as fast');
+assert.strictEqual(policy.getLargeImageFastMs({ imageTimeout: 3000 }), 2000, 'the fast GIF threshold must not drop below 2s');
+assert.strictEqual(policy.getLargeImageFastMs({ imageTimeout: 60000 }), 5000, 'the fast GIF threshold must not exceed 5s');
+assert.strictEqual(policy.getLargeImageSlowMs({ imageTimeout: 8000 }), 8000, 'a GIF slower than the image timeout counts as slow');
+assert.strictEqual(policy.getLargeImageSlowMs({ imageTimeout: 3000 }), 6000, 'the slow GIF threshold must not drop below 6s');
+assert.strictEqual(policy.getLargeImageSlowMs({ imageTimeout: 60000 }), 15000, 'the slow GIF threshold must not exceed 15s');
+const snapshotWithLane = policy.getPublicSnapshot({ imageTimeout: 8000, imageTaskDeadline: 16000 });
+assert(snapshotWithLane.largeImageTimeout === 30000 && snapshotWithLane.largeImageTaskDeadline === 48000 &&
+  snapshotWithLane.largeImageHostConcurrency === 2, 'the public policy snapshot must report the GIF lane settings');
+
 console.log('loading policy tests passed');

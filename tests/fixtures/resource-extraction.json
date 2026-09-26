@@ -22,6 +22,27 @@
       }
     },
     {
+      "name": "same-paragraph-anchor-codes",
+      "html": "<p>\u63d0\u53d6\u7801: abcd <a href=\"https://pan.baidu.com/s/one\">Baidu</a> <a href=\"https://pan.quark.cn/s/two\">Quark</a> \u63d0\u53d6\u7801: efgh</p>",
+      "expected": {
+        "baidu": [{ "url": "https://pan.baidu.com/s/one", "code": "abcd" }],
+        "quark": [{ "url": "https://pan.quark.cn/s/two", "code": "efgh" }]
+      }
+    },
+    {
+      "name": "do-not-share-code-between-anchors",
+      "html": "<p><a href=\"https://pan.baidu.com/s/one\">Baidu</a> \u63d0\u53d6\u7801: 1111 <a href=\"https://pan.quark.cn/s/two\">Quark</a></p>",
+      "expected": {
+        "baidu": [{ "url": "https://pan.baidu.com/s/one", "code": "1111" }],
+        "quark": [{ "url": "https://pan.quark.cn/s/two" }]
+      }
+    },
+    {
+      "name": "ignore-hidden-resource-text",
+      "html": "<script>const x='https://pan.baidu.com/s/fake'; // \u89e3\u538b\u5bc6\u7801: hidden123</script><style>.x{content:'https://pan.quark.cn/s/fake'}</style>",
+      "expected": {}
+    },
+    {
       "name": "protocol-links",
       "html": "<a href=\"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&amp;dn=Fixture\">Magnet</a><a href=\"ed2k://|file|fixture.zip|123|0123456789ABCDEF0123456789ABCDEF|/\">ED2K</a>",
       "expected": {
@@ -78,6 +99,16 @@
       "expectedUrls": [
         "https://dl.ldkms.la/dup.txt?b=2&a=1#first"
       ]
+    },
+    {
+      "name": "reject-unrelated-attachment-like-paths",
+      "html": "<a href=\"/admin.php?aid=7\">report.txt</a><a href=\"https://xia.ewrewej.la/logout\">logout</a><a href=\"forum.php?mod=attachment&amp;aid=8\">real.txt</a>",
+      "expectedUrls": ["https://www.sehuatang.org/forum.php?mod=attachment&aid=8"]
+    },
+    {
+      "name": "ignore-hidden-attachment-links",
+      "html": "<textarea><a href=\"forum.php?mod=attachment&amp;aid=1\">hidden.txt</a></textarea><script>const x='https://xia.ewrewej.la/download?id=hidden&amp;sign=1';</script>",
+      "expectedUrls": []
     }
   ]
 }

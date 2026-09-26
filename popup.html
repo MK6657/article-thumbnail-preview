@@ -25,6 +25,21 @@
 
     <div id="popupStatus" class="popup-status popup-status-empty" role="status" aria-live="polite"></div>
 
+    <details id="mirrorSection" class="settings-section settings-section-collapsible mirror-section">
+      <summary class="settings-section-summary">镜像站点 <span id="mirrorCount" class="mirror-count">0</span></summary>
+      <div class="settings-section-body">
+        <p class="mirror-hint">论坛镜像或反代域名需逐个授权，仅支持 HTTPS。授权后刷新该站点页面即可生效；镜像页只读取本站内容。</p>
+        <div id="mirrorStatus" class="popup-status popup-status-empty" role="status" aria-live="polite"></div>
+        <button id="addCurrentMirror" class="btn hidden" type="button">添加当前站点</button>
+        <div class="mirror-add">
+          <input id="mirrorInput" type="text" inputmode="url" autocomplete="off" spellcheck="false" placeholder="例如 mirror.example" aria-label="镜像站点域名">
+          <button id="addMirror" class="btn" type="button">添加</button>
+        </div>
+        <ul id="mirrorList" class="mirror-list" aria-label="已授权的镜像站点"></ul>
+        <p id="mirrorEmpty" class="mirror-empty">尚未添加镜像站点</p>
+      </div>
+    </details>
+
     <div id="settingsContainer"></div>
 
     <section class="settings-section">
@@ -34,6 +49,8 @@
       <button id="clearAllCache" class="btn">清除全部缓存</button>
       <button id="clearTestCache" class="btn btn-secondary">一键清空缓存和日志</button>
       <button id="resetSettings" class="btn btn-secondary">恢复默认设置</button>
+      <button id="resetForumPacer" class="btn" type="button">立即重置论坛节流</button>
+      <p id="forumPacerInfo" class="maintenance-hint" aria-live="polite">尚无论坛节流记录；打开论坛页面后会显示当前速度。</p>
     </section>
 
     <section class="settings-section">
@@ -67,6 +84,7 @@
   <script src="settings-schema.js"></script>
   <script src="defaults.js"></script>
   <script src="shared-utils.js"></script>
+  <script src="popup-mirrors.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

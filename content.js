@@ -35,14 +35,44 @@
   var retryScanDueAt = 0;
   var emptyRetryAfterByUrl = {};
   var emptyRetryAttemptsByUrl = {};
+  // Threads that used up their automatic retries: left alone until the page
+  // (or the thumbnail list) is reloaded.
+  var emptyRetryGivenUp = {};
+  // Attempts per cap class ('flood' / 'page'), keyed by thread and class, so
+  // failures of one kind do not use up the allowance of another.
+  var emptyRetryClassAttempts = {};
+  // Threads whose retry also waits for the pacer's pause: the pause is read
+  // live, so a pause lifted early (a normal page load) frees them at once.
+  var emptyRetryPaceBound = {};
   var EMPTY_RETRY_DELAY = 15000;
   var EMPTY_RETRY_MAX_DELAY = 60000;
+  // A page answer that is not the thread (notice, blocked or unknown page)
+  // is retried this many times; retrying it forever would keep spending the
+  // forum's request allowance.
+  var UNRECOGNIZED_PAGE_MAX_RETRIES = 4;
+  // Pacing and the pause after a forum challenge live in forum-pacer.js; a
+  // thread still gives up after this many challenged attempts on this page.
+  var FORUM_FLOOD_MAX_RETRIES = 6;
+  // A pacer pause longer than this parks no worker: the thread is deferred to
+  // the end of the pause, so cached and newly visible rows are not stuck
+  // behind it.
+  var PACE_DEFER_MIN_PAUSE_MS = 1000;
+  var FORUM_WAIT_NOTE_CLASS = 'atp-forum-wait';
+  var FORUM_WAIT_NOTE_TEXT = {
+    held: '论坛限流，排队中',
+    retry: '论坛限流，稍后自动重试',
+    gaveUp: '论坛限流未加载，刷新页面可重试'
+  };
   var scanGeneration = 0;
   var processCandidateQueue = [];
   var processCandidateQueueCursor = 0;
   var processCandidateQueueGeneration = 0;
   var processCandidateQueueMayHaveMore = false;
   var processCandidateScanState = null;
+  var processCandidateScanAllPhase = false;
+  // Near phase runs visible-first: one pass from the first on-screen row down,
+  // then one pass over the prefetch band above the screen.
+  var processCandidateAbovePass = false;
   var bfcacheRecoveryPending = false;
 
   function logUrl(url) {
@@ -55,6 +85,15 @@
     } catch (e) {
       return false;
     }
+  }
+
+  // Thread links into another site (a mirror page linking the built-in forum,
+  // or the reverse) are skipped before any fetch or cache read, so one site's
+  // session data never renders into another site's page.
+  function isArticleUrlInPageZone(url) {
+    if (!SharedUtils.getForumUrlZone) return true;
+    var pageZone = SharedUtils.getForumUrlZone(location.href);
+    return !pageZone || SharedUtils.getForumUrlZone(url) === pageZone;
   }
 
   function needsSettingsReload(previousSettings, nextSettings) {
@@ -108,8 +147,8 @@
     }
   }
 
-  async function fetchSameOriginArticle(url) {
-    return { url: url, data: await ATPFetcher.fetchArticleData(url, location.href) };
+  async function fetchSameOriginArticle(url, paceOptions) {
+    return { url: url, data: await ATPFetcher.fetchArticleData(url, location.href, paceOptions) };
   }
 
   function getArticleGroupKey(url) {
@@ -126,7 +165,77 @@
       reason === 'cloudflare' ||
       reason === 'blocked' ||
       reason === 'http_401' ||
-      reason === 'http_403';
+      reason === 'http_403' ||
+      reason === 'unrecognized_page' ||
+      reason === 'forum_message' ||
+      reason === 'pace_deferred' ||
+      isForumFloodReason(reason);
+  }
+
+  // The forum's page answers about one thread; the background path reports
+  // isBlockedPage's own names instead of 'blocked'.
+  var PAGE_ANSWER_REASONS = {
+    unrecognized_page: true,
+    forum_message: true,
+    blocked: true,
+    login_page: true,
+    permission_page: true,
+    download_blocked: true,
+    purchase_page: true
+  };
+
+  function getRetryCapClass(reason) {
+    if (isForumFloodReason(reason)) return 'flood';
+    return PAGE_ANSWER_REASONS[reason] === true ? 'page' : '';
+  }
+
+  function getRetryCapLimit(capClass) {
+    if (capClass === 'flood') return FORUM_FLOOD_MAX_RETRIES;
+    return capClass === 'page' ? UNRECOGNIZED_PAGE_MAX_RETRIES : Infinity;
+  }
+
+  // The forum answered with an anti-flood / interstitial page or a throttling
+  // status instead of the thread.
+  function isForumFloodReason(reason) {
+    return !!(SharedUtils.isForumFloodReason && SharedUtils.isForumFloodReason(reason));
+  }
+
+  function getForumPacer() {
+    return window.ATPForumPacer && typeof window.ATPForumPacer.acquire === 'function' ? window.ATPForumPacer : null;
+  }
+
+  // The note goes after the thread title; the scanner's own link for a row may
+  // be the folder icon in its narrow first cell.
+  function getForumWaitNoteAnchor(entry) {
+    var container = entry && entry.container;
+    var title = container && typeof container.querySelector === 'function' ? container.querySelector('a.xst') : null;
+    return title || (entry && entry.link) || null;
+  }
+
+  // A short note after the thread title while the forum holds its content
+  // back, so a row without thumbnails does not look forgotten.
+  function setForumWaitNote(entries, state) {
+    if (typeof document.createElement !== 'function') return;
+    for (var i = 0; i < entries.length; i++) {
+      var link = getForumWaitNoteAnchor(entries[i]);
+      if (!link || !link.parentNode || typeof link.insertAdjacentElement !== 'function') continue;
+      var note = link.nextElementSibling;
+      if (!note || !note.classList || !note.classList.contains(FORUM_WAIT_NOTE_CLASS)) {
+        note = document.createElement('span');
+        note.className = FORUM_WAIT_NOTE_CLASS;
+        note.title = '论坛对短时间内的大量请求返回了验证页，插件已放慢抓取并会自动重试';
+        link.insertAdjacentElement('afterend', note);
+      }
+      note.textContent = FORUM_WAIT_NOTE_TEXT[state] || FORUM_WAIT_NOTE_TEXT.retry;
+    }
+  }
+
+  function clearForumWaitNote(entries) {
+    for (var i = 0; i < entries.length; i++) {
+      var link = getForumWaitNoteAnchor(entries[i]);
+      var note = link && link.nextElementSibling;
+      if (note && note.classList && note.classList.contains(FORUM_WAIT_NOTE_CLASS) && note.remove) note.remove();
+    }
   }
 
   function shouldNegativeCacheEmptyReason(reason) {
@@ -154,6 +263,45 @@
     return window.ATPState && window.ATPState.settings || {};
   }
 
+  function logDiagnosticConfig(settings, reason) {
+    if (!Logger.event) return;
+    settings = settings || {};
+    var ordinary = Math.max(1, Number(settings.firstScreenConcurrency) || 3);
+    // The loader runs no heavy channel when heavy optimization is off.
+    var heavy = settings.heavyImageOptimization === false ? 0 : Math.max(0, Number(settings.heavyImageConcurrency) || 2);
+    var globalLimit = ATPLoadPolicy.getGlobalImageConcurrency(settings, ordinary, heavy);
+    var visibleReserve = Math.min(Math.max(0, globalLimit - 1),
+      ATPLoadPolicy.getViewportPriorityReservedSlots(settings));
+    var pacer = getForumPacer();
+    var paceState = pacer && pacer.getState ? pacer.getState() : null;
+    Logger.event('diagnostic_config', {
+      reason: reason || 'startup',
+      gridCols: settings.gridCols,
+      visibleRows: settings.visibleRows,
+      autoLoadOffscreenFirstRowsEnabled: settings.autoLoadOffscreenFirstRowsEnabled === true,
+      firstScreenConcurrency: ordinary,
+      backgroundConcurrency: settings.backgroundConcurrency,
+      heavyImageConcurrency: heavy,
+      globalImageConcurrency: globalLimit,
+      viewportPriorityReservedSlots: visibleReserve,
+      offscreenAdmissionLimit: Math.max(1, globalLimit - visibleReserve),
+      offscreenOrdinaryLimit: Math.min(ATPLoadPolicy.getOffscreenFirstRowOrdinaryLimit(settings), Math.max(1, globalLimit - visibleReserve)),
+      ordinaryHostConcurrency: settings.ordinaryHostConcurrency,
+      autoHostSafetyLimit: settings.autoLoadOffscreenFirstRowsEnabled === true
+        ? Math.min(Math.max(1, Number(settings.ordinaryHostConcurrency) || 6), 6)
+        : undefined,
+      articleFetchConcurrency: ATPLoadPolicy.getArticleFetchConcurrency(settings),
+      forumRequestBurst: paceState ? paceState.burst : undefined,
+      forumRequestIntervalMs: paceState ? paceState.refillMs : undefined,
+      imageTimeout: settings.imageTimeout,
+      imageTaskDeadline: settings.imageTaskDeadline,
+      largeImageTimeout: ATPLoadPolicy.getLargeImageTimeout(settings),
+      largeImageTaskDeadline: ATPLoadPolicy.getLargeImageTaskDeadline(settings),
+      largeImageHostConcurrency: ATPLoadPolicy.getLargeImageHostConcurrency(settings),
+      debugLogging: settings.debugLogging === true
+    }, 'INFO');
+  }
+
   function getArticleFetchConcurrency() {
     return ATPLoadPolicy.getArticleFetchConcurrency(getLoadPolicySettings());
   }
@@ -164,6 +312,11 @@
 
   function getArticlePrefetchDistance() {
     return ATPLoadPolicy.getArticlePrefetchDistance(getLoadPolicySettings());
+  }
+
+  function shouldAutoLoadOffscreenFirstRows() {
+    var settings = getLoadPolicySettings();
+    return settings.autoLoadOffscreenFirstRowsEnabled === true;
   }
 
   function createProcessScanContext() {
@@ -189,17 +342,22 @@
 
   function isProcessCandidate(entry, scanContext) {
     var url = entry && entry.link && entry.link.href;
-    if (!url || ATPScanner.shouldExcludeUrl(url) || !ATPScanner.isArticlePageUrl(url)) return false;
+    if (!url || ATPScanner.shouldExcludeUrl(url) || !ATPScanner.isArticlePageUrl(url) || !isArticleUrlInPageZone(url)) return false;
     var retryKey = getRetryableEmptyKey(url);
+    if (emptyRetryGivenUp[retryKey]) return false;
     var retryAfter = emptyRetryAfterByUrl[retryKey];
     scanContext = scanContext || createProcessScanContext();
+    if (retryAfter && emptyRetryPaceBound[retryKey]) retryAfter = Math.max(retryAfter, getLivePauseUntil());
     if (retryAfter && scanContext.now < retryAfter) {
       scheduleRetryScanAt(retryAfter);
       return false;
     }
     // 重试到期：仅清除到期时间，保留尝试次数，确保再次失败时指数退避继续生效
-    if (retryAfter) delete emptyRetryAfterByUrl[retryKey];
-    return isNearViewport(entry, scanContext);
+    if (retryAfter) {
+      delete emptyRetryAfterByUrl[retryKey];
+      delete emptyRetryPaceBound[retryKey];
+    }
+    return (shouldAutoLoadOffscreenFirstRows() && processCandidateScanAllPhase) || isNearViewport(entry, scanContext);
   }
 
   function clearQueuedProcessCandidates() {
@@ -220,12 +378,16 @@
     }
     processCandidateQueueGeneration = scanGeneration;
     processCandidateScanState = null;
+    processCandidateScanAllPhase = false;
+    processCandidateAbovePass = false;
     processCandidateQueueMayHaveMore = true;
   }
 
   function clearProcessCandidateQueue() {
     clearQueuedProcessCandidates();
     processCandidateScanState = null;
+    processCandidateScanAllPhase = false;
+    processCandidateAbovePass = false;
   }
 
   function isLiveProcessCandidate(entry, scanContext, expectedUrl) {
@@ -274,8 +436,11 @@
     processCandidateQueue = ATPScanner.detectArticleContainers({
       limit: scanLimit + 1,
       scanState: processCandidateScanState,
-      seekViewportStart: true,
-      viewportTop: scanContext ? scanContext.viewportTop : -getArticlePrefetchDistance(),
+      seekViewportStart: !processCandidateScanAllPhase,
+      // Seek to the first on-screen row, and only then to the band above:
+      // seeking from the band top after a jump (End key, scroll restore)
+      // queued and fetched the rows above the screen before the visible ones.
+      viewportTop: processCandidateAbovePass ? (scanContext ? scanContext.viewportTop : -getArticlePrefetchDistance()) : 0,
       skipServiceThreads: !settings || settings.skipServiceThreads !== false,
       accept: function(entry) {
         return isProcessCandidate(entry, scanContext);
@@ -284,9 +449,25 @@
     processCandidateQueueCursor = 0;
     processCandidateQueueGeneration = scanGeneration;
     var hasSentinelCandidate = processCandidateQueue.length > scanLimit;
-    var shouldContinueScan = !processCandidateScanState.exhausted &&
-      (!scanContext || !scanContext.reachedBelowViewport || processCandidateQueue.length > 0);
-    processCandidateQueueMayHaveMore = hasSentinelCandidate || shouldContinueScan;
+    var nearPhaseDone = shouldAutoLoadOffscreenFirstRows() && !processCandidateScanAllPhase &&
+      (processCandidateScanState.exhausted || (scanContext && scanContext.reachedBelowViewport && !processCandidateQueue.length));
+    if (nearPhaseDone) {
+      processCandidateScanAllPhase = true;
+      processCandidateScanState = null;
+    }
+    var shouldContinueScan = !!(processCandidateScanState && !processCandidateScanState.exhausted &&
+      (processCandidateScanAllPhase || !scanContext || !scanContext.reachedBelowViewport || processCandidateQueue.length > 0));
+    var startAbovePass = !processCandidateScanAllPhase && !processCandidateAbovePass && !nearPhaseDone &&
+      !hasSentinelCandidate && !shouldContinueScan;
+    if (startAbovePass) {
+      processCandidateAbovePass = true;
+      // An exhausted cursor makes the scanner reset and seek again, now from
+      // the band top.
+      processCandidateScanState.exhausted = true;
+    }
+    processCandidateQueueMayHaveMore = hasSentinelCandidate || nearPhaseDone ||
+      shouldContinueScan || startAbovePass;
+    return startAbovePass;
   }
 
   function hasMoreProcessCandidates() {
@@ -299,6 +480,11 @@
     var scanContext = createProcessScanContext();
     var candidates = takeQueuedProcessCandidates(limit, scanContext);
     if (candidates.length) return candidates;
+    var abovePassArmed = refillProcessCandidateQueue(limit, scanContext);
+    candidates = takeQueuedProcessCandidates(limit, scanContext);
+    if (candidates.length || !abovePassArmed) return candidates;
+    // The visible-first pass came up empty: cover the band above in this same
+    // call instead of chaining another scan cycle.
     refillProcessCandidateQueue(limit, scanContext);
     return takeQueuedProcessCandidates(limit, scanContext);
   }
@@ -316,7 +502,8 @@
       cls.contains('atp-thumbnail-loading') ||
       cls.contains('atp-heavy-preview-canvas') ||
       cls.contains('atp-resource-sidebar') ||
-      cls.contains('atp-resource-inline')
+      cls.contains('atp-resource-inline') ||
+      cls.contains(FORUM_WAIT_NOTE_CLASS)
     )) return true;
     if (node.closest && node.closest('.atp-thread-panel,.atp-thumb-row,.atp-thumbnail-container,.atp-thumbnail-wrapper,.atp-resource-sidebar,.atp-resource-inline')) {
       return true;
@@ -428,6 +615,9 @@
     window.ATPState.generation = scanGeneration;
     emptyRetryAfterByUrl = {};
     emptyRetryAttemptsByUrl = {};
+    emptyRetryGivenUp = {};
+    emptyRetryClassAttempts = {};
+    emptyRetryPaceBound = {};
     clearProcessCandidateQueue();
   }
 
@@ -563,24 +753,112 @@
     }, Math.max(50, delay));
   }
 
+  // Returns false when the thread has used up its automatic retries.
   function rememberRetryableEmpty(url, info) {
     var retryKey = getRetryableEmptyKey(url);
     var reason = getRetryableEmptyReason(info);
     var explicitRetryAfter = getRetryableEmptyRetryAfter(info);
+    if (reason === 'pace_deferred') {
+      // Never sent: no attempt used, back when the pacer's pause ends.
+      var deferredDue = Date.now() + 1000;
+      emptyRetryAfterByUrl[retryKey] = deferredDue;
+      emptyRetryPaceBound[retryKey] = true;
+      scheduleRetryScanAt(Math.max(deferredDue, getLivePauseUntil()));
+      return true;
+    }
     var attempts = (emptyRetryAttemptsByUrl[retryKey] || 0) + 1;
     emptyRetryAttemptsByUrl[retryKey] = attempts;
+    var capClass = getRetryCapClass(reason);
+    if (capClass) {
+      var classKey = retryKey + '|' + capClass;
+      var classAttempts = (emptyRetryClassAttempts[classKey] || 0) + 1;
+      emptyRetryClassAttempts[classKey] = classAttempts;
+      if (classAttempts > getRetryCapLimit(capClass)) {
+        emptyRetryGivenUp[retryKey] = true;
+        delete emptyRetryAfterByUrl[retryKey];
+        delete emptyRetryPaceBound[retryKey];
+        Logger.debug('文章多次返回非帖子页，本页不再自动重试', reason + ' ' + logUrl(url));
+        return false;
+      }
+    }
     var delay = Math.min(EMPTY_RETRY_MAX_DELAY, EMPTY_RETRY_DELAY * Math.pow(2, Math.min(attempts - 1, 3)));
-    var dueAt = explicitRetryAfter || (Date.now() + delay);
-    if (explicitRetryAfter) delay = Math.max(0, explicitRetryAfter - Date.now());
+    // Retry-After raises the backoff but never shortens it; a server answering
+    // "Retry-After: 0" must not turn the retry into a tight loop.
+    var dueAt = Math.max(explicitRetryAfter || 0, Date.now() + delay);
+    delay = Math.max(0, dueAt - Date.now());
     emptyRetryAfterByUrl[retryKey] = dueAt;
+    // A refusal by the forum also waits for the pacer's pause, read live.
+    if (capClass === 'flood') emptyRetryPaceBound[retryKey] = true;
+    else delete emptyRetryPaceBound[retryKey];
     Logger.debug('文章临时空结果，稍后重试', (reason || 'retryable') + ' ' + delay + 'ms ' + logUrl(url));
-    scheduleRetryScanAt(dueAt);
+    scheduleRetryScanAt(capClass === 'flood' ? Math.max(dueAt, getLivePauseUntil()) : dueAt);
+    return true;
   }
 
   function clearRetryableEmpty(url) {
     var retryKey = getRetryableEmptyKey(url);
     delete emptyRetryAfterByUrl[retryKey];
     delete emptyRetryAttemptsByUrl[retryKey];
+    delete emptyRetryGivenUp[retryKey];
+    delete emptyRetryPaceBound[retryKey];
+    delete emptyRetryClassAttempts[retryKey + '|flood'];
+    delete emptyRetryClassAttempts[retryKey + '|page'];
+  }
+
+  function getLivePauseUntil() {
+    var pacer = getForumPacer();
+    return pacer ? pacer.getPauseUntil() : 0;
+  }
+
+  function hasPaceBoundRetries() {
+    for (var key in emptyRetryPaceBound) {
+      if (Object.prototype.hasOwnProperty.call(emptyRetryPaceBound, key)) return true;
+    }
+    return false;
+  }
+
+  // Another tab changed the shared pacer state; if that lifted the pause (a
+  // normal forum page load, or the pause ran out), threads waiting on it are
+  // due now rather than at the old pause end.
+  function handleForumPacerStorage(event) {
+    var pacer = getForumPacer();
+    if (!pacer || !event || event.key !== pacer.STORE_KEY || !hasPaceBoundRetries()) return;
+    if (!ATPConfig.isEnabled() || pacer.getPauseUntil() - Date.now() > PACE_DEFER_MIN_PAUSE_MS) return;
+    scheduleRetryScanAt(Date.now());
+  }
+
+
+  // How a queued article fetch waits for the forum pacer: the thread on
+  // screen goes first, the wait ends with the scan that asked for it, and a
+  // real pause defers the thread instead of parking the worker.
+  function makeArticlePaceOptions(job, generation) {
+    var pacer = getForumPacer();
+    job.paceDeferred = false;
+    return {
+      getPriority: function() {
+        if (!pacer) return 0;
+        return isArticleJobVisible(job) ? pacer.PRIORITY_VISIBLE : pacer.PRIORITY_ARTICLE;
+      },
+      isCancelled: function() {
+        if (generation !== scanGeneration || shouldPauseScanningWhenHidden() || !ATPConfig.isEnabled()) return true;
+        if (typeof job.shouldHandBack === 'function' && job.shouldHandBack(job)) {
+          job.handedBack = true;
+          return true;
+        }
+        if (pacer && pacer.getPauseUntil() - Date.now() > PACE_DEFER_MIN_PAUSE_MS) {
+          job.paceDeferred = true;
+          return true;
+        }
+        return false;
+      },
+      onHeld: function() {
+        if (generation === scanGeneration) setForumWaitNote(getLiveCommitEntries(job), 'held');
+      },
+      onGranted: function(waitMs) {
+        job.paceWaitMs = waitMs;
+        if (typeof job.onPaceGranted === 'function') job.onPaceGranted();
+      }
+    };
   }
 
   var articleCommitQueue = [];
@@ -615,7 +893,25 @@
     return out;
   }
 
+  // How far the job's row is from the viewport (0 when on screen); Infinity
+  // when it cannot be measured or the page is hidden.
+  function getArticleJobViewportDistance(job) {
+    if (document.visibilityState && document.visibilityState !== 'visible') return Infinity;
+    var entries = getLiveCommitEntries(job);
+    var vh = window.innerHeight || document.documentElement.clientHeight || 800;
+    var best = Infinity;
+    for (var i = 0; i < entries.length; i++) {
+      var el = entries[i].container;
+      if (!el || !el.getBoundingClientRect) return 0;
+      var rect = el.getBoundingClientRect();
+      var distance = rect.top > vh ? rect.top - vh : (rect.bottom < 0 ? -rect.bottom : 0);
+      if (distance < best) best = distance;
+    }
+    return best;
+  }
+
   function isArticleJobVisible(job) {
+    if (document.visibilityState && document.visibilityState !== 'visible') return false;
     var entries = getLiveCommitEntries(job);
     var vh = window.innerHeight || document.documentElement.clientHeight || 800;
     for (var i = 0; i < entries.length; i++) {
@@ -651,15 +947,25 @@
       if (job.retryableEmpty) {
         if (!job.retryRemembered) {
           job.retryRemembered = true;
-          rememberRetryableEmpty(job.url, job.retryableEmpty);
+          var retryScheduled = rememberRetryableEmpty(job.url, job.retryableEmpty);
+          var retryReason = getRetryableEmptyReason(job.retryableEmpty);
+          if (retryReason === 'pace_deferred') {
+            setForumWaitNote(entries, 'held');
+          } else if (isForumFloodReason(retryReason)) {
+            setForumWaitNote(entries, retryScheduled ? 'retry' : 'gaveUp');
+          } else {
+            clearForumWaitNote(entries);
+          }
         }
         return;
       }
       clearRetryableEmpty(job.url);
+      clearForumWaitNote(entries);
       for (var i = 0; i < entries.length; i++) entries[i].container.classList.add('atp-processed');
       return;
     }
     clearRetryableEmpty(job.url);
+    clearForumWaitNote(entries);
     var best = pickBestArticleEntry(entries);
     ATPRenderer.injectThumbnails(best.container, data, best.link, job.fetchStartedAt);
   }
@@ -758,7 +1064,7 @@
     if (cacheState && cacheState.negative) {
       return makeArticleFetchOutcome(null, makeRetryableEmptyInfo('negative_cache', cacheState.negativeExpiresAt));
     }
-    var data = await ATPFetcher.fetchArticleDataByBackground(job.url);
+    var data = await ATPFetcher.fetchArticleDataByBackground(job.url, makeArticlePaceOptions(job, generation));
     if (generation !== scanGeneration || pauseScanningForHiddenPage()) return null;
     if (!data) return makeArticleFetchOutcome(null, makeRetryableEmptyInfo('background_timeout', 0));
     data = ATPCache.normalizeArticleData(data);
@@ -780,9 +1086,13 @@
     if (!job.fetchStartedAt) job.fetchStartedAt = Date.now();
     if (!job.sameOrigin) return await fetchCrossOriginArticle(job, generation);
     try {
-      var result = await fetchSameOriginArticle(job.url);
+      var result = await fetchSameOriginArticle(job.url, makeArticlePaceOptions(job, generation));
       if (generation !== scanGeneration || pauseScanningForHiddenPage()) return null;
       var data = ATPCache.normalizeArticleData(result && result.data);
+      if (result && result.data && Array.isArray(result.data.freshTextAttachments)) {
+        data.freshTextAttachments = result.data.freshTextAttachments;
+        data.freshTextAttachmentsAt = result.data.freshTextAttachmentsAt;
+      }
       if (data.retryableEmpty) {
         return makeNormalizedArticleFetchOutcome(data, makeRetryableEmptyInfo(data.emptyReason || 'same_origin_retryable', data.retryAfter));
       }
@@ -801,16 +1111,27 @@
     var summary = { articles: 0, images: 0, resources: 0, sameOrigin: 0, crossOrigin: 0 };
     var jobs = [];
     var jobCursor = 0;
+    var queuedCount = 0;
     var jobsByKey = {};
     var commitPromises = [];
+    // Offscreen jobs waiting for the forum pacer (at most one while no request
+    // could start) and the workers idling until then without a job.
+    var parkedOffscreen = 0;
+    // Admitted jobs whose pacer turn has not come yet (reading the cache or
+    // waiting); the pacer cannot see the ones that have not queued yet.
+    var awaitingTurn = 0;
+    // Workers holding a job; idle workers wait at the gate while any do,
+    // so a scroll can still hand them rows that came on screen.
+    var busyWorkers = 0;
+    var gateWaiters = [];
 
     function queuedJobCount() {
-      return Math.max(0, jobs.length - jobCursor);
+      return queuedCount;
     }
 
     function addEntryToJob(job, entry) {
       for (var i = 0; i < job.entries.length; i++) {
-        if (job.entries[i] === entry) return;
+        if (job.entries[i] === entry || job.entries[i].container === entry.container) return;
       }
       job.entries.push(entry);
       if (job.state === 'done') commitPromises.push(enqueueArticleCommit(job, summary, generation));
@@ -820,7 +1141,7 @@
       for (var i = 0; i < nextContainers.length; i++) {
         var entry = nextContainers[i];
         var url = entry && entry.link && entry.link.href;
-        if (!url || ATPScanner.shouldExcludeUrl(url) || !ATPScanner.isArticlePageUrl(url)) continue;
+        if (!url || ATPScanner.shouldExcludeUrl(url) || !ATPScanner.isArticlePageUrl(url) || !isArticleUrlInPageZone(url)) continue;
         var key = getArticleGroupKey(url);
         var existing = jobsByKey[key];
         if (existing) {
@@ -836,6 +1157,7 @@
           data: null,
           retryableEmpty: null,
           fetchStartedAt: 0,
+          paceWaitMs: 0,
           commitQueued: false,
           commitPromise: null,
           summaryCounted: false,
@@ -845,7 +1167,156 @@
         };
         jobsByKey[key] = job;
         jobs.push(job);
+        queuedCount++;
       }
+    }
+
+    // Rows on screen right now, found by a short scan from the first visible
+    // row; they join the queue beyond the high watermark.
+    function boostVisibleJobs() {
+      if (!articleVisibleBoostRequested) return;
+      articleVisibleBoostRequested = false;
+      if (!ATPScanner.detectArticleContainers) return;
+      var settings = window.ATPState && window.ATPState.settings;
+      var scanContext = createProcessScanContext();
+      var vh = window.innerHeight || document.documentElement.clientHeight || 800;
+      var limit = Math.max(4, getArticleFetchConcurrency() * 2);
+      var found = ATPScanner.detectArticleContainers({
+        limit: limit,
+        nodeBudget: limit * 4,
+        scanState: {},
+        seekViewportStart: true,
+        viewportTop: 0,
+        skipServiceThreads: !settings || settings.skipServiceThreads !== false,
+        accept: function(entry) {
+          var el = entry && entry.container;
+          if (!el || !el.getBoundingClientRect) return false;
+          var rect = el.getBoundingClientRect();
+          if (rect.bottom < 0 || rect.top > vh) return false;
+          var known = entry.link && entry.link.href ? jobsByKey[getArticleGroupKey(entry.link.href)] : null;
+          if (known && jobHasContainer(known, el)) return false;
+          return isProcessCandidate(entry, scanContext);
+        }
+      });
+      if (found.length) enqueueContainers(found);
+      // A full batch may have left rows on screen unqueued: look again on the
+      // next turn (rows with a job no longer count, so this ends).
+      if (found.length >= limit) articleVisibleBoostRequested = true;
+    }
+
+    function jobHasContainer(job, container) {
+      for (var i = 0; i < job.entries.length; i++) {
+        if (job.entries[i].container === container) return true;
+      }
+      return false;
+    }
+
+    function wakeArticleGate() {
+      var waiting = gateWaiters;
+      gateWaiters = [];
+      for (var i = 0; i < waiting.length; i++) waiting[i]();
+    }
+
+    function waitArticleGate() {
+      // A scroll asked for the rows now on screen: go take them at once.
+      if (articleVisibleBoostRequested) return Promise.resolve();
+      return new Promise(function(resolve) {
+        var finished = false;
+        var timer = null;
+        function finish() {
+          if (finished) return;
+          finished = true;
+          if (timer) clearTimeout(timer);
+          resolve();
+        }
+        timer = setTimeout(finish, 1000);
+        gateWaiters.push(finish);
+      });
+    }
+
+    function releaseParkedJob(job) {
+      var released = false;
+      if (job.awaitingTurn) {
+        job.awaitingTurn = false;
+        awaitingTurn = Math.max(0, awaitingTurn - 1);
+        released = awaitingTurn === 0;
+      }
+      if (job.parkedOffscreen) {
+        job.parkedOffscreen = false;
+        parkedOffscreen = Math.max(0, parkedOffscreen - 1);
+        released = true;
+      }
+      job.onPaceGranted = null;
+      if (released) wakeArticleGate();
+    }
+
+    function admitJob(job, offscreen) {
+      job.awaitingTurn = true;
+      awaitingTurn++;
+      if (offscreen) {
+        job.parkedOffscreen = true;
+        parkedOffscreen++;
+      }
+      job.onPaceGranted = function() { releaseParkedJob(job); };
+    }
+
+    // While a job waits for the pacer: one that has gone offscreen takes the
+    // free offscreen slot, or gives its worker back so rows now on screen get
+    // it instead of waiting behind the reserve.
+    function hasQueuedVisibleJob() {
+      for (var i = jobCursor; i < jobs.length; i++) {
+        if (jobs[i].state === 'queued' && isArticleJobVisible(jobs[i])) return true;
+      }
+      return false;
+    }
+
+    function shouldHandBack(job) {
+      if (isArticleJobVisible(job)) return false;
+      // Rows on screen need a worker and none is idle: even the waiting
+      // offscreen job gives its worker back (with one worker it would
+      // otherwise hold rows on screen behind the reserve).
+      if (job.parkedOffscreen) return !gateWaiters.length && (articleVisibleBoostRequested || hasQueuedVisibleJob());
+      if (parkedOffscreen < 1) {
+        job.parkedOffscreen = true;
+        parkedOffscreen++;
+        return false;
+      }
+      return true;
+    }
+
+    // Whether this job may go to the fetcher now. On-screen jobs always may
+    // (the pacer serves them first). An offscreen job may while no other
+    // offscreen job waits for the pacer or a request could start at once;
+    // otherwise its worker hands it back and idles, so the next turn goes to
+    // whatever is on screen when it comes instead of a job bound in page
+    // order. Jobs the cache answers need no request and never wait.
+    async function admitArticleJob(job) {
+      var pacer = getForumPacer();
+      if (!pacer || typeof pacer.canStartNow !== 'function') return true;
+      if (isArticleJobVisible(job)) {
+        admitJob(job, false);
+        return true;
+      }
+      // canStartNow only sees requests already queued, so a second offscreen
+      // job may go only when no admitted job is still on its way there.
+      if (parkedOffscreen < 1 || (!awaitingTurn && pacer.canStartNow(pacer.PRIORITY_ARTICLE))) {
+        admitJob(job, true);
+        return true;
+      }
+      var cacheState = null;
+      try {
+        cacheState = await ATPCache.getArticleCacheState(job.url);
+      } catch (e) {
+        cacheState = null;
+      }
+      return !!(cacheState && (cacheState.cached || cacheState.negative));
+    }
+
+    function returnJob(job) {
+      job.state = 'queued';
+      queuedCount++;
+      var index = jobs.indexOf(job);
+      if (index !== -1 && index < jobCursor) jobCursor = index;
     }
 
     function refillJobs() {
@@ -868,20 +1339,51 @@
       }
     }
 
+    // The first queued job on screen, else the queued one nearest the
+    // viewport (what the reader reaches next), else page order.
     function takeJob() {
       refillJobs();
-      if (jobCursor >= jobs.length) return null;
-      var job = jobs[jobCursor++];
+      boostVisibleJobs();
+      var pick = -1;
+      var bestDistance = Infinity;
+      for (var i = jobCursor; i < jobs.length; i++) {
+        if (jobs[i].state !== 'queued') continue;
+        if (pick === -1) pick = i;
+        var distance = getArticleJobViewportDistance(jobs[i]);
+        if (distance === 0) {
+          pick = i;
+          break;
+        }
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          pick = i;
+        }
+      }
+      if (pick === -1) return null;
+      var job = jobs[pick];
       job.state = 'inflight';
+      queuedCount = Math.max(0, queuedCount - 1);
+      while (jobCursor < jobs.length && jobs[jobCursor].state !== 'queued') jobCursor++;
       return job;
     }
 
     async function worker() {
       while (generation === scanGeneration && ATPConfig.isEnabled() && !pauseScanningForHiddenPage()) {
         var job = takeJob();
-        if (!job) return;
-        if (job.sameOrigin) summary.sameOrigin++;
-        else summary.crossOrigin++;
+        if (!job) {
+          if (!busyWorkers) break;
+          await waitArticleGate();
+          continue;
+        }
+        busyWorkers++;
+        if (!(await admitArticleJob(job))) {
+          busyWorkers--;
+          returnJob(job);
+          await waitArticleGate();
+          continue;
+        }
+        job.handedBack = false;
+        job.shouldHandBack = shouldHandBack;
         job.fetchStartedAt = Date.now();
         if (Logger.event && (!Logger.isEnabled || Logger.isEnabled('DEBUG'))) {
           Logger.event('article_fetch_start', {
@@ -897,6 +1399,23 @@
         } catch (e) {
           Logger.warn('正文抓取异常', logUrl(job.url) + ' ' + (e && e.message ? e.message : String(e)));
           outcome = makeArticleFetchOutcome(null, makeRetryableEmptyInfo('transient_exception', 0));
+        } finally {
+          busyWorkers--;
+          job.shouldHandBack = null;
+          releaseParkedJob(job);
+        }
+        if (job.handedBack) {
+          job.handedBack = false;
+          if (generation !== scanGeneration || pauseScanningForHiddenPage()) return;
+          returnJob(job);
+          if (!hasQueuedVisibleJob()) await waitArticleGate();
+          continue;
+        }
+        if (job.sameOrigin) summary.sameOrigin++;
+        else summary.crossOrigin++;
+        if (job.paceDeferred && outcome) {
+          var deferPacer = getForumPacer();
+          outcome = makeArticleFetchOutcome(null, makeRetryableEmptyInfo('pace_deferred', deferPacer ? deferPacer.getPauseUntil() : 0));
         }
         if (!outcome || generation !== scanGeneration || pauseScanningForHiddenPage()) return;
         job.data = outcome.data;
@@ -909,6 +1428,7 @@
             sameOrigin: job.sameOrigin,
             queueWaitMs: Math.max(0, job.fetchStartedAt - job.createdAt),
             fetchMs: Math.max(0, job.fetchCompletedAt - job.fetchStartedAt),
+            paceWaitMs: job.paceWaitMs || 0,
             images: job.data.images.length,
             resources: SharedUtils.countResources(job.data.resources),
             retryable: !!job.retryableEmpty
@@ -916,14 +1436,18 @@
         }
         commitPromises.push(enqueueArticleCommit(job, summary, generation));
       }
+      // Idle workers see the run is over and exit too.
+      wakeArticleGate();
     }
 
     enqueueContainers(containers);
     refillJobs();
+    articleDispatchWake = wakeArticleGate;
     var workerCount = getArticleFetchConcurrency();
     var workers = new Array(workerCount);
     for (var i = 0; i < workerCount; i++) workers[i] = worker();
     await Promise.all(workers);
+    if (articleDispatchWake === wakeArticleGate) articleDispatchWake = null;
     await Promise.all(commitPromises);
     if (generation !== scanGeneration || !ATPConfig.isEnabled() || pauseScanningForHiddenPage()) return;
     Logger.info('扫描完成', '文章' + summary.articles + ' 图片' + summary.images + ' 资源' + summary.resources + ' (同源' + summary.sameOrigin + '+跨域' + summary.crossOrigin + ')');
@@ -1130,11 +1654,16 @@
     var containers = document.querySelectorAll('.atp-processed');
     removeClassFromNodes(containers, 'atp-processed');
 
+    removeNodes(document.querySelectorAll('.' + FORUM_WAIT_NOTE_CLASS));
+
     if (window.ATPState) {
       window.ATPState.threads = {};
     }
     emptyRetryAfterByUrl = {};
     emptyRetryAttemptsByUrl = {};
+    emptyRetryGivenUp = {};
+    emptyRetryClassAttempts = {};
+    emptyRetryPaceBound = {};
 
     if (window.ATPViewport) {
       ATPViewport.destroy();
@@ -1166,6 +1695,27 @@
     scrollBound = false;
   }
 
+  // The running article scan (if any) is woken after a scroll: rows that came
+  // on screen join its queue ahead of offscreen ones and take the next
+  // forum turn.
+  var articleDispatchWake = null;
+  var articleVisibleBoostRequested = false;
+
+  // A manual pacer reset lifts any pause at once: threads held for it are due.
+  window.addEventListener('atp-forum-pacer-reset', function() {
+    if (!ATPConfig.isEnabled() || !hasPaceBoundRetries()) return;
+    scheduleRetryScanAt(Date.now());
+  });
+
+  window.ATPArticleWork = {
+    isBusy: function() { return processing; }
+  };
+
+  function requestArticleVisibleBoost() {
+    articleVisibleBoostRequested = true;
+    if (articleDispatchWake) articleDispatchWake();
+  }
+
   function handleScrollScan() {
     if (pauseScanningForHiddenPage()) return;
     if (scrollScanTimer) return;
@@ -1173,6 +1723,7 @@
       scrollScanTimer = null;
       if (pauseScanningForHiddenPage()) return;
       keepUnconsumedQueuedProcessCandidates();
+      requestArticleVisibleBoost();
       detectAndProcess();
     }, 180);
   }
@@ -1357,6 +1908,7 @@
       initATPState();
       await ATPConfig.getSettings();
       if (Logger.setDebugEnabled) Logger.setDebugEnabled(ATPConfig.settings && ATPConfig.settings.debugLogging === true);
+      logDiagnosticConfig(ATPConfig.settings, 'startup');
       if (startupCancelled) return;
       addSettingsChangedListener();
       initialized = true;
@@ -1380,6 +1932,7 @@
       if (!window.ATPState) window.ATPState = {};
       window.ATPState.settings = ATPConfig.settings;
       if (Logger.setDebugEnabled) Logger.setDebugEnabled(nextSettings.debugLogging === true);
+      logDiagnosticConfig(nextSettings, 'settings_change');
       var nowEnabled = ATPConfig.isEnabled();
       if (window.__bfpPanel && typeof window.__bfpPanel.setSettings === 'function') {
         window.__bfpPanel.setSettings(ATPConfig.settings);
@@ -1551,6 +2104,7 @@
   }
 
   document.addEventListener('visibilitychange', handleVisibilityChange);
+  window.addEventListener('storage', handleForumPacerStorage);
   window.addEventListener('pagehide', handlePageHide);
   window.addEventListener('pageshow', handlePageShow);
 })();

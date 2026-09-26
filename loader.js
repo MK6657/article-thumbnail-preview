@@ -57,6 +57,16 @@
     return !!(host && SharedUtils.isHeavyImageHost(host));
   }
 
+  // 动图单独限流（宽度见 ATPLoadPolicy.getLargeImageHostConcurrency）：用户日志中慢图床上的
+  // 失败几乎全是动图，十几张并发把带宽占满、同时卡到任务截止，同屏的静态缩略图也等不到槽位。
+  function isLargeImageSrc(src) {
+    return !!(src && SharedUtils.isAnimatedGifUrl && SharedUtils.isAnimatedGifUrl(src));
+  }
+
+  function isLargeLaneTask(task) {
+    return !!task && !isHighFanoutTask(task) && isLargeImageSrc(getTaskImageSrc(task));
+  }
+
   function shouldUseNoReferrerByDefault(url) {
     return isHighFanoutImageHost(url);
   }
@@ -134,6 +144,8 @@
       timeout = ATPLoadPolicy.getHeavyImageTimeout(settings);
       var health = getHeavyHostHealthLogFields(task, settings, getActiveOrdinaryCount() > 0);
       coolingTimeoutMode = health.heavyHostState;
+    } else if (task && isLargeLaneTask(task)) {
+      timeout = ATPLoadPolicy.getLargeImageTimeout(settings);
     }
     if (task && task.taskDeadlineAt) {
       taskDeadlineRemaining = Math.max(1, task.taskDeadlineAt - Date.now());
@@ -163,12 +175,35 @@
     return Math.max(1, Number(getImageLoadTimeout(settings, task)) || 1);
   }
 
+  function isImageTaskDeadlineSpent(task) {
+    return !!(task && task.taskDeadlineAt && Date.now() + 25 >= task.taskDeadlineAt);
+  }
+
+  function tryContinueTimedImageLoad(task, img, restartTimer) {
+    if (img && img.complete && img.naturalWidth && typeof img.onload === 'function') {
+      img.onload();
+      return true;
+    }
+    if (!task || !task.taskDeadlineAt || task.timeoutGraceTried ||
+        !img || img.referrerPolicy === 'no-referrer' ||
+        !isTaskCurrent(task) ||
+        isHeavyChannelTask(task, getCurrentSettings())) return false;
+    var remaining = task.taskDeadlineAt - Date.now();
+    if (remaining < 500) return false;
+    task.timeoutGraceTried = true;
+    noteLargeLaneOutcome(task, getTaskImageSrc(task), getTaskCurrentSrcAgeMs(task), true);
+    if (restartTimer) restartTimer(remaining);
+    logImageEvent('image_wait', task, { reason: 'inflight_timeout_grace', remainingMs: remaining });
+    return true;
+  }
+
   function markTaskCurrentSourceStart(task, src, noReferrer, startedAt) {
     if (!task) return;
     var now = startedAt || Date.now();
     var key = getImageUrlKey(src);
     if (task.currentSrcKey !== key) {
       task.currentSrcNoReferrerTried = false;
+      task.timeoutGraceTried = false;
     }
     task.currentSrcKey = key;
     task.currentSrcStartedAt = now;
@@ -275,6 +310,7 @@
       budgetFollowups: 0,
       maxActive: 0,
       maxOrdinaryActive: 0,
+      maxOrdinaryHostLargeActive: 0,
       maxHeavyActive: 0,
       maxHeavyVisibleMP: 0,
       maxHeavyVisibleRestoringMP: 0,
@@ -410,7 +446,7 @@
 
   function recordHostTiming(summary, fields) {
     if (!summary || !fields || fields.ms === undefined) return;
-    var host = fields.host || 'unknown';
+    var host = (fields.largeImage ? 'gif:' : '') + (fields.host || 'unknown');
     var stats = summary.hostStats[host];
     if (!stats) {
       stats = summary.hostStats[host] = { done: 0, fail: 0, totalMs: 0, maxMs: 0, samples: [], sampleOffset: 0 };
@@ -496,6 +532,7 @@
     incrementCount(summary.channels, fields.channel || '');
     summary.maxActive = Math.max(summary.maxActive, getNumber(fields.active));
     summary.maxOrdinaryActive = Math.max(summary.maxOrdinaryActive, getNumber(fields.ordinaryActive));
+    summary.maxOrdinaryHostLargeActive = Math.max(summary.maxOrdinaryHostLargeActive, getNumber(fields.ordinaryHostLargeActive));
     summary.maxHeavyActive = Math.max(summary.maxHeavyActive, getNumber(fields.heavyActive));
     summary.maxHeavyVisibleMP = Math.max(summary.maxHeavyVisibleMP, getNumber(fields.heavyVisibleMP));
     summary.maxHeavyVisibleRestoringMP = Math.max(summary.maxHeavyVisibleRestoringMP, getNumber(fields.heavyVisibleRestoringMP));
@@ -680,6 +717,7 @@
       budgetFollowups: summary.budgetFollowups,
       maxActive: summary.maxActive,
       maxOrdinaryActive: summary.maxOrdinaryActive,
+      maxOrdinaryHostLargeActive: summary.maxOrdinaryHostLargeActive || undefined,
       maxHeavyActive: summary.maxHeavyActive,
       maxHeavyVisibleMP: roundNumber(summary.maxHeavyVisibleMP),
       maxHeavyVisibleRestoringMP: roundNumber(summary.maxHeavyVisibleRestoringMP),
@@ -778,9 +816,11 @@
   function getHostHealthEpochForUrl(url) {
     var host = getUrlHost(url);
     if (!host) return 0;
-    var stats = isHighFanoutImageHost(url)
-      ? getHeavyHostStats(host, true)
-      : getOrdinaryHostStats(host, true);
+    var heavy = isHighFanoutImageHost(url);
+    var stats = heavy ? getHeavyHostStats(host, true) : getOrdinaryHostStats(host, true);
+    // A request starting after a cooldown ran out belongs to the recovered
+    // epoch even if no health snapshot has run since the expiry.
+    if (!heavy) recoverExpiredOrdinaryHostCooldown(stats, Date.now(), getCurrentSettings() || {});
     return stats ? (stats.failureEpoch || 0) : 0;
   }
 
@@ -788,6 +828,8 @@
     if (!task) return;
     task.currentHostHealthHost = String(getUrlHost(url) || '').toLowerCase();
     task.currentHostHealthEpoch = getHostHealthEpochForUrl(url);
+    var laneStats = isHighFanoutImageHost(url) ? null : getOrdinaryHostStats(task.currentHostHealthHost, false);
+    task.largeLaneEpoch = laneStats ? (laneStats.largeLaneEpoch || 0) : 0;
   }
 
   function advanceHostHealthEpoch(stats) {
@@ -1147,20 +1189,94 @@
     return ORDINARY_HOST_HEALTH.stats[host] || null;
   }
 
-  function getOrdinaryHostActiveCount(host, priorityOnly) {
-    if (!host) return 0;
+  // Counted live, not kept as counters: a fallback can change a task's src
+  // (and so its host or GIF status) while it holds a slot.
+  function getOrdinaryHostActiveCounts(host) {
+    var counts = { active: 0, priorityActive: 0, largeActive: 0, largePriorityActive: 0 };
+    if (!host) return counts;
     host = String(host).toLowerCase();
-    var count = 0;
     for (var slotToken in GLOBAL_ACTIVE_SLOTS) {
       if (!Object.prototype.hasOwnProperty.call(GLOBAL_ACTIVE_SLOTS, slotToken)) continue;
       var task = GLOBAL_ACTIVE_SLOTS[slotToken];
       if (!task || task.slotCounted === false) continue;
-      if (priorityOnly && !isCurrentlyVisibleImageTask(task)) continue;
       var src = getTaskImageSrc(task);
       if (isHighFanoutImageHost(src)) continue;
-      if (String(getUrlHost(src)).toLowerCase() === host) count++;
+      if (String(getUrlHost(src)).toLowerCase() !== host) continue;
+      var visible = isCurrentlyVisibleImageTask(task);
+      var large = isLargeImageSrc(src);
+      counts.active++;
+      if (visible) counts.priorityActive++;
+      if (large) {
+        counts.largeActive++;
+        if (visible) counts.largePriorityActive++;
+      }
     }
-    return count;
+    return counts;
+  }
+
+  function getOrdinaryHostActiveCount(host, priorityOnly) {
+    var counts = getOrdinaryHostActiveCounts(host);
+    return priorityOnly ? counts.priorityActive : counts.active;
+  }
+
+  // GIF lane width per ordinary host. It starts at, and never drops below,
+  // getLargeImageHostConcurrency: the width that stopped the user's GIF
+  // timeouts on a saturated host. A narrower lane only holds back each
+  // post's first screen, and with it the post's later rows. When GIFs finish
+  // within the fast threshold while the lane is full (the user's healthy
+  // host: about 2 s each with two in flight), it widens by one, up to half
+  // the host limit: browsers queue HTTP/1.1 requests beyond 6 per host, so a
+  // wider lane makes static thumbnails wait behind GIFs. Any image on the
+  // host, GIF or static, slower than the slow threshold or timing out halves
+  // it back toward the start. Only images started after the last narrowing
+  // count, so one slow batch narrows it once.
+  function getLargeLaneCeiling(settings, base) {
+    var hostLimit = Math.min(
+      ATPLoadPolicy.getOrdinaryHostConcurrency(settings),
+      getOrdinaryImageSlotLimit(ATPLoader.getConc())
+    );
+    return Math.max(base, Math.min(Math.floor(ATPLoadPolicy.getOrdinaryHostConcurrency(settings) / 2), hostLimit - 1));
+  }
+
+  function getAdaptiveLargeLaneLimit(stats, settings) {
+    var base = Math.max(1, ATPLoadPolicy.getLargeImageHostConcurrency(settings));
+    if (!ATPLoadPolicy.isOrdinaryHostAdaptive(settings)) return base;
+    if (!stats || !(stats.largeLaneLimit > base)) return base;
+    return Math.min(stats.largeLaneLimit, getLargeLaneCeiling(settings, base));
+  }
+
+  function noteLargeLaneOutcome(task, url, elapsedMs, timedOut) {
+    if (!task || task.manualRetry || !url || isHighFanoutImageHost(url)) return false;
+    var settings = getCurrentSettings() || {};
+    if (!ATPLoadPolicy.isOrdinaryHostAdaptive(settings)) return false;
+    var host = String(getUrlHost(url) || '').toLowerCase();
+    if (!host) return false;
+    var stats = getOrdinaryHostStats(host, true);
+    if ((task.largeLaneEpoch || 0) !== (stats.largeLaneEpoch || 0)) return false;
+    var base = Math.max(1, ATPLoadPolicy.getLargeImageHostConcurrency(settings));
+    var current = getAdaptiveLargeLaneLimit(stats, settings);
+    var next = current;
+    var reason = '';
+    if (timedOut || elapsedMs > ATPLoadPolicy.getLargeImageSlowMs(settings)) {
+      if (current <= base) return false;
+      next = Math.max(base, Math.floor(current / 2));
+      reason = (isLargeLaneTask(task) ? '' : 'static_') + (timedOut ? 'timeout' : 'slow');
+      stats.largeLaneEpoch = (stats.largeLaneEpoch || 0) + 1;
+    } else if (isLargeLaneTask(task) && elapsedMs <= ATPLoadPolicy.getLargeImageFastMs(settings)) {
+      // Only a lane that was in use can show there is room for more; the
+      // finishing GIF has already released its slot.
+      if (current < getLargeLaneCeiling(settings, base) && getOrdinaryHostActiveCounts(host).largeActive + 1 >= current) {
+        next = current + 1;
+        reason = 'fast';
+      }
+    }
+    if (next === current) return false;
+    stats.largeLaneLimit = next;
+    logEventThrottled('ordinaryLargeLane:' + host, 'ordinary_large_lane_window', {
+      host: host, from: current, to: next, reason: reason, ms: Math.round(elapsedMs || 0),
+      largeLaneEpoch: stats.largeLaneEpoch || 0
+    }, 500, 'INFO');
+    return true;
   }
 
   function getOrdinaryHostOutcomeLimit(settings) {
@@ -1237,12 +1353,14 @@
         effectiveLimit = Math.min(effectiveLimit, ATPLoadPolicy.getOrdinaryHostSoftLimit(settings));
       }
     }
-    var active = getOrdinaryHostActiveCount(host);
-    var priorityActive = getOrdinaryHostActiveCount(host, true);
+    if (settings.autoLoadOffscreenFirstRowsEnabled === true) {
+      effectiveLimit = Math.min(effectiveLimit, 6);
+    }
+    var counts = getOrdinaryHostActiveCounts(host);
     return {
       ordinaryHost: host,
-      ordinaryHostActive: active,
-      ordinaryHostPriorityActive: priorityActive,
+      ordinaryHostActive: counts.active,
+      ordinaryHostPriorityActive: counts.priorityActive,
       ordinaryHostLimit: effectiveLimit,
       ordinaryHostBaseLimit: baseLimit,
       ordinaryHostFailures: failures,
@@ -1254,7 +1372,10 @@
       ordinaryHostCooldownRemainingMs: Math.round(cooldownRemaining),
       ordinaryHostCooldownCount: stats.cooldownCount || 0,
       ordinaryHostLastReason: stats.lastReason || undefined,
-      ordinaryHostLastFailureAgeMs: stats.lastFailureAt ? Math.max(0, now - stats.lastFailureAt) : undefined
+      ordinaryHostLastFailureAgeMs: stats.lastFailureAt ? Math.max(0, now - stats.lastFailureAt) : undefined,
+      ordinaryHostLargeActive: counts.largeActive,
+      ordinaryHostLargePriorityActive: counts.largePriorityActive,
+      ordinaryHostLargeLimit: Math.max(1, Math.min(getAdaptiveLargeLaneLimit(stats, settings), effectiveLimit - 1))
     };
   }
 
@@ -1294,6 +1415,10 @@
     if (!host) return false;
     var stats = getOrdinaryHostStats(host, true);
     var now = Date.now();
+    // Recover an expired cooldown first (as the heavy path does), so a late
+    // failure from the cooling window is judged stale instead of re-arming a
+    // fresh cooldown depending on whether a snapshot happened to run.
+    recoverExpiredOrdinaryHostCooldown(stats, now, getCurrentSettings() || {});
     if (isStaleHostFailure(task, url, stats)) return true;
     var wasCooling = getOrdinaryHostCooldownRemaining(stats, now) > 0;
     stats.failures = (stats.failures || 0) + 1;
@@ -1525,6 +1650,8 @@
       ordinaryActive: getActiveOrdinaryCount(),
       heavyActive: GLOBAL_HIGH_FANOUT_ACTIVE
     };
+    if (isLargeLaneTask(task)) fields.largeImage = true;
+    if (task && task.taskDeadlineAt && task.taskDeadlineMs) fields.taskDeadlineMs = task.taskDeadlineMs;
     return Object.assign(
       fields,
       extraFields,
@@ -1570,7 +1697,22 @@
   }
 
   function logImageDone(task, ok, reason, extra) {
-    if (!isDiagnosticLoggingEnabled('DEBUG')) return;
+    var detailed = isDiagnosticLoggingEnabled('DEBUG');
+    if (!detailed && ok) return;
+    if (!detailed && !ok) {
+      if (typeof Logger !== 'undefined' && Logger.event) {
+        Logger.event('image_failure', {
+          reason: reason || 'failed',
+          host: getUrlHost(getTaskImageSrc(task)),
+          url: shortUrl(getTaskImageSrc(task)),
+          threadId: task && task.threadId,
+          idx: task && task.idx,
+          queueKind: task && task.queueKind,
+          ms: getTaskElapsedMs(task)
+        }, 'WARN');
+      }
+      return;
+    }
     var fields = Object.assign({
       ok: !!ok,
       reason: reason || (ok ? 'loaded' : 'failed'),
@@ -1626,7 +1768,11 @@
 
   function getTaskPreviewIndex(task) {
     var imgData = getTaskImageData(task);
-    return imgData && typeof imgData.previewIndex === 'number' ? imgData.previewIndex : task.idx;
+    // previewIndex is a position in sourceCandidates, which is the preview
+    // list only for heavy-mode threads; ordinary threads preview
+    // ts.candidates, where a fallback replacement sits at task.idx.
+    var ts = imgData && typeof imgData.previewIndex === 'number' ? getThreadState(task.threadId) : null;
+    return ts && ts.heavyMode && ts.sourceCandidates ? imgData.previewIndex : task.idx;
   }
 
   function getPreviewActivationLabel(task) {
@@ -1891,7 +2037,10 @@
     if (task.slotCounted === false) return;
     if (task.slotEpoch !== IMAGE_SLOT_EPOCH) return;
     if (!isRegisteredActiveSlot(task)) return;
-    var nextHighFanout = isHeavyChannelSrc(src);
+    // Count with the admission rule: a heavy-host thumbnail whose preview
+    // differs is admitted as ordinary and must occupy an ordinary slot, or the
+    // heavy counter overflows while ordinary limits see free capacity.
+    var nextHighFanout = src === getTaskImageSrc(task) ? isHeavyChannelTask(task) : isHeavyChannelSrc(src);
     if (task.highFanoutSlot === nextHighFanout) return;
     if (task.highFanoutSlot && GLOBAL_HIGH_FANOUT_ACTIVE > 0) GLOBAL_HIGH_FANOUT_ACTIVE--;
     if (nextHighFanout) GLOBAL_HIGH_FANOUT_ACTIVE++;
@@ -1912,9 +2061,17 @@
       task.activeSlotToken = slotToken;
       task.highFanoutSlot = false;
       task.loadStartAt = now;
+      startOnLiveAttachmentHost(task);
       if (!task.taskDeadlineAt) {
-        var taskDeadlineMs = ATPLoadPolicy.getImageTaskDeadline(getCurrentSettings() || {});
+        var deadlineSettings = getCurrentSettings() || {};
+        var taskDeadlineMs = isLargeLaneTask(task)
+          ? ATPLoadPolicy.getLargeImageTaskDeadline(deadlineSettings)
+          : ATPLoadPolicy.getImageTaskDeadline(deadlineSettings);
         task.taskDeadlineAt = taskDeadlineMs > 0 ? now + taskDeadlineMs : 0;
+        task.taskDeadlineMs = taskDeadlineMs;
+        // A fresh deadline is a fresh attempt; the slow-image grace used by an
+        // earlier attempt (before a requeue or retry) must be available again.
+        task.timeoutGraceTried = false;
       }
       task.noReferrerFallbackTried = false;
       resetNoReferrerFallbackWindow(task, now);
@@ -2117,8 +2274,25 @@
     return defer;
   }
 
+  function getLargeLaneCap(snapshot, visible) {
+    var limit = snapshot.ordinaryHostLargeLimit;
+    return visible
+      ? limit + (snapshot.ordinaryHostLargePriorityActive === 0 ? 1 : 0)
+      : Math.max(1, Math.min(limit - 1, Math.ceil(limit / 2)));
+  }
+
+  // True when the last admission check refused this task only because of its
+  // host's GIF lane, so callers can tell a lane wait from a lack of general
+  // slots. Recorded by the check itself: it used the caller's limit (the
+  // background or offscreen first-row limit), which a fresh snapshot here
+  // would not know.
+  function isLargeLaneBlocked(task) {
+    return !!(task && task.largeLaneDeferred && !task.manualRetry && isLargeLaneTask(task));
+  }
+
   function shouldDeferOrdinaryHostTask(task, ordinaryLimit) {
-    if (!task || task.manualRetry || isHeavyChannelTask(task, getCurrentSettings())) return false;
+    var settings = getCurrentSettings() || {};
+    if (!task || task.manualRetry || isHeavyChannelTask(task, settings)) return false;
     var snapshot = getOrdinaryHostHealthSnapshot(getTaskImageSrc(task), getOrdinaryImageSlotLimit(ordinaryLimit));
     if (!snapshot) return false;
     var admissionActive = snapshot.ordinaryHostActive;
@@ -2131,11 +2305,35 @@
         Math.min(snapshot.ordinaryHostBaseLimit, ATPLoadPolicy.getOrdinaryHostSoftLimit(getCurrentSettings() || {}))
       );
     }
-    var defer = admissionActive >= admissionLimit;
+    // Full-list first-row loading can otherwise let visible probes bypass a
+    // crowded host while many offscreen originals are already in flight. The
+    // cap is the fixed safety limit, not the adaptive one: a cooling host
+    // drops to 1-2 and is already covered by the visible-reserve rule above.
+    var autoHostFull = settings.autoLoadOffscreenFirstRowsEnabled === true &&
+      snapshot.ordinaryHostActive >= Math.min(6, snapshot.ordinaryHostBaseLimit);
+    var defer = autoHostFull || admissionActive >= admissionLimit;
+    // GIFs wait for the host's small GIF lane (counted over every GIF in
+    // flight, visible or not) while static thumbnails keep the other slots.
+    // Offscreen GIFs leave one lane free for a visible GIF. GIFs admitted as
+    // visible can scroll away and hold the lane for their long deadline, so
+    // a visible GIF gets one extra lane while no GIF in flight is visible.
+    var largeLaneFull = false;
+    var largeCap = 0;
+    if (!defer && isLargeLaneTask(task)) {
+      largeCap = getLargeLaneCap(snapshot, isPriorityImageTask(task));
+      largeLaneFull = snapshot.ordinaryHostLargeActive >= largeCap;
+      defer = largeLaneFull;
+      task.largeLaneDeferred = largeLaneFull;
+    }
     if (defer && !task.ordinaryHostDeferredLogged) {
       task.ordinaryHostDeferredLogged = true;
       logImageEvent('image_defer', task, {
-        reason: snapshot.ordinaryHostCooling ? 'ordinary_host_cooling' : 'ordinary_host_limit',
+        reason: largeLaneFull ? 'ordinary_large_lane' : snapshot.ordinaryHostCooling ? 'ordinary_host_cooling' :
+          (autoHostFull ? 'ordinary_host_auto_limit' : 'ordinary_host_limit'),
+        largeActive: largeLaneFull ? snapshot.ordinaryHostLargeActive : undefined,
+        largePriorityActive: largeLaneFull ? snapshot.ordinaryHostLargePriorityActive : undefined,
+        largeLimit: largeLaneFull ? snapshot.ordinaryHostLargeLimit : undefined,
+        largeCap: largeLaneFull ? largeCap : undefined,
         hostActive: admissionActive,
         hostLimit: admissionLimit,
         hostTotalActive: snapshot.ordinaryHostActive,
@@ -2152,6 +2350,10 @@
   }
 
   function shouldDeferTaskForSlots(task, ordinaryLimit, hasNonHighFanoutWaiting) {
+    if (task) task.largeLaneDeferred = false;
+    // A task for a host known to be down moves first, so the host snapshot,
+    // GIF lane and per-host limits below are the sibling's.
+    startOnLiveAttachmentHost(task);
     var settings = getCurrentSettings();
     var totalLimit = getTotalImageSlotLimit();
     var normalizedOrdinaryLimit = getOrdinaryImageSlotLimit(ordinaryLimit);
@@ -2161,6 +2363,9 @@
     }
     if (shouldDeferOrdinaryHostTask(task, normalizedOrdinaryLimit)) return true;
     var limit = normalizedOrdinaryLimit;
+    if (task && task.offscreenAutoLoad && !isPriorityImageTask(task)) {
+      limit = Math.min(limit, ATPLoadPolicy.getOffscreenFirstRowOrdinaryLimit(settings || {}));
+    }
     var defer = getActiveOrdinaryCount() >= limit;
     if (defer && task && !task.ordinaryDeferredLogged) {
       task.ordinaryDeferredLogged = true;
@@ -2197,6 +2402,32 @@
       ts.firstTaskOffset = 0;
     }
     return task;
+  }
+
+  // A GIF waiting for its host's GIF lane must not hold back the thread's
+  // static or heavy-host first tasks behind it (heavy threads are not
+  // reordered static-first, and failed retries are appended at the end).
+  // The GIF stays at the head so it starts as soon as its lane frees; a later
+  // non-GIF task starts past it only when it passes the same gates now, so
+  // nothing that cannot start is moved in front of the GIF.
+  function startFirstTaskPastLargeLane(ts, head, distance, gates) {
+    if (!head || !isLargeLaneBlocked(head)) return false;
+    var offset = getFirstTaskOffset(ts);
+    for (var i = offset + 1; i < ts.firstTasks.length; i++) {
+      var next = ts.firstTasks[i];
+      if (!next || isLargeLaneTask(next)) continue;
+      next.viewportPriority = distance === 0;
+      next.offscreenAutoLoad = gates.autoLoadOffscreen && distance !== 0;
+      if (next.offscreenAutoLoad && (HEAVY_SCROLLING || GLOBAL_ACTIVE >= gates.offscreenAdmissionLimit)) continue;
+      if (next.offscreenAutoLoad && GLOBAL_HIGH_FANOUT_ACTIVE >= gates.offscreenHeavyLimit &&
+          isHeavyChannelTask(next, gates.settings)) continue;
+      if (shouldDeferTaskForSlots(next, next.offscreenAutoLoad ? gates.offscreenLimit : gates.max, gates.hasOrdinaryWaiting)) continue;
+      ts.firstTasks.splice(i, 1);
+      next.viewportRegistration = false;
+      ATPLoader.globalLoadImage(next);
+      return true;
+    }
+    return false;
   }
 
   function hasNonHighFanoutFirstTask(threadIds, threads) {
@@ -2481,6 +2712,7 @@
 
   function shouldRegisterFirstTaskInViewport(ts, task, settings) {
     if (!window.ATPViewport || !task || shouldBypassViewportLazyLoad(settings)) return false;
+    if (settings && settings.autoLoadOffscreenFirstRowsEnabled === true) return false;
     var distance = getThreadViewportDistance(ts);
     return distance !== null && distance > 0;
   }
@@ -2489,6 +2721,13 @@
     var roundIdx = 0;
     var settings = getCurrentSettings();
     var maxPending = getViewportPendingLimit(settings, max);
+    var autoLoadOffscreen = !!(settings && settings.autoLoadOffscreenFirstRowsEnabled === true);
+    // Keep offscreen first rows progressing without letting a long listing
+    // admit a full visible batch of large images from the same host, and
+    // leave the visible reserve free inside both the ordinary and heavy pools.
+    var offscreenLimit = Math.min(max, ATPLoadPolicy.getOffscreenFirstRowOrdinaryLimit(settings || {}));
+    var offscreenHeavyLimit = ATPLoadPolicy.getOffscreenFirstRowHeavyLimit(settings || {});
+    var offscreenAdmissionLimit = getBackgroundGlobalAdmissionLimit(getTotalImageSlotLimit());
     // 视口待加载计数在单轮排程内做增量维护：getViewportPendingCount 每次调用都会
     // 全量清理 pendingWrappers（每项 3 次 document.contains），不能放在内层循环里反复调
     var viewportPendingCount = ATPLoader.getViewportPendingCount();
@@ -2508,13 +2747,36 @@
 
         var task = peekFirstTask(ts);
         var useViewportRegistration = shouldRegisterFirstTaskInViewport(ts, task, settings);
-        task.viewportPriority = !useViewportRegistration && getThreadViewportDistance(ts) === 0;
+        var distance = getThreadViewportDistance(ts);
+        task.viewportPriority = !useViewportRegistration && distance === 0;
+        task.offscreenAutoLoad = autoLoadOffscreen && distance !== 0;
+        if (task.offscreenAutoLoad && HEAVY_SCROLLING) {
+          roundIdx++;
+          checked++;
+          continue;
+        }
         if (useViewportRegistration && viewportPendingCount >= maxPending) {
           roundIdx++;
           checked++;
           continue;
         }
-        if (!useViewportRegistration && shouldDeferTaskForSlots(task, max, hasOrdinaryWaiting)) {
+        if (!useViewportRegistration && task.offscreenAutoLoad && GLOBAL_ACTIVE >= offscreenAdmissionLimit) {
+          roundIdx++;
+          checked++;
+          continue;
+        }
+        if (!useViewportRegistration && task.offscreenAutoLoad && GLOBAL_HIGH_FANOUT_ACTIVE >= offscreenHeavyLimit &&
+            isHeavyChannelTask(task, settings)) {
+          roundIdx++;
+          checked++;
+          continue;
+        }
+        if (!useViewportRegistration && shouldDeferTaskForSlots(task, task.offscreenAutoLoad ? offscreenLimit : max, hasOrdinaryWaiting)) {
+          if (startFirstTaskPastLargeLane(ts, task, distance, {
+            settings: settings, max: max, autoLoadOffscreen: autoLoadOffscreen, offscreenLimit: offscreenLimit,
+            offscreenHeavyLimit: offscreenHeavyLimit, offscreenAdmissionLimit: offscreenAdmissionLimit,
+            hasOrdinaryWaiting: hasOrdinaryWaiting
+          })) started = true;
           roundIdx++;
           checked++;
           continue;
@@ -2560,6 +2822,7 @@
         heavyActive: GLOBAL_HIGH_FANOUT_ACTIVE,
         firstLimit: firstLimit,
         bgLimit: bgLimit,
+        offscreenOrdinaryLimit: Math.min(firstLimit, ATPLoadPolicy.getOffscreenFirstRowOrdinaryLimit(settings || {})),
         heavyConfiguredLimit: getHeavyImageConcurrency(settings),
         firstOrdinaryQueue: firstCounts.ordinary,
         firstHeavyQueue: firstCounts.heavy,
@@ -2594,9 +2857,11 @@
     recordOrdinaryHostFailure(url, reason, task);
   }
 
-  function recordDomainSuccess(url) {
+  function recordDomainSuccess(url, task) {
     if (recordHeavyHostSuccess(url)) return;
     recordOrdinaryHostSuccess(url);
+    noteAttachmentHostSuccess(url);
+    if (task) noteLargeLaneOutcome(task, url, getTaskCurrentSrcAgeMs(task), false);
   }
 
   function recordTaskImageFailure(task, url, reason, finalFailure) {
@@ -2609,6 +2874,7 @@
       recordDomainFailure(url, reason, task);
       return;
     }
+    if (reason === 'candidate_timeout') noteLargeLaneOutcome(task, url, getTaskCurrentSrcAgeMs(task), true);
     if (finalFailure) {
       var ordinaryHost = String(getUrlHost(url) || '').toLowerCase();
       var ordinaryStampedEpoch = getTaskStampedHostHealthEpoch(task, url);
@@ -2636,7 +2902,32 @@
 
   function getThreadStatusTotal(ts) {
     if (!ts) return 0;
-    return ts.bgQueued ? ts.total : ts.firstScreenTotal;
+    return ts.bgQueued || ts.bgQueueActive || ts.nextIdx > ts.firstScreenTotal
+      ? ts.total
+      : ts.firstScreenTotal;
+  }
+
+  function isOrdinaryBackgroundNearTail(ts, settings) {
+    if (!ts || ts.nextIdx <= ts.firstScreenTotal) return true;
+    var viewport = ts.grid && ts.grid.parentNode;
+    if (!viewport || typeof viewport.scrollHeight !== 'number') return true;
+    if (viewport.style && viewport.style.maxHeight === 'none') return true;
+    var thumbHeight = Number(settings && settings.thumbHeight);
+    if (!isFinite(thumbHeight) || thumbHeight <= 0) thumbHeight = 82;
+    var gridGap = Number(settings && settings.gridGap);
+    if (!isFinite(gridGap) || gridGap < 0) gridGap = 6;
+    var rowHeight = thumbHeight + gridGap;
+    return viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= rowHeight;
+  }
+
+  function releaseBackgroundBatchTask(task, ts) {
+    if (!task || !task.backgroundBatch || task.backgroundBatchReleased || !ts) return false;
+    task.backgroundBatchReleased = true;
+    ts.bgBatchPending = Math.max(0, (ts.bgBatchPending || 0) - 1);
+    if (ts.bgBatchPending > 0) return false;
+    ts.bgBatchPending = 0;
+    ts.bgQueueActive = false;
+    return true;
   }
 
   function getBackgroundRemaining(ts) {
@@ -2650,6 +2941,14 @@
     var count = Math.max(0, Math.min(remaining, maxPerPost - ts.firstScreenTotal));
     if (isLightweightHeavyThread(ts)) {
       count = Math.min(count, getLightweightHeavyBackgroundBatchSize(ts, settings));
+    } else {
+      // Keep viewport-lazy work bounded per thread. The old code staged every
+      // remaining candidate at once; a long page could leave hundreds of
+      // pending tasks that were repeatedly scanned while only 24 wrappers
+      // could actually wait for the viewport.
+      var backgroundConcurrency = Math.max(1, Number(settings && settings.backgroundConcurrency) || 1);
+      var batchLimit = Math.max(4, Math.min(8, backgroundConcurrency * 2));
+      count = Math.min(count, batchLimit);
     }
     return count;
   }
@@ -2940,7 +3239,10 @@
     // 把本轮的精判结果记在任务上供直载路径复用：否则同一 tick 内会对同一 wrapper
     // 做两次祖先链测量（都紧跟样式写入，每次都是强制回流）
     if (task) task.lazyProbeVisible = undefined;
-    if (!window.ATPViewport || !task || shouldBypassViewportLazyLoad(settings)) return false;
+    if (!window.ATPViewport || !task) return false;
+    if (isBackgroundImageLocked(task)) return true;
+    if (shouldBypassViewportLazyLoad(settings)) return false;
+    if (task.isFirstScreen && settings && settings.autoLoadOffscreenFirstRowsEnabled === true) return false;
     if (task.manualRetry || task.forceEager || task.forcePreload) return false;
     if (task.viewportRegistration === true) return true;
     if (wrapper && isWrapperInViewport(wrapper)) {
@@ -2949,6 +3251,12 @@
     }
     task.lazyProbeVisible = false;
     return true;
+  }
+
+  function isBackgroundImageLocked(task) {
+    if (!task || task.isFirstScreen || task.manualRetry) return false;
+    var ts = getThreadState(task.threadId);
+    return !!(ts && ts.backgroundUnlocked === false && task.idx >= ts.firstScreenTotal);
   }
 
   function drainHiddenViewportPending(settings, bgSnapshot) {
@@ -3202,6 +3510,95 @@
     }
   }
 
+  // Animated GIF thumbnails show a still first frame; hovering plays the GIF
+  // (CSS on .atp-gif-frozen). Every playing GIF re-decodes full-size frames
+  // and re-rasters its tile on each frame, and a list page on the user's
+  // host can show dozens at once: in the GIF bench, 30 playing GIFs cost
+  // about half a core while scrolling, in decode threads and the GPU. The
+  // frame is decoded asynchronously (img.decode) and drawn once into a canvas
+  // at the tile's pixel size; the animated <img> stays for hover and preview.
+  // Draws run in idle time, a few per callback, so a burst of GIFs finishing
+  // during a scroll does not add main-thread work to scroll frames.
+  var STILL_FRAME_QUEUE = [];
+  var STILL_FRAME_TIMER = null;
+
+  function flushStillFrameQueue(deadline) {
+    var drawn = 0;
+    while (STILL_FRAME_QUEUE.length) {
+      if (drawn > 0 && (!deadline || typeof deadline.timeRemaining !== 'function' || deadline.timeRemaining() < 4)) break;
+      var draw = STILL_FRAME_QUEUE.shift();
+      draw();
+      drawn++;
+    }
+    if (STILL_FRAME_QUEUE.length) scheduleStillFrameQueue();
+  }
+
+  function scheduleStillFrameQueue() {
+    if (STILL_FRAME_TIMER !== null) return;
+    if (typeof requestIdleCallback === 'function') {
+      STILL_FRAME_TIMER = requestIdleCallback(function(deadline) {
+        STILL_FRAME_TIMER = null;
+        flushStillFrameQueue(deadline);
+      }, { timeout: 500 });
+    } else {
+      STILL_FRAME_TIMER = setTimeout(function() {
+        STILL_FRAME_TIMER = null;
+        flushStillFrameQueue(null);
+      }, 16);
+    }
+  }
+
+  function queueStillFrame(draw) {
+    STILL_FRAME_QUEUE.push(draw);
+    scheduleStillFrameQueue();
+  }
+
+  function freezeAnimatedThumbnail(wrapper, img, task) {
+    var settings = getCurrentSettings() || {};
+    if (settings.animatedThumbnailMode === 'play') return false;
+    if (!wrapper || !img || !task || !isLargeLaneTask(task)) return false;
+    if (wrapper.classList && wrapper.classList.contains('atp-gif-frozen')) return false;
+    var src = img.currentSrc || img.src;
+    var draw = function() {
+      if (!img.naturalWidth || !img.naturalHeight || (img.currentSrc || img.src) !== src) return;
+      if (img.parentNode !== wrapper || (document.contains && !document.contains(wrapper))) return;
+      var tileWidth = Math.max(1, Number(settings.thumbWidth) || 110);
+      var tileHeight = Math.max(1, Number(settings.thumbHeight) || 82);
+      var pixelRatio = Math.min(2, Math.max(1, Number(window.devicePixelRatio) || 1));
+      // object-fit: contain, like the <img>: the frame's aspect ratio inside the tile.
+      var scale = Math.min(tileWidth / img.naturalWidth, tileHeight / img.naturalHeight, 1) * pixelRatio;
+      var canvasWidth = Math.max(1, Math.round(img.naturalWidth * scale));
+      var canvasHeight = Math.max(1, Math.round(img.naturalHeight * scale));
+      var canvas = document.createElement('canvas');
+      canvas.className = 'atp-gif-still';
+      canvas.setAttribute('aria-hidden', 'true');
+      canvas.width = canvasWidth;
+      canvas.height = canvasHeight;
+      // willReadFrequently keeps the canvas CPU-backed and painted with the
+      // page; an accelerated canvas (large tiles at high DPI) would be a
+      // compositing layer per tile, the cost the shimmer removal took away.
+      var ctx = canvas.getContext && canvas.getContext('2d', { alpha: true, willReadFrequently: true });
+      if (!ctx) return;
+      try {
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'medium';
+        ctx.drawImage(img, 0, 0, canvasWidth, canvasHeight);
+      } catch (e) {
+        return;
+      }
+      var old = wrapper.querySelector ? wrapper.querySelector('.atp-gif-still') : null;
+      if (old && old.parentNode) old.parentNode.removeChild(old);
+      wrapper.appendChild(canvas);
+      wrapper.classList.add('atp-gif-frozen');
+    };
+    if (typeof img.decode === 'function') {
+      img.decode().then(function() { queueStillFrame(draw); }, function() {});
+    } else {
+      queueStillFrame(draw);
+    }
+    return true;
+  }
+
   function clearHeavyWrapperVisualState(wrapper) {
     if (!wrapper) return;
     wrapper.classList.remove('atp-heavy-preview-active');
@@ -3302,8 +3699,147 @@
     if (canApply()) img.src = src;
   }
 
+  // The forum serves one attachment store under several rotating hosts
+  // (tu.<name>/tupian/forum/YYYYMM/DD/<HHMMSS + 16 chars>.<ext>): it picks a
+  // host each time it renders a thread, and the same path is on the others.
+  // A host that is down fails every image at once (in the user's logs one
+  // host never loaded an image while another served the same paths), so an
+  // attachment that failed with and without a Referer is tried once on a
+  // sibling host that has already served this page. Once a host has failed
+  // like that three times without a single success, new images for it start
+  // on the sibling directly.
+  var ATTACHMENT_PATH_RE = /^((?:\/[^\/?#]+)*\/)forum\/\d{6}\/\d{2}\/\d{6}[a-z0-9]{16}\.(?:jpe?g|png|gif|webp|bmp)(?:\.thumb\.jpg)?$/i;
+  var ATTACHMENT_SIBLING_MAX_AGE_MS = 10 * 60 * 1000;
+  var ATTACHMENT_HOSTS = {};
+
+  function getAttachmentFamily(url) {
+    if (!url || isHighFanoutImageHost(url)) return null;
+    var parsed;
+    try {
+      parsed = new URL(url);
+    } catch (e) {
+      return null;
+    }
+    if (parsed.protocol !== 'https:') return null;
+    var match = ATTACHMENT_PATH_RE.exec(parsed.pathname);
+    if (!match) return null;
+    var host = parsed.hostname.toLowerCase();
+    return { key: host.split('.')[0] + '|' + match[1], host: host };
+  }
+
+  function getAttachmentHostStats(family, create) {
+    var hosts = ATTACHMENT_HOSTS[family.key];
+    if (!hosts) {
+      if (!create) return null;
+      hosts = ATTACHMENT_HOSTS[family.key] = {};
+    }
+    if (!hosts[family.host] && create) hosts[family.host] = { ok: 0, fail: 0, lastOkAt: 0 };
+    return hosts[family.host] || null;
+  }
+
+  function noteAttachmentHostSuccess(url) {
+    var family = getAttachmentFamily(url);
+    if (!family) return;
+    var stats = getAttachmentHostStats(family, true);
+    stats.ok++;
+    stats.lastOkAt = Date.now();
+  }
+
+  // A family host that served at least two images recently and is not cooling.
+  function pickSiblingAttachmentHost(family) {
+    var hosts = ATTACHMENT_HOSTS[family.key];
+    if (!hosts) return '';
+    var now = Date.now();
+    var best = '';
+    var bestAt = 0;
+    for (var host in hosts) {
+      if (!Object.prototype.hasOwnProperty.call(hosts, host) || host === family.host) continue;
+      var stats = hosts[host];
+      if (stats.ok < 2 || now - stats.lastOkAt > ATTACHMENT_SIBLING_MAX_AGE_MS || stats.lastOkAt <= bestAt) continue;
+      var health = getOrdinaryHostStats(host, false);
+      if (health && health.cooldownUntil && health.cooldownUntil > now) continue;
+      best = host;
+      bestAt = stats.lastOkAt;
+    }
+    return best;
+  }
+
+  function isDeadAttachmentHost(family) {
+    var stats = getAttachmentHostStats(family, false);
+    return !!(stats && stats.ok === 0 && stats.fail >= 3);
+  }
+
+  function withAttachmentHost(candidate, fromHost, toHost) {
+    var out = Object.assign({}, candidate);
+    ['src', 'displaySrc', 'previewSrc'].forEach(function(field) {
+      if (!out[field]) return;
+      try {
+        var parsed = new URL(out[field]);
+        if (parsed.hostname.toLowerCase() !== fromHost) return;
+        parsed.hostname = toHost;
+        out[field] = parsed.href;
+      } catch (e) {}
+    });
+    out.siblingHostFrom = fromHost;
+    return out;
+  }
+
+  // Points the task's candidate at a sibling host (a copy: the cached
+  // candidate list keeps the forum's own URLs). Returns the sibling host or ''.
+  function moveTaskToSiblingHost(task, family) {
+    var imgData = getTaskImageData(task);
+    if (!imgData || !family) return '';
+    var sibling = pickSiblingAttachmentHost(family);
+    if (!sibling) return '';
+    var ts = getThreadState(task.threadId);
+    if (ts) {
+      // The forum's own URL leaves the rendered list here: keep the ordinary
+      // fallback from picking the same picture again for another slot.
+      markThreadFallbackCandidateUsed(ts, imgData, getTaskPreviewIndex(task));
+      // The list the cache is written from keeps the forum's URLs.
+      if (ts.cacheImages && ts.cacheImages === task.candidates) ts.cacheImages = ts.cacheImages.slice();
+    }
+    task.candidates[task.idx] = withAttachmentHost(imgData, family.host, sibling);
+    if (ts) ts.__activeCandidateKeys = null;
+    task.siblingHostTried = true;
+    return sibling;
+  }
+
+  // Before a task's first request: a host known to be down is skipped.
+  function startOnLiveAttachmentHost(task) {
+    if (!task || task.siblingHostTried) return;
+    var family = getAttachmentFamily(getTaskImageSrc(task));
+    if (!family || !isDeadAttachmentHost(family)) return;
+    var sibling = moveTaskToSiblingHost(task, family);
+    if (sibling) {
+      logImageEvent('image_retry', task, { reason: 'sibling_host_start', fromHost: family.host, toHost: sibling }, 'INFO');
+    }
+  }
+
+  function trySiblingHostFallback(task, img, restartTimer, shouldApply) {
+    if (!task || task.siblingHostTried || !isTaskCurrent(task) || !task.currentSrcNoReferrerTried) return false;
+    if (isHeavyChannelTask(task, getCurrentSettings()) || isImageTaskDeadlineSpent(task)) return false;
+    var family = getAttachmentFamily(getTaskImageSrc(task));
+    if (!family) return false;
+    getAttachmentHostStats(family, true).fail++;
+    var sibling = moveTaskToSiblingHost(task, family);
+    if (!sibling) return false;
+    var newSrc = getTaskImageSrc(task);
+    markTaskCurrentSourceStart(task, newSrc, false);
+    // One request on the sibling, which already served this page with a Referer.
+    task.currentSrcNoReferrerTried = true;
+    task.noReferrerFallbackTried = true;
+    task.noReferrerFallbackSrcKey = getImageUrlKey(newSrc);
+    if (restartTimer) restartTimer();
+    logImageEvent('image_retry', task, { reason: 'sibling_host', fromHost: family.host, toHost: sibling, retryUrl: shortUrl(newSrc) }, 'INFO');
+    setImageSource(img, newSrc, false, shouldApply);
+    return true;
+  }
+
   function tryNoReferrerFallback(task, img, src, restartTimer, shouldApply) {
-    if (!task) return false;
+    // A task whose thread was re-rendered is thrown away on completion; a
+    // second request for it only holds a slot.
+    if (!task || !isTaskCurrent(task)) return false;
     var srcKey = getImageUrlKey(src);
     if (task.currentSrcKey !== srcKey) markTaskCurrentSourceStart(task, src, false);
     if (task.currentSrcNoReferrerTried || (task.noReferrerFallbackTried && task.noReferrerFallbackSrcKey === srcKey)) return false;
@@ -3395,9 +3931,26 @@
     return false;
   }
 
+  // Heavy threads preview sourceCandidates, which a sibling-host swap of a
+  // rendered slot does not touch: lay the swapped slots over it.
+  function withSiblingHostPreviews(ts, list) {
+    var shown = ts && ts.candidates;
+    if (!shown || !list || shown === list) return list;
+    var out = null;
+    for (var i = 0; i < shown.length; i++) {
+      var candidate = shown[i];
+      if (!candidate || !candidate.siblingHostFrom) continue;
+      var at = typeof candidate.previewIndex === 'number' ? candidate.previewIndex : i;
+      if (at < 0 || at >= list.length || list[at] === candidate) continue;
+      if (!out) out = list.slice();
+      out[at] = candidate;
+    }
+    return out || list;
+  }
+
   function getPreviewCandidates(ts) {
     if (!ts) return [];
-    return ts.heavyMode && ts.sourceCandidates ? ts.sourceCandidates : (ts.candidates || []);
+    return withSiblingHostPreviews(ts, ts.heavyMode && ts.sourceCandidates ? ts.sourceCandidates : (ts.candidates || []));
   }
 
   function setFallbackIndex(ts, fallbackIdx) {
@@ -3658,14 +4211,27 @@
   var ATPLoader = {
     isPaused: function() { return GLOBAL_PAUSED; },
 
-    recordDomainSuccess: function(url) { recordDomainSuccess(url); },
+    recordDomainSuccess: function(url, task) { recordDomainSuccess(url, task); },
     recordDomainFailure: function(url, reason) { recordDomainFailure(url, reason); },
     recordTaskImageFailure: function(task, url, reason, finalFailure) {
       recordTaskImageFailure(task, url, reason, finalFailure);
     },
+    getPreviewCandidates: function(ts) { return getPreviewCandidates(ts); },
+
+    trySiblingHostFallback: function(task, img, restartTimer, shouldApply) {
+      return trySiblingHostFallback(task, img, restartTimer, shouldApply);
+    },
+
     tryNoReferrerFallback: function(task, img, src, restartTimer, shouldApply) {
       return tryNoReferrerFallback(task, img, src, restartTimer, shouldApply);
     },
+    tryContinueTimedImageLoad: function(task, img, restartTimer) {
+      return tryContinueTimedImageLoad(task, img, restartTimer);
+    },
+    isImageTaskDeadlineSpent: function(task) { return isImageTaskDeadlineSpent(task); },
+    isLargeImageTask: function(task) { return isLargeLaneTask(task); },
+    isLargeLaneBlocked: function(task) { return isLargeLaneBlocked(task); },
+    freezeAnimatedThumbnail: function(wrapper, img, task) { return freezeAnimatedThumbnail(wrapper, img, task); },
     setImageSource: function(img, src, noReferrer, shouldApply) {
       setImageSource(img, src, noReferrer, shouldApply);
     },
@@ -3718,6 +4284,7 @@
     logImageDone: function(task, ok, reason, extra) { logImageDone(task, ok, reason, extra); },
     logRenderEvent: function(type, task, fields, level) { logRenderEvent(type, task, fields, level); },
     isTaskCurrent: function(task) { return isTaskCurrent(task); },
+    isBackgroundImageLocked: function(task) { return isBackgroundImageLocked(task); },
     isWrapperVisible: function(wrapper) { return isWrapperInViewport(wrapper); },
     isHeavyScrollActive: function() { return !!HEAVY_SCROLLING; },
     // 供视口层判断「免槽的可见恢复」是否该放行：熔断冷却期内不额外加压
@@ -3856,6 +4423,11 @@
         }
         task.viewportRegistration = useViewportRegistration;
         ATPLoader.globalLoadImage(task);
+        var dispatchedThread = getThreadState(task.threadId);
+        if (dispatchedThread && !dispatchedThread.heavyMode &&
+            releaseBackgroundBatchTask(task, dispatchedThread)) {
+          ATPLoader.enqueueBgForThread(task.threadId);
+        }
         if (useViewportRegistration) pendingCount++;
         else directProcessed++;
         processed++;
@@ -4053,9 +4625,11 @@
             abandonStaleActiveLoad();
             return;
           }
+          if (tryContinueTimedImageLoad(task, img, startTimer)) return;
           var currentSrc = getTaskImageSrc(task);
-          if (tryNoReferrerFallback(task, img, currentSrc, startTimer, isActiveLoadCurrent)) return;
           recordTaskImageFailure(task, currentSrc, 'candidate_timeout', false);
+          if (isImageTaskDeadlineSpent(task)) { failFinal('deadline_exhausted'); return; }
+          if (!isLargeLaneTask(task) && tryNoReferrerFallback(task, img, currentSrc, startTimer, isActiveLoadCurrent)) return;
           if (tryHeavyCandidateFallback(task, img, startTimer, isActiveLoadCurrent)) return;
           failFinal();
         }, imgTimeout);
@@ -4111,12 +4685,13 @@
           ATPLoader.globalSchedule();
           return;
         }
-        recordDomainSuccess(getTaskImageSrc(task));
+        recordDomainSuccess(getTaskImageSrc(task), task);
         var heavyTask = isHeavyChannelTask(task);
         if (heavyTask && window.ATPViewport && ATPViewport.monitorLoadedHeavyImage) {
           ATPViewport.monitorLoadedHeavyImage(wrapper, img, task);
         } else {
           clearHeavyWrapperVisualState(wrapper);
+          freezeAnimatedThumbnail(wrapper, img, task);
         }
         if (lel && lel.parentNode) lel.remove();
         if (!wrapper.classList.contains('atp-heavy-unloaded')) img.style.display = 'block';
@@ -4158,6 +4733,7 @@
         }
         var currentSrc = getTaskImageSrc(task);
         if (tryNoReferrerFallback(task, img, currentSrc, startTimer, isActiveLoadCurrent)) return;
+        if (trySiblingHostFallback(task, img, startTimer, isActiveLoadCurrent)) return;
         recordTaskImageFailure(task, currentSrc, 'candidate_error', false);
         if (tryHeavyCandidateFallback(task, img, startTimer, isActiveLoadCurrent)) return;
         failFinal();
@@ -4364,9 +4940,11 @@
             abandonStaleActiveLoad();
             return;
           }
+          if (tryContinueTimedImageLoad(task, img, startTimer)) return;
           var src = getTaskImageSrc(task);
-          if (tryNoReferrerFallback(task, img, src, startTimer, isActiveLoadCurrent)) return;
           recordTaskImageFailure(task, src, 'candidate_timeout', false);
+          if (isImageTaskDeadlineSpent(task)) { failFinal('deadline_exhausted'); return; }
+          if (!isLargeLaneTask(task) && tryNoReferrerFallback(task, img, src, startTimer, isActiveLoadCurrent)) return;
           if (tryHeavyCandidateFallback(task, img, startTimer, isActiveLoadCurrent)) return;
           failFinal();
         }, imgTimeout);
@@ -4418,13 +4996,14 @@
           ATPLoader.globalSchedule();
           return;
         }
-        recordDomainSuccess(getTaskImageSrc(task));
+        recordDomainSuccess(getTaskImageSrc(task), task);
         clearPreviewActivation(wrapper);
         var heavyTask = isHeavyChannelTask(task);
         if (heavyTask && window.ATPViewport && ATPViewport.monitorLoadedHeavyImage) {
           ATPViewport.monitorLoadedHeavyImage(wrapper, img, task);
         } else {
           clearHeavyWrapperVisualState(wrapper);
+          freezeAnimatedThumbnail(wrapper, img, task);
         }
         if (loadingEl && loadingEl.parentNode) loadingEl.remove();
         if (!wrapper.classList.contains('atp-heavy-unloaded')) img.style.display = 'block';
@@ -4477,6 +5056,7 @@
         }
         var src = getTaskImageSrc(task);
         if (tryNoReferrerFallback(task, img, src, startTimer, isActiveLoadCurrent)) return;
+        if (trySiblingHostFallback(task, img, startTimer, isActiveLoadCurrent)) return;
         recordTaskImageFailure(task, src, 'candidate_error', false);
         if (tryHeavyCandidateFallback(task, img, startTimer, isActiveLoadCurrent)) return;
         failFinal();
@@ -4497,6 +5077,9 @@
 
       if (task.retries <= maxRetry) {
         task.queuedAt = Date.now();
+        // A retry gets its own deadline; reusing the spent one made every
+        // retry expire after 1ms while still sending a real request.
+        task.taskDeadlineAt = 0;
         task.currentlyVisible = undefined; // 重试入队时清除过期的可见性标记
         task.queueKind = task.isFirstScreen ? 'first_retry' : 'background_retry';
         if (task.isFirstScreen && ts && ts.firstTasks) {
@@ -4560,13 +5143,7 @@
         }
       }
 
-      if (!task.isFirstScreen && task.backgroundBatch && isLightweightHeavyThread(ts)) {
-        ts.bgBatchPending = Math.max(0, (ts.bgBatchPending || 0) - 1);
-        if (ts.bgBatchPending <= 0) {
-          ts.bgBatchPending = 0;
-          ts.bgQueueActive = false;
-        }
-      }
+      if (!task.isFirstScreen) releaseBackgroundBatchTask(task, ts);
 
       ts.statusEl.textContent = ATPLoader.formatThreadStatus(ts, false);
       if (ts.nextIdx < ts.candidates.length && !ts.bgQueued && !ts.bgQueueActive) {
@@ -4588,8 +5165,9 @@
       var threads = window.ATPState && window.ATPState.threads;
       if (!threads) return;
       var ts = threads[threadId];
-      if (!isThreadCurrent(ts) || ts.bgQueued || ts.bgQueueActive) return;
+      if (!isThreadCurrent(ts) || ts.bgQueued || ts.bgQueueActive || ts.backgroundUnlocked === false || !ts.firstScreenDone) return;
       var settings = ATPLoader.getSettings();
+      if (!ts.heavyMode && !isOrdinaryBackgroundNearTail(ts, settings)) return;
       var heavyDeferInfo = getHeavyBackgroundDeferredInfo(ts);
       if (heavyDeferInfo) {
         applyHeavyBackgroundDeferred(ts, threadId, heavyDeferInfo);
@@ -4607,9 +5185,9 @@
         return;
       }
       var stagedLightweight = isLightweightHeavyThread(ts);
+      ts.bgQueueActive = true;
+      ts.bgBatchPending = (ts.bgBatchPending || 0) + toEnqueue;
       if (stagedLightweight) {
-        ts.bgQueueActive = true;
-        ts.bgBatchPending = (ts.bgBatchPending || 0) + toEnqueue;
         if (isDiagnosticLoggingEnabled('DEBUG') && typeof Logger !== 'undefined' && Logger.event) {
           Logger.event('schedule_state', Object.assign({
             reason: 'lightweight_bg_batch',
@@ -4634,7 +5212,7 @@
           generation: ts.generation,
           grid: ts.grid,
           isFirstScreen: false,
-          backgroundBatch: stagedLightweight,
+          backgroundBatch: true,
           createdAt: now,
           queuedAt: now,
           queueKind: stagedLightweight ? 'lightweight_background' : 'background'

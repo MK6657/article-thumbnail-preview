@@ -1,16 +1,21 @@
 {
   "manifest_version": 3,
   "name": "文章缩略图预览",
-  "version": "1.17.3",
+  "version": "1.18.4",
   "description": "在文章列表页自动抓取文章内图片，显示缩略图，避免被标题党欺骗。",
   "permissions": [
-    "storage"
+    "storage",
+    "scripting",
+    "activeTab"
   ],
   "host_permissions": [
     "https://*.sehuatang.org/*",
     "https://*.sehuatang.net/*",
     "https://dl.ldkms.la/*",
     "https://xia.ewrewej.la/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*"
   ],
   "content_scripts": [
     {
@@ -27,7 +32,7 @@
         "https://*.sehuatang.org/*",
         "https://*.sehuatang.net/*"
       ],
-      "js": ["settings-schema.js", "defaults.js", "shared-utils.js", "loading-policy.js", "logger.js", "cache.js", "config.js", "scanner.js", "fetcher.js", "viewport-observer.js", "loader.js", "resource-panel.js", "renderer.js", "previewer.js", "floating-panel.js", "content.js"],
+      "js": ["settings-schema.js", "defaults.js", "shared-utils.js", "loading-policy.js", "logger.js", "cache.js", "config.js", "scanner.js", "forum-pacer.js", "fetcher.js", "viewport-observer.js", "loader.js", "resource-panel.js", "renderer.js", "previewer.js", "floating-panel.js", "content.js"],
       "css": ["content.css"],
       "run_at": "document_end"
     }

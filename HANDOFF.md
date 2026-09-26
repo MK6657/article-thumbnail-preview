@@ -2,7 +2,11 @@
 
 ## 当前基准
 
-- 当前版本：v1.17.3
+- 当前版本：v1.18.4（每个交给用户测试的构建都递增版本号，避免混用旧版日志）
+- 1.18.3 手动重置节流：`ATPForumPacer.reset()` 删除本域名 localStorage 的 `atp.forumPacer.limits.v1` 与 `atp.forumPacer.v2`（删不掉时改写为正常速度），恢复突发 10 / 2 秒并派发 `atp-forum-pacer-reset`（content.js 据此唤醒因暂停推迟的帖子）。1.18.4 起弹窗不再给标签页发消息：`resetForumPacer` 在 chrome.storage.local 写入 `atp_forum_pacer_reset_at`（时间戳，只作标识）。forum-pacer.js 的 `applyResetMarker`（页面初始化读取一次，之后由 `chrome.storage.onChanged` 实时触发）在该论坛域名 localStorage 的 `atp.forumPacer.resetApplied.v1` 与新标记不同时调用 `clearLearnedPace`（与 `reset()` 共用：删除学到的速度和状态，恢复突发 10 / 2 秒）并记下已应用；相同则只重新读取共享存储。每个标记每个域名只应用一次，不和时间戳比较，所以验证页在 5 分钟前（页面记录已重建、没有验证页时间）也能重置，系统时间回拨也不会吞掉之后的验证页。速度有变时记日志“论坛节流已按弹窗重置”并派发同一事件。各页面在每个请求结束时调用 `publishStatus`，把本域名速度及 `limitsUntil`（学到速度失效）/ `idleUntil`（闲置 5 分钟状态清空）写入 `atp_forum_pacer_status_v1`（最多 10 个域名；签名变化时写，否则至多每 60 秒刷新），弹窗 `getForumPaceNow` 按这两个时间让没人用的域名到期后显示为恢复。
+- 1.18.2 首屏调度：`forum-pacer.js` 为屏幕内帖子保留名额（`getReserve`：优先级高于 PRIORITY_VISIBLE 的请求需 tokens ≥ cost + min(4, floor(burst×0.4), burst−cost)，探测期为 0；`canStartNow` 供内容脚本判断）。`content.js` processContainers 改为轮到名额时再挑帖子（`takeJob` 屏幕内优先，其次离视口最近；`admitArticleJob` 名额不足时只让一个屏外帖子在节流器等待（`awaitingTurn` 防同一时刻多个放行），其余线程 `waitArticleGate` 空手等，`busyWorkers` 期间空闲线程不退出；等待中滚出屏幕的帖子经 `isCancelled`→`shouldHandBack` 让出线程；缓存命中不等；`requestArticleVisibleBoost` 滚动后把屏幕内新行分批插队直到整屏入队）。自动 TXT 复用抓正文时读到的 Discuz 附件链接（内存 3 分钟，`freshTextAttachments`），正文抓取进行中（`ATPArticleWork.isBusy()`）只放行屏幕内帖子的自动 TXT。`loader.js` 同族附件图床回退：`trySiblingHostFallback` / `startOnLiveAttachmentHost`（`ATTACHMENT_PATH_RE`，域名首段 + 路径前缀为一族）。
+- 1.18.0 论坛节流：真实论坛在几秒内收到约 30 个正文 / TXT 请求后，返回约 1.2KB、以随机名言作者为标题的验证页（HTTP 200）。发往论坛本站的请求统一经 `forum-pacer.js` 排队（10 个突发后每 2 秒 1 个、可见优先；触发验证页时的节奏记忆 24 小时，恢复不会超过它；额度和暂停存于该论坛域名 localStorage，所有标签页共享，闲置 5 分钟清空；任何标签页正常打开论坛页面会解除旧暂停并改为单路探测）；验证页、限流页、429/503 和 Cloudflare 挑战页使论坛请求暂停 20 秒起并单路探测，Discuz 提示页和无法识别的页面不算限流。不要执行或应答验证页，也不要绕过节流器直接对论坛发请求；新增论坛请求路径须经 `acquireForumTurn` 取号并用 `ticket.done(outcome)` 回报。
+- 1.18.0 / 1.18.1 动图通道（1.18.1 起通道宽度自适应、动图缩略图默认静帧）：用户日志的“加载失败”几乎都是慢图床上几 MB 的 `.gif` 同时下载、一起卡到截止。`loader.js` 的 `shouldDeferOrdinaryHostTask` 在图床限额之外再按 `getLargeLaneCap` 限制每个普通图床的在途动图（起始宽度 `ATPLoadPolicy.getLargeImageHostConcurrency` = 2；`noteLargeLaneOutcome` 按完成耗时自适应：通道占满时动图快完成 +1，上限为图床上限的一半；该图床任何图片慢完成或超时则减半，不低于起始的 2，按 `largeLaneEpoch` 每批只减一次；屏外最多约一半；所有在途动图都已滚出屏幕时可见动图可多用 1）。动图用 `getLargeImageTimeout` / `getLargeImageTaskDeadline`（3 倍，至少 30 / 45 秒），超时不做无 Referer 重试。`renderer.js` 的 `prioritizeStaticFirstScreenCandidates` 在显示范围内先排静态图。队首动图等通道时仍留在队首（通道一空即可开始），`startFirstTaskPastLargeLane` 越过它启动同帖后面此刻就能准入的非动图首批任务，重图帖子和失败重试也不会被挡住。缓存写回用 `threadState.cacheImages`（帖子原顺序）。动图缩略图默认静帧（设置 `animatedThumbnailMode`：`still` / `play`）：`freezeAnimatedThumbnail` 在三条成功路径的非重图分支里，`img.decode()` 后排入空闲队列（`flushStillFrameQueue`），把第一帧画进 `.atp-gif-still` 画布并给 wrapper 加 `atp-gif-frozen`；CSS 用 `!important` 隐藏原 <img>（它带内联 display:block），悬停时换回播放。动图识别只看 URL 路径（`SharedUtils.isAnimatedGifUrl`），重图主机不走此通道。
 - 当前交接：运行时来自 v1.16.8 发布目录，测试和工具来自 v1.16.3 源码快照并继续维护；安装、验证和仓库结构以 README.md 为准。以下基线记录是历史材料，不代表当前发布验证结果。
 - 最新基线补充：v1.16.3 将识别到的 TXT 自动送入独立 FIFO（同时 2 帖），content/background 对单帖附件串行读取，成功后直接显示复制按钮，失败后才显示手动解析/本地导入。文章缓存显式保存 TXT 完成与未解析计数，部分成功不会在返回页面时误判完成；运行令牌隔离本地导入和迟到请求。图片调度与预设、权限、缓存 key/TTL、复制格式不变。
 - 上一基线补充：v1.16.2 根据真实 `thread-3632512` 解析日志修复 Discuz 下载型 TXT。隔离 content fetch 报 `Failed to fetch`、后台代理又被 Cloudflare/SameSite 会话边界拦截时，扩展现在先通过仅允许当前 origin 附件 URL 的 MAIN world 桥读取，限制 512KB/10 秒；仍失败时资源面板可“导入已下载TXT”，复用现有解析器并把结果写回文章和匹配附件缓存。不增加权限，不修改图片调度、缓存 key/TTL 或复制格式。
@@ -255,7 +259,7 @@ v1.14.59 起日志有字节预算：content 单 key 约 160KB、总量约 2MB，
 - 不要用“提高全局并发”解决所有问题。重图慢时，盲目提高全局并发可能让普通图、日志写入、渲染和网络都变差。
 - 不要让重图滚动保护把可见图片长期藏起来。现在采用轻量缩略是为了让用户先看到可辨认内容，再逐步优化速度。
 - 不要把均衡模式和轻量缩略模式混在一起。均衡仍按预算清晰/模糊切换；轻量缩略是生成低细节 canvas 缩略并释放原图 `src`。
-- 不要改 manifest 权限，除非确实需要支持新域名，并且要说明原因。
+- 不要改 manifest 权限，除非确实需要支持新域名，并且要说明原因。1.18.0 起新增论坛镜像不改 Manifest：用户在弹窗授予可选主机权限，后台据此注册内容脚本；主机判断只改 SharedUtils 站点注册表。
 - 不要提交 `.agents/`、`.opencode/`、`.codex/`、`.claude/`、`.env`、日志文件、浏览器配置、密钥、cookie、账号信息或本地数据库；`tools/verify.js` 会检查这些本地工具目录不能出现在 `git ls-files` 中。
 - 不要提交从测试网站导出的诊断日志，日志里可能包含访问 URL 和用户测试路径。
 - 不要强推远端，除非维护者明确要求。

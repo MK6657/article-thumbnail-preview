@@ -100,6 +100,21 @@
       return Math.max(1, Number(ordinaryLimit) || 1) + Math.max(0, Number(heavyLimit) || 0);
     },
 
+    // Offscreen first rows share the ordinary pool with visible images. The
+    // visible reserve must hold inside that pool, not only in the global
+    // total, or offscreen loads can take every ordinary slot (3 of 3 with
+    // defaults). Capped at 3 lanes; at least 1 so offscreen work progresses.
+    getOffscreenFirstRowOrdinaryLimit: function(settings) {
+      var pool = positiveInteger(settings, 'firstScreenConcurrency', 3);
+      var reserve = Math.min(pool - 1, ATPLoadPolicy.getViewportPriorityReservedSlots(settings));
+      return Math.max(1, Math.min(3, pool - Math.max(0, reserve)));
+    },
+
+    // Heavy slots keep one for visible heavy threads the same way.
+    getOffscreenFirstRowHeavyLimit: function(settings) {
+      return Math.max(1, positiveInteger(settings, 'heavyImageConcurrency', 2) - 1);
+    },
+
     getViewportPendingLimit: function(settings, backgroundLimit) {
       var configured = nonNegativeInteger(settings, 'viewportPendingLimit', 0);
       if (configured > 0) return configured;
@@ -191,6 +206,34 @@
       return nonNegativeInteger(settings, 'imageTaskDeadline', 0);
     },
 
+    // 动图（几 MB 起）在限流的单独通道里下载，给更长的单次超时和任务截止，
+    // 免得下载到一大半就被判失败、字节白费。无任务截止时仍不设截止。
+    getLargeImageTimeout: function(settings) {
+      var base = nonNegativeInteger(settings, 'imageTimeout', 15000) || 15000;
+      return Math.max(base * 3, 30000);
+    },
+
+    getLargeImageTaskDeadline: function(settings) {
+      var base = nonNegativeInteger(settings, 'imageTaskDeadline', 0);
+      return base > 0 ? Math.max(base * 3, 45000) : 0;
+    },
+
+    // 同一普通图床同时下载动图的起始宽度；之后按动图实际完成速度自适应放宽或收窄。
+    getLargeImageHostConcurrency: function() {
+      return 2;
+    },
+
+    // 动图在此时间内完成算“快”，动图通道可放宽一条；超过“慢”阈值或超时则减半。
+    getLargeImageFastMs: function(settings) {
+      var base = nonNegativeInteger(settings, 'imageTimeout', 15000) || 15000;
+      return Math.max(2000, Math.min(5000, Math.round(base * 0.4)));
+    },
+
+    getLargeImageSlowMs: function(settings) {
+      var base = nonNegativeInteger(settings, 'imageTimeout', 15000) || 15000;
+      return Math.max(6000, Math.min(15000, base));
+    },
+
     getHeavyDecodedBudgetMP: function(settings) {
       return nonNegativeInteger(settings, 'heavyDecodedBudgetMP', 160);
     },
@@ -235,6 +278,11 @@
         heavyImageTimeout: ATPLoadPolicy.getHeavyImageTimeout(settings),
         heavyFallbackLimit: ATPLoadPolicy.getHeavyFallbackLimit(settings),
         imageTaskDeadline: ATPLoadPolicy.getImageTaskDeadline(settings),
+        largeImageTimeout: ATPLoadPolicy.getLargeImageTimeout(settings),
+        largeImageTaskDeadline: ATPLoadPolicy.getLargeImageTaskDeadline(settings),
+        largeImageHostConcurrency: ATPLoadPolicy.getLargeImageHostConcurrency(settings),
+        largeImageFastMs: ATPLoadPolicy.getLargeImageFastMs(settings),
+        largeImageSlowMs: ATPLoadPolicy.getLargeImageSlowMs(settings),
         heavyDecodedBudgetMP: ATPLoadPolicy.getHeavyDecodedBudgetMP(settings),
         heavyVisibleBudgetMP: ATPLoadPolicy.getHeavyVisibleBudgetMP(settings),
         heavyDecodedImageLimit: ATPLoadPolicy.getHeavyDecodedImageLimit(settings),

@@ -18,9 +18,29 @@ const Logger = (function() {
   var MAX_LOG_KEY_BYTES = (typeof SharedUtils !== 'undefined' && SharedUtils.CONTENT_LOG_KEY_BYTES) || (160 * 1024);
   var FLUSH_INTERVAL = 5000;
   var SESSION_ID = 's_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+  var SESSION_STARTED_AT_MS = Date.now();
   var FIELD_VALUE_LIMIT = 240;
   var DATA_VALUE_LIMIT = 800;
   var MAX_FIELD_KEYS = 80;
+  var UNSERIALIZABLE_FIELD = {};
+  var RETENTION_TYPE = 'log_retention';
+  var RETENTION_RESERVED_BYTES = 12288;
+  var RETENTION_RECENT_INCIDENTS = 6;
+  var retention = {
+    observedEntries: 0,
+    droppedEntries: 0,
+    droppedBatches: 0,
+    firstDroppedAt: '',
+    lastDroppedAt: '',
+    incidentCount: 0,
+    config: null,
+    firstIncident: null,
+    firstImageFailure: null,
+    recentIncidents: [],
+    incidentTypes: {},
+    incidentHosts: {}
+  };
+  var lastClearedAtMs = 0;
   var PRIORITY_FIELD_KEYS = [
     'reason',
     'threadId',
@@ -133,6 +153,12 @@ const Logger = (function() {
   var MAX_FLUSH_QUEUE_BATCHES = 50;
   var retryBatch = null;
   var flushing = false;
+  // Each waiter resolves once every entry logged before its flush request has
+  // been written or dropped, so continuous logging cannot starve it.
+  var flushWaiters = [];
+  var enqueuedLogCount = 0;
+  var settledLogCount = 0;
+  var inFlightLogCount = 0;
   var flushErrorCount = 0;
   var MAX_FLUSH_RETRIES = 3;
   var timezoneNameCache = null;
@@ -298,20 +324,33 @@ const Logger = (function() {
     }
     var seen = {};
     var keys = [];
+    var values = [];
+    // 每个值只读取一次（可能是 getter）；值为 undefined 的键序列化后本就不存在，不占字段上限
+    function collect(key) {
+      var value;
+      try {
+        value = fields[key];
+      } catch (readError) {
+        value = UNSERIALIZABLE_FIELD;
+      }
+      if (value === undefined) return;
+      keys.push(key);
+      values.push(value);
+    }
     for (var p = 0; p < PRIORITY_FIELD_KEYS.length; p++) {
       var priorityKey = PRIORITY_FIELD_KEYS[p];
       if (Object.prototype.hasOwnProperty.call(fields, priorityKey) && !seen[priorityKey]) {
         seen[priorityKey] = true;
-        keys.push(priorityKey);
+        collect(priorityKey);
       }
     }
     try {
       for (var key in fields) {
+        if (keys.length >= MAX_FIELD_KEYS) break;
         if (!Object.prototype.hasOwnProperty.call(fields, key)) continue;
         if (seen[key]) continue;
         seen[key] = true;
-        keys.push(key);
-        if (keys.length >= MAX_FIELD_KEYS) break;
+        collect(key);
       }
     } catch (e) {
       if (seenObjects) seenObjects.delete(fields);
@@ -320,7 +359,9 @@ const Logger = (function() {
     for (var i = 0; i < keys.length; i++) {
       var outputKey = sanitizeLogKey(keys[i], out);
       try {
-        out[outputKey] = normalizeFieldValue(fields[keys[i]], keys[i], seenObjects);
+        out[outputKey] = values[i] === UNSERIALIZABLE_FIELD
+          ? '[Unserializable]'
+          : normalizeFieldValue(values[i], keys[i], seenObjects);
       } catch (e2) {
         out[outputKey] = '[Unserializable]';
       }
@@ -353,6 +394,59 @@ const Logger = (function() {
     return sanitizeLogText(data).substring(0, DATA_VALUE_LIMIT);
   }
 
+  function incrementRetentionCount(counts, value) {
+    var key = String(value || 'unknown').substring(0, 80);
+    if (!Object.prototype.hasOwnProperty.call(counts, key) && Object.keys(counts).length >= 12) key = 'other';
+    counts[key] = (counts[key] || 0) + 1;
+  }
+
+  function compactIncident(entry) {
+    var fields = entry.fields || {};
+    var compact = {
+      at: entry.tsUtc || entry.ts || '',
+      type: entry.type || entry.lv || '',
+      reason: String(fields.reason || entry.msg || '').substring(0, 120),
+      host: String(fields.host || '').substring(0, 120),
+      threadId: String(fields.threadId || '').substring(0, 80),
+      idx: typeof fields.idx === 'number' ? fields.idx : undefined,
+      queueKind: String(fields.queueKind || '').substring(0, 48),
+      ms: typeof fields.ms === 'number' ? fields.ms : undefined
+    };
+    if (isImageFailureEntry(entry) && fields.url) compact.url = sanitizeLogUrl(fields.url);
+    return compact;
+  }
+
+  function isImageFailureEntry(entry) {
+    return !!(entry && (entry.type === 'image_failure' ||
+      (entry.type === 'image_done' && entry.fields && entry.fields.ok === false)));
+  }
+
+  function isIncidentEntry(entry) {
+    return !!(entry && (isImageFailureEntry(entry) || entry.lv === 'WARN' || entry.lv === 'ERROR'));
+  }
+
+  function rememberIncident(entry) {
+    if (!entry || entry.type === RETENTION_TYPE) return;
+    if (entry.type === 'diagnostic_config') {
+      retention.config = entry.fields || null;
+      return;
+    }
+    var imageFailure = isImageFailureEntry(entry);
+    if (!isIncidentEntry(entry)) return;
+    var incident = compactIncident(entry);
+    retention.incidentCount++;
+    if (!retention.firstIncident) retention.firstIncident = incident;
+    if (imageFailure && !retention.firstImageFailure) retention.firstImageFailure = incident;
+    retention.recentIncidents.push(incident);
+    if (retention.recentIncidents.length > RETENTION_RECENT_INCIDENTS) retention.recentIncidents.shift();
+    incrementRetentionCount(retention.incidentTypes, incident.type);
+    if (incident.host) incrementRetentionCount(retention.incidentHosts, incident.host);
+  }
+
+  function markObservedEntry() {
+    retention.observedEntries++;
+  }
+
   function add(level, msg, data, type) {
     if (!isEnabled(level)) return;
     var timestampDate = new Date();
@@ -381,14 +475,18 @@ const Logger = (function() {
         }
         entry.fields = normalizedFields;
       }
-      entry.data = stringifyData(data, normalizedFields);
+      // Structured fields are already sanitized; storing their JSON string a
+      // second time consumes the per-session byte budget without adding facts.
+      if (typeof data !== 'object') entry.data = stringifyData(data);
     }
     buffer.push(entry);
+    enqueuedLogCount++;
+    markObservedEntry();
+    rememberIncident(entry);
 
     var prefix = '[' + source + ':' + level + ']';
-    // entry.data 与控制台串同源（stringifyData / formatConsoleData 实现相同），
-    // 复用已算好的结果，避免同一份 fields 每条日志被 JSON.stringify 两次
-    var consoleData = data === undefined ? '' : entry.data;
+    var consoleData = data === undefined ? '' :
+      (typeof data === 'object' ? stringifyData(data, normalizedFields) : entry.data);
     var consoleLine = prefix + ' ' + safeMsg + (consoleData ? ' ' + consoleData : '');
     if (level === 'ERROR') {
       console.error(consoleLine);
@@ -398,7 +496,7 @@ const Logger = (function() {
       console.log(consoleLine);
     }
 
-    if (buffer.length >= 20 || level === 'WARN' || level === 'ERROR') {
+    if (buffer.length >= 20 || (level === 'WARN' && type !== 'image_failure') || level === 'ERROR') {
       flush();
     }
   }
@@ -526,6 +624,108 @@ const Logger = (function() {
     return trimLogEntriesFrom(entries, Math.max(0, entries.length - maxEntries), maxBytes);
   }
 
+  function resetRetention() {
+    retention.observedEntries = 0;
+    retention.droppedEntries = 0;
+    retention.droppedBatches = 0;
+    retention.firstDroppedAt = '';
+    retention.lastDroppedAt = '';
+    retention.incidentCount = 0;
+    retention.config = null;
+    retention.firstIncident = null;
+    retention.firstImageFailure = null;
+    retention.recentIncidents = [];
+    retention.incidentTypes = {};
+    retention.incidentHosts = {};
+  }
+
+  function makeRetentionEntry() {
+    var date = new Date();
+    return {
+      ts: now(date),
+      tsUtc: date.toISOString(),
+      timezoneOffsetMinutes: getTimezoneOffsetMinutes(date),
+      timezone: getTimezoneName(),
+      lv: 'INFO',
+      src: source,
+      msg: '日志留存状态',
+      type: RETENTION_TYPE,
+      sessionId: SESSION_ID,
+      pageUrl: getPageUrl(),
+      pageHost: getPageHost(),
+      version: getVersion(),
+      fields: {
+        observedEntries: retention.observedEntries,
+        droppedEntries: retention.droppedEntries,
+        droppedBatches: retention.droppedBatches,
+        firstDroppedAt: retention.firstDroppedAt,
+        lastDroppedAt: retention.lastDroppedAt,
+        incidentCount: retention.incidentCount,
+        config: retention.config,
+        firstIncident: retention.firstIncident,
+        firstImageFailure: retention.firstImageFailure,
+        recentIncidents: retention.recentIncidents,
+        incidentTypes: retention.incidentTypes,
+        incidentHosts: retention.incidentHosts
+      }
+    };
+  }
+
+  function fitRetentionEntry(entry) {
+    if (estimateLogEntryBytes(entry) <= RETENTION_RESERVED_BYTES) return entry;
+    entry.fields.recentIncidents = (entry.fields.recentIncidents || []).slice(-3);
+    if (estimateLogEntryBytes(entry) <= RETENTION_RESERVED_BYTES) return entry;
+    entry.fields.incidentHosts = {};
+    entry.fields.incidentTypes = {};
+    if (estimateLogEntryBytes(entry) <= RETENTION_RESERVED_BYTES) return entry;
+    entry.fields.recentIncidents = [];
+    return entry;
+  }
+
+  function refreshRetainedIncidents(ordinary, previousRetention) {
+    var retainedIncidentCount = 0;
+    for (var i = 0; i < ordinary.length; i++) {
+      if (isIncidentEntry(ordinary[i])) retainedIncidentCount++;
+    }
+    var priorCount = previousRetention ? Math.max(0, Number(previousRetention.incidentCount) || 0) : 0;
+    if (priorCount > retainedIncidentCount && retention.observedEntries <=
+        (Number(previousRetention.observedEntries) || 0)) {
+      retention.incidentCount = priorCount;
+      retention.firstIncident = previousRetention.firstIncident || retention.firstIncident;
+      retention.firstImageFailure = previousRetention.firstImageFailure || retention.firstImageFailure;
+      retention.incidentTypes = previousRetention.incidentTypes || retention.incidentTypes;
+      retention.incidentHosts = previousRetention.incidentHosts || retention.incidentHosts;
+    }
+    if (previousRetention && previousRetention.droppedEntries > 0 &&
+        (!retention.firstIncident || !retention.firstImageFailure)) {
+      retention.firstIncident = retention.firstIncident || previousRetention.firstIncident || null;
+      retention.firstImageFailure = retention.firstImageFailure || previousRetention.firstImageFailure || null;
+    }
+    if (previousRetention && Array.isArray(previousRetention.recentIncidents)) {
+      var recent = previousRetention.recentIncidents.slice(-RETENTION_RECENT_INCIDENTS);
+      var latest = retention.recentIncidents.slice(-RETENTION_RECENT_INCIDENTS);
+      for (var ri = 0; ri < ordinary.length; ri++) {
+        if (!isIncidentEntry(ordinary[ri])) continue;
+        recent.push(compactIncident(ordinary[ri]));
+      }
+      for (var li = 0; li < latest.length; li++) {
+        recent.push(latest[li]);
+      }
+      recent.sort(function(a, b) {
+        return String(a.at || '').localeCompare(String(b.at || '')) || (Number(a.idx) || 0) - (Number(b.idx) || 0);
+      });
+      var deduped = [];
+      for (var di = 0; di < recent.length; di++) {
+        var previous = deduped.length ? deduped[deduped.length - 1] : null;
+        var item = recent[di];
+        if (previous && previous.at === item.at && previous.type === item.type &&
+            previous.threadId === item.threadId && previous.idx === item.idx) continue;
+        deduped.push(item);
+      }
+      retention.recentIncidents = deduped.slice(-RETENTION_RECENT_INCIDENTS);
+    }
+  }
+
   // 增量估算裁剪起点：只序列化一次并逐条递减，避免每轮循环整表 JSON.stringify
   function trimLogEntriesFrom(entries, start, maxBytes) {
     start = Math.max(0, Number(start) || 0);
@@ -584,33 +784,62 @@ const Logger = (function() {
     return out;
   }
 
-  function finishLogWrite(success) {
-    if (success) flushErrorCount = 0;
-    flushing = false;
-    if (buffer.length || retryBatch || flushQueue.length) flush();
+  function resolveFlushWaiters(ok, all) {
+    var ready = [];
+    for (var i = flushWaiters.length - 1; i >= 0; i--) {
+      if (all || flushWaiters[i].target <= settledLogCount) ready.unshift(flushWaiters.splice(i, 1)[0]);
+    }
+    for (var ri = 0; ri < ready.length; ri++) ready[ri].callback(!!ok);
   }
+
+  function finishLogWrite(success) {
+    if (success) {
+      flushErrorCount = 0;
+      settledLogCount += inFlightLogCount;
+    }
+    inFlightLogCount = 0;
+    flushing = false;
+    if (success) resolveFlushWaiters(true, false);
+    if (buffer.length || retryBatch || flushQueue.length) {
+      flush();
+      return;
+    }
+    resolveFlushWaiters(success, true);
+  }
+
 
   function planLogKeyPrune(keys, items, forceDropOldest) {
     keys = collectSortedContentLogKeys(keys);
     var stale = [];
     var kept = [];
-    var totalBytes = 0;
+    // The live session's shard is never pruned by its own writer: with 20+
+    // newer tabs it ranked past MAX_LOG_KEYS and was deleted right after each
+    // write. It takes its slot and bytes first, then the newest others fill in.
+    var ownShard = keys.indexOf(LOG_KEY) !== -1;
+    var keptCount = ownShard ? 1 : 0;
+    var totalBytes = ownShard ? estimateLogBytes(items && items[LOG_KEY]) : 0;
     for (var i = 0; i < keys.length; i++) {
       var key = keys[i];
-      if (i >= MAX_LOG_KEYS) {
-        stale.push(key);
+      if (key === LOG_KEY) {
+        kept.push(key);
         continue;
       }
-      var bytes = estimateLogBytes(items && items[key]);
-      if (key === LOG_KEY || totalBytes + bytes <= MAX_LOG_TOTAL_BYTES) {
+      var bytes = keptCount < MAX_LOG_KEYS ? estimateLogBytes(items && items[key]) : 0;
+      if (keptCount < MAX_LOG_KEYS && totalBytes + bytes <= MAX_LOG_TOTAL_BYTES) {
         kept.push(key);
+        keptCount++;
         totalBytes += bytes;
       } else {
         stale.push(key);
       }
     }
-    if (forceDropOldest && !stale.length && kept.length > 1) {
-      stale.push(kept.pop());
+    if (forceDropOldest && !stale.length) {
+      for (var k = kept.length - 1; k >= 0; k--) {
+        if (kept[k] !== LOG_KEY) {
+          stale.push(kept.splice(k, 1)[0]);
+          break;
+        }
+      }
     }
     return { kept: kept, stale: stale };
   }
@@ -737,7 +966,52 @@ const Logger = (function() {
       }
       var clearedAtMs = getLogClearedAtMs(clearResult && clearResult[LOG_CLEARED_AT_KEY]);
       var filteredBatch = filterLogsAfterClearedAt(batch, clearedAtMs);
-      merged = trimLogEntries(filterLogsAfterClearedAt(merged, clearedAtMs), MAX_ENTRIES, MAX_LOG_KEY_BYTES);
+      var filtered = filterLogsAfterClearedAt(merged, clearedAtMs);
+      var previousRetention = null;
+      var ordinary = [];
+      for (var fi = 0; fi < filtered.length; fi++) {
+        if (!filtered[fi]) continue;
+        if (filtered[fi].type === RETENTION_TYPE) previousRetention = filtered[fi].fields || null;
+        else ordinary.push(filtered[fi]);
+      }
+      if (clearedAtMs > lastClearedAtMs) {
+        // Only a clear made while this page was open resets the session
+        // counters; an older marker merely filters entries logged before it.
+        var clearedDuringSession = clearedAtMs >= SESSION_STARTED_AT_MS;
+        lastClearedAtMs = clearedAtMs;
+        if (clearedDuringSession) {
+          resetRetention();
+          retention.observedEntries = ordinary.length;
+          for (var ci = 0; ci < ordinary.length; ci++) rememberIncident(ordinary[ci]);
+        }
+      } else if (previousRetention && previousRetention.droppedEntries > retention.droppedEntries) {
+        retention.droppedEntries = previousRetention.droppedEntries;
+        retention.droppedBatches = previousRetention.droppedBatches || retention.droppedBatches;
+        retention.firstDroppedAt = previousRetention.firstDroppedAt || '';
+        retention.lastDroppedAt = previousRetention.lastDroppedAt || '';
+        if (retention.observedEntries <= (Number(previousRetention.observedEntries) || 0)) {
+          retention.observedEntries = Number(previousRetention.observedEntries) || 0;
+          retention.incidentCount = previousRetention.incidentCount || retention.incidentCount;
+          retention.incidentTypes = previousRetention.incidentTypes || retention.incidentTypes;
+          retention.incidentHosts = previousRetention.incidentHosts || retention.incidentHosts;
+        }
+        retention.firstIncident = previousRetention.firstIncident || retention.firstIncident;
+        retention.firstImageFailure = previousRetention.firstImageFailure || retention.firstImageFailure;
+      }
+      if (previousRetention && !retention.config) retention.config = previousRetention.config || null;
+      refreshRetainedIncidents(ordinary, previousRetention);
+      var retained = trimLogEntries(ordinary, MAX_ENTRIES - 1, MAX_LOG_KEY_BYTES - RETENTION_RESERVED_BYTES);
+      // Count actual trims: entries still buffered while this write runs are
+      // not dropped and must not inflate the "已裁剪" summary.
+      var droppedNow = ordinary.length - retained.length;
+      retention.droppedEntries += droppedNow;
+      if (droppedNow > 0) {
+        if (!retention.firstDroppedAt) {
+          retention.firstDroppedAt = ordinary[0].tsUtc || ordinary[0].ts || '';
+        }
+        retention.lastDroppedAt = ordinary[droppedNow - 1].tsUtc || ordinary[droppedNow - 1].ts || '';
+      }
+      merged = ordinary.length ? [fitRetentionEntry(makeRetentionEntry())].concat(retained) : [];
       if (!merged.length) {
         chrome.storage.local.remove(LOG_KEY, function() {
           if (chrome.runtime.lastError) {
@@ -754,11 +1028,19 @@ const Logger = (function() {
           console.warn('[Logger] storage写入失败:', chrome.runtime.lastError.message);
           if (!retried) {
             pruneStoredContentLogs(true, function() {
-              var retryMerged = trimLogEntriesFrom(merged, Math.ceil(merged.length / 2), MAX_LOG_KEY_BYTES);
-              writeMergedLogs(retryMerged, filteredBatch, true);
+              var retryStart = Math.max(1, Math.ceil(merged.length / 2));
+              if (retryStart > 1) {
+                // merged[0] is the retention entry; the halving drops the rest.
+                retention.droppedEntries += retryStart - 1;
+                if (!retention.firstDroppedAt) retention.firstDroppedAt = merged[1].tsUtc || merged[1].ts || '';
+                retention.lastDroppedAt = merged[retryStart - 1].tsUtc || merged[retryStart - 1].ts || '';
+              }
+              var retryMerged = trimLogEntriesFrom(merged, retryStart, MAX_LOG_KEY_BYTES - RETENTION_RESERVED_BYTES);
+              writeMergedLogs([fitRetentionEntry(makeRetentionEntry())].concat(retryMerged), filteredBatch, true);
             });
             return;
           }
+          settledLogCount += batch.length - filteredBatch.length;
           requeueBatch(filteredBatch, chrome.runtime.lastError.message);
         } else {
           rememberLogKey();
@@ -773,7 +1055,13 @@ const Logger = (function() {
     flushErrorCount++;
     if (flushErrorCount > MAX_FLUSH_RETRIES) {
       console.warn('[Logger] storage连续失败，丢弃日志批次:', reason || '');
+      retention.droppedBatches++;
+      retention.droppedEntries += batch.length;
+      if (!retention.firstDroppedAt && batch[0]) retention.firstDroppedAt = batch[0].tsUtc || batch[0].ts || '';
+      if (batch.length) retention.lastDroppedAt = batch[batch.length - 1].tsUtc || batch[batch.length - 1].ts || '';
       flushErrorCount = 0;
+      settledLogCount += batch.length;
+      resolveFlushWaiters(false, true);
       return;
     }
     retryBatch = batch;
@@ -797,14 +1085,27 @@ const Logger = (function() {
     return batch;
   }
 
-  function flush() {
+  function flush(callback) {
+    if (typeof callback === 'function') flushWaiters.push({ target: enqueuedLogCount, callback: callback });
     if (buffer.length) {
       flushQueue.push(buffer.splice(0, buffer.length));
       // 防止 flushing 卡死或存储长期不可用时积压无上界：超限丢最旧批次
-      while (flushQueue.length > MAX_FLUSH_QUEUE_BATCHES) flushQueue.shift();
+      while (flushQueue.length > MAX_FLUSH_QUEUE_BATCHES) {
+        var droppedBatch = flushQueue.shift();
+        settledLogCount += droppedBatch.length;
+        retention.droppedBatches++;
+        retention.droppedEntries += droppedBatch.length;
+        if (!retention.firstDroppedAt && droppedBatch[0]) retention.firstDroppedAt = droppedBatch[0].tsUtc || droppedBatch[0].ts || '';
+        if (droppedBatch.length) retention.lastDroppedAt = droppedBatch[droppedBatch.length - 1].tsUtc || droppedBatch[droppedBatch.length - 1].ts || '';
+      }
     }
-    if (flushing || (!retryBatch && flushQueue.length === 0)) return;
+    if (flushing) return;
+    if (!retryBatch && flushQueue.length === 0) {
+      resolveFlushWaiters(true, true);
+      return;
+    }
     var batch = drainFlushQueue();
+    inFlightLogCount = batch.length;
     flushing = true;
 
     if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
@@ -813,6 +1114,7 @@ const Logger = (function() {
           if (chrome.runtime.lastError) {
             console.warn('[Logger] storage读取失败:', chrome.runtime.lastError.message);
             requeueBatch(batch, chrome.runtime.lastError.message);
+            inFlightLogCount = 0;
             flushing = false;
             if (buffer.length || retryBatch || flushQueue.length) flush();
             return;
@@ -824,10 +1126,12 @@ const Logger = (function() {
         // 扩展上下文失效（重载/更新后的孤儿内容脚本）时同步抛错：必须复位 flushing 并吞掉异常
         console.warn('[Logger] storage访问异常:', e && e.message ? e.message : String(e));
         requeueBatch(batch, e && e.message);
+        inFlightLogCount = 0;
         flushing = false;
       }
     } else {
       requeueBatch(batch, 'storage不可用');
+      inFlightLogCount = 0;
       flushing = false;
     }
   }
@@ -862,6 +1166,13 @@ const Logger = (function() {
 
   window.addEventListener('pagehide', handlePageHide);
   document.addEventListener('visibilitychange', handleVisibilityFlush);
+  if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage && chrome.runtime.onMessage.addListener) {
+    chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
+      if (!message || message.type !== 'ATP_FLUSH_CONTENT_LOGS') return false;
+      flush(function(ok) { sendResponse({ ok: ok === true, sessionId: SESSION_ID, logKey: LOG_KEY }); });
+      return true;
+    });
+  }
 
   return {
     init: init,

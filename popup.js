@@ -4,7 +4,7 @@
   var els = {};
   (function() {
     var ids = ['toggleEnabled','settingsContainer',
-      'clearImageCache','clearFailCache','clearAllCache','clearTestCache','resetSettings',
+      'clearImageCache','clearFailCache','clearAllCache','clearTestCache','resetSettings','resetForumPacer','forumPacerInfo',
       'toggleLogs','logPanel','logViewer','logCount','logFilter','logSearch','exportLogs','clearLogs',
       'currentSite','firstScreenInfo','popupStatus','toggleHelp','helpPanel'];
     for (var i = 0; i < ids.length; i++) { els[ids[i]] = document.getElementById(ids[i]); }
@@ -15,6 +15,7 @@
   var LOG_KEY_PREFIXES = ['atp_logs_content_'];
   var LOG_KEY_INDEX = (typeof SharedUtils !== 'undefined' && SharedUtils.CONTENT_LOG_INDEX_KEY) || 'atp_logs_content_keys';
   var LOG_CLEARED_AT_KEY = 'atp_logs_cleared_at';
+  var LOG_RETENTION_TYPE = 'log_retention';
   var CACHE_GENERATION_KEY = (typeof SharedUtils !== 'undefined' && SharedUtils.CACHE_GENERATION_KEY) || 'atp_cache_generation_v1';
   var MAX_CONTENT_LOG_KEYS = (typeof SharedUtils !== 'undefined' && SharedUtils.MAX_CONTENT_LOG_KEYS) || 20;
   var LOG_VIEW_LIMIT = 1000;
@@ -34,7 +35,7 @@
   var settingsLoadFailed = false;
   var DESTRUCTIVE_CONFIRM_MS = 3000;
   var pendingDestructiveButton = null;
-  var CACHE_PREFIXES = (typeof SharedUtils !== 'undefined' && SharedUtils.CACHE_PREFIXES) || { IMAGE: 'thumb_cache_v2_', ARTICLE: 'article_cache_v9_', TEXT_RESOURCE: 'txt_resource_cache_v2_', TEXT_FAIL: 'atp_text_fail_v1_', NEGATIVE: 'atp_empty_v8_', IMAGE_BASE: 'thumb_cache_', ARTICLE_BASE: 'article_cache_', TEXT_RESOURCE_BASE: 'txt_resource_cache_', TEXT_FAIL_BASE: 'atp_text_fail_', NEGATIVE_BASE: 'atp_empty_' };
+  var CACHE_PREFIXES = (typeof SharedUtils !== 'undefined' && SharedUtils.CACHE_PREFIXES) || { IMAGE: 'thumb_cache_v2_', ARTICLE: 'article_cache_v11_', TEXT_RESOURCE: 'txt_resource_cache_v2_', TEXT_FAIL: 'atp_text_fail_v1_', NEGATIVE: 'atp_empty_v9_', IMAGE_BASE: 'thumb_cache_', ARTICLE_BASE: 'article_cache_', TEXT_RESOURCE_BASE: 'txt_resource_cache_', TEXT_FAIL_BASE: 'atp_text_fail_', NEGATIVE_BASE: 'atp_empty_' };
   var HEAVY_ORIGINAL_PRESET = ATPGetSettingsPreset('heavyOriginal', SETTINGS_SCHEMA);
 
   var settings = null;
@@ -486,7 +487,9 @@
     return isNaN(ts) ? 0 : ts;
   }
 
-  function getPrunableContentLogKeys(keys) {
+  // protectedKeys: live shards (the tab just flushed for export) that must
+  // survive even when 20+ newer page sessions outrank them.
+  function getPrunableContentLogKeys(keys, protectedKeys) {
     var newest = [];
     var contentCount = 0;
     keys = keys || [];
@@ -499,6 +502,7 @@
     if (contentCount <= MAX_CONTENT_LOG_KEYS) return [];
     var keepMap = {};
     for (var ki = 0; ki < newest.length; ki++) keepMap[newest[ki]] = true;
+    for (var pk = 0; protectedKeys && pk < protectedKeys.length; pk++) keepMap[protectedKeys[pk]] = true;
     var stale = [];
     for (var si = 0; si < keys.length; si++) {
       var staleKey = keys[si];
@@ -805,8 +809,8 @@
     return keys;
   }
 
-  async function pruneContentLogKeys(logKeys) {
-    var stale = getPrunableContentLogKeys(logKeys);
+  async function pruneContentLogKeys(logKeys, protectedKeys) {
+    var stale = getPrunableContentLogKeys(logKeys, protectedKeys);
     if (!stale.length) return stale;
     try {
       await storageRemove(stale, '裁剪旧日志');
@@ -1108,10 +1112,25 @@
     try {
       var parsed = new URL(url || '');
       if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
-      return parsed.hostname.replace(/^www\./, '');
+      return parsed.hostname.replace(/\.$/, '').replace(/^www\./, '');
     } catch (e) {
       return '';
     }
+  }
+
+  // activeTab exposes every active tab's URL, so the per-site toggle is only
+  // offered where the content scripts actually run (built-in or approved).
+  function getSupportedTabHostname(url) {
+    var host = getTabHostname(url);
+    return host && SharedUtils.isSupportedForumHost(host) ? host : '';
+  }
+
+  async function waitForMirrorSites() {
+    var mirrors = window.ATPPopupMirrors;
+    if (!mirrors || !mirrors.ready || typeof mirrors.ready.then !== 'function') return;
+    try {
+      await mirrors.ready;
+    } catch (e) {}
   }
 
   function setDisableSiteHost(hostname) {
@@ -1216,6 +1235,7 @@
     updateDependentControls();
 
     clearPopupStatusIfText('正在读取设置...');
+    await waitForMirrorSites();
     if (!chrome.tabs || typeof chrome.tabs.query !== 'function') {
       setDisableSiteHost('');
       setPopupStatus('读取当前标签页失败：tabs.query 不可用', 'warn', true);
@@ -1228,7 +1248,7 @@
           setPopupStatus('读取当前标签页失败：' + errorMessage(chrome.runtime.lastError), 'warn', true);
           return;
         }
-        setDisableSiteHost(tabs[0] ? getTabHostname(tabs[0].url) : '');
+        setDisableSiteHost(tabs[0] ? getSupportedTabHostname(tabs[0].url) : '');
       });
     } catch (e) {
       setDisableSiteHost('');
@@ -1553,7 +1573,7 @@
 
   function isImageLog(e) {
     var type = getLogType(e);
-    if (/^(content_start|image_|render_|diagnostic_summary|schedule_state|thread_registered|scan_complete|fallback_)/.test(type)) return true;
+    if (/^(content_start|image_|render_|diagnostic_summary|schedule_state|thread_registered|scan_complete|fallback_|log_retention)/.test(type)) return true;
     return /High fanout|Image candidate fallback|图片无Referer|首屏完成|重图/.test(String((e && e.msg) || '') + ' ' + getLogDataText(e));
   }
 
@@ -1676,7 +1696,7 @@
     options = options || {};
     var logKeys = await getLogKeysForRead(!!options.allowDiscovery);
     if (options.prune) {
-      var staleLogKeys = await pruneContentLogKeys(logKeys);
+      var staleLogKeys = await pruneContentLogKeys(logKeys, options.protectedLogKeys);
       if (staleLogKeys.length) {
         var prunedLogKeyMap = {};
         for (var pi = 0; pi < staleLogKeys.length; pi++) prunedLogKeyMap[staleLogKeys[pi]] = true;
@@ -1700,13 +1720,30 @@
       }
     }
     logs = filterLogsAfterClearedAt(logs, clearedAtMs);
+    var retentionEntries = [];
+    for (var re = 0; re < logs.length; re++) {
+      if (logs[re].type === LOG_RETENTION_TYPE) retentionEntries.push(logs[re]);
+    }
     logs.sort(function(a, b) {
       var at = getLogSortTimestamp(a);
       var bt = getLogSortTimestamp(b);
       if (at !== bt) return at - bt;
       return String(a.ts || '').localeCompare(String(b.ts || ''));
     });
-    if (logs.length > LOG_VIEW_LIMIT) logs.splice(0, logs.length - LOG_VIEW_LIMIT);
+    if (logs.length > LOG_VIEW_LIMIT) {
+      logs.splice(0, logs.length - LOG_VIEW_LIMIT);
+      var retainedSessions = {};
+      for (var li = 0; li < logs.length; li++) {
+        if (logs[li].sessionId) retainedSessions[logs[li].sessionId] = true;
+      }
+      for (var ri = 0; ri < retentionEntries.length; ri++) {
+        var retentionEntry = retentionEntries[ri];
+        if (!retainedSessions[retentionEntry.sessionId] || logs.indexOf(retentionEntry) !== -1) continue;
+        logs.splice(0, 1);
+        logs.push(retentionEntry);
+      }
+      logs.sort(function(a, b) { return getLogSortTimestamp(a) - getLogSortTimestamp(b); });
+    }
     return logs;
   }
 
@@ -1760,12 +1797,25 @@
     var typeSummary = formatLogSummaryCounts(stats.types, 12) || '-';
     var hostSummary = formatLogSummaryCounts(stats.hosts, 12) || '-';
     var levelSummary = formatLogSummaryCounts(stats.levels, 6) || '-';
+    var retentionLines = [];
+    var seenSessions = {};
+    for (var ri = 0; ri < logs.length; ri++) {
+      var entry = logs[ri];
+      if (!entry || entry.type !== LOG_RETENTION_TYPE) continue;
+      var fields = getLogFields(entry);
+      var session = sanitizeLogExportLabel(entry.sessionId || '-');
+      if (seenSessions[session]) continue;
+      seenSessions[session] = true;
+      retentionLines.push('会话 ' + session + ': 已裁剪' + (Number(fields.droppedEntries) || 0) +
+        '条，异常累计' + (Number(fields.incidentCount) || 0) +
+        (fields.firstDroppedAt ? '，最早裁剪于' + sanitizeLogExportLabel(fields.firstDroppedAt) : ''));
+    }
     return [
       '最近会话: ' + latestSessionId,
       '级别统计: ' + levelSummary,
       '事件统计: ' + typeSummary,
       'Host统计: ' + hostSummary
-    ].join('\n');
+    ].concat(retentionLines).join('\n');
   }
 
   function formatLogLine(e) {
@@ -1801,11 +1851,166 @@
     return parts.join('');
   }
 
+  // Forum pacing: every forum page reports its pace to extension storage and
+  // follows the reset marker the popup writes there, so both work on any page
+  // and for every forum domain at once.
+  var FORUM_PACER_RESET_KEY = 'atp_forum_pacer_reset_at';
+  var FORUM_PACER_STATUS_KEY = 'atp_forum_pacer_status_v1';
+  var FORUM_PACER_NORMAL_BURST = 10;
+  var FORUM_PACER_NORMAL_REFILL_MS = 2000;
+  // The pacer's own lifetimes, for entries written without them.
+  var FORUM_PACER_LIMIT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+  var FORUM_PACER_IDLE_MAX_AGE_MS = 5 * 60 * 1000;
+
+  // The pace a host is at now, from what its pages last reported: the
+  // learned pace lapses after a day, and a host nobody has used for a while
+  // is back at its learned pace with no pause, as the pacer itself decides.
+  function getForumPaceNow(entry, now) {
+    if (!entry || typeof entry !== 'object') return null;
+    var at = Number(entry.at) || 0;
+    var pauseUntil = Number(entry.pauseUntil) || 0;
+    var limitsUntil = Number(entry.limitsUntil) || (at ? at + FORUM_PACER_LIMIT_MAX_AGE_MS : 0);
+    var idleUntil = Number(entry.idleUntil) || (Math.max(at, pauseUntil) + FORUM_PACER_IDLE_MAX_AGE_MS);
+    var learnedBurst = Number(entry.learnedBurst) || FORUM_PACER_NORMAL_BURST;
+    var learnedRefillMs = Number(entry.learnedRefillMs) || FORUM_PACER_NORMAL_REFILL_MS;
+    if (limitsUntil && now >= limitsUntil) {
+      learnedBurst = FORUM_PACER_NORMAL_BURST;
+      learnedRefillMs = FORUM_PACER_NORMAL_REFILL_MS;
+    }
+    if (now >= idleUntil) return { burst: learnedBurst, refillMs: learnedRefillMs, level: 0, pauseUntil: 0 };
+    return {
+      burst: Number(entry.burst) || learnedBurst,
+      refillMs: Number(entry.refillMs) || learnedRefillMs,
+      level: Number(entry.level) || 0,
+      pauseUntil: pauseUntil
+    };
+  }
+
+  function isForumPaceSlowed(pace, now) {
+    return !!pace && (
+      pace.burst < FORUM_PACER_NORMAL_BURST ||
+      pace.refillMs > FORUM_PACER_NORMAL_REFILL_MS ||
+      pace.level > 0 ||
+      pace.pauseUntil > now
+    );
+  }
+
+  function describeForumPacerStatus(all) {
+    var hosts = all && typeof all === 'object' ? Object.keys(all) : [];
+    if (!hosts.length) return '尚无论坛节流记录；打开论坛页面后会显示当前速度。';
+    var now = Date.now();
+    var slowed = [];
+    for (var i = 0; i < hosts.length; i++) {
+      var pace = getForumPaceNow(all[hosts[i]], now);
+      if (!isForumPaceSlowed(pace, now)) continue;
+      var text = hosts[i] + '：突发 ' + pace.burst + '，之后每 ' + (Math.round(pace.refillMs / 100) / 10) + ' 秒 1 个';
+      if (pace.pauseUntil > now) text += '，暂停中（约 ' + Math.ceil((pace.pauseUntil - now) / 1000) + ' 秒）';
+      else if (pace.level > 0) text += '，限流后单路探测中';
+      slowed.push(text);
+    }
+    if (!slowed.length) return '论坛节流：正常速度（突发 10，之后每 2 秒 1 个）。';
+    return '论坛节流已放慢（此前触发过论坛验证页，自动放慢并保持 24 小时）：' + slowed.join('；') + '。可立即重置。';
+  }
+
+  function refreshForumPacerInfo() {
+    if (!els.forumPacerInfo || !chrome.storage || !chrome.storage.local) return Promise.resolve(null);
+    return new Promise(function(resolve) {
+      try {
+        chrome.storage.local.get(FORUM_PACER_STATUS_KEY, function(result) {
+          var all = result && result[FORUM_PACER_STATUS_KEY];
+          els.forumPacerInfo.textContent = describeForumPacerStatus(all);
+          resolve(all || null);
+        });
+      } catch (e) { resolve(null); }
+    });
+  }
+
+  // Every forum page applies the marker (open pages at once, others when
+  // they next load); the recorded statuses are set to the normal pace now so
+  // the popup does not keep showing hosts that are not open.
+  async function resetForumPacing() {
+    var now = Date.now();
+    var items = {};
+    items[FORUM_PACER_RESET_KEY] = now;
+    var all = await new Promise(function(resolve) {
+      try {
+        chrome.storage.local.get(FORUM_PACER_STATUS_KEY, function(result) { resolve(result && result[FORUM_PACER_STATUS_KEY]); });
+      } catch (e) { resolve(null); }
+    });
+    if (all && typeof all === 'object') {
+      Object.keys(all).forEach(function(host) {
+        all[host] = {
+          burst: FORUM_PACER_NORMAL_BURST,
+          refillMs: FORUM_PACER_NORMAL_REFILL_MS,
+          learnedBurst: FORUM_PACER_NORMAL_BURST,
+          learnedRefillMs: FORUM_PACER_NORMAL_REFILL_MS,
+          level: 0,
+          pauseUntil: 0,
+          limitsUntil: 0,
+          idleUntil: now + FORUM_PACER_IDLE_MAX_AGE_MS,
+          at: now
+        };
+      });
+      items[FORUM_PACER_STATUS_KEY] = all;
+    }
+    await chrome.storage.local.set(items);
+    if (els.forumPacerInfo) els.forumPacerInfo.textContent = describeForumPacerStatus(all);
+    return true;
+  }
+
+  if (els.resetForumPacer) {
+    els.resetForumPacer.addEventListener('click', function() {
+      runButtonAction(els.resetForumPacer, '重置中...', '已重置（所有论坛域名）', '立即重置论坛节流', resetForumPacing);
+    });
+  }
+  if (chrome.storage && chrome.storage.onChanged && chrome.storage.onChanged.addListener) {
+    chrome.storage.onChanged.addListener(function(changes, areaName) {
+      if (areaName === 'local' && changes && changes[FORUM_PACER_STATUS_KEY] && els.forumPacerInfo) {
+        els.forumPacerInfo.textContent = describeForumPacerStatus(changes[FORUM_PACER_STATUS_KEY].newValue);
+      }
+    });
+  }
+  refreshForumPacerInfo();
+
+  // liveSession (optional) receives the flushed tab's log key so export
+  // pruning keeps that shard.
+  async function flushLiveContentLogsBeforeExport(liveSession) {
+    return new Promise(function(resolve) {
+      if (!chrome.tabs || !chrome.tabs.query || !chrome.tabs.sendMessage) { resolve(false); return; }
+      var done = false;
+      var timer = setTimeout(function() { finish(false); }, 1500);
+      function finish(ok) {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(ok === true);
+      }
+      try {
+        chrome.tabs.query({ active: true, currentWindow: true }, function(tabs) {
+          if (chrome.runtime.lastError || !tabs || !tabs[0] || typeof tabs[0].id !== 'number') { finish(false); return; }
+          try {
+            chrome.tabs.sendMessage(tabs[0].id, { type: 'ATP_FLUSH_CONTENT_LOGS' }, function(response) {
+              var ok = !chrome.runtime.lastError && response && response.ok === true;
+              if (ok && liveSession && typeof response.logKey === 'string') liveSession.logKey = response.logKey;
+              finish(ok);
+            });
+          } catch (e) { finish(false); }
+        });
+      } catch (e) { finish(false); }
+    });
+  }
+
   els.exportLogs.addEventListener('click', function() {
     runButtonAction(els.exportLogs, '导出中...', function(result) {
       return result === 'empty' ? '无日志' : '已导出!';
     }, '导出日志', async function() {
-      var logs = await loadLogEntries({ allowDiscovery: true, prune: true });
+      var liveSession = {};
+      var refreshed = await flushLiveContentLogsBeforeExport(liveSession);
+      var logs = await loadLogEntries({
+        allowDiscovery: true,
+        prune: true,
+        protectedLogKeys: liveSession.logKey ? [liveSession.logKey] : []
+      });
       if (els.logPanel && !els.logPanel.classList.contains('hidden')) {
         loadedLogEntries = logs;
         renderLoadedLogs(loadedLogEntries);
@@ -1818,6 +2023,8 @@
       var exportOffsetMinutes = -exportDate.getTimezoneOffset();
       var exportTimezone = getTimezoneName();
       var text = buildLogExportText(logs, version, exportDate, exportOffsetMinutes, exportTimezone);
+      if (!refreshed) text = text.replace('================================\n\n',
+        '实时刷新: 未收到当前页面确认，最后几秒日志可能尚未写入\n================================\n\n');
       var blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
       var url = URL.createObjectURL(blob);
       var a = document.createElement('a');
@@ -2053,6 +2260,7 @@
       discoverLogKeysFromStorage: discoverLogKeysFromStorage,
       refreshLogCount: refreshLogCount,
       loadLogEntries: loadLogEntries,
+      flushLiveContentLogsBeforeExport: flushLiveContentLogsBeforeExport,
       loadLogs: loadLogs,
       scheduleLogReload: scheduleLogReload,
       renderLoadedLogs: renderLoadedLogs,
