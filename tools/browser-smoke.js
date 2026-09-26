@@ -14,6 +14,10 @@ const EXPECTED_VERSION = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, 'man
 const SMOKE_HOST = 'smoke.sehuatang.org';
 const CROSS_HOST = 'other.sehuatang.org';
 const HEAVY_HOST = 'image.imx.to';
+const HOT_IMAGE_HOST = 'hot.sehuatang.org';
+const MIRROR_ROOT = 'smoke-mirror.test';
+const MIRROR_HOST = 'www.' + MIRROR_ROOT;
+const MIRROR_PATTERN = 'https://*.' + MIRROR_ROOT + '/*';
 const CERT_PASSWORD = 'atp-browser-smoke';
 const DEVTOOLS_TIMEOUT_MS = 15000;
 const PAGE_TIMEOUT_MS = 30000;
@@ -90,6 +94,7 @@ function createCertificate(pfxPath) {
     '$san = [System.Security.Cryptography.X509Certificates.SubjectAlternativeNameBuilder]::new()',
     "$san.AddDnsName('smoke.sehuatang.org')",
     "$san.AddDnsName('other.sehuatang.org')",
+    "$san.AddDnsName('hot.sehuatang.org')",
     "$san.AddDnsName('image.imx.to')",
     '$request.CertificateExtensions.Add($san.Build())',
     '$request.CertificateExtensions.Add([System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new($false, $false, 0, $false))',
@@ -124,6 +129,19 @@ function forumPage(port, mode) {
   var rows;
   if (mode === 'heavy') {
     rows = '<tbody id="normalthread_300"><tr><th><a class="xst" href="https://' + SMOKE_HOST + ':' + port + '/thread-300-1-1.html">Heavy gallery</a></th></tr></tbody>';
+  } else if (mode === 'offscreen') {
+    return htmlPage('<div id="threadlist" class="threadlist"><table id="threadlisttable">' +
+      '<tbody id="normalthread_400"><tr><th><a class="xst" href="https://' + SMOKE_HOST + ':' + port + '/thread-400-1-1.html">Near gallery</a></th></tr></tbody></table>' +
+      '<div style="height:5000px"></div><table>' +
+      '<tbody id="normalthread_401"><tr><th><a class="xst" href="https://' + SMOKE_HOST + ':' + port + '/thread-401-1-1.html">Far gallery</a></th></tr></tbody></table></div>',
+      'ATP offscreen forum');
+  } else if (mode === 'host-limit') {
+    rows = '<tbody id="normalthread_402"><tr><th><a class="xst" href="https://' + SMOKE_HOST + ':' + port + '/thread-402-1-1.html">Host limit gallery</a></th></tr></tbody>';
+  } else if (mode === 'mirror') {
+    // One thread on the mirror itself and one on the built-in forum; a mirror
+    // page must never have the built-in thread fetched with that session.
+    rows = '<tbody id="normalthread_600"><tr><th><a class="xst" href="https://' + MIRROR_HOST + ':' + port + '/thread-600-1-1.html">Mirror gallery</a></th></tr></tbody>' +
+      '<tbody id="normalthread_500"><tr><th><a class="xst" href="https://' + SMOKE_HOST + ':' + port + '/thread-500-1-1.html">Built-in gallery</a></th></tr></tbody>';
   } else {
     var listing = fs.readFileSync(path.join(PROJECT_ROOT, 'tests/fixtures/pages/listing.html'), 'utf8')
       .replaceAll('{{ORIGIN}}', 'https://' + SMOKE_HOST + ':' + port)
@@ -164,16 +182,29 @@ function heavyThread(port) {
   return htmlPage('<h1>Heavy gallery</h1>' + imageMarkup(HEAVY_HOST, port, 'heavy', 20), 'Heavy thread');
 }
 
+function mirrorThread(port) {
+  return htmlPage(
+    '<h1>Mirror gallery</h1>' + imageMarkup(MIRROR_HOST, port, 'mirror', 6) +
+    '<p><a href="https://' + MIRROR_HOST + ':' + port + '/forum.php?mod=attachment&aid=789">mirror-resources.txt</a></p>',
+    'Mirror thread'
+  );
+}
+
 function createFixtureServer(pfxPath) {
   var pixel = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
   var metrics = {
     requestCount: 0,
+    requestPaths: [],
     requestsByHost: {},
     requestsByPath: {},
     activeOrdinaryImages: 0,
+    activeHostLimitImages: 0,
+    activeFarImages: 0,
     activeHeavyImages: 0,
     activeImages: 0,
     maxOrdinaryImages: 0,
+    maxHostLimitImages: 0,
+    maxFarImages: 0,
     maxHeavyImages: 0,
     maxCombinedImages: 0
   };
@@ -182,6 +213,7 @@ function createFixtureServer(pfxPath) {
     var requestUrl = new URL(req.url, 'https://' + (req.headers.host || SMOKE_HOST));
     var pathname = requestUrl.pathname;
     metrics.requestCount++;
+    metrics.requestPaths.push(pathname);
     metrics.requestsByHost[host] = (metrics.requestsByHost[host] || 0) + 1;
     metrics.requestsByPath[pathname] = (metrics.requestsByPath[pathname] || 0) + 1;
 
@@ -192,7 +224,8 @@ function createFixtureServer(pfxPath) {
     }
 
     if (pathname === '/bridge-redirect.txt') {
-      var redirectHost = requestUrl.searchParams.get('target') === 'cross' ? CROSS_HOST : SMOKE_HOST;
+      var redirectTarget = requestUrl.searchParams.get('target');
+      var redirectHost = redirectTarget === 'cross' ? CROSS_HOST : (redirectTarget === 'self' ? host : SMOKE_HOST);
       res.writeHead(302, { location: 'https://' + redirectHost + ':' + server.address().port + '/bridge-target.txt' });
       res.end();
       return;
@@ -233,6 +266,27 @@ function createFixtureServer(pfxPath) {
       res.end(heavyThread(server.address().port));
       return;
     }
+    if (pathname === '/thread-600-1-1.html') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(mirrorThread(server.address().port));
+      return;
+    }
+    if (pathname === '/thread-500-1-1.html') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(ordinaryThread(server.address().port));
+      return;
+    }
+    if (pathname === '/thread-400-1-1.html' || pathname === '/thread-401-1-1.html') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(htmlPage('<h1>Offscreen gallery</h1>' + imageMarkup(SMOKE_HOST, server.address().port,
+        pathname === '/thread-400-1-1.html' ? 'near' : 'far', pathname === '/thread-400-1-1.html' ? 10 : 13), 'Offscreen thread'));
+      return;
+    }
+    if (pathname === '/thread-402-1-1.html') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(htmlPage('<h1>Host limit gallery</h1>' + imageMarkup(HOT_IMAGE_HOST, server.address().port, 'host-limit', 14), 'Host limit thread'));
+      return;
+    }
     if (pathname === '/other.html') {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       res.end(htmlPage('<h1>BFCache destination</h1>', 'BFCache destination'));
@@ -240,6 +294,8 @@ function createFixtureServer(pfxPath) {
     }
     if (pathname.indexOf('/img/') === 0) {
       var heavy = host === HEAVY_HOST;
+      var far = pathname.indexOf('/img/far-') === 0;
+      var hostLimitImage = pathname.indexOf('/img/host-limit-') === 0;
       var settled = false;
       if (heavy) {
         metrics.activeHeavyImages++;
@@ -248,6 +304,14 @@ function createFixtureServer(pfxPath) {
         metrics.activeOrdinaryImages++;
         metrics.maxOrdinaryImages = Math.max(metrics.maxOrdinaryImages, metrics.activeOrdinaryImages);
       }
+      if (far) {
+        metrics.activeFarImages++;
+        metrics.maxFarImages = Math.max(metrics.maxFarImages, metrics.activeFarImages);
+      }
+      if (hostLimitImage) {
+        metrics.activeHostLimitImages++;
+        metrics.maxHostLimitImages = Math.max(metrics.maxHostLimitImages, metrics.activeHostLimitImages);
+      }
       metrics.activeImages++;
       metrics.maxCombinedImages = Math.max(metrics.maxCombinedImages, metrics.activeImages);
       function settleImage() {
@@ -255,6 +319,8 @@ function createFixtureServer(pfxPath) {
         settled = true;
         if (heavy) metrics.activeHeavyImages = Math.max(0, metrics.activeHeavyImages - 1);
         else metrics.activeOrdinaryImages = Math.max(0, metrics.activeOrdinaryImages - 1);
+        if (far) metrics.activeFarImages = Math.max(0, metrics.activeFarImages - 1);
+        if (hostLimitImage) metrics.activeHostLimitImages = Math.max(0, metrics.activeHostLimitImages - 1);
         metrics.activeImages = Math.max(0, metrics.activeImages - 1);
       }
       res.on('close', settleImage);
@@ -265,7 +331,7 @@ function createFixtureServer(pfxPath) {
         } else {
           settleImage();
         }
-      }, IMAGE_DELAY_MS);
+      }, pathname.indexOf('/img/host-limit-') === 0 ? 650 : IMAGE_DELAY_MS);
       return;
     }
     res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
@@ -489,6 +555,221 @@ function summarizeErrors(session) {
   };
 }
 
+function spawnSmokeBrowser(browserPath, profileDir, extensionDir, mappedHosts) {
+  var output = '';
+  var child = childProcess.spawn(browserPath, [
+    '--headless=new',
+    '--disable-gpu',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-background-networking',
+    '--disable-component-update',
+    '--disable-default-apps',
+    '--disable-sync',
+    '--metrics-recording-only',
+    '--no-pings',
+    '--no-proxy-server',
+    '--ignore-certificate-errors',
+    '--remote-debugging-address=127.0.0.1',
+    '--remote-debugging-port=0',
+    '--user-data-dir=' + profileDir,
+    '--disable-extensions-except=' + extensionDir,
+    '--load-extension=' + extensionDir,
+    '--host-resolver-rules=' + mappedHosts.map(function(host) { return 'MAP ' + host + ' 127.0.0.1'; }).join(', ') + ', EXCLUDE localhost',
+    '--window-size=1440,1000',
+    'about:blank'
+  ], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+  child.stdout.on('data', function(chunk) { output = (output + chunk.toString()).slice(-32768); });
+  child.stderr.on('data', function(chunk) { output = (output + chunk.toString()).slice(-32768); });
+  return { child: child, output: function() { return output; } };
+}
+
+async function waitForDevtoolsPort(profileDir, browser) {
+  var devtoolsFile = path.join(profileDir, 'DevToolsActivePort');
+  var devtoolsText = await waitFor('DevToolsActivePort', async function() {
+    if (browser.child.exitCode !== null) throw new Error('Browser exited with code ' + browser.child.exitCode + '\n' + browser.output());
+    if (!fs.existsSync(devtoolsFile)) return null;
+    var text = fs.readFileSync(devtoolsFile, 'utf8').trim();
+    return text || null;
+  }, DEVTOOLS_TIMEOUT_MS);
+  var devtoolsLines = devtoolsText.split(/\r?\n/);
+  var devtoolsPort = Number(devtoolsLines[0]);
+  assert(Number.isFinite(devtoolsPort) && devtoolsPort > 0, 'Invalid DevTools port: ' + devtoolsLines[0]);
+  return devtoolsPort;
+}
+
+async function findExtensionWorkerTarget(devtoolsPort, manifest) {
+  var expectedWorkerPath = '/' + String(manifest.background && manifest.background.service_worker || 'background.js').replace(/^\/+/, '');
+  return waitFor('unpacked extension service worker', async function() {
+    var targets = await listTargets(devtoolsPort);
+    for (var target of targets) {
+      if (target.type !== 'service_worker' || !/^chrome-extension:\/\//.test(target.url || '')) continue;
+      var workerConnection = null;
+      try {
+        if (new URL(target.url).pathname !== expectedWorkerPath || !target.webSocketDebuggerUrl) continue;
+        workerConnection = await new CdpConnection(target.webSocketDebuggerUrl).connect();
+        var workerResult = await workerConnection.send('Runtime.evaluate', {
+          expression: 'chrome.runtime.getManifest()', returnByValue: true
+        });
+        var workerManifest = workerResult.result && workerResult.result.value;
+        if (matchesExtensionManifest(workerManifest, manifest)) return target;
+      } catch (error) {
+        // A worker may disappear while its target is being inspected; retry.
+      } finally {
+        if (workerConnection) workerConnection.close();
+      }
+    }
+    return null;
+  }, DEVTOOLS_TIMEOUT_MS, 120);
+}
+
+async function stopSmokeBrowser(browser) {
+  if (browser.child.exitCode === null) browser.child.kill();
+  await Promise.race([
+    new Promise(function(resolve) { browser.child.once('exit', resolve); }),
+    sleep(3000)
+  ]);
+}
+
+async function evaluateInWorker(devtoolsPort, manifest, expression) {
+  var target = await findExtensionWorkerTarget(devtoolsPort, manifest);
+  var connection = await new CdpConnection(target.webSocketDebuggerUrl).connect();
+  try {
+    var result = await connection.send('Runtime.evaluate', { expression: expression, awaitPromise: true, returnByValue: true });
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.text || 'worker evaluation failed');
+    return result.result ? result.result.value : undefined;
+  } finally {
+    connection.close();
+  }
+}
+
+// Chrome's optional-permission prompt cannot be answered headlessly, so the
+// mirror session loads a copy whose only change is the mirror grant approved
+// up front in host_permissions. The worker derives mirrors from granted
+// origins either way, so registration, injection and the zone boundary run
+// the shipped code unmodified.
+function createMirrorGrantExtensionCopy(runRoot) {
+  var copyDir = path.join(runRoot, 'mirror-extension');
+  fs.cpSync(EXTENSION_DIR, copyDir, { recursive: true });
+  var manifestPath = path.join(copyDir, 'manifest.json');
+  var manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  manifest.host_permissions = (manifest.host_permissions || []).concat([MIRROR_PATTERN]);
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+  return { dir: copyDir, manifest: manifest };
+}
+
+async function runMirrorScenario(browserPath, runRoot, fixture, fixturePort) {
+  var copy = createMirrorGrantExtensionCopy(runRoot);
+  var profileDir = path.join(runRoot, 'mirror-profile');
+  fs.mkdirSync(profileDir, { recursive: true });
+  var browser = spawnSmokeBrowser(browserPath, profileDir, copy.dir, [MIRROR_HOST, SMOKE_HOST]);
+  var page = null;
+  var devtoolsPort = 0;
+  var browserConnection = null;
+  try {
+    devtoolsPort = await waitForDevtoolsPort(profileDir, browser);
+    var versionInfo = await fetchJson('http://127.0.0.1:' + devtoolsPort + '/json/version');
+    browserConnection = await new CdpConnection(versionInfo.webSocketDebuggerUrl).connect();
+    var workerTarget = await findExtensionWorkerTarget(devtoolsPort, copy.manifest);
+    var extensionId = /^chrome-extension:\/\/([a-p]{32})/.exec(workerTarget.url || '')[1];
+
+    var registration = await waitFor('mirror content script registration', async function() {
+      var state = await evaluateInWorker(devtoolsPort, copy.manifest, `(async () => ({
+        scripts: (await chrome.scripting.getRegisteredContentScripts()).map((s) => ({ id: s.id, matches: s.matches, world: s.world || 'ISOLATED', js: s.js.length })),
+        stored: (await chrome.storage.local.get('atp_mirror_sites_v1')).atp_mirror_sites_v1 || null
+      }))()`);
+      return state && state.scripts.length === 2 && state.stored && state.stored.sites.length === 1 ? state : null;
+    });
+    registration.scripts.forEach(function(script) {
+      assert.deepStrictEqual(script.matches, [MIRROR_PATTERN], 'Mirror scripts must match only the granted mirror pattern');
+    });
+    assert.deepStrictEqual(registration.scripts.map(function(script) { return script.world; }).sort(), ['ISOLATED', 'MAIN'],
+      'Mirror registration must include the MAIN-world page bridge and the isolated runtime');
+    assert.strictEqual(registration.stored.sites[0].root, MIRROR_ROOT);
+
+    var builtinThreadRequestsBefore = fixture.metrics.requestsByPath['/thread-500-1-1.html'] || 0;
+    page = await createPageSession(devtoolsPort);
+    await navigate(page, 'https://' + MIRROR_HOST + ':' + fixturePort + '/forum.php?mode=mirror');
+    var context = await waitForExtensionContext(page, extensionId);
+    await waitFor('mirror floating panel styles', async function() {
+      return evaluate(page, `(() => {
+        const root = document.querySelector('#bfp-root');
+        const style = root && root.shadowRoot && root.shadowRoot.querySelector('style');
+        return !!(style && style.textContent.includes('.bfp-panel') && root.style.visibility !== 'hidden');
+      })()`);
+    });
+    var gallery = await waitFor('mirror first screen', async function() {
+      var state = await evaluate(page, `(() => {
+        const threads = Object.values(window.ATPState.threads);
+        const thread = threads.find((item) => item.link.includes('/thread-600-1-1.html'));
+        if (!thread || !thread.firstScreenDone) return null;
+        return {
+          threadCount: threads.length,
+          panelCount: document.querySelectorAll('.atp-thread-panel').length,
+          firstScreenOk: thread.firstScreenOk,
+          firstScreenTotal: thread.firstScreenTotal
+        };
+      })()`, context.id);
+      return state && state.firstScreenOk === state.firstScreenTotal && state.firstScreenOk > 0 ? state : null;
+    });
+    assert.strictEqual(gallery.threadCount, 1, 'A mirror page must only process threads from its own site');
+    assert.strictEqual(gallery.panelCount, 1);
+
+    var txt = await waitFor('mirror same-origin TXT through the page bridge', async function() {
+      var state = await evaluate(page, `(() => {
+        const thread = Object.values(window.ATPState.threads).find((item) => item.link.includes('/thread-600-1-1.html'));
+        return thread && thread.textResourcesDone ? thread.resources : null;
+      })()`, context.id);
+      if (!state) return null;
+      return flattenResourceItems(state).some(function(item) { return item.type === 'ed2k' && /43B5B13B95A9187A3BF041CC0A94FFC2/.test(item.url); }) ? state : null;
+    });
+    assert(txt, 'Mirror TXT attachment was not resolved');
+
+    var bridge = await evaluate(page, `new Promise((resolve, reject) => {
+      const id = 'bridge_mirror_self';
+      const timer = setTimeout(() => reject(new Error('mirror bridge timeout')), 3000);
+      window.addEventListener('message', function listener(event) {
+        if (event.source !== window || !event.data || event.data.type !== 'ATP_PAGE_TEXT_FETCH_RESPONSE_V1' || event.data.id !== id) return;
+        clearTimeout(timer);
+        window.removeEventListener('message', listener);
+        resolve(event.data.ok);
+      });
+      window.postMessage({ type: 'ATP_PAGE_TEXT_FETCH_REQUEST_V1', id, url: location.origin + '/bridge-redirect.txt?target=self', timeoutMs: 2000 }, location.origin);
+    })`);
+    assert.strictEqual(bridge, true, 'The MAIN-world bridge must run on granted mirrors');
+
+    // Article jobs start together; any cross-site fetch would have landed by now.
+    await sleep(300);
+    assert.strictEqual(fixture.metrics.requestsByPath['/thread-500-1-1.html'] || 0, builtinThreadRequestsBefore,
+      'A mirror page must never have a built-in thread fetched');
+
+    var errors = summarizeErrors(page);
+    var extensionErrors = errors.consoleErrors.filter(function(text) { return /chrome-extension|ATP|bfp|Uncaught|TypeError|ReferenceError/i.test(text); });
+    assert.strictEqual(errors.exceptions.length, 0, 'Mirror runtime exceptions: ' + JSON.stringify(errors.exceptions));
+    assert.strictEqual(extensionErrors.length, 0, 'Mirror extension console errors: ' + JSON.stringify(extensionErrors));
+
+    return {
+      registeredScripts: registration.scripts.length,
+      threadCount: gallery.threadCount,
+      firstScreenLoaded: gallery.firstScreenOk,
+      txtResolved: true,
+      pageBridge: true,
+      floatingPanelStyled: true,
+      crossSiteThreadRequests: 0
+    };
+  } finally {
+    if (page) {
+      page.cdp.close();
+      await closeTarget(devtoolsPort, page.target.id);
+    }
+    if (browserConnection) {
+      try { await browserConnection.send('Browser.close'); } catch (error) {}
+      browserConnection.close();
+    }
+    await stopSmokeBrowser(browser);
+  }
+}
+
 async function main() {
   assert(fs.existsSync(path.join(EXTENSION_DIR, 'manifest.json')), 'Packaged extension is missing: ' + EXTENSION_DIR);
   var packagedManifest = JSON.parse(fs.readFileSync(path.join(EXTENSION_DIR, 'manifest.json'), 'utf8'));
@@ -507,75 +788,67 @@ async function main() {
     fixture.server.listen(0, '127.0.0.1', resolve);
   });
   var fixturePort = fixture.server.address().port;
-  var browserOutput = '';
-  var browser = childProcess.spawn(browserPath, [
-    '--headless=new',
-    '--disable-gpu',
-    '--no-first-run',
-    '--no-default-browser-check',
-    '--disable-background-networking',
-    '--disable-component-update',
-    '--disable-default-apps',
-    '--disable-sync',
-    '--metrics-recording-only',
-    '--no-pings',
-    '--no-proxy-server',
-    '--ignore-certificate-errors',
-    '--remote-debugging-address=127.0.0.1',
-    '--remote-debugging-port=0',
-    '--user-data-dir=' + profileDir,
-    '--disable-extensions-except=' + EXTENSION_DIR,
-    '--load-extension=' + EXTENSION_DIR,
-    '--host-resolver-rules=MAP ' + SMOKE_HOST + ' 127.0.0.1, MAP ' + CROSS_HOST + ' 127.0.0.1, MAP ' + HEAVY_HOST + ' 127.0.0.1, EXCLUDE localhost',
-    '--window-size=1440,1000',
-    'about:blank'
-  ], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-  browser.stdout.on('data', function(chunk) { browserOutput = (browserOutput + chunk.toString()).slice(-32768); });
-  browser.stderr.on('data', function(chunk) { browserOutput = (browserOutput + chunk.toString()).slice(-32768); });
+  var browser = spawnSmokeBrowser(browserPath, profileDir, EXTENSION_DIR, [SMOKE_HOST, CROSS_HOST, HOT_IMAGE_HOST, HEAVY_HOST]);
 
   var sessions = [];
   var browserConnection = null;
   var smokeFailure = null;
   try {
-    var devtoolsFile = path.join(profileDir, 'DevToolsActivePort');
-    var devtoolsText = await waitFor('DevToolsActivePort', async function() {
-      if (browser.exitCode !== null) throw new Error('Browser exited with code ' + browser.exitCode + '\n' + browserOutput);
-      if (!fs.existsSync(devtoolsFile)) return null;
-      var text = fs.readFileSync(devtoolsFile, 'utf8').trim();
-      return text || null;
-    }, DEVTOOLS_TIMEOUT_MS);
-    var devtoolsLines = devtoolsText.split(/\r?\n/);
-    var devtoolsPort = Number(devtoolsLines[0]);
-    assert(Number.isFinite(devtoolsPort) && devtoolsPort > 0, 'Invalid DevTools port: ' + devtoolsLines[0]);
+    var devtoolsPort = await waitForDevtoolsPort(profileDir, browser);
 
     var versionInfo = await fetchJson('http://127.0.0.1:' + devtoolsPort + '/json/version');
     browserConnection = await new CdpConnection(versionInfo.webSocketDebuggerUrl).connect();
 
-    var expectedWorkerPath = '/' + String(packagedManifest.background && packagedManifest.background.service_worker || 'background.js').replace(/^\/+/, '');
-    var extensionTarget = await waitFor('unpacked extension service worker', async function() {
-      var targets = await listTargets(devtoolsPort);
-      for (var target of targets) {
-        if (target.type !== 'service_worker' || !/^chrome-extension:\/\//.test(target.url || '')) continue;
-        var workerConnection = null;
-        try {
-          if (new URL(target.url).pathname !== expectedWorkerPath || !target.webSocketDebuggerUrl) continue;
-          workerConnection = await new CdpConnection(target.webSocketDebuggerUrl).connect();
-          var workerResult = await workerConnection.send('Runtime.evaluate', {
-            expression: 'chrome.runtime.getManifest()', returnByValue: true
-          });
-          var workerManifest = workerResult.result && workerResult.result.value;
-          if (matchesExtensionManifest(workerManifest, packagedManifest)) return target;
-        } catch (error) {
-          // A worker may disappear while its target is being inspected; retry.
-        } finally {
-          if (workerConnection) workerConnection.close();
-        }
-      }
-      return null;
-    }, DEVTOOLS_TIMEOUT_MS, 120);
+    var extensionTarget = await findExtensionWorkerTarget(devtoolsPort, packagedManifest);
     var extensionMatch = /^chrome-extension:\/\/([a-p]{32})/.exec(extensionTarget.url || '');
     assert(extensionMatch, 'Could not read the unpacked extension id from ' + extensionTarget.url);
     var extensionId = extensionMatch[1];
+
+    var legacyWorker = await new CdpConnection(extensionTarget.webSocketDebuggerUrl).connect();
+    try {
+      var legacySettingResult = await legacyWorker.send('Runtime.evaluate', {
+        expression: 'chrome.storage.local.set({settings:{autoLoadOffscreenFirstRows:true}}).then(() => true)',
+        awaitPromise: true,
+        returnByValue: true
+      });
+      assert(legacySettingResult.result && legacySettingResult.result.value === true,
+        'Browser smoke must seed the old default-on setting before checking migration');
+    } finally {
+      legacyWorker.close();
+    }
+
+    var defaultDistancePage = await createPageSession(devtoolsPort);
+    sessions.push(defaultDistancePage);
+    await navigate(defaultDistancePage, 'https://' + SMOKE_HOST + ':' + fixturePort + '/forum.php?mode=offscreen');
+    var defaultDistanceContext = await waitForExtensionContext(defaultDistancePage, extensionId);
+    await waitFor('default nearby thread panel', async function() {
+      return evaluate(defaultDistancePage, `(() => Object.values(window.ATPState.threads)
+        .some((item) => item.link.includes('/thread-400-1-1.html')))()`, defaultDistanceContext.id);
+    });
+    await sleep(350);
+    var distantDefaultState = await evaluate(defaultDistancePage, `({
+      enabled: window.ATPState.settings.autoLoadOffscreenFirstRowsEnabled,
+      farRegistered: Object.values(window.ATPState.threads)
+        .some((item) => item.link.includes('/thread-401-1-1.html'))
+    })`, defaultDistanceContext.id);
+    assert(distantDefaultState.enabled === false && distantDefaultState.farRegistered === false,
+      'Default settings must leave a distant thread unregistered until the user scrolls');
+    defaultDistancePage.cdp.close();
+    await closeTarget(devtoolsPort, defaultDistancePage.target.id);
+    sessions.splice(sessions.indexOf(defaultDistancePage), 1);
+
+    var setupWorker = await new CdpConnection(extensionTarget.webSocketDebuggerUrl).connect();
+    try {
+      var optInResult = await setupWorker.send('Runtime.evaluate', {
+        expression: 'chrome.storage.local.set({settings:{autoLoadOffscreenFirstRowsEnabled:true}}).then(() => true)',
+        awaitPromise: true,
+        returnByValue: true
+      });
+      assert(optInResult.result && optInResult.result.value === true,
+        'Browser smoke must explicitly opt in to offscreen first-row loading');
+    } finally {
+      setupWorker.close();
+    }
 
     var pageOne = await createPageSession(devtoolsPort);
     sessions.push(pageOne);
@@ -825,6 +1098,63 @@ async function main() {
     assert.strictEqual(pageOneRootCount, 1, 'First tab must contain exactly one floating root');
     assert.strictEqual(pageTwoRootCount, 1, 'Second tab must contain exactly one floating root');
 
+    var offscreenPage = await createPageSession(devtoolsPort);
+    sessions.push(offscreenPage);
+    await navigate(offscreenPage, 'https://' + SMOKE_HOST + ':' + fixturePort + '/forum.php?mode=offscreen');
+    var offscreenContext = await waitForExtensionContext(offscreenPage, extensionId);
+    var farFirstRows = await waitFor('far thread first rows without page scrolling', async function() {
+      return evaluate(offscreenPage, `(() => {
+        const thread = Object.values(window.ATPState.threads).find((item) => item.link.includes('/thread-401-1-1.html'));
+        if (!thread || !thread.firstScreenDone) return null;
+        return { firstScreenTotal: thread.firstScreenTotal, firstScreenOk: thread.firstScreenOk,
+          nextIdx: thread.nextIdx, bgQueued: thread.bgQueued, backgroundUnlocked: thread.backgroundUnlocked,
+          top: thread.panel.getBoundingClientRect().top, viewportHeight: innerHeight };
+      })()`, offscreenContext.id);
+    });
+    assert(farFirstRows.firstScreenTotal === 10 && farFirstRows.firstScreenOk === 10 &&
+      farFirstRows.top > farFirstRows.viewportHeight + 2000,
+      'Far thread must load exactly the configured 5x2 first rows without page scrolling');
+    assert(farFirstRows.nextIdx === 10 && farFirstRows.bgQueued === false && farFirstRows.backgroundUnlocked === false,
+      'Far thread must leave extra images out of the background queue until interaction');
+    // Defaults: 3 ordinary slots minus the 2 reserved for visible images.
+    var offscreenMaxFarImages = fixture.metrics.maxFarImages;
+    assert.strictEqual(offscreenMaxFarImages, 1,
+      'Far first-row images must keep the visible-slot reserve inside the ordinary pool (3 - 2 = 1 lane)');
+    assert(fixture.metrics.requestPaths.indexOf('/img/near-0.jpg') !== -1 &&
+      fixture.metrics.requestPaths.indexOf('/img/near-0.jpg') < fixture.metrics.requestPaths.indexOf('/img/far-0.jpg'),
+      'Near thread images must start before far thread images');
+    for (var farIndex = 10; farIndex < 13; farIndex++) {
+      assert(!fixture.metrics.requestsByPath['/img/far-' + farIndex + '.jpg'], 'Far thread must wait for interaction after the first 10 images');
+    }
+    await evaluate(offscreenPage, `(() => {
+      const thread = Object.values(window.ATPState.threads).find((item) => item.link.includes('/thread-401-1-1.html'));
+      thread.panel.scrollIntoView();
+      return true;
+    })()`, offscreenContext.id);
+    await sleep(300);
+    assert(!fixture.metrics.requestsByPath['/img/far-10.jpg'], 'Page scrolling alone must not exceed the per-thread automatic image cap');
+    await evaluate(offscreenPage, `(() => {
+      const thread = Object.values(window.ATPState.threads).find((item) => item.link.includes('/thread-401-1-1.html'));
+      thread.panel.querySelector('.atp-thumbnail-expand').click();
+      return true;
+    })()`, offscreenContext.id);
+    await waitFor('far thread extra images after expand', async function() {
+      return !!fixture.metrics.requestsByPath['/img/far-10.jpg'];
+    });
+
+    var hostLimitPage = await createPageSession(devtoolsPort);
+    sessions.push(hostLimitPage);
+    await navigate(hostLimitPage, 'https://' + SMOKE_HOST + ':' + fixturePort + '/forum.php?mode=host-limit');
+    var hostLimitContext = await waitForExtensionContext(hostLimitPage, extensionId);
+    await waitFor('host-limit first rows', async function() {
+      return evaluate(hostLimitPage, `(() => {
+        const thread = Object.values(window.ATPState.threads).find((item) => item.link.includes('/thread-402-1-1.html'));
+        return !!(thread && thread.firstScreenDone);
+      })()`, hostLimitContext.id);
+    });
+    var hostLimitObserved = fixture.metrics.maxHostLimitImages;
+    assert(hostLimitObserved <= 6, 'automatic loading must cap one ordinary image host at six concurrent requests');
+
     var popup = await createPageSession(devtoolsPort);
     sessions.push(popup);
     await navigate(popup, 'chrome-extension://' + extensionId + '/popup.html');
@@ -888,12 +1218,14 @@ async function main() {
     })`);
     var bfcachePersisted = bfcacheState.pageShows.indexOf(true) !== -1;
 
-    var pageErrors = [summarizeErrors(pageOne), summarizeErrors(pageTwo), summarizeErrors(popup)];
+    var pageErrors = [summarizeErrors(pageOne), summarizeErrors(pageTwo), summarizeErrors(offscreenPage), summarizeErrors(hostLimitPage), summarizeErrors(popup)];
     var allExceptions = [].concat.apply([], pageErrors.map(function(item) { return item.exceptions; }));
     var extensionConsoleErrors = [].concat.apply([], pageErrors.map(function(item) { return item.consoleErrors; }))
       .filter(function(text) { return /chrome-extension|ATP|bfp|Uncaught|TypeError|ReferenceError/i.test(text); });
     assert.strictEqual(allExceptions.length, 0, 'Browser runtime exceptions: ' + JSON.stringify(allExceptions));
     assert.strictEqual(extensionConsoleErrors.length, 0, 'Extension console errors: ' + JSON.stringify(extensionConsoleErrors));
+
+    var mirrorReport = await runMirrorScenario(browserPath, runRoot, fixture, fixturePort);
 
     var report = {
       ok: true,
@@ -923,6 +1255,13 @@ async function main() {
         heavyCandidates: heavyState.sourceCandidates,
         heavyFirstScreenLoaded: heavyFirstScreen.firstScreenOk
       },
+      offscreen: {
+        firstRowsLoadedWithoutScroll: farFirstRows.firstScreenOk,
+        maxParallelFarImages: offscreenMaxFarImages,
+        beyondFirstRowsWaited: true,
+        expandedExtraRequested: true
+      },
+      hostLimitObservedMax: hostLimitObserved,
       concurrency: {
         ordinaryObservedMax: fixture.metrics.maxOrdinaryImages,
         ordinaryConfiguredFirstScreen: 3,
@@ -944,6 +1283,7 @@ async function main() {
         panelCount: bfcacheState.panelCount,
         notUsedReasons: pageOne.bfcacheNotUsed
       },
+      mirror: mirrorReport,
       fixtureRequests: fixture.metrics.requestCount,
       runtimeExceptions: allExceptions.length,
       extensionConsoleErrors: extensionConsoleErrors.length
@@ -978,11 +1318,7 @@ async function main() {
       fixture.server.close(resolve);
       if (typeof fixture.server.closeAllConnections === 'function') fixture.server.closeAllConnections();
     });
-    if (browser.exitCode === null) browser.kill();
-    await Promise.race([
-      new Promise(function(resolve) { browser.once('exit', resolve); }),
-      sleep(3000)
-    ]);
+    await stopSmokeBrowser(browser);
     if (process.env.ATP_BROWSER_SMOKE_KEEP !== '1') {
       try {
         await removeSmokeRunRoot(runRoot);

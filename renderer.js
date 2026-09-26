@@ -7,6 +7,10 @@
   var AUTO_TEXT_RESOURCE_ACTIVE = 0;
   var AUTO_TEXT_RESOURCE_CONCURRENCY = 2;
   var AUTO_TEXT_RESOURCE_DRAIN_SCHEDULED = false;
+  var AUTO_TEXT_RESOURCE_RECHECK_TIMER = null;
+  // Attachment links read by the article fetch stay usable this long for the
+  // automatic TXT run; Discuz attachment links are short-lived.
+  var FRESH_TEXT_LINK_REUSE_MS = 3 * 60 * 1000;
 
   function isThreadCurrent(threadState) {
     if (!threadState) return false;
@@ -97,9 +101,39 @@
     scheduleAutomaticTextResourceDrain();
   }
 
+  function isThreadOnScreen(threadState) {
+    var el = threadState && (threadState.panel || threadState.container);
+    if (!el || !el.getBoundingClientRect) return false;
+    var rect = el.getBoundingClientRect();
+    var vh = window.innerHeight || (document.documentElement && document.documentElement.clientHeight) || 800;
+    return rect.bottom > 0 && rect.top < vh;
+  }
+
+  // Automatic TXT work costs forum requests. Threads on screen always go
+  // first; while the page's article fetches are still running, offscreen
+  // threads also wait so the posts themselves come first.
+  function takeNextAutomaticTextResourceThread() {
+    for (var i = 0; i < AUTO_TEXT_RESOURCE_QUEUE.length; i++) {
+      var candidate = AUTO_TEXT_RESOURCE_QUEUE[i];
+      if (!candidate || !candidate.textResourcesAutoQueued || isThreadOnScreen(candidate)) {
+        return AUTO_TEXT_RESOURCE_QUEUE.splice(i, 1)[0];
+      }
+    }
+    var busy = !!(window.ATPArticleWork && typeof window.ATPArticleWork.isBusy === 'function' && window.ATPArticleWork.isBusy());
+    if (!busy) return AUTO_TEXT_RESOURCE_QUEUE.shift();
+    if (!AUTO_TEXT_RESOURCE_RECHECK_TIMER) {
+      AUTO_TEXT_RESOURCE_RECHECK_TIMER = setTimeout(function() {
+        AUTO_TEXT_RESOURCE_RECHECK_TIMER = null;
+        scheduleAutomaticTextResourceDrain();
+      }, 1000);
+    }
+    return undefined;
+  }
+
   function drainAutomaticTextResourceQueue() {
     while (AUTO_TEXT_RESOURCE_ACTIVE < AUTO_TEXT_RESOURCE_CONCURRENCY && AUTO_TEXT_RESOURCE_QUEUE.length) {
-      var threadState = AUTO_TEXT_RESOURCE_QUEUE.shift();
+      var threadState = takeNextAutomaticTextResourceThread();
+      if (threadState === undefined) return;
       if (!threadState || !threadState.textResourcesAutoQueued) continue;
       threadState.textResourcesAutoQueued = false;
       if (
@@ -315,6 +349,31 @@
       return out;
     },
 
+    // 首屏（前 limit 个）里静态图排在动图前面，其余顺序不变；无需调整时原样返回，
+    // 不改动入参（它可能与缓存数据共用同一数组）。动图仍留在首屏，只是后开始加载。
+    prioritizeStaticFirstScreenCandidates: function(candidates, limit) {
+      if (!Array.isArray(candidates) || typeof SharedUtils.isAnimatedGifUrl !== 'function' || typeof SharedUtils.getImageDisplaySrc !== 'function') {
+        return candidates;
+      }
+      limit = Math.min(candidates.length, Math.max(0, Math.floor(Number(limit) || 0)));
+      if (limit <= 1) return candidates;
+      var gifFlags = new Array(limit);
+      var seenGif = false;
+      var needsMove = false;
+      for (var i = 0; i < limit; i++) {
+        gifFlags[i] = SharedUtils.isAnimatedGifUrl(SharedUtils.getImageDisplaySrc(candidates[i]));
+        if (gifFlags[i]) seenGif = true;
+        else if (seenGif) needsMove = true;
+      }
+      if (!needsMove) return candidates;
+      var out = new Array(candidates.length);
+      var write = 0;
+      for (var s = 0; s < limit; s++) if (!gifFlags[s]) out[write++] = candidates[s];
+      for (var g = 0; g < limit; g++) if (gifFlags[g]) out[write++] = candidates[g];
+      for (var r = limit; r < candidates.length; r++) out[write++] = candidates[r];
+      return out;
+    },
+
     injectThumbnails: function(container, articleData, link, cacheWriteStartedAt) {
       if (container.tagName === 'TH' || container.tagName === 'TD') {
         container = container.parentElement;
@@ -338,14 +397,23 @@
       var displayLimit = SharedUtils.effectiveDisplayLimit(settings);
       var candidatePool = copyCandidatePrefix(images, fetchLimit);
       var heavyPlan = ATPRenderer.getHeavyImagePlan(candidatePool, settings, cols, displayLimit);
+      // 缓存按帖子原顺序保存：静态优先只是本次渲染的加载顺序，每次渲染按当时的显示设置重新计算
+      // A copy: a rendered slot can move to a sibling attachment host while
+      // the thread registers, and the cache keeps the forum's own URLs.
+      var cacheImages = candidatePool.slice();
       if (heavyPlan.enabled) {
         candidatePool = ATPRenderer.prioritizeLoadedCandidates(candidatePool, data.loadedUrls);
+        cacheImages = candidatePool.slice();
+      } else {
+        // 只在实际显示的前缀里调整，免得把显示上限之外的静态图换进来、把动图挤出显示范围
+        candidatePool = ATPRenderer.prioritizeStaticFirstScreenCandidates(candidatePool, Math.min(cols * visRows, displayLimit));
       }
       var sourceCandidates = candidatePool;
       var renderLimit = heavyPlan.enabled ? heavyPlan.limit : displayLimit;
       var allCandidates = copyCandidatePrefix(candidatePool, renderLimit);
       var visibleRowsForRender = heavyPlan.enabled && !heavyPlan.lightweight ? 1 : visRows;
       var visibleCount = cols * visibleRowsForRender;
+      var firstAutoCount = Math.min(heavyPlan.enabled && heavyPlan.lightweight ? cols : visibleCount, allCandidates.length);
       var gridWidth = cols * w + (cols - 1) * gap;
       var viewportContentH = visibleRowsForRender * h + (visibleRowsForRender - 1) * gap;
       var viewportH = viewportContentH + 12;
@@ -353,6 +421,16 @@
 
       var panel = document.createElement('div');
       panel.className = 'atp-thread-panel';
+      var threadState = null;
+      function unlockBackgroundImages() {
+        if (!threadState || threadState.backgroundUnlocked) return;
+        threadState.backgroundUnlocked = true;
+        if (window.ATPLoader && ATPLoader.enqueueBgForThread && threadState.firstScreenDone) {
+          ATPLoader.enqueueBgForThread(threadState.id);
+        }
+        if (window.ATPViewport && ATPViewport.retryVisiblePending) ATPViewport.retryVisiblePending();
+        if (window.ATPLoader && ATPLoader.globalSchedule) ATPLoader.globalSchedule();
+      }
       var viewportId = 'atp-scroll-' + Date.now() + '-' + Math.random().toString(36).substring(2, 8);
       var intrinsicH = (allCandidates.length ? viewportH : 0) + 30;
       panel.style.containIntrinsicHeight = 'auto ' + intrinsicH + 'px';
@@ -387,6 +465,12 @@
           if (!vp) return;
           var expanded = vp.style.maxHeight !== 'none';
           vp.style.maxHeight = expanded ? 'none' : viewportH + 'px';
+          if (expanded) {
+            unlockBackgroundImages();
+            if (threadState && window.ATPLoader && ATPLoader.enqueueBgForThread) {
+              ATPLoader.enqueueBgForThread(threadState.id);
+            }
+          }
           expandBtn.textContent = expanded ? '收起' : '展开';
           expandBtn.setAttribute('aria-expanded', expanded ? 'true' : 'false');
           expandBtn.setAttribute('aria-label', expanded ? '收起缩略图列表' : '展开缩略图列表');
@@ -423,6 +507,9 @@
         grid = document.createElement('div');
         grid.className = THUMB_CLASS;
         grid.style.cssText = 'display:grid;grid-template-columns:repeat(' + cols + ',' + w + 'px);grid-auto-rows:' + h + 'px;gap:' + gap + 'px;width:' + gridWidth + 'px;max-width:none;box-sizing:border-box;';
+        if (settings.autoLoadOffscreenFirstRowsEnabled === true && allCandidates.length > firstAutoCount) {
+          grid.style.minHeight = ((visibleRowsForRender + 1) * h + visibleRowsForRender * gap) + 'px';
+        }
         viewport.appendChild(grid);
       }
 
@@ -446,14 +533,34 @@
         if (container.classList) container.classList.add(CONTAINER_CLASS);
       }
 
-      var threadState = ATPRenderer.registerThread(allCandidates, resources, grid, statusEl, container, link.href, outerRow, panel, textAttachments, sourceCandidates, heavyPlan, data.hasTextAttachments, data.textAttachmentCount, data.partial, cacheWriteStartedAt, data.textResourcesComplete, data.textResourcesAttemptedCount, data.textResourcesUnresolvedCount, data.textResourcesRetryableCount);
+      threadState = ATPRenderer.registerThread(allCandidates, resources, grid, statusEl, container, link.href, outerRow, panel, textAttachments, sourceCandidates, heavyPlan, data.hasTextAttachments, data.textAttachmentCount, data.partial, cacheWriteStartedAt, data.textResourcesComplete, data.textResourcesAttemptedCount, data.textResourcesUnresolvedCount, data.textResourcesRetryableCount, { readAt: data.readAt, textResourcesImported: data.textResourcesImported, textAttachmentsLimited: data.textAttachmentsLimited });
+      threadState.cacheImages = cacheImages;
+      // Which thread this is and what the list calls it, for marking and the
+      // copy backup.
+      if (window.ATPMarks) {
+        var identity = ATPMarks.getThreadIdentity(link.href, container.id);
+        threadState.markIdentity = identity.ok ? identity : null;
+        threadState.title = ATPMarks.findThreadTitle(container, link, identity.ok ? identity.tid : '');
+      }
+      if (articleData && Array.isArray(articleData.freshTextAttachments) && articleData.freshTextAttachmentsAt) {
+        threadState.freshTextAttachments = articleData.freshTextAttachments;
+        threadState.freshTextAttachmentsAt = articleData.freshTextAttachmentsAt;
+      }
+      if (viewport && allCandidates.length > threadState.firstScreenTotal) {
+        viewport.addEventListener('scroll', function() {
+          if (viewport.scrollTop > 0) unlockBackgroundImages();
+          if (window.ATPLoader && ATPLoader.enqueueBgForThread) {
+            ATPLoader.enqueueBgForThread(threadState.id);
+          }
+        });
+      }
       queueAutomaticTextResourceLoad(threadState);
       if (window.ATPResourcePanel) {
         ATPResourcePanel.attachThread(panel, threadState);
       }
     },
 
-    registerThread: function(allCandidates, resources, grid, statusEl, container, linkUrl, outerRow, panel, textAttachments, sourceCandidates, heavyPlan, hasTextAttachments, textAttachmentCount, partial, cacheWriteStartedAt, textResourcesComplete, textResourcesAttemptedCount, textResourcesUnresolvedCount, textResourcesRetryableCount) {
+    registerThread: function(allCandidates, resources, grid, statusEl, container, linkUrl, outerRow, panel, textAttachments, sourceCandidates, heavyPlan, hasTextAttachments, textAttachmentCount, partial, cacheWriteStartedAt, textResourcesComplete, textResourcesAttemptedCount, textResourcesUnresolvedCount, textResourcesRetryableCount, extra) {
       var settings = ATPRenderer.getSettings();
       var cols = settings.gridCols || 5;
       var visRows = settings.visibleRows || 2;
@@ -494,6 +601,7 @@
         firstScreenOk: 0,
         firstScreenFailed: 0,
         firstScreenDone: false,
+        backgroundUnlocked: settings.autoLoadOffscreenFirstRowsEnabled !== true,
         bgQueued: false,
         bgQueueActive: false,
         bgBatchPending: 0,
@@ -529,6 +637,11 @@
         panel: panel,
         total: allCandidates.length
       };
+      // When the thread's content was actually read: a cache hit is not a
+      // fresh read.
+      threadState.contentReadAt = Number(extra && extra.readAt) || threadState.cacheWriteStartedAt;
+      threadState.textResourcesImported = !!(extra && extra.textResourcesImported);
+      threadState.textAttachmentsLimited = !!(extra && extra.textAttachmentsLimited);
 
       if (typeof Logger !== 'undefined' && Logger.event && (!Logger.isEnabled || Logger.isEnabled('DEBUG'))) {
         Logger.event('thread_registered', {
@@ -581,7 +694,10 @@
           textResourcesAttemptedCount: threadState.textResourcesAttemptedCount,
           textResourcesUnresolvedCount: threadState.textResourcesUnresolvedCount,
           textResourcesRetryableCount: threadState.textResourcesRetryableCount,
-          partial: threadState.partial
+          partial: threadState.partial,
+          readAt: threadState.contentReadAt,
+          textResourcesImported: threadState.textResourcesImported,
+          textAttachmentsLimited: threadState.textAttachmentsLimited
         }, !threadState.partial, threadState.cacheWriteStartedAt);
         return threadState;
       }
@@ -637,7 +753,10 @@
       };
 
       var hasCachedAttachments = threadState.textAttachments && threadState.textAttachments.length;
-      var doFetch = function(attachments) {
+      // pendingCount: attachments known to exist but not in this list (their
+      // fresh links could not be read); they keep the thread retryable.
+      var doFetch = function(attachments, pendingCount) {
+        pendingCount = Math.max(0, Number(pendingCount) || 0);
         if (!isRunCurrent()) {
           releaseAutomaticTextResourceSlot(threadState, run);
           return;
@@ -664,14 +783,16 @@
           var textStatus = normalizeTextResourceLoadResult(result, attachments.length);
           var resources = textStatus.resources;
           var hasFetchedResources = SharedUtils.hasResourcePayload(resources);
-          threadState.textResourcesDone = hasFetchedResources && textStatus.unresolvedCount === 0;
-          threadState.textResourcesRetryable = textStatus.retryableCount > 0 || !hasFetchedResources;
+          var unresolvedCount = textStatus.unresolvedCount + pendingCount;
+          var retryableCount = textStatus.retryableCount + pendingCount;
+          threadState.textResourcesDone = hasFetchedResources && unresolvedCount === 0;
+          threadState.textResourcesRetryable = retryableCount > 0 || !hasFetchedResources;
           threadState.textResourcesAttemptedCount = textStatus.attemptedCount;
-          threadState.textResourcesUnresolvedCount = textStatus.unresolvedCount;
-          threadState.textResourcesRetryableCount = textStatus.retryableCount;
+          threadState.textResourcesUnresolvedCount = unresolvedCount;
+          threadState.textResourcesRetryableCount = retryableCount;
           threadState.resources = SharedUtils.mergeResources(threadState.resources, resources);
-          if (textStatus.unresolvedCount > 0 && hasFetchedResources) {
-            threadState.textResourceMessage = '已解析部分 TXT 资源，仍有 ' + textStatus.unresolvedCount + ' 个附件待重试';
+          if (unresolvedCount > 0 && hasFetchedResources) {
+            threadState.textResourceMessage = '已解析部分 TXT 资源，仍有 ' + unresolvedCount + ' 个附件待重试';
           } else {
             threadState.textResourceMessage = hasFetchedResources
               ? ''
@@ -699,7 +820,7 @@
             }
           }
           ATPCache.setCachedArticleData(threadState.link, {
-            images: threadState.sourceCandidates || threadState.candidates || [],
+            images: threadState.cacheImages || threadState.sourceCandidates || threadState.candidates || [],
             resources: threadState.resources,
             textAttachments: cachedAttachments,
             loadedUrls: threadState.loadedUrls || [],
@@ -709,7 +830,10 @@
             textResourcesAttemptedCount: threadState.textResourcesAttemptedCount,
             textResourcesUnresolvedCount: threadState.textResourcesUnresolvedCount,
             textResourcesRetryableCount: threadState.textResourcesRetryableCount,
-            partial: threadState.partial
+            partial: threadState.partial,
+            readAt: threadState.contentReadAt,
+            textResourcesImported: threadState.textResourcesImported,
+            textAttachmentsLimited: threadState.textAttachmentsLimited
           }, imageDone && !threadState.partial, writeStartedAt);
           Logger.debug('TXT资源补齐', threadState.link + ' 资源' + SharedUtils.countResources(threadState.resources));
         }, function(e) {
@@ -726,7 +850,7 @@
             ATPResourcePanel.updateThread(threadState);
           }
           Logger.debug(message + '，改用已缓存TXT附件', threadState.link + ' ' + (e && e.message ? e.message : e || 'unknown error'));
-          doFetch(threadState.textAttachments);
+          doFetch(threadState.textAttachments, Math.max(0, (Number(threadState.textAttachmentCount || 0) || 0) - threadState.textAttachments.length));
           return;
         }
         failTextResourceLoad(message, e);
@@ -755,8 +879,18 @@
           return;
         }
         var freshPromise;
+        // An automatic run reuses the links the article fetch read minutes
+        // ago instead of reading the thread page again; a manual retry always
+        // re-reads.
+        var reusableLinks = !manualRetry && Array.isArray(threadState.freshTextAttachments) &&
+          Date.now() - (Number(threadState.freshTextAttachmentsAt) || 0) < FRESH_TEXT_LINK_REUSE_MS
+          ? threadState.freshTextAttachments
+          : null;
+        threadState.freshTextAttachments = null;
         try {
-          freshPromise = ATPFetcher.fetchTextAttachmentsFresh(threadState.link);
+          freshPromise = reusableLinks
+            ? Promise.resolve(reusableLinks)
+            : ATPFetcher.fetchTextAttachmentsFresh(threadState.link, { manualRetry: !!manualRetry });
         } catch (e) {
           fallbackToCachedAttachmentsAfterFreshFailure('TXT 附件链接提取失败', e);
           return;
@@ -768,6 +902,12 @@
         Promise.resolve(freshPromise).then(function(freshAttachments) {
           if (!isRunCurrent()) {
             releaseAutomaticTextResourceSlot(threadState, run);
+            return;
+          }
+          // null: the thread could not be re-read this time (network, forum
+          // challenge, or the wait ran past its deadline), not "no attachments".
+          if (!Array.isArray(freshAttachments)) {
+            fallbackToCachedAttachmentsAfterFreshFailure('TXT 附件链接提取失败', 'fresh attachment links unavailable');
             return;
           }
           var attachments = mergeTextAttachments(threadState.textAttachments, freshAttachments, threadState.link);
@@ -802,6 +942,10 @@
       for (var i = 0; i < imports.length; i++) {
         var normalized = SharedUtils.normalizeResources(imports[i] && imports[i].resources);
         if (!SharedUtils.hasResourcePayload(normalized)) continue;
+        // Links from a local file stay labelled as such wherever they are kept.
+        SharedUtils.RESOURCE_GROUP_ORDER.forEach(function(type) {
+          normalized.groups[type].forEach(function(item) { item.source = SharedUtils.mergeResourceSource(item.source, 'import'); });
+        });
         usable.push({ name: String(imports[i].name || ''), resources: normalized });
         merged = SharedUtils.mergeResources(merged, normalized);
       }
@@ -830,6 +974,7 @@
         importUnresolvedCount ? '，仍有 ' + importUnresolvedCount + ' 个附件待补齐' : ''
       );
       threadState.textResourcesAutoAttempted = true;
+      threadState.textResourcesImported = true;
       if (!threadState.candidates.length && threadState.statusEl) threadState.statusEl.textContent = '资源链接';
 
       function normalizeFileName(name) {
@@ -859,7 +1004,7 @@
       }
       var imageDone = !threadState.candidates.length || (threadState.nextIdx >= threadState.candidates.length && threadState.loaded + threadState.failedCount >= threadState.candidates.length);
       ATPCache.setCachedArticleData(threadState.link, {
-        images: threadState.sourceCandidates || threadState.candidates || [],
+        images: threadState.cacheImages || threadState.sourceCandidates || threadState.candidates || [],
         resources: threadState.resources,
         textAttachments: cachedAttachments,
         loadedUrls: threadState.loadedUrls || [],
@@ -869,7 +1014,10 @@
         textResourcesAttemptedCount: threadState.textResourcesAttemptedCount,
         textResourcesUnresolvedCount: threadState.textResourcesUnresolvedCount,
         textResourcesRetryableCount: threadState.textResourcesRetryableCount,
-        partial: threadState.partial
+        partial: threadState.partial,
+        readAt: threadState.contentReadAt,
+        textResourcesImported: true,
+        textAttachmentsLimited: threadState.textAttachmentsLimited
       }, imageDone && !threadState.partial, writeStartedAt);
       if (window.ATPResourcePanel) ATPResourcePanel.updateThread(threadState);
       Logger.debug('本地TXT资源导入', threadState.link + ' 资源' + SharedUtils.countResources(merged));

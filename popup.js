@@ -4,9 +4,11 @@
   var els = {};
   (function() {
     var ids = ['toggleEnabled','settingsContainer',
-      'clearImageCache','clearFailCache','clearAllCache','clearTestCache','resetSettings',
+      'clearImageCache','clearFailCache','clearAllCache','clearTestCache','resetSettings','resetForumPacer','forumPacerInfo',
       'toggleLogs','logPanel','logViewer','logCount','logFilter','logSearch','exportLogs','clearLogs',
-      'currentSite','firstScreenInfo','popupStatus','toggleHelp','helpPanel'];
+      'currentSite','firstScreenInfo','popupStatus','toggleHelp','helpPanel',
+      'marksSection','marksCount','marksSummary','marksList','exportMarks','copyMarks','clearExportedMarks','clearAllMarks',
+      'backupSection','backupCount','backupList','downloadAllBackups'];
     for (var i = 0; i < ids.length; i++) { els[ids[i]] = document.getElementById(ids[i]); }
   })();
 
@@ -15,6 +17,7 @@
   var LOG_KEY_PREFIXES = ['atp_logs_content_'];
   var LOG_KEY_INDEX = (typeof SharedUtils !== 'undefined' && SharedUtils.CONTENT_LOG_INDEX_KEY) || 'atp_logs_content_keys';
   var LOG_CLEARED_AT_KEY = 'atp_logs_cleared_at';
+  var LOG_RETENTION_TYPE = 'log_retention';
   var CACHE_GENERATION_KEY = (typeof SharedUtils !== 'undefined' && SharedUtils.CACHE_GENERATION_KEY) || 'atp_cache_generation_v1';
   var MAX_CONTENT_LOG_KEYS = (typeof SharedUtils !== 'undefined' && SharedUtils.MAX_CONTENT_LOG_KEYS) || 20;
   var LOG_VIEW_LIMIT = 1000;
@@ -34,7 +37,7 @@
   var settingsLoadFailed = false;
   var DESTRUCTIVE_CONFIRM_MS = 3000;
   var pendingDestructiveButton = null;
-  var CACHE_PREFIXES = (typeof SharedUtils !== 'undefined' && SharedUtils.CACHE_PREFIXES) || { IMAGE: 'thumb_cache_v2_', ARTICLE: 'article_cache_v9_', TEXT_RESOURCE: 'txt_resource_cache_v2_', TEXT_FAIL: 'atp_text_fail_v1_', NEGATIVE: 'atp_empty_v8_', IMAGE_BASE: 'thumb_cache_', ARTICLE_BASE: 'article_cache_', TEXT_RESOURCE_BASE: 'txt_resource_cache_', TEXT_FAIL_BASE: 'atp_text_fail_', NEGATIVE_BASE: 'atp_empty_' };
+  var CACHE_PREFIXES = (typeof SharedUtils !== 'undefined' && SharedUtils.CACHE_PREFIXES) || { IMAGE: 'thumb_cache_v2_', ARTICLE: 'article_cache_v12_', TEXT_RESOURCE: 'txt_resource_cache_v3_', TEXT_FAIL: 'atp_text_fail_v1_', NEGATIVE: 'atp_empty_v9_', IMAGE_BASE: 'thumb_cache_', ARTICLE_BASE: 'article_cache_', TEXT_RESOURCE_BASE: 'txt_resource_cache_', TEXT_FAIL_BASE: 'atp_text_fail_', NEGATIVE_BASE: 'atp_empty_' };
   var HEAVY_ORIGINAL_PRESET = ATPGetSettingsPreset('heavyOriginal', SETTINGS_SCHEMA);
 
   var settings = null;
@@ -486,7 +489,9 @@
     return isNaN(ts) ? 0 : ts;
   }
 
-  function getPrunableContentLogKeys(keys) {
+  // protectedKeys: live shards (the tab just flushed for export) that must
+  // survive even when 20+ newer page sessions outrank them.
+  function getPrunableContentLogKeys(keys, protectedKeys) {
     var newest = [];
     var contentCount = 0;
     keys = keys || [];
@@ -499,6 +504,7 @@
     if (contentCount <= MAX_CONTENT_LOG_KEYS) return [];
     var keepMap = {};
     for (var ki = 0; ki < newest.length; ki++) keepMap[newest[ki]] = true;
+    for (var pk = 0; protectedKeys && pk < protectedKeys.length; pk++) keepMap[protectedKeys[pk]] = true;
     var stale = [];
     for (var si = 0; si < keys.length; si++) {
       var staleKey = keys[si];
@@ -805,8 +811,8 @@
     return keys;
   }
 
-  async function pruneContentLogKeys(logKeys) {
-    var stale = getPrunableContentLogKeys(logKeys);
+  async function pruneContentLogKeys(logKeys, protectedKeys) {
+    var stale = getPrunableContentLogKeys(logKeys, protectedKeys);
     if (!stale.length) return stale;
     try {
       await storageRemove(stale, '裁剪旧日志');
@@ -1108,10 +1114,25 @@
     try {
       var parsed = new URL(url || '');
       if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
-      return parsed.hostname.replace(/^www\./, '');
+      return parsed.hostname.replace(/\.$/, '').replace(/^www\./, '');
     } catch (e) {
       return '';
     }
+  }
+
+  // activeTab exposes every active tab's URL, so the per-site toggle is only
+  // offered where the content scripts actually run (built-in or approved).
+  function getSupportedTabHostname(url) {
+    var host = getTabHostname(url);
+    return host && SharedUtils.isSupportedForumHost(host) ? host : '';
+  }
+
+  async function waitForMirrorSites() {
+    var mirrors = window.ATPPopupMirrors;
+    if (!mirrors || !mirrors.ready || typeof mirrors.ready.then !== 'function') return;
+    try {
+      await mirrors.ready;
+    } catch (e) {}
   }
 
   function setDisableSiteHost(hostname) {
@@ -1216,6 +1237,7 @@
     updateDependentControls();
 
     clearPopupStatusIfText('正在读取设置...');
+    await waitForMirrorSites();
     if (!chrome.tabs || typeof chrome.tabs.query !== 'function') {
       setDisableSiteHost('');
       setPopupStatus('读取当前标签页失败：tabs.query 不可用', 'warn', true);
@@ -1228,7 +1250,7 @@
           setPopupStatus('读取当前标签页失败：' + errorMessage(chrome.runtime.lastError), 'warn', true);
           return;
         }
-        setDisableSiteHost(tabs[0] ? getTabHostname(tabs[0].url) : '');
+        setDisableSiteHost(tabs[0] ? getSupportedTabHostname(tabs[0].url) : '');
       });
     } catch (e) {
       setDisableSiteHost('');
@@ -1553,7 +1575,7 @@
 
   function isImageLog(e) {
     var type = getLogType(e);
-    if (/^(content_start|image_|render_|diagnostic_summary|schedule_state|thread_registered|scan_complete|fallback_)/.test(type)) return true;
+    if (/^(content_start|image_|render_|diagnostic_summary|schedule_state|thread_registered|scan_complete|fallback_|log_retention)/.test(type)) return true;
     return /High fanout|Image candidate fallback|图片无Referer|首屏完成|重图/.test(String((e && e.msg) || '') + ' ' + getLogDataText(e));
   }
 
@@ -1676,7 +1698,7 @@
     options = options || {};
     var logKeys = await getLogKeysForRead(!!options.allowDiscovery);
     if (options.prune) {
-      var staleLogKeys = await pruneContentLogKeys(logKeys);
+      var staleLogKeys = await pruneContentLogKeys(logKeys, options.protectedLogKeys);
       if (staleLogKeys.length) {
         var prunedLogKeyMap = {};
         for (var pi = 0; pi < staleLogKeys.length; pi++) prunedLogKeyMap[staleLogKeys[pi]] = true;
@@ -1700,13 +1722,30 @@
       }
     }
     logs = filterLogsAfterClearedAt(logs, clearedAtMs);
+    var retentionEntries = [];
+    for (var re = 0; re < logs.length; re++) {
+      if (logs[re].type === LOG_RETENTION_TYPE) retentionEntries.push(logs[re]);
+    }
     logs.sort(function(a, b) {
       var at = getLogSortTimestamp(a);
       var bt = getLogSortTimestamp(b);
       if (at !== bt) return at - bt;
       return String(a.ts || '').localeCompare(String(b.ts || ''));
     });
-    if (logs.length > LOG_VIEW_LIMIT) logs.splice(0, logs.length - LOG_VIEW_LIMIT);
+    if (logs.length > LOG_VIEW_LIMIT) {
+      logs.splice(0, logs.length - LOG_VIEW_LIMIT);
+      var retainedSessions = {};
+      for (var li = 0; li < logs.length; li++) {
+        if (logs[li].sessionId) retainedSessions[logs[li].sessionId] = true;
+      }
+      for (var ri = 0; ri < retentionEntries.length; ri++) {
+        var retentionEntry = retentionEntries[ri];
+        if (!retainedSessions[retentionEntry.sessionId] || logs.indexOf(retentionEntry) !== -1) continue;
+        logs.splice(0, 1);
+        logs.push(retentionEntry);
+      }
+      logs.sort(function(a, b) { return getLogSortTimestamp(a) - getLogSortTimestamp(b); });
+    }
     return logs;
   }
 
@@ -1760,12 +1799,25 @@
     var typeSummary = formatLogSummaryCounts(stats.types, 12) || '-';
     var hostSummary = formatLogSummaryCounts(stats.hosts, 12) || '-';
     var levelSummary = formatLogSummaryCounts(stats.levels, 6) || '-';
+    var retentionLines = [];
+    var seenSessions = {};
+    for (var ri = 0; ri < logs.length; ri++) {
+      var entry = logs[ri];
+      if (!entry || entry.type !== LOG_RETENTION_TYPE) continue;
+      var fields = getLogFields(entry);
+      var session = sanitizeLogExportLabel(entry.sessionId || '-');
+      if (seenSessions[session]) continue;
+      seenSessions[session] = true;
+      retentionLines.push('会话 ' + session + ': 已裁剪' + (Number(fields.droppedEntries) || 0) +
+        '条，异常累计' + (Number(fields.incidentCount) || 0) +
+        (fields.firstDroppedAt ? '，最早裁剪于' + sanitizeLogExportLabel(fields.firstDroppedAt) : ''));
+    }
     return [
       '最近会话: ' + latestSessionId,
       '级别统计: ' + levelSummary,
       '事件统计: ' + typeSummary,
       'Host统计: ' + hostSummary
-    ].join('\n');
+    ].concat(retentionLines).join('\n');
   }
 
   function formatLogLine(e) {
@@ -1801,11 +1853,467 @@
     return parts.join('');
   }
 
+  // Forum pacing: every forum page reports its pace to extension storage and
+  // follows the reset marker the popup writes there, so both work on any page
+  // and for every forum domain at once.
+  var FORUM_PACER_RESET_KEY = 'atp_forum_pacer_reset_at';
+  var FORUM_PACER_STATUS_KEY = 'atp_forum_pacer_status_v1';
+  var FORUM_PACER_NORMAL_BURST = 10;
+  var FORUM_PACER_NORMAL_REFILL_MS = 2000;
+  // The pacer's own lifetimes, for entries written without them.
+  var FORUM_PACER_LIMIT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+  var FORUM_PACER_IDLE_MAX_AGE_MS = 5 * 60 * 1000;
+
+  // The pace a host is at now, from what its pages last reported: the
+  // learned pace lapses after a day, and a host nobody has used for a while
+  // is back at its learned pace with no pause, as the pacer itself decides.
+  function getForumPaceNow(entry, now) {
+    if (!entry || typeof entry !== 'object') return null;
+    var at = Number(entry.at) || 0;
+    var pauseUntil = Number(entry.pauseUntil) || 0;
+    var limitsUntil = Number(entry.limitsUntil) || (at ? at + FORUM_PACER_LIMIT_MAX_AGE_MS : 0);
+    var idleUntil = Number(entry.idleUntil) || (Math.max(at, pauseUntil) + FORUM_PACER_IDLE_MAX_AGE_MS);
+    var learnedBurst = Number(entry.learnedBurst) || FORUM_PACER_NORMAL_BURST;
+    var learnedRefillMs = Number(entry.learnedRefillMs) || FORUM_PACER_NORMAL_REFILL_MS;
+    if (limitsUntil && now >= limitsUntil) {
+      learnedBurst = FORUM_PACER_NORMAL_BURST;
+      learnedRefillMs = FORUM_PACER_NORMAL_REFILL_MS;
+    }
+    if (now >= idleUntil) return { burst: learnedBurst, refillMs: learnedRefillMs, level: 0, pauseUntil: 0 };
+    return {
+      burst: Number(entry.burst) || learnedBurst,
+      refillMs: Number(entry.refillMs) || learnedRefillMs,
+      level: Number(entry.level) || 0,
+      pauseUntil: pauseUntil
+    };
+  }
+
+  function isForumPaceSlowed(pace, now) {
+    return !!pace && (
+      pace.burst < FORUM_PACER_NORMAL_BURST ||
+      pace.refillMs > FORUM_PACER_NORMAL_REFILL_MS ||
+      pace.level > 0 ||
+      pace.pauseUntil > now
+    );
+  }
+
+  function describeForumPacerStatus(all) {
+    var hosts = all && typeof all === 'object' ? Object.keys(all) : [];
+    if (!hosts.length) return '尚无论坛节流记录；打开论坛页面后会显示当前速度。';
+    var now = Date.now();
+    var slowed = [];
+    for (var i = 0; i < hosts.length; i++) {
+      var pace = getForumPaceNow(all[hosts[i]], now);
+      if (!isForumPaceSlowed(pace, now)) continue;
+      var text = hosts[i] + '：突发 ' + pace.burst + '，之后每 ' + (Math.round(pace.refillMs / 100) / 10) + ' 秒 1 个';
+      if (pace.pauseUntil > now) text += '，暂停中（约 ' + Math.ceil((pace.pauseUntil - now) / 1000) + ' 秒）';
+      else if (pace.level > 0) text += '，限流后单路探测中';
+      slowed.push(text);
+    }
+    if (!slowed.length) return '论坛节流：正常速度（突发 10，之后每 2 秒 1 个）。';
+    return '论坛节流已放慢（此前触发过论坛验证页，自动放慢并保持 24 小时）：' + slowed.join('；') + '。可立即重置。';
+  }
+
+  function refreshForumPacerInfo() {
+    if (!els.forumPacerInfo || !chrome.storage || !chrome.storage.local) return Promise.resolve(null);
+    return new Promise(function(resolve) {
+      try {
+        chrome.storage.local.get(FORUM_PACER_STATUS_KEY, function(result) {
+          var all = result && result[FORUM_PACER_STATUS_KEY];
+          els.forumPacerInfo.textContent = describeForumPacerStatus(all);
+          resolve(all || null);
+        });
+      } catch (e) { resolve(null); }
+    });
+  }
+
+  // Every forum page applies the marker (open pages at once, others when
+  // they next load); the recorded statuses are set to the normal pace now so
+  // the popup does not keep showing hosts that are not open.
+  async function resetForumPacing() {
+    var now = Date.now();
+    var items = {};
+    items[FORUM_PACER_RESET_KEY] = now;
+    var all = await new Promise(function(resolve) {
+      try {
+        chrome.storage.local.get(FORUM_PACER_STATUS_KEY, function(result) { resolve(result && result[FORUM_PACER_STATUS_KEY]); });
+      } catch (e) { resolve(null); }
+    });
+    if (all && typeof all === 'object') {
+      Object.keys(all).forEach(function(host) {
+        all[host] = {
+          burst: FORUM_PACER_NORMAL_BURST,
+          refillMs: FORUM_PACER_NORMAL_REFILL_MS,
+          learnedBurst: FORUM_PACER_NORMAL_BURST,
+          learnedRefillMs: FORUM_PACER_NORMAL_REFILL_MS,
+          level: 0,
+          pauseUntil: 0,
+          limitsUntil: 0,
+          idleUntil: now + FORUM_PACER_IDLE_MAX_AGE_MS,
+          at: now
+        };
+      });
+      items[FORUM_PACER_STATUS_KEY] = all;
+    }
+    await chrome.storage.local.set(items);
+    if (els.forumPacerInfo) els.forumPacerInfo.textContent = describeForumPacerStatus(all);
+    return true;
+  }
+
+  if (els.resetForumPacer) {
+    els.resetForumPacer.addEventListener('click', function() {
+      runButtonAction(els.resetForumPacer, '重置中...', '已重置（所有论坛域名）', '立即重置论坛节流', resetForumPacing);
+    });
+  }
+  if (chrome.storage && chrome.storage.onChanged && chrome.storage.onChanged.addListener) {
+    chrome.storage.onChanged.addListener(function(changes, areaName) {
+      if (areaName === 'local' && changes && changes[FORUM_PACER_STATUS_KEY] && els.forumPacerInfo) {
+        els.forumPacerInfo.textContent = describeForumPacerStatus(changes[FORUM_PACER_STATUS_KEY].newValue);
+      }
+    });
+  }
+  refreshForumPacerInfo();
+
+  // ---- Marked resources and the daily backup ----
+  // The worker stores the marks; the popup reads them, builds the files here
+  // (never inside a forum page) and tells the worker what it exported or
+  // copied, which also goes into that day's backup. Nothing here deletes a
+  // backup.
+  var MARKS = typeof ATPMarks !== 'undefined' ? ATPMarks : null;
+  var MARKS_LIST_LIMIT = 50;
+  var MARKS_ERROR_TEXT = {
+    stale: '标记刚刚有变化，请确认列表后再清空',
+    not_allowed: '操作被拒绝',
+    storage_write_failed: '存储写入失败',
+    storage_read_failed: '存储读取失败'
+  };
+  var marksIndex = null;
+  var marksRefreshTimer = null;
+
+  function marksErrorText(code) {
+    return MARKS_ERROR_TEXT[code] || '操作失败';
+  }
+
+  function sendMarksMutation(payload) {
+    return new Promise(function(resolve, reject) {
+      try {
+        chrome.runtime.sendMessage(Object.assign({ type: SharedUtils.MESSAGE_TYPES.MARKS_MUTATION }, payload), function(response) {
+          if (chrome.runtime.lastError) {
+            reject(new Error('后台未响应'));
+            return;
+          }
+          if (!response || !response.ok) {
+            reject(new Error(marksErrorText(response && response.error)));
+            return;
+          }
+          resolve(response);
+        });
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+
+  function describeMarksSummary(index) {
+    var items = index.items;
+    if (!items.length) return '尚未标记帖子。在论坛列表页帖子缩略图上方点「标记」即可保存标题、链接和密码。';
+    var unexported = 0;
+    var attention = 0;
+    items.forEach(function(item) {
+      if (!MARKS.isExported(item)) unexported++;
+      if (item.attention) attention++;
+    });
+    return '共 ' + items.length + ' 帖' + (unexported ? '，未导出 ' + unexported + ' 帖' : '，均已导出') +
+      (attention ? '，' + attention + ' 帖需注意（导出文件中有说明）' : '') + '。';
+  }
+
+  function renderMarksList(index) {
+    if (!els.marksList) return;
+    els.marksList.textContent = '';
+    var items = index.items.slice().reverse();
+    items.slice(0, MARKS_LIST_LIMIT).forEach(function(item) {
+      var li = document.createElement('li');
+      li.className = 'marks-item';
+      var title = document.createElement('span');
+      title.className = 'marks-item-title';
+      title.textContent = item.title || '（未读取到标题）';
+      title.title = item.title || '';
+      var meta = document.createElement('span');
+      meta.className = 'marks-item-meta';
+      meta.textContent = '链接 ' + (item.links || 0) + (item.passwords ? ' · 密码 ' + item.passwords : '') +
+        ' · ' + (MARKS.isExported(item) ? '已导出' : (item.exportedAt ? '导出后有更新' : '未导出')) + (item.attention ? ' · 需注意' : '');
+      var remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'btn-link marks-item-remove';
+      remove.setAttribute('data-mark-remove', item.id);
+      remove.setAttribute('aria-label', '取消标记：' + (item.title || item.id));
+      remove.textContent = '移除';
+      li.appendChild(title);
+      li.appendChild(meta);
+      li.appendChild(remove);
+      els.marksList.appendChild(li);
+    });
+    if (items.length > MARKS_LIST_LIMIT) {
+      var more = document.createElement('li');
+      more.className = 'marks-item marks-item-more';
+      more.textContent = '…另有 ' + (items.length - MARKS_LIST_LIMIT) + ' 帖（导出文件中完整列出）';
+      els.marksList.appendChild(more);
+    }
+  }
+
+  function renderBackupDays(days) {
+    if (!els.backupList) return;
+    var dates = Object.keys(days.days).sort().reverse();
+    if (els.backupCount) els.backupCount.textContent = dates.length;
+    els.backupList.textContent = '';
+    dates.forEach(function(date) {
+      var info = days.days[date] || {};
+      var li = document.createElement('li');
+      li.className = 'marks-item';
+      var label = document.createElement('span');
+      label.className = 'marks-item-title';
+      label.textContent = date + ' · ' + (info.threads || 0) + ' 帖 · ' + (info.links || 0) + ' 条链接';
+      var download = document.createElement('button');
+      download.type = 'button';
+      download.className = 'btn-link';
+      download.setAttribute('data-backup-day', date);
+      download.setAttribute('aria-label', '下载 ' + date + ' 的备份');
+      download.textContent = '下载';
+      li.appendChild(label);
+      li.appendChild(download);
+      els.backupList.appendChild(li);
+    });
+    if (els.downloadAllBackups) els.downloadAllBackups.disabled = !dates.length;
+  }
+
+  async function refreshMarks() {
+    if (!MARKS || !els.marksSection) return null;
+    var items = await storageGet([MARKS.KEYS.INDEX, MARKS.KEYS.DAYS], '读取标记');
+    marksIndex = MARKS.readIndex(items && items[MARKS.KEYS.INDEX]);
+    var days = MARKS.readDays(items && items[MARKS.KEYS.DAYS]);
+    if (els.marksCount) els.marksCount.textContent = marksIndex.items.length;
+    if (els.marksSummary) els.marksSummary.textContent = describeMarksSummary(marksIndex);
+    renderMarksList(marksIndex);
+    renderBackupDays(days);
+    var hasMarks = marksIndex.items.length > 0;
+    [els.exportMarks, els.copyMarks, els.clearAllMarks].forEach(function(btn) {
+      if (btn) btn.disabled = !hasMarks;
+    });
+    if (els.clearExportedMarks) els.clearExportedMarks.disabled = !marksIndex.items.some(MARKS.isExported);
+    return marksIndex;
+  }
+
+  function scheduleMarksRefresh() {
+    if (marksRefreshTimer) clearTimeout(marksRefreshTimer);
+    marksRefreshTimer = setTimeout(function() {
+      marksRefreshTimer = null;
+      refreshMarks().catch(function() {});
+    }, 150);
+  }
+
+  async function readMarkRecords(index) {
+    var keys = index.items.map(function(item) { return MARKS.itemKey(item.id); });
+    var stored = keys.length ? await storageGet(keys, '读取标记') : {};
+    var records = [];
+    index.items.forEach(function(item) {
+      var record = stored && stored[MARKS.itemKey(item.id)];
+      if (record && typeof record === 'object' && Array.isArray(record.links)) records.push(record);
+    });
+    return records;
+  }
+
+  function downloadTextFile(text, filename) {
+    var blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    // Revoking at once can cancel the download in some browsers.
+    setTimeout(function() { URL.revokeObjectURL(url); }, 10000);
+  }
+
+  function handedOut(records) {
+    return records.map(function(record) { return { id: record.id, updatedAt: record.updatedAt }; });
+  }
+
+  async function exportMarks() {
+    var index = await refreshMarks();
+    if (!index || !index.items.length) return { count: 0 };
+    var records = await readMarkRecords(index);
+    if (!records.length) return { count: 0 };
+    var now = new Date();
+    var text = MARKS.formatExport(records, { version: chrome.runtime.getManifest().version, now: now.getTime() });
+    downloadTextFile(text, 'thumbnail-preview-marked-' + formatLocalFilenameTimestamp(now) + '.txt');
+    await sendMarksMutation({ op: 'exported', marks: handedOut(records) });
+    await refreshMarks();
+    return { count: records.length };
+  }
+
+  async function copyMarks() {
+    var index = await refreshMarks();
+    if (!index || !index.items.length) return { count: 0 };
+    var records = await readMarkRecords(index);
+    if (!records.length) return { count: 0 };
+    var text = MARKS.formatExport(records, { version: chrome.runtime.getManifest().version, now: Date.now() }).replace(/^\ufeff/, '').replace(/\r\n/g, '\n');
+    await navigator.clipboard.writeText(text);
+    await sendMarksMutation({ op: 'copiedMarks', marks: handedOut(records) });
+    await refreshMarks();
+    return { count: records.length };
+  }
+
+  async function readBackupDays(dates) {
+    var keys = dates.map(MARKS.dayKey);
+    var stored = keys.length ? await storageGet(keys, '读取备份') : {};
+    var days = [];
+    dates.forEach(function(date) {
+      var value = stored && stored[MARKS.dayKey(date)];
+      if (value) days.push(MARKS.readDay(value, date));
+    });
+    return days;
+  }
+
+  async function downloadBackups(dates, filename) {
+    var days = await readBackupDays(dates);
+    if (!days.length) throw new Error('没有可下载的备份');
+    var text = MARKS.formatDayBackup(days, { version: chrome.runtime.getManifest().version, now: Date.now() });
+    downloadTextFile(text, filename);
+    return days.length;
+  }
+
+  function countSuccess(verb) {
+    return function(result) {
+      var count = result && result.count;
+      return count ? { text: '已' + verb + ' ' + count + ' 帖', type: 'ok' } : { text: '没有标记', type: 'info' };
+    };
+  }
+
+  if (MARKS && els.marksSection) {
+    if (els.exportMarks) {
+      els.exportMarks.addEventListener('click', function() {
+        runButtonAction(els.exportMarks, '导出中...', countSuccess('导出'), '导出 TXT', exportMarks);
+      });
+    }
+    if (els.copyMarks) {
+      els.copyMarks.addEventListener('click', function() {
+        runButtonAction(els.copyMarks, '复制中...', countSuccess('复制'), '复制全部', copyMarks);
+      });
+    }
+    if (els.clearExportedMarks) {
+      els.clearExportedMarks.addEventListener('click', function() {
+        runDestructiveButtonAction(els.clearExportedMarks, '再次点击清空', '再次点击确认：移除已导出且之后没有更新的标记（备份保留）', '清空中...', function(result) {
+          return { text: '已移除 ' + ((result && result.removed) || 0) + ' 帖', type: 'ok' };
+        }, '清空已导出', async function() {
+          var result = await sendMarksMutation({ op: 'clearExported' });
+          await refreshMarks();
+          return result;
+        });
+      });
+    }
+    if (els.clearAllMarks) {
+      els.clearAllMarks.addEventListener('click', function() {
+        var unexported = marksIndex ? MARKS.countUnexported(marksIndex) : 0;
+        runDestructiveButtonAction(els.clearAllMarks, '再次点击清空', '再次点击确认清空全部标记' + (unexported ? '（其中 ' + unexported + ' 帖未导出）' : '') + '；每日备份保留', '清空中...', function(result) {
+          return { text: '已移除 ' + ((result && result.removed) || 0) + ' 帖', type: 'ok' };
+        }, '清空全部标记', async function() {
+          var index = marksIndex || await refreshMarks();
+          try {
+            return await sendMarksMutation({ op: 'clearAll', rev: index ? index.rev : -1 });
+          } finally {
+            await refreshMarks();
+          }
+        });
+      });
+    }
+    if (els.marksList) {
+      els.marksList.addEventListener('click', function(e) {
+        var btn = e.target && e.target.closest ? e.target.closest('[data-mark-remove]') : null;
+        if (!btn) return;
+        var id = btn.getAttribute('data-mark-remove');
+        runButtonAction(btn, '移除中...', null, '移除', async function() {
+          await sendMarksMutation({ op: 'remove', ids: [id] });
+          await refreshMarks();
+        });
+      });
+    }
+    if (els.backupList) {
+      els.backupList.addEventListener('click', function(e) {
+        var btn = e.target && e.target.closest ? e.target.closest('[data-backup-day]') : null;
+        if (!btn) return;
+        var date = btn.getAttribute('data-backup-day');
+        runButtonAction(btn, '下载中...', '已下载', '下载', function() {
+          return downloadBackups([date], 'thumbnail-preview-backup-' + date + '.txt');
+        });
+      });
+    }
+    if (els.downloadAllBackups) {
+      els.downloadAllBackups.addEventListener('click', function() {
+        runButtonAction(els.downloadAllBackups, '下载中...', function(count) {
+          return { text: '已下载 ' + count + ' 天的备份', type: 'ok' };
+        }, '下载全部备份', async function() {
+          var stored = await storageGet(MARKS.KEYS.DAYS, '读取备份');
+          var dates = Object.keys(MARKS.readDays(stored && stored[MARKS.KEYS.DAYS]).days).sort();
+          return downloadBackups(dates, 'thumbnail-preview-backup-all-' + formatLocalFilenameTimestamp(new Date()) + '.txt');
+        });
+      });
+    }
+    // Turning the extension off with marks not yet exported: say so.
+    if (els.toggleEnabled) {
+      els.toggleEnabled.addEventListener('change', function() {
+        if (els.toggleEnabled.checked || !marksIndex) return;
+        var unexported = MARKS.countUnexported(marksIndex);
+        if (unexported) setPopupStatus('还有 ' + unexported + ' 个已标记的帖子未导出，可在上方「已标记资源」中导出。', 'info', true);
+      });
+    }
+    if (chrome.storage && chrome.storage.onChanged && chrome.storage.onChanged.addListener) {
+      chrome.storage.onChanged.addListener(function(changes, areaName) {
+        if (areaName === 'local' && changes && (changes[MARKS.KEYS.INDEX] || changes[MARKS.KEYS.DAYS])) scheduleMarksRefresh();
+      });
+    }
+    refreshMarks().catch(function(e) {
+      if (els.marksSummary) els.marksSummary.textContent = '读取标记失败：' + errorMessage(e);
+    });
+  }
+
+  // liveSession (optional) receives the flushed tab's log key so export
+  // pruning keeps that shard.
+  async function flushLiveContentLogsBeforeExport(liveSession) {
+    return new Promise(function(resolve) {
+      if (!chrome.tabs || !chrome.tabs.query || !chrome.tabs.sendMessage) { resolve(false); return; }
+      var done = false;
+      var timer = setTimeout(function() { finish(false); }, 1500);
+      function finish(ok) {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(ok === true);
+      }
+      try {
+        chrome.tabs.query({ active: true, currentWindow: true }, function(tabs) {
+          if (chrome.runtime.lastError || !tabs || !tabs[0] || typeof tabs[0].id !== 'number') { finish(false); return; }
+          try {
+            chrome.tabs.sendMessage(tabs[0].id, { type: 'ATP_FLUSH_CONTENT_LOGS' }, function(response) {
+              var ok = !chrome.runtime.lastError && response && response.ok === true;
+              if (ok && liveSession && typeof response.logKey === 'string') liveSession.logKey = response.logKey;
+              finish(ok);
+            });
+          } catch (e) { finish(false); }
+        });
+      } catch (e) { finish(false); }
+    });
+  }
+
   els.exportLogs.addEventListener('click', function() {
     runButtonAction(els.exportLogs, '导出中...', function(result) {
       return result === 'empty' ? '无日志' : '已导出!';
     }, '导出日志', async function() {
-      var logs = await loadLogEntries({ allowDiscovery: true, prune: true });
+      var liveSession = {};
+      var refreshed = await flushLiveContentLogsBeforeExport(liveSession);
+      var logs = await loadLogEntries({
+        allowDiscovery: true,
+        prune: true,
+        protectedLogKeys: liveSession.logKey ? [liveSession.logKey] : []
+      });
       if (els.logPanel && !els.logPanel.classList.contains('hidden')) {
         loadedLogEntries = logs;
         renderLoadedLogs(loadedLogEntries);
@@ -1818,6 +2326,8 @@
       var exportOffsetMinutes = -exportDate.getTimezoneOffset();
       var exportTimezone = getTimezoneName();
       var text = buildLogExportText(logs, version, exportDate, exportOffsetMinutes, exportTimezone);
+      if (!refreshed) text = text.replace('================================\n\n',
+        '实时刷新: 未收到当前页面确认，最后几秒日志可能尚未写入\n================================\n\n');
       var blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
       var url = URL.createObjectURL(blob);
       var a = document.createElement('a');
@@ -2053,6 +2563,7 @@
       discoverLogKeysFromStorage: discoverLogKeysFromStorage,
       refreshLogCount: refreshLogCount,
       loadLogEntries: loadLogEntries,
+      flushLiveContentLogsBeforeExport: flushLiveContentLogsBeforeExport,
       loadLogs: loadLogs,
       scheduleLogReload: scheduleLogReload,
       renderLoadedLogs: renderLoadedLogs,

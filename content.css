@@ -29,6 +29,20 @@
   line-height: 16px;
 }
 
+.atp-forum-wait {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: #fff3d7;
+  color: #7a4b00;
+  font-size: 11px;
+  font-weight: normal;
+  line-height: 16px;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
 .atp-thumbnail-expand {
   margin-left: 8px;
   min-width: 44px;
@@ -115,6 +129,46 @@
 .atp-thumbnail-wrapper:focus-visible {
   outline: 2px solid #4a90d9;
   outline-offset: 2px;
+}
+
+/* 动图缩略图显示静帧（画布），悬停时换回原 <img> 播放；隐藏的动图不再逐帧解码重绘。
+   <img> 成功加载后带内联 display:block，这里必须用 !important 覆盖。 */
+.atp-gif-still {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  object-position: center center;
+  background: #f5f5f5;
+}
+
+.atp-gif-frozen .atp-thumbnail-img {
+  display: none !important;
+}
+
+.atp-gif-frozen:hover .atp-thumbnail-img {
+  display: block !important;
+}
+
+.atp-gif-frozen:hover .atp-gif-still {
+  display: none;
+}
+
+.atp-gif-frozen::after {
+  content: 'GIF';
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  padding: 0 3px;
+  border-radius: 2px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font: bold 9px/13px sans-serif;
+  pointer-events: none;
+}
+
+.atp-gif-frozen:hover::after {
+  display: none;
 }
 
 .atp-heavy-thumbnail .atp-thumbnail-img {
@@ -365,7 +419,10 @@
   font-weight: 600;
 }
 
-/* 骨架屏微光：动画改用 transform（合成器动画），不再逐帧重绘 background-position */
+/* 加载占位：静态骨架，不做动画。
+   逐格无限微光即使走 transform，也会让每个加载中的缩略图各占一个合成层，
+   滚动时每一帧都要为它们重算样式、更新合成输入；图床慢时屏幕附近常有几十格同时加载，
+   实测滚动期间主线程工作多出约三成。加载进度由工具栏“加载中 x/y”显示。 */
 .atp-thumbnail-loading {
   position: absolute;
   inset: 0;
@@ -373,34 +430,11 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #f0f0f0;
+  background: linear-gradient(90deg, #f0f0f0 0%, #e7e7e7 50%, #f0f0f0 100%);
   overflow: hidden;
 }
 
-.atp-thumbnail-loading::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(90deg, rgba(224, 224, 224, 0) 0%, #e0e0e0 50%, rgba(224, 224, 224, 0) 100%);
-  transform: translateX(-100%);
-  animation: none;
-}
-
-.atp-thumbnail-wrapper.atp-loading-near-viewport .atp-thumbnail-loading::after {
-  animation: atp-shimmer 1.5s infinite;
-}
-
-@keyframes atp-shimmer {
-  0% { transform: translateX(-100%); }
-  100% { transform: translateX(100%); }
-}
-
 @media (prefers-reduced-motion: reduce) {
-  .atp-thumbnail-loading::after,
-  .atp-thumbnail-wrapper.atp-loading-near-viewport .atp-thumbnail-loading::after {
-    animation: none;
-  }
-
   .atp-thumbnail-img {
     transition: none;
   }
@@ -428,5 +462,84 @@
 
   .atp-resource-inline {
     display: flex;
+  }
+}
+
+/* Mark a thread's resources for export (toolbar toggle). */
+.atp-mark-toggle {
+  margin-left: auto;
+  border: 1px solid #b9c7a8;
+  border-radius: 4px;
+  background: #fbfdf7;
+  color: #3d5a1e;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  line-height: 1.2;
+  min-height: 24px;
+  min-width: 24px;
+  padding: 2px 7px;
+  white-space: nowrap;
+}
+
+.atp-resource-trigger ~ .atp-mark-toggle {
+  margin-left: 0;
+}
+
+.atp-mark-toggle[aria-pressed="true"] {
+  border-color: #4f8a2b;
+  background: #e3f3d6;
+  color: #2d5a12;
+  font-weight: 600;
+}
+
+.atp-mark-toggle:not([aria-disabled="true"]):hover {
+  background: #eef7e4;
+}
+
+.atp-mark-toggle:focus-visible {
+  outline: 2px solid #3d5a1e;
+  outline-offset: 2px;
+}
+
+.atp-mark-toggle[aria-disabled="true"] {
+  cursor: progress;
+  opacity: 0.75;
+}
+
+.atp-mark-toggle[role="alert"] {
+  border-color: #c0392b;
+  background: #fdecea;
+  color: #8a1f14;
+}
+
+.atp-resource-thread-title {
+  margin: -4px 0 8px;
+  font-size: 12px;
+  color: #445;
+  line-height: 1.4;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  word-break: break-all;
+}
+
+.atp-resource-mark-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: #e3f3d6;
+  color: #2d5a12;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+@media (max-width: 1024px) {
+  .atp-resource-trigger ~ .atp-mark-toggle {
+    margin-left: auto;
   }
 }

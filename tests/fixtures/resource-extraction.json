@@ -22,6 +22,27 @@
       }
     },
     {
+      "name": "same-paragraph-anchor-codes",
+      "html": "<p>\u63d0\u53d6\u7801: abcd <a href=\"https://pan.baidu.com/s/one\">Baidu</a> <a href=\"https://pan.quark.cn/s/two\">Quark</a> \u63d0\u53d6\u7801: efgh</p>",
+      "expected": {
+        "baidu": [{ "url": "https://pan.baidu.com/s/one", "code": "abcd" }],
+        "quark": [{ "url": "https://pan.quark.cn/s/two", "code": "efgh" }]
+      }
+    },
+    {
+      "name": "do-not-share-code-between-anchors",
+      "html": "<p><a href=\"https://pan.baidu.com/s/one\">Baidu</a> \u63d0\u53d6\u7801: 1111 <a href=\"https://pan.quark.cn/s/two\">Quark</a></p>",
+      "expected": {
+        "baidu": [{ "url": "https://pan.baidu.com/s/one", "code": "1111" }],
+        "quark": [{ "url": "https://pan.quark.cn/s/two" }]
+      }
+    },
+    {
+      "name": "ignore-hidden-resource-text",
+      "html": "<script>const x='https://pan.baidu.com/s/fake'; // \u89e3\u538b\u5bc6\u7801: hidden123</script><style>.x{content:'https://pan.quark.cn/s/fake'}</style>",
+      "expected": {}
+    },
+    {
       "name": "protocol-links",
       "html": "<a href=\"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&amp;dn=Fixture\">Magnet</a><a href=\"ed2k://|file|fixture.zip|123|0123456789ABCDEF0123456789ABCDEF|/\">ED2K</a>",
       "expected": {
@@ -60,6 +81,563 @@
         ]
       },
       "passwords": ["pass-123"]
+    },
+    {
+      "name": "code-does-not-leak-to-next-link-br",
+      "html": "<div>https://pan.baidu.com/s/1pair \u63d0\u53d6\u7801: aaaa<br>https://pan.quark.cn/s/qpair</div>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1pair", "code": "aaaa" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qpair" }
+        ]
+      }
+    },
+    {
+      "name": "code-does-not-leak-to-next-link-own-line",
+      "html": "<div>https://pan.baidu.com/s/1pair<br>\u63d0\u53d6\u7801: aaaa<br>https://pan.quark.cn/s/qpair</div>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1pair", "code": "aaaa" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qpair" }
+        ]
+      }
+    },
+    {
+      "name": "code-does-not-leak-same-line",
+      "html": "<div>https://pan.baidu.com/s/1pair \u63d0\u53d6\u7801: aaaa https://pan.quark.cn/s/qpair</div>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1pair", "code": "aaaa" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qpair" }
+        ]
+      }
+    },
+    {
+      "name": "code-written-before-its-link",
+      "html": "<p>\u63d0\u53d6\u7801: aaaa \u767e\u5ea6: https://pan.baidu.com/s/1pair</p><p>\u63d0\u53d6\u7801: bbbb \u5938\u514b: https://pan.quark.cn/s/qpair</p>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1pair", "code": "aaaa" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qpair", "code": "bbbb" }
+        ]
+      }
+    },
+    {
+      "name": "code-line-before-link-line",
+      "html": "<p>\u63d0\u53d6\u7801: aaaa<br>https://pan.baidu.com/s/1pair</p><p>\u63d0\u53d6\u7801: bbbb<br>https://pan.quark.cn/s/qpair</p>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1pair", "code": "aaaa" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qpair", "code": "bbbb" }
+        ]
+      }
+    },
+    {
+      "name": "anchor-code-written-before",
+      "html": "<p>\u63d0\u53d6\u7801: aaaa <a href=\"https://pan.baidu.com/s/1pair\">\u767e\u5ea6\u7f51\u76d8</a></p><p>\u63d0\u53d6\u7801: bbbb <a href=\"https://pan.quark.cn/s/qpair\">\u5938\u514b\u7f51\u76d8</a></p>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1pair", "code": "aaaa" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qpair", "code": "bbbb" }
+        ]
+      }
+    },
+    {
+      "name": "anchor-with-visible-url-no-leak",
+      "html": "<p><a href=\"https://pan.baidu.com/s/1pair\">https://pan.baidu.com/s/1pair</a> \u63d0\u53d6\u7801: aaaa<br><a href=\"https://pan.quark.cn/s/qpair\">https://pan.quark.cn/s/qpair</a></p>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1pair", "code": "aaaa" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qpair" }
+        ]
+      }
+    },
+    {
+      "name": "far-away-code-is-not-borrowed",
+      "html": "<p>https://pan.baidu.com/s/1pair</p><p>\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57</p><p>\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57</p><p>\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57</p><p>\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57</p><p>\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57</p><p>\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57</p><p>\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57</p><p>\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57</p><p>\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57</p><p>\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57</p><p>\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57</p><p>\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57\u8bf4\u660e\u6587\u5b57</p><p>\u63d0\u53d6\u7801: aaaa</p>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1pair" }
+        ]
+      }
+    },
+    {
+      "name": "code-next-to-hidden-anchor-stays-with-it",
+      "html": "\u3010\u767e\u5ea6\u3011<a href=\"https://pan.baidu.com/s/1rev\">https://pan.baidu.com/s/1rev</a><br>\u3010\u5938\u514b\u3011<a href=\"https://pan.quark.cn/s/qrev\">\u70b9\u6b64\u83b7\u53d6</a> \u63d0\u53d6\u7801\uff1abbbb",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1rev" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qrev", "code": "bbbb" }
+        ]
+      }
+    },
+    {
+      "name": "drive-labelled-codes-after-both-links",
+      "html": "\u767e\u5ea6: https://pan.baidu.com/s/1rev<br>\u5938\u514b: https://pan.quark.cn/s/qrev<br>\u767e\u5ea6\u63d0\u53d6\u7801\uff1aaaaa<br>\u5938\u514b\u63d0\u53d6\u7801\uff1abbbb",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1rev", "code": "aaaa" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qrev", "code": "bbbb" }
+        ]
+      }
+    },
+    {
+      "name": "line-starting-with-previous-links-code",
+      "html": "<a href=\"https://pan.baidu.com/s/1rev\">https://pan.baidu.com/s/1rev</a><br />\r\n\u63d0\u53d6\u7801\uff1aaaaa \u5907\u7528\uff1a<a href=\"https://pan.quark.cn/s/qrev\">https://pan.quark.cn/s/qrev</a> \u63d0\u53d6\u7801\uff1aqqqq",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1rev", "code": "aaaa" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qrev", "code": "qqqq" }
+        ]
+      }
+    },
+    {
+      "name": "two-baidu-share-snippets",
+      "html": "\u94fe\u63a5: https://pan.baidu.com/s/1rev<br />\r\n\u63d0\u53d6\u7801: aaaa \u590d\u5236\u8fd9\u6bb5\u5185\u5bb9\u540e\u6253\u5f00\u767e\u5ea6\u7f51\u76d8\u624b\u673aApp\uff0c\u64cd\u4f5c\u66f4\u65b9\u4fbf\u54e6 \u94fe\u63a5: https://pan.baidu.com/s/1rev2<br />\r\n\u63d0\u53d6\u7801: bbbb",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1rev", "code": "aaaa" },
+          { "url": "https://pan.baidu.com/s/1rev2", "code": "bbbb" }
+        ]
+      }
+    },
+    {
+      "name": "other-drive-keeps-its-own-code",
+      "html": "\u84dd\u594f\u4e91\uff1a<a href=\"https://wwa.lanzoux.com/iabc\">https://wwa.lanzoux.com/iabc</a> \u5bc6\u7801\uff1alz12<br />\r\n\u5938\u514b\u7f51\u76d8\uff1a<a href=\"https://pan.quark.cn/s/qrev\">https://pan.quark.cn/s/qrev</a><br />\r\n\u63d0\u53d6\u7801\uff1aqqqq",
+      "expected": {
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qrev", "code": "qqqq" }
+        ]
+      }
+    },
+    {
+      "name": "archive-password-line-between-link-and-code",
+      "html": "\u3010\u4e0b\u8f7d\u94fe\u63a5\u3011\uff1ahttps://pan.baidu.com/s/1rev<br />\r\n\u3010\u89e3\u538b\u5bc6\u7801\u3011\uff1axyz123<br />\r\n\u63d0\u53d6\u7801\uff1aaaaa",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1rev", "code": "aaaa" }
+        ]
+      },
+      "passwords": ["xyz123"]
+    },
+    {
+      "name": "screenshots-between-links-and-codes",
+      "html": "\u767e\u5ea6\u7f51\u76d8\uff1a<a href=\"https://pan.baidu.com/s/1rev\">\u70b9\u51fb\u4e0b\u8f7d</a><br />\r\n<ignore_js_op><img src=\"https://tu.example/a.jpg\"><div class=\"tip tip_4 aimg_tip\"><p><strong>1.jpg</strong> <em class=\"xg1\">(123.4 KB, \u4e0b\u8f7d\u6b21\u6570: 12)</em></p><p><a href=\"forum.php?mod=attachment&amp;aid=MTIz\">\u4e0b\u8f7d\u9644\u4ef6</a></p><p class=\"xg1 y\">2023-1-1 12:00 \u4e0a\u4f20</p></div></ignore_js_op><ignore_js_op><img src=\"https://tu.example/a.jpg\"><div class=\"tip tip_4 aimg_tip\"><p><strong>1.jpg</strong> <em class=\"xg1\">(123.4 KB, \u4e0b\u8f7d\u6b21\u6570: 12)</em></p><p><a href=\"forum.php?mod=attachment&amp;aid=MTIz\">\u4e0b\u8f7d\u9644\u4ef6</a></p><p class=\"xg1 y\">2023-1-1 12:00 \u4e0a\u4f20</p></div></ignore_js_op><br />\r\n\u63d0\u53d6\u7801\uff1aaaaa<br />\r\n\u5938\u514b\u7f51\u76d8\uff1a<a href=\"https://pan.quark.cn/s/qrev\">\u70b9\u51fb\u4e0b\u8f7d</a>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1rev", "code": "aaaa" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qrev" }
+        ]
+      }
+    },
+    {
+      "name": "download-password-is-not-a-share-code",
+      "html": "\u4e0b\u8f7d\uff1ahttps://files.example/pack.rar \u5bc6\u7801\uff1arar123<br>\u767e\u5ea6\uff1ahttps://pan.baidu.com/s/1rev",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1rev" }
+        ],
+        "other": [
+          { "url": "https://files.example/pack.rar" }
+        ]
+      },
+      "passwords": ["rar123"]
+    },
+    {
+      "name": "other-drive-anchor-keeps-its-own-code",
+      "html": "\u84dd\u594f\u4e91\uff1a<a href=\"https://wwa.lanzoux.com/iabc\">\u70b9\u51fb\u4e0b\u8f7d</a> \u5bc6\u7801\uff1alz12<br />\r\n\u5938\u514b\u7f51\u76d8\uff1a<a href=\"https://pan.quark.cn/s/qrev3\">\u70b9\u51fb\u4e0b\u8f7d</a><br />\r\n\u63d0\u53d6\u7801\uff1aqqqq",
+      "expected": {
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qrev3", "code": "qqqq" }
+        ]
+      }
+    },
+    {
+      "name": "archive-password-on-top-does-not-shift-codes",
+      "html": "\u538b\u7f29\u5305\u5bc6\u7801\uff1asht2023<br />\u767e\u5ea6\uff1a<a href=\"https://pan.baidu.com/s/1r2a\">\u70b9\u51fb</a><br />\u63d0\u53d6\u7801\uff1aa111<br />\u5938\u514b\uff1a<a href=\"https://pan.quark.cn/s/qr2\">\u70b9\u51fb</a><br />\u63d0\u53d6\u7801\uff1aq222<br />\u963f\u91cc\uff1a<a href=\"https://www.alipan.com/s/ar2\">\u70b9\u51fb</a><br />\u63d0\u53d6\u7801\uff1ac333",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r2a", "code": "a111" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qr2", "code": "q222" }
+        ],
+        "aliyun": [
+          { "url": "https://alipan.com/s/ar2", "code": "c333" }
+        ]
+      },
+      "passwords": ["sht2023"]
+    },
+    {
+      "name": "hidden-link-code-on-top-does-not-shift-codes",
+      "html": "\u767e\u5ea6\u7f51\u76d8\uff1a<div class=\"locked\">\u5982\u679c\u60a8\u8981\u67e5\u770b\u672c\u5e16\u9690\u85cf\u5185\u5bb9\u8bf7<a href=\"forum.php?mod=post&amp;action=reply&amp;fid=2&amp;tid=1\">\u56de\u590d</a></div>\u63d0\u53d6\u7801\uff1aa111<br />\r\n\u5938\u514b\u7f51\u76d8\uff1a<a href=\"https://pan.quark.cn/s/qr2\">https://pan.quark.cn/s/qr2</a><br />\r\n\u63d0\u53d6\u7801\uff1aq222<br />\r\n\u963f\u91cc\u4e91\u76d8\uff1a<a href=\"https://www.alipan.com/s/ar2\">\u963f\u91cc\u4e91\u76d8</a><br />\r\n\u63d0\u53d6\u7801\uff1ac333",
+      "expected": {
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qr2", "code": "q222" }
+        ],
+        "aliyun": [
+          { "url": "https://alipan.com/s/ar2", "code": "c333" }
+        ]
+      }
+    },
+    {
+      "name": "info-link-then-codes-before-their-links",
+      "html": "\u5b98\u7f51\uff1a<a href=\"https://www.example.com/\">https://www.example.com/</a><br>\u63d0\u53d6\u7801\uff1aa111 \u767e\u5ea6\uff1a<a href=\"https://pan.baidu.com/s/1r2a\">\u70b9\u51fb</a><br>\u63d0\u53d6\u7801\uff1ab222 \u767e\u5ea6\uff1a<a href=\"https://pan.baidu.com/s/1r2b\">\u70b9\u51fb</a>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r2a", "code": "a111" },
+          { "url": "https://pan.baidu.com/s/1r2b", "code": "b222" }
+        ]
+      }
+    },
+    {
+      "name": "image-host-thumbnail-then-codes-before-their-links",
+      "html": "<a href=\"https://imgbox.com/AbCdEf12\" target=\"_blank\"><img src=\"https://thumbs2.imgbox.com/ab/cd/AbCdEf12_t.jpg\"/></a><br />\n<p>\u63d0\u53d6\u7801: aaaa \u767e\u5ea6: https://pan.baidu.com/s/1r2a</p><p>\u63d0\u53d6\u7801: bbbb \u5938\u514b: https://pan.quark.cn/s/qr2</p>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r2a", "code": "aaaa" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qr2", "code": "bbbb" }
+        ]
+      }
+    },
+    {
+      "name": "link-without-scheme-keeps-its-code",
+      "html": "\u84dd\u594f\u4e91\uff1awwi.lanzoup.com/iabc \u5bc6\u7801\uff1alz12<br>\u5938\u514b\uff1a<a href=\"https://pan.quark.cn/s/qr2\">\u70b9\u51fb</a><br>\u63d0\u53d6\u7801\uff1aq222",
+      "expected": {
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qr2", "code": "q222" }
+        ]
+      }
+    },
+    {
+      "name": "archive-password-label-is-not-a-share-code",
+      "html": "\u767e\u5ea6\uff1a<a href=\"https://pan.baidu.com/s/1r2a\">\u70b9\u51fb</a><br>\u538b\u7f29\u5305\u5bc6\u7801\uff1asht123",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r2a" }
+        ]
+      },
+      "passwords": ["sht123"]
+    },
+    {
+      "name": "no-code-across-a-magnet",
+      "html": "\u767e\u5ea6\uff1a<a href=\"https://pan.baidu.com/s/1r2a\">\u70b9\u51fb</a><br>\u78c1\u529b\uff1a<a href=\"magnet:?xt=urn:btih:0123456789012345678901234567890123456789\">\u78c1\u529b</a><br>\u5bc6\u7801\uff1asehuatang",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r2a" }
+        ],
+        "magnet": [
+          { "url": "magnet:?xt=urn:btih:0123456789012345678901234567890123456789" }
+        ]
+      }
+    },
+    {
+      "name": "share-id-ending-like-a-drive-name",
+      "html": "UC\u7f51\u76d8\uff1ahttps://drive.uc.cn/s/u1xyz<br>\u767e\u5ea6\u7f51\u76d8\uff1ahttps://pan.baidu.com/s/1Q2w3E4r5T6y7U8i9O0pUC \u63d0\u53d6\u7801\uff1aab12",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1Q2w3E4r5T6y7U8i9O0pUC", "code": "ab12" }
+        ],
+        "uc": [
+          { "url": "https://drive.uc.cn/s/u1xyz" }
+        ]
+      }
+    },
+    {
+      "name": "no-code-across-an-ed2k-line",
+      "html": "\u767e\u5ea6\uff1a<a href=\"https://pan.baidu.com/s/1r3a\">\u70b9\u51fb</a><br>ed2k://|file|movie name.mp4|123456|AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA|/<br>\u5bc6\u7801\uff1asht123",
+      "expected": {
+        "ed2k": [
+          { "url": "ed2k://|file|movie name.mp4|123456|AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA|/" }
+        ],
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r3a" }
+        ]
+      }
+    },
+    {
+      "name": "link-without-scheme-before-a-codeless-link",
+      "html": "123\u4e91\u76d8\uff1awww.123pan.com/s/abc-xyz \u63d0\u53d6\u7801\uff1az999<br>\u767e\u5ea6\u7f51\u76d8\uff1a<a href=\"https://pan.baidu.com/s/1r3a\">https://pan.baidu.com/s/1r3a</a>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r3a" }
+        ]
+      }
+    },
+    {
+      "name": "image-host-link-between-link-and-code",
+      "html": "\u767e\u5ea6\uff1ahttps://pan.baidu.com/s/1r3a<br>https://imgbox.com/AbCdEf12<br>\u63d0\u53d6\u7801\uff1aaaaa",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r3a", "code": "aaaa" }
+        ]
+      }
+    },
+    {
+      "name": "codes-several-lines-below-their-links",
+      "html": "\u4e0b\u8f7d\u5730\u5740\uff1a<a href=\"https://pan.baidu.com/s/1r4a\">https://pan.baidu.com/s/1r4a</a><br />\r\n\u6587\u4ef6\u5927\u5c0f\uff1a1G<br />\r\n\u6587\u4ef6\u683c\u5f0f\uff1aMP4<br />\r\n\u6709\u65e0\u6c34\u5370\uff1a\u65e0<br />\r\n\u89e3\u538b\u5bc6\u7801\uff1asht<br />\r\n\u63d0\u53d6\u7801\uff1aaaaa<br />\r\n\u4e0b\u8f7d\u5730\u5740\uff1a<a href=\"https://pan.baidu.com/s/1r4b\">https://pan.baidu.com/s/1r4b</a><br />\r\n\u6587\u4ef6\u5927\u5c0f\uff1a1G<br />\r\n\u6587\u4ef6\u683c\u5f0f\uff1aMP4<br />\r\n\u6709\u65e0\u6c34\u5370\uff1a\u65e0<br />\r\n\u89e3\u538b\u5bc6\u7801\uff1asht<br />\r\n\u63d0\u53d6\u7801\uff1abbbb<br />\r\n\u4e0b\u8f7d\u5730\u5740\uff1a<a href=\"https://pan.baidu.com/s/1r4c\">https://pan.baidu.com/s/1r4c</a><br />\r\n\u6587\u4ef6\u5927\u5c0f\uff1a1G<br />\r\n\u6587\u4ef6\u683c\u5f0f\uff1aMP4<br />\r\n\u6709\u65e0\u6c34\u5370\uff1a\u65e0<br />\r\n\u89e3\u538b\u5bc6\u7801\uff1asht<br />\r\n\u63d0\u53d6\u7801\uff1acccc<br />\r\n",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r4a", "code": "aaaa" },
+          { "url": "https://pan.baidu.com/s/1r4b", "code": "bbbb" },
+          { "url": "https://pan.baidu.com/s/1r4c", "code": "cccc" }
+        ]
+      },
+      "passwords": ["sht"]
+    },
+    {
+      "name": "code-three-lines-below-then-codeless-link",
+      "html": "\u767e\u5ea6\u7f51\u76d8\uff1a<a href=\"https://pan.baidu.com/s/1r4a\">https://pan.baidu.com/s/1r4a</a><br />\r\n\u3010\u5f71\u7247\u5927\u5c0f\u3011\uff1a5.2GB<br />\r\n\u3010\u89e3\u538b\u5bc6\u7801\u3011\uff1asehuatang<br />\r\n\u63d0\u53d6\u7801\uff1aaaaa<br />\r\n\u5938\u514b\u7f51\u76d8\uff1a<a href=\"https://pan.quark.cn/s/qr4\">https://pan.quark.cn/s/qr4</a>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r4a", "code": "aaaa" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qr4" }
+        ]
+      },
+      "passwords": ["sehuatang"]
+    },
+    {
+      "name": "no-code-label-takes-no-value",
+      "html": "\u963f\u91cc\u4e91\u76d8\uff1a<a href=\"https://www.alipan.com/s/alr4\">https://www.alipan.com/s/alr4</a> \u65e0\u9700\u63d0\u53d6\u7801<br />\r\n115\u7f51\u76d8\uff1a<a href=\"https://115.com/s/swr4\">https://115.com/s/swr4</a><br />\u5938\u514b\u7f51\u76d8\uff1a<a href=\"https://pan.quark.cn/s/qr4\">\u70b9\u51fb\u4e0b\u8f7d</a> \u514d\u63d0\u53d6\u7801<br />\r\nSSIS-001 \u9ad8\u6e05\u4e2d\u6587\u5b57\u5e55",
+      "expected": {
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qr4" }
+        ],
+        "aliyun": [
+          { "url": "https://alipan.com/s/alr4" }
+        ],
+        "pan115": [
+          { "url": "https://115.com/s/swr4" }
+        ]
+      }
+    },
+    {
+      "name": "empty-code-label-takes-no-next-line",
+      "html": "\u94fe\u63a5\uff1ahttps://pan.baidu.com/s/1r4a<br />\u63d0\u53d6\u7801\uff1a<br />1080P\u9ad8\u6e05\u65e0\u7801",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r4a" }
+        ]
+      }
+    },
+    {
+      "name": "extraction-in-prose-is-not-a-code",
+      "html": "\u97f3\u8f68\u4ece\u539f\u76d8\u63d0\u53d6DTS<br />\u767e\u5ea6\u7f51\u76d8\uff1ahttps://pan.baidu.com/s/1r4a \u5b57\u5e55\u5df2\u63d0\u53d6SRT",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r4a" }
+        ]
+      }
+    },
+    {
+      "name": "source-link-before-codes-above-their-links",
+      "html": "<p>\u6765\u6e90\uff1a<a href=\"https://www.example.com/v/12\">https://www.example.com/v/12</a></p><p>\u63d0\u53d6\u7801: aaaa<br>https://pan.baidu.com/s/1r4a</p><p>\u63d0\u53d6\u7801: bbbb<br>https://pan.quark.cn/s/qr4</p>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r4a", "code": "aaaa" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qr4", "code": "bbbb" }
+        ]
+      }
+    },
+    {
+      "name": "file-drive-keeps-its-code-across-lines",
+      "html": "\u57ce\u901a\u7f51\u76d8\uff1a<a href=\"https://url89.ctfile.com/f/ctct\">\u70b9\u51fb\u4e0b\u8f7d</a><br>\u3010\u5f71\u7247\u5927\u5c0f\u3011\uff1a1.2GB<br>\u8bbf\u95ee\u7801\uff1af123<br><br>\u767e\u5ea6\u7f51\u76d8\uff1a<a href=\"https://pan.baidu.com/s/1r4b\">https://pan.baidu.com/s/1r4b</a><br>\u767e\u5ea6\u7f51\u76d8\uff1a<a href=\"https://pan.baidu.com/s/1r4c\">https://pan.baidu.com/s/1r4c</a><br><a href=\"https://url89.ctfile.com/f/ctcu\"><img src=\"download.png\"></a> \u8bbf\u95ee\u7801\uff1af456",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r4b" },
+          { "url": "https://pan.baidu.com/s/1r4c" }
+        ]
+      }
+    },
+    {
+      "name": "blank-line-groups-code-with-link-below",
+      "html": "\u5938\u514b\uff1a<a href=\"https://pan.quark.cn/s/qr4\">https://pan.quark.cn/s/qr4</a><br><br>\u63d0\u53d6\u7801\uff1aab12<br>\u767e\u5ea6\uff1a<a href=\"https://pan.baidu.com/s/1r4b\">https://pan.baidu.com/s/1r4b</a>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r4b", "code": "ab12" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qr4" }
+        ]
+      }
+    },
+    {
+      "name": "page-text-with-marker-characters",
+      "html": "\u767e\u5ea6\uff1a<a href=\"https://pan.baidu.com/s/1r4a\">https://pan.baidu.com/s/1r4a</a><br>\u63d0\u53d6\u7801\uff1aab12<br>&#57344;0&#57345;",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r4a", "code": "ab12" }
+        ]
+      }
+    },
+    {
+      "name": "page-text-with-out-of-range-marker-characters",
+      "html": "\u767e\u5ea6\uff1a<a href=\"https://pan.baidu.com/s/1r4m\">https://pan.baidu.com/s/1r4m</a><br>\u63d0\u53d6\u7801\uff1aab12<br>&#57344;9&#57345; \ue0007\ue001",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r4m", "code": "ab12" }
+        ]
+      }
+    },
+    {
+      "name": "no-code-label-with-words-after-it",
+      "html": "\u963f\u91cc\u4e91\u76d8\uff1a<a href=\"https://www.alipan.com/s/alr5\">https://www.alipan.com/s/alr5</a> \u65e0\u9700\u63d0\u53d6\u7801 ABC\u5408\u96c6",
+      "expected": {
+        "aliyun": [
+          { "url": "https://alipan.com/s/alr5" }
+        ]
+      }
+    },
+    {
+      "name": "picture-line-between-link-and-code",
+      "html": "\u767e\u5ea6\u7f51\u76d8\uff1a<a href=\"https://pan.baidu.com/s/1r5b\">https://pan.baidu.com/s/1r5b</a><br /><img src=\"https://tu.example/shot.jpg\"><br />\u63d0\u53d6\u7801\uff1aaaaa<br />\u5938\u514b\u7f51\u76d8\uff1a<a href=\"https://pan.quark.cn/s/qr5\">https://pan.quark.cn/s/qr5</a>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r5b", "code": "aaaa" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qr5" }
+        ]
+      }
+    },
+    {
+      "name": "drive-labelled-codes-stay-with-their-resource",
+      "html": "\u767e\u5ea6\u7f51\u76d8\uff1ahttps://pan.baidu.com/s/1r6a  \u5938\u514b\u7f51\u76d8\uff1ahttps://pan.quark.cn/s/qr6a<br />\r\n\u767e\u5ea6\u63d0\u53d6\u7801\uff1abd11  \u5938\u514b\u63d0\u53d6\u7801\uff1aqk11<br />\r\n\u767e\u5ea6\u7f51\u76d8\uff1ahttps://pan.baidu.com/s/1r6b  \u5938\u514b\u7f51\u76d8\uff1ahttps://pan.quark.cn/s/qr6b<br />\r\n\u767e\u5ea6\u63d0\u53d6\u7801\uff1abd22  \u5938\u514b\u63d0\u53d6\u7801\uff1aqk22",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r6a", "code": "bd11" },
+          { "url": "https://pan.baidu.com/s/1r6b", "code": "bd22" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qr6a", "code": "qk11" },
+          { "url": "https://pan.quark.cn/s/qr6b", "code": "qk22" }
+        ]
+      }
+    },
+    {
+      "name": "drive-labelled-code-for-one-drive-only",
+      "html": "\u767e\u5ea6\uff1ahttps://pan.baidu.com/s/1r6a  \u5938\u514b\uff1ahttps://pan.quark.cn/s/qr6a<br />\r\n\u767e\u5ea6\u63d0\u53d6\u7801\uff1abd11<br />\r\n\u767e\u5ea6\uff1ahttps://pan.baidu.com/s/1r6b  \u5938\u514b\uff1ahttps://pan.quark.cn/s/qr6b<br />\r\n\u767e\u5ea6\u63d0\u53d6\u7801\uff1abd22",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r6a", "code": "bd11" },
+          { "url": "https://pan.baidu.com/s/1r6b", "code": "bd22" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qr6a" },
+          { "url": "https://pan.quark.cn/s/qr6b" }
+        ]
+      }
+    },
+    {
+      "name": "link-saying-it-has-no-code-takes-none",
+      "html": "\u4e0b\u8f7d\u5730\u5740\uff1a<a href=\"https://pan.baidu.com/s/1r6a\">\u767e\u5ea6\u7f51\u76d8</a><br />\r\n\u8d44\u6e90\u540d\u79f0\uff1aABC-123<br />\r\n\u8d44\u6e90\u5927\u5c0f\uff1a5.2GB<br />\r\n\u8d44\u6e90\u683c\u5f0f\uff1aMP4<br />\r\n\u89e3\u538b\u5bc6\u7801\uff1asehuatang<br />\r\n\u63d0\u53d6\u7801\uff1abd12<br />\r\n\u5907\u7528\u5730\u5740\uff1a<a href=\"https://pan.quark.cn/s/qr6a\">\u5938\u514b\u7f51\u76d8</a>\uff08\u65e0\u9700\u63d0\u53d6\u7801\uff09",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r6a", "code": "bd12" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qr6a" }
+        ]
+      },
+      "passwords": ["sehuatang"]
+    },
+    {
+      "name": "hidden-content-block-keeps-code-with-link-above",
+      "html": "\u767e\u5ea6\u7f51\u76d8\uff1a<a href=\"https://pan.baidu.com/s/1r6a\">https://pan.baidu.com/s/1r6a</a><br />\r\n<div class=\"showhide\"><h4>\u672c\u5e16\u9690\u85cf\u7684\u5185\u5bb9</h4>\u63d0\u53d6\u7801\uff1abd12<br />\r\n\u5938\u514b\u7f51\u76d8\uff1a<a href=\"https://pan.quark.cn/s/qr6a\">https://pan.quark.cn/s/qr6a</a></div>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r6a", "code": "bd12" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qr6a" }
+        ]
+      }
+    },
+    {
+      "name": "list-item-starts-a-new-line",
+      "html": "<ul><li>\u767e\u5ea6\u7f51\u76d8\uff1a<a href=\"https://pan.baidu.com/s/1r6a\">https://pan.baidu.com/s/1r6a</a><br />\u63d0\u53d6\u7801\uff1aaaaa<li>\u963f\u91cc\u4e91\u76d8\uff1a<a href=\"https://www.alipan.com/s/alr6\">https://www.alipan.com/s/alr6</a></ul>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r6a", "code": "aaaa" }
+        ],
+        "aliyun": [
+          { "url": "https://alipan.com/s/alr6" }
+        ]
+      }
+    },
+    {
+      "name": "links-then-codes-pair-by-position",
+      "html": "\u767e\u5ea6\u7f51\u76d8\uff1a<a href=\"https://pan.baidu.com/s/1r6a\">https://pan.baidu.com/s/1r6a</a><br />\r\n\u5938\u514b\u7f51\u76d8\uff1a<a href=\"https://pan.quark.cn/s/qr6a\">https://pan.quark.cn/s/qr6a</a><br />\r\n\u63d0\u53d6\u7801\uff1abd12<br />\r\n\u63d0\u53d6\u7801\uff1aqk12",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r6a", "code": "bd12" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qr6a", "code": "qk12" }
+        ]
+      }
+    },
+    {
+      "name": "table-with-drive-columns-and-no-code-cell",
+      "html": "<table class=\"t_table\"><tr><td>\u767e\u5ea6\u7f51\u76d8</td><td>\u5938\u514b\u7f51\u76d8</td></tr><tr><td><a href=\"https://pan.baidu.com/s/1r6a\">https://pan.baidu.com/s/1r6a</a></td><td><a href=\"https://pan.quark.cn/s/qr6a\">https://pan.quark.cn/s/qr6a</a></td></tr><tr><td>\u63d0\u53d6\u7801\uff1abd12</td><td>\u65e0</td></tr></table>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r6a", "code": "bd12" }
+        ],
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qr6a" }
+        ]
+      }
+    },
+    {
+      "name": "link-with-code-in-url-takes-no-other-code",
+      "html": "\u767e\u5ea6\u7f51\u76d8\uff1a<a href=\"https://pan.baidu.com/s/1r6a?pwd=aaaa\">\u70b9\u51fb\u4e0b\u8f7d</a><br />\r\n\u63d0\u53d6\u7801\uff1abbbb<br />\r\n\u767e\u5ea6\u7f51\u76d8\uff1a<a href=\"https://pan.baidu.com/s/1r6b\">https://pan.baidu.com/s/1r6b</a>",
+      "expected": {
+        "baidu": [
+          { "url": "https://pan.baidu.com/s/1r6b", "code": "bbbb" },
+          { "url": "https://pan.baidu.com/s/1r6a", "code": "aaaa" }
+        ]
+      }
+    },
+    {
+      "name": "no-code-statement-keeps-the-link-above-its-code",
+      "html": "\u5938\u514b\u7f51\u76d8\uff1a<a href=\"https://pan.quark.cn/s/qr7\">https://pan.quark.cn/s/qr7</a><br />\r\n<br />\r\n\u63d0\u53d6\u7801\uff1aqk12<br />\r\nUC\u7f51\u76d8\uff1a<a href=\"https://drive.uc.cn/s/ucr7\">https://drive.uc.cn/s/ucr7</a> \uff08\u65e0\u63d0\u53d6\u7801\uff09",
+      "expected": {
+        "quark": [
+          { "url": "https://pan.quark.cn/s/qr7", "code": "qk12" }
+        ],
+        "uc": [
+          { "url": "https://drive.uc.cn/s/ucr7" }
+        ]
+      }
     }
   ],
   "attachmentCases": [
@@ -78,6 +656,16 @@
       "expectedUrls": [
         "https://dl.ldkms.la/dup.txt?b=2&a=1#first"
       ]
+    },
+    {
+      "name": "reject-unrelated-attachment-like-paths",
+      "html": "<a href=\"/admin.php?aid=7\">report.txt</a><a href=\"https://xia.ewrewej.la/logout\">logout</a><a href=\"forum.php?mod=attachment&amp;aid=8\">real.txt</a>",
+      "expectedUrls": ["https://www.sehuatang.org/forum.php?mod=attachment&aid=8"]
+    },
+    {
+      "name": "ignore-hidden-attachment-links",
+      "html": "<textarea><a href=\"forum.php?mod=attachment&amp;aid=1\">hidden.txt</a></textarea><script>const x='https://xia.ewrewej.la/download?id=hidden&amp;sign=1';</script>",
+      "expectedUrls": []
     }
   ]
 }

@@ -190,18 +190,63 @@
     });
   }
 
+  // Requests to the forum itself queue in the page's pacer (forum-pacer.js);
+  // contexts without one fetch straight away.
+  var UNPACED_TICKET = { startedAt: 0, waitMs: 0, done: function() {} };
+
+  function acquireForumTurn(options) {
+    var pacer = typeof window !== 'undefined' && window ? window.ATPForumPacer : null;
+    if (!pacer || typeof pacer.acquire !== 'function') return Promise.resolve(UNPACED_TICKET);
+    return pacer.acquire(options);
+  }
+
+  function getForumPriority(name) {
+    var pacer = typeof window !== 'undefined' && window ? window.ATPForumPacer : null;
+    return pacer && typeof pacer[name] === 'number' ? pacer[name] : 0;
+  }
+
+  // Automatic TXT work never waits past its deadline (it then shows the
+  // manual retry); a user's click goes out at once.
+  function getTextPaceOptions(options, cost) {
+    options = options || {};
+    return {
+      manual: !!(options.manualRetry || options.force),
+      priority: getForumPriority('PRIORITY_ARTICLE'),
+      deadline: options.deadline || 0,
+      cost: cost || 1
+    };
+  }
+
+  function withFreshTextDeadline(options) {
+    options = options || {};
+    if (options.deadline) return options;
+    return withTextResourceDeadline(options, Date.now() + SharedUtils.getTextAttachmentBackgroundTimeout(1));
+  }
+
+  // What an article answer says about the forum's request budget.
+  function getArticleForumOutcome(data) {
+    if (!data) return '';
+    if (data.retryableEmpty) return SharedUtils.isForumFloodReason(data.emptyReason) ? 'flood' : '';
+    return data.emptyReason === 'exception' || data.emptyReason === 'redirect_disallowed' ? '' : 'ok';
+  }
+
+  // The forum zone of the page this content script runs on: 'builtin' for
+  // the manifest sites, 'mirror:<root>' for an approved mirror.
+  function getPageForumZone() {
+    return typeof location !== 'undefined' ? SharedUtils.getForumUrlZone(location.href) : '';
+  }
+
+  // Redirects must stay on a supported forum in this page's own zone, so a
+  // mirror page never receives content fetched from another site.
   function isAllowedArticleFinalUrl(url) {
-    try {
-      var u = new URL(url);
-      var h = u.hostname;
-      return u.protocol === 'https:' && (h === 'sehuatang.org' || h === 'sehuatang.net' || h.endsWith('.sehuatang.org') || h.endsWith('.sehuatang.net'));
-    } catch (e) {
-      return false;
-    }
+    var zone = SharedUtils.getForumUrlZone(url);
+    if (!zone) return false;
+    var pageZone = getPageForumZone();
+    return !pageZone || zone === pageZone;
   }
 
   function isAllowedTextAttachmentFinalUrl(url) {
-    return SharedUtils.isAllowedTextAttachmentUrl(url, location.href);
+    return SharedUtils.isTextAttachmentUrlAllowedInZone(url, getPageForumZone(), location.href);
   }
 
   function getSafeAttachmentReferrer(attachment) {
@@ -283,15 +328,51 @@
     });
   }
 
-  async function fetchTextAttachmentResourceViaPage(attachment, timeoutMs, writeStartedAt) {
+  async function fetchTextAttachmentResourceViaPage(attachment, timeoutMs, writeStartedAt, options) {
+    var ticket = await acquireForumTurn(getTextPaceOptions(options, 1));
+    // Out of time while queued: unresolved this round, nothing was sent.
+    if (!ticket) return { handled: true, resources: SharedUtils.emptyResources() };
+    var report = { outcome: '' };
+    try {
+      return await readTextAttachmentViaPage(attachment, timeoutMs, writeStartedAt, report);
+    } finally {
+      ticket.done(report.outcome);
+    }
+  }
+
+  async function readTextAttachmentViaPage(attachment, timeoutMs, writeStartedAt, report) {
     var response = await requestTextAttachmentFromPage(attachment, timeoutMs);
-    if (!response || response.ok !== true) return { handled: false, resources: SharedUtils.emptyResources() };
+    if (!response || response.ok !== true) {
+      // The forum's HTTP answer is final for this attempt: repeating it through
+      // the content script and then the worker tripled requests to a server
+      // that was already refusing or throttling. Only transport failures and
+      // cross-origin redirects (which the worker can follow) fall back.
+      var httpStatus = response ? Number(response.status) || 0 : 0;
+      if (httpStatus === 429 || httpStatus === 503) report.outcome = 'flood';
+      if (httpStatus >= 400 || (response && response.error === 'response_too_large')) {
+        Logger.debug('TXT页面会话读取失败，本轮不再回退', (httpStatus ? 'HTTP' + httpStatus : response.error) + ' ' + logUrl(attachment.url));
+        return { handled: true, resources: SharedUtils.emptyResources(), finalFailure: true };
+      }
+      // Once the page's own request reached the forum and failed in transport
+      // (typically the forum redirecting to a download host), the isolated
+      // world's fetch fails the same way under the page's CORS; only the
+      // worker can follow, so go there directly instead of asking again.
+      var sentRequest = !!response && response.error !== 'url_not_allowed';
+      return { handled: false, resources: SharedUtils.emptyResources(), skipDirect: sentRequest };
+    }
     var finalUrl = response.finalUrl || attachment.url;
-    if (!isAllowedTextAttachmentFinalUrl(finalUrl)) return { handled: false, resources: SharedUtils.emptyResources() };
+    if (!isAllowedTextAttachmentFinalUrl(finalUrl)) return { handled: false, resources: SharedUtils.emptyResources(), skipDirect: true };
     var buffer = decodeBase64Buffer(response.base64);
     if (!buffer) return { handled: false, resources: SharedUtils.emptyResources() };
     var text = SharedUtils.decodeTextBuffer(buffer, response.contentType || '');
     var htmlLike = SharedUtils.looksLikeHtmlDocument(text);
+    if (htmlLike && SharedUtils.isForumChallengePage(text)) {
+      // Every other route would get the same challenge page.
+      report.outcome = 'flood';
+      Logger.debug('TXT页面会话读取返回论坛验证页', attachment.name || logUrl(attachment.url));
+      return { handled: true, resources: SharedUtils.emptyResources(), finalFailure: true };
+    }
+    report.outcome = 'ok';
     if (htmlLike || SharedUtils.looksLikeDownloadIntermediary(text)) {
       Logger.debug('TXT页面会话读取返回中转页', attachment.name || logUrl(attachment.url));
       return { handled: false, resources: SharedUtils.emptyResources() };
@@ -470,14 +551,35 @@
       });
     },
 
-    fetchTextAttachmentResourcesByBackgroundWithStatus: function(attachments, options) {
+    fetchTextAttachmentResourcesByBackgroundWithStatus: async function(attachments, options) {
       options = options || {};
-      var manualRetry = !!(options.manualRetry || options.force);
       attachments = attachments || [];
       var deadline = getTextResourceDeadline(options, attachments.length);
       if (isTextResourceDeadlineExhausted(deadline)) {
-        return Promise.resolve(makeTextResourceFetchStatus(SharedUtils.emptyResources(), attachments.length, attachments.length, attachments.length));
+        return makeTextResourceFetchStatus(SharedUtils.emptyResources(), attachments.length, attachments.length, attachments.length);
       }
+      // The worker's requests reach the forum from the same browser, so the
+      // forum-hosted attachments in the batch spend this page's allowance.
+      var forumCount = 0;
+      for (var fi = 0; fi < attachments.length; fi++) {
+        if (attachments[fi] && SharedUtils.getForumUrlZone(attachments[fi].url)) forumCount++;
+      }
+      var ticket = forumCount
+        ? await acquireForumTurn(getTextPaceOptions(withTextResourceDeadline(options, deadline), forumCount))
+        : UNPACED_TICKET;
+      if (!ticket || isTextResourceDeadlineExhausted(deadline)) {
+        if (ticket) ticket.done('unused');
+        return makeTextResourceFetchStatus(SharedUtils.emptyResources(), attachments.length, attachments.length, attachments.length);
+      }
+      try {
+        return await ATPFetcher._requestTextResourcesFromBackground(attachments, options, deadline);
+      } finally {
+        ticket.done('');
+      }
+    },
+
+    _requestTextResourcesFromBackground: function(attachments, options, deadline) {
+      var manualRetry = !!(options.manualRetry || options.force);
       return new Promise(function(resolve) {
         var done = false;
         var timeoutMs = Math.max(1, deadline - Date.now());
@@ -526,7 +628,7 @@
       var manualRetry = !!(options.manualRetry || options.force);
       depth = depth || 0;
       try {
-        if (!SharedUtils.isAllowedTextAttachmentUrl(attachment.url, location.href)) {
+        if (!SharedUtils.isTextAttachmentUrlAllowedInZone(attachment.url, getPageForumZone(), location.href)) {
           Logger.debug('TXT attachment URL blocked', logUrl(attachment.url));
           return SharedUtils.emptyResources();
         }
@@ -553,13 +655,35 @@
           return SharedUtils.emptyResources();
         }
 
-        if (isSameOriginUrl(attachment.url)) {
-          var pageResult = await fetchTextAttachmentResourceViaPage(attachment, fetchTimeout, writeStartedAt);
-          if (pageResult.handled) return pageResult.resources;
+        var sameOrigin = isSameOriginUrl(attachment.url);
+        if (sameOrigin) {
+          var pageResult = await fetchTextAttachmentResourceViaPage(attachment, fetchTimeout, writeStartedAt, options);
+          if (pageResult.handled) {
+            if (pageResult.finalFailure && hardFailSet) hardFailSet[attachment.url] = true;
+            return pageResult.resources;
+          }
+          if (pageResult.skipDirect) return SharedUtils.emptyResources();
           fetchTimeout = getTextAttachmentFetchTimeout(options.deadline);
           if (fetchTimeout <= 0) return SharedUtils.emptyResources();
         }
 
+        var ticket = sameOrigin ? await acquireForumTurn(getTextPaceOptions(options, 1)) : UNPACED_TICKET;
+        if (!ticket) return SharedUtils.emptyResources();
+        var report = { outcome: '', retryAfter: 0, ticket: ticket };
+        try {
+          return await ATPFetcher._readTextAttachmentDirect(attachment, depth, hardFailSet, options, fetchTimeout, writeStartedAt, report);
+        } finally {
+          ticket.done(report.outcome, report.retryAfter);
+        }
+      } catch (e) {
+        Logger.debug('TXT附件异常', (attachment && attachment.url ? logUrl(attachment.url) : '') + ' ' + e.message);
+        return SharedUtils.emptyResources();
+      }
+    },
+
+    _readTextAttachmentDirect: async function(attachment, depth, hardFailSet, options, fetchTimeout, writeStartedAt, report) {
+      report = report || {};
+      try {
         var ctrl = new AbortController();
         var t = setTimeout(function() { ctrl.abort(); }, fetchTimeout);
         try {
@@ -580,6 +704,12 @@
             return SharedUtils.emptyResources();
           }
 
+          if (isSameOriginUrl(finalAttachmentUrl) && SharedUtils.isCloudflareChallengeResponse(resp)) {
+            report.outcome = 'flood';
+            if (hardFailSet) hardFailSet[attachment.url] = true;
+            Logger.debug('TXT附件返回 Cloudflare 验证', logUrl(attachment.url));
+            return SharedUtils.emptyResources();
+          }
           if (!resp.ok) {
             var status = resp.status;
             var isHardFail = status === 401 || status === 403;
@@ -589,8 +719,15 @@
               if (hardFailSet) hardFailSet[attachment.url] = true;
               return SharedUtils.emptyResources();
             }
-            if (status === 429) {
-              Logger.debug('TXT附件限流', logUrl(attachment.url));
+            if (status === 429 || status >= 500) {
+              if ((status === 429 || status === 503) && isSameOriginUrl(attachment.url)) {
+                report.outcome = 'flood';
+                report.retryAfter = SharedUtils.parseRetryAfterHeader(resp.headers);
+              }
+              Logger.debug('TXT附件限流或服务异常 HTTP' + status, logUrl(attachment.url));
+              // Retrying the same request through the worker right away only
+              // adds load; it stays retryable for the next attempt.
+              if (hardFailSet) hardFailSet[attachment.url] = true;
               return SharedUtils.emptyResources();
             }
             Logger.debug('TXT附件跳过 HTTP' + status, logUrl(attachment.url));
@@ -621,6 +758,18 @@
 
           var text = SharedUtils.decodeTextBuffer(buffer, contentType);
           var htmlLike = SharedUtils.looksLikeHtmlDocument(text);
+          if (htmlLike && isSameOriginUrl(resp.url || attachment.url) && SharedUtils.isForumChallengePage(text)) {
+            // The worker would be handed the same challenge page.
+            report.outcome = 'flood';
+            if (hardFailSet) hardFailSet[attachment.url] = true;
+            Logger.debug('TXT附件返回论坛验证页', attachment.name || logUrl(attachment.url));
+            return SharedUtils.emptyResources();
+          }
+          if (isSameOriginUrl(resp.url || attachment.url)) report.outcome = 'ok';
+          // This request is finished; following a download link below asks
+          // the pacer again, which must not wait on this one (one request at a
+          // time after a challenge).
+          if (report.ticket) report.ticket.done(report.outcome, report.retryAfter);
           var downloadLike = SharedUtils.looksLikeDownloadIntermediary(text);
           if ((htmlLike || downloadLike) && depth < 2) {
             var downloadUrls = SharedUtils.extractTextDownloadUrls(text, resp.url || attachment.url, TEXT_ATTACHMENT_MAX_COUNT);
@@ -666,6 +815,9 @@
           return normalizedResources;
         } finally {
           clearTimeout(t);
+          // Early exits (redirect, status, type, size) leave the body unread;
+          // abort so a rejected response stops downloading.
+          if (resp && !resp.bodyUsed) ctrl.abort();
         }
       } catch (e) {
         var isTransient = e.name === 'AbortError' || e.name === 'TypeError' || !navigator.onLine;
@@ -678,11 +830,21 @@
       }
     },
 
-    fetchArticleData: function(url, baseUrl) {
+    // requestOptions (optional) tune the wait for the forum pacer:
+    // getPriority, isCancelled, onHeld, onGranted(waitMs).
+    fetchArticleData: function(url, baseUrl, requestOptions) {
       var inflightKey = (SharedUtils.normalizeArticleUrl ? SharedUtils.normalizeArticleUrl(url) : url) || String(url || '');
       var existing = ARTICLE_FETCH_IN_FLIGHT[inflightKey];
-      if (existing) return existing;
-      var promise = ATPFetcher._fetchArticleDataImpl(url, baseUrl);
+      if (existing) {
+        return existing.then(function(data) {
+          // The first caller gave up its place in the pacer queue; this one
+          // still wants the page.
+          return data && data.emptyReason === 'pace_cancelled'
+            ? ATPFetcher.fetchArticleData(url, baseUrl, requestOptions)
+            : data;
+        });
+      }
+      var promise = ATPFetcher._fetchArticleDataImpl(url, baseUrl, requestOptions);
       ARTICLE_FETCH_IN_FLIGHT[inflightKey] = promise;
       var release = function() {
         if (ARTICLE_FETCH_IN_FLIGHT[inflightKey] === promise) delete ARTICLE_FETCH_IN_FLIGHT[inflightKey];
@@ -691,8 +853,8 @@
       return promise;
     },
 
-    _fetchArticleDataImpl: async function(url, baseUrl) {
-      var writeStartedAt = Date.now();
+    _fetchArticleDataImpl: async function(url, baseUrl, requestOptions) {
+      requestOptions = requestOptions || {};
       var cacheState = await ATPCache.getArticleCacheState(url);
       var cached = cacheState.cached;
       if (cached) {
@@ -727,6 +889,24 @@
         return emptyArticleData(true, 'negative_cache', cacheState.negativeExpiresAt);
       }
 
+      var ticket = await acquireForumTurn({
+        priority: getForumPriority('PRIORITY_ARTICLE'),
+        getPriority: requestOptions.getPriority,
+        isCancelled: requestOptions.isCancelled,
+        onHeld: requestOptions.onHeld
+      });
+      if (!ticket) return emptyArticleData(true, 'pace_cancelled');
+      if (typeof requestOptions.onGranted === 'function') requestOptions.onGranted(ticket.waitMs);
+      var result = null;
+      try {
+        result = await ATPFetcher._fetchArticleNetwork(url, Date.now());
+        return result;
+      } finally {
+        ticket.done(getArticleForumOutcome(result), result && result.retryAfter);
+      }
+    },
+
+    _fetchArticleNetwork: async function(url, writeStartedAt) {
       try {
         var settings = ATPFetcher.getSettings();
         var articleTimeout = ATPLoadPolicy.getArticleTimeout(settings);
@@ -744,6 +924,10 @@
             return emptyArticleData(false, 'redirect_disallowed');
           }
 
+          if (SharedUtils.isCloudflareChallengeResponse(resp)) {
+            Logger.warn('文章返回 Cloudflare 验证（不写负缓存）', 'HTTP' + resp.status + ' ' + logUrl(url));
+            return emptyArticleData(true, 'cloudflare', SharedUtils.parseRetryAfterHeader(resp.headers));
+          }
           if (!resp.ok) {
             var status = resp.status;
             var isTransientHttp = status === 401 || status === 403 || status === 429 || (status >= 500 && status <= 599);
@@ -788,7 +972,7 @@
           var blockedReason = SharedUtils.isBlockedPage(html);
           if (blockedReason) {
             Logger.warn('文章不可用页（不写负缓存）', blockedReason + ' ' + logUrl(url));
-            return emptyArticleData(true, 'blocked');
+            return emptyArticleData(true, blockedReason === 'cloudflare' ? 'cloudflare' : 'blocked');
           }
 
           var parsedArticle = await enqueueArticleParse(html, finalUrl, settings, url);
@@ -809,9 +993,23 @@
             textAttachments: filteredAttachments,
             hasTextAttachments: hasTransientAttachment || !!filteredAttachments.length,
             textAttachmentCount: rawTextAttachments.length,
+            textAttachmentsLimited: !!rawTextAttachments.limited,
             partial: htmlTruncated
           });
+          // The short-lived Discuz attachment links this fetch just read are
+          // kept in memory only (normalizeArticleData never stores them), so
+          // the automatic TXT run can use them instead of reading the thread
+          // page again, one forum request less per TXT thread.
+          if (hasTransientAttachment) {
+            data.freshTextAttachments = rawTextAttachments.slice();
+            data.freshTextAttachmentsAt = Date.now();
+          }
           if (!data.images.length && !SharedUtils.hasResourcePayload(data.resources) && !data.textAttachments.length && !data.hasTextAttachments) {
+            var emptyPage = SharedUtils.classifyEmptyArticlePage(html);
+            if (emptyPage && emptyPage.retryable) {
+              Logger.warn('正文返回非帖子页（不写负缓存）', emptyPage.reason + ' title="' + SharedUtils.getHtmlPageTitle(html) + '" ' + html.length + '字符 ' + logUrl(url));
+              return emptyArticleData(true, emptyPage.reason);
+            }
             if (htmlTruncated) {
               Logger.warn('文章HTML截断且无结果，不写负缓存', logUrl(url));
             } else {
@@ -826,6 +1024,9 @@
           return data;
         } finally {
           clearTimeout(t);
+          // Early exits (redirect, status, type, size) leave the body unread;
+          // abort so a rejected response stops downloading.
+          if (resp && !resp.bodyUsed) ctrl.abort();
         }
       } catch (e) {
         var isTransient = e.name === 'AbortError' || e.name === 'TypeError' || !navigator.onLine;
@@ -839,7 +1040,26 @@
       }
     },
 
-    fetchArticleDataByBackground: function(url) {
+    fetchArticleDataByBackground: async function(url, requestOptions) {
+      requestOptions = requestOptions || {};
+      var ticket = await acquireForumTurn({
+        priority: getForumPriority('PRIORITY_ARTICLE'),
+        getPriority: requestOptions.getPriority,
+        isCancelled: requestOptions.isCancelled,
+        onHeld: requestOptions.onHeld
+      });
+      if (!ticket) return null;
+      if (typeof requestOptions.onGranted === 'function') requestOptions.onGranted(ticket.waitMs);
+      var data = null;
+      try {
+        data = await ATPFetcher._requestArticleDataFromBackground(url);
+        return data;
+      } finally {
+        ticket.done(getArticleForumOutcome(data), data && data.retryAfter);
+      }
+    },
+
+    _requestArticleDataFromBackground: function(url) {
       return new Promise(function(resolve) {
         var settings = ATPFetcher.getSettings();
         var articleTimeout = ATPLoadPolicy.getArticleTimeout(settings);
@@ -889,8 +1109,19 @@
       });
     },
 
-    fetchTextAttachmentsFreshByBackground: async function(url) {
-      return await new Promise(function(resolve) {
+    fetchTextAttachmentsFreshByBackground: async function(url, options) {
+      var ticket = await acquireForumTurn(getTextPaceOptions(withFreshTextDeadline(options), 1));
+      if (!ticket) return null;
+      var report = { outcome: '' };
+      try {
+        return await ATPFetcher._requestFreshTextAttachmentsFromBackground(url, report);
+      } finally {
+        ticket.done(report.outcome);
+      }
+    },
+
+    _requestFreshTextAttachmentsFromBackground: function(url, report) {
+      return new Promise(function(resolve) {
         var settings = ATPFetcher.getSettings();
         var articleTimeout = ATPLoadPolicy.getArticleTimeout(settings);
         var done = false;
@@ -921,9 +1152,11 @@
             }
             if (runtimeError || !resp || resp.ok !== true || !Array.isArray(resp.textAttachments)) {
               if (runtimeError) Logger.debug('后台TXT附件消息失败', runtimeError.message);
+              if (resp && SharedUtils.isForumFloodReason(resp.reason)) report.outcome = 'flood';
               resolve(null);
               return;
             }
+            report.outcome = 'ok';
             resolve(resp.textAttachments);
           });
         } catch (e) {
@@ -937,10 +1170,23 @@
       });
     },
 
-    fetchTextAttachmentsFresh: async function(url) {
+    // Re-reads the thread for current attachment links. null means the links
+    // could not be read this time (retryable); [] means the thread has none.
+    fetchTextAttachmentsFresh: async function(url, options) {
       if (!isSameOriginUrl(url)) {
-        return await ATPFetcher.fetchTextAttachmentsFreshByBackground(url);
+        return await ATPFetcher.fetchTextAttachmentsFreshByBackground(url, options);
       }
+      var ticket = await acquireForumTurn(getTextPaceOptions(withFreshTextDeadline(options), 1));
+      if (!ticket) return null;
+      var report = { outcome: '', retryAfter: 0 };
+      try {
+        return await ATPFetcher._fetchTextAttachmentsFreshNetwork(url, report);
+      } finally {
+        ticket.done(report.outcome, report.retryAfter);
+      }
+    },
+
+    _fetchTextAttachmentsFreshNetwork: async function(url, report) {
       try {
         var settings = ATPFetcher.getSettings();
         var ctrl = new AbortController();
@@ -957,7 +1203,16 @@
             return null;
           }
 
+          if (SharedUtils.isCloudflareChallengeResponse(resp)) {
+            report.outcome = 'flood';
+            Logger.debug('按需TXT提取返回 Cloudflare 验证', logUrl(url));
+            return null;
+          }
           if (!resp.ok) {
+            if (resp.status === 429 || resp.status === 503) {
+              report.outcome = 'flood';
+              report.retryAfter = SharedUtils.parseRetryAfterHeader(resp.headers);
+            }
             Logger.debug('按需TXT提取失败 HTTP' + resp.status, logUrl(url));
             return null;
           }
@@ -983,16 +1238,32 @@
           if (html.length !== rawHtml.length) {
             Logger.debug('按需TXT提取HTML截断', rawHtml.length + ' -> ' + html.length + ' ' + logUrl(url));
           }
-          if (SharedUtils.isBlockedPage(html)) {
+          var blockedReason = SharedUtils.isBlockedPage(html);
+          if (blockedReason) {
+            if (blockedReason === 'cloudflare') report.outcome = 'flood';
             return null;
           }
 
           // 不过滤临时 TXT 附件 URL，全部保留给按需解析
           var attachments = SharedUtils.extractTextAttachments(html, finalUrl, TEXT_ATTACHMENT_MAX_COUNT);
+          if (!attachments.length) {
+            // A challenge page has no attachments either; reporting [] would
+            // tell the thread it has none.
+            var emptyPage = SharedUtils.classifyEmptyArticlePage(html);
+            if (emptyPage && SharedUtils.isForumFloodReason(emptyPage.reason)) {
+              report.outcome = 'flood';
+              Logger.warn('按需TXT提取返回非帖子页', emptyPage.reason + ' title="' + SharedUtils.getHtmlPageTitle(html) + '" ' + html.length + '字符 ' + logUrl(url));
+              return null;
+            }
+          }
+          report.outcome = 'ok';
           Logger.debug('按需TXT提取', logUrl(url) + ' 原始附件' + attachments.length + '个');
           return attachments;
         } finally {
           clearTimeout(t);
+          // Early exits (redirect, status, type, size) leave the body unread;
+          // abort so a rejected response stops downloading.
+          if (resp && !resp.bodyUsed) ctrl.abort();
         }
       } catch (e) {
         Logger.debug('按需TXT提取异常', logUrl(url) + ' ' + e.message);

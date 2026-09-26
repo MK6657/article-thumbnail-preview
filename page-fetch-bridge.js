@@ -19,7 +19,8 @@
       var url = new URL(rawUrl, location.href);
       if (url.protocol !== 'https:' || url.origin !== location.origin) return false;
       if (/\.txt$/i.test(url.pathname)) return true;
-      if (/\/(?:attachment|misc)\.php$/i.test(url.pathname)) return true;
+      if (/\/attachment\.php$/i.test(url.pathname)) return true;
+      if (/\/misc\.php$/i.test(url.pathname) && /(?:^|&)(?:mod|action)=attach(?:ment)?(?:&|$)/i.test(url.search.slice(1))) return true;
       return /\/forum\.php$/i.test(url.pathname) && /(?:^|&)mod=attachment(?:&|$)/i.test(url.search.slice(1));
     } catch (e) {
       return false;

@@ -5,6 +5,7 @@
 importScripts('settings-schema.js');
 importScripts('defaults.js');
 importScripts('shared-utils.js');
+importScripts('resource-marks.js');
 importScripts('loading-policy.js');
 
 if (typeof SharedUtils !== 'undefined' && SharedUtils.cacheIndex) {
@@ -312,9 +313,22 @@ const BGLOG = (function() {
   };
 })();
 
+var bgCacheTtlMs = 30 * 60 * 1000;
+
 function syncBackgroundDebugLogging(rawSettings) {
   var normalized = ATPNormalizeSettings(rawSettings);
   BGLOG.setDebugEnabled(normalized.debugLogging === true);
+  bgCacheTtlMs = (Number(normalized.cacheTTL) || 30) * 60 * 1000;
+}
+
+// Entries past the cache TTL go first (oldest first): they can never be read
+// again, yet type priority alone evicted every live article before them.
+function compareEvictionOrder(a, b, expiredBefore) {
+  var aExpired = a.ts < expiredBefore;
+  var bExpired = b.ts < expiredBefore;
+  if (aExpired !== bExpired) return aExpired ? -1 : 1;
+  if (a.priority !== b.priority) return b.priority - a.priority;
+  return a.ts - b.ts;
 }
 
 try {
@@ -343,7 +357,7 @@ if (chrome.storage.onChanged && typeof chrome.storage.onChanged.addListener === 
 }
 
 function isAllowedOriginHost(host) {
-  return host === 'sehuatang.org' || host === 'sehuatang.net' || host.endsWith('.sehuatang.org') || host.endsWith('.sehuatang.net');
+  return SharedUtils.isSupportedForumHost(host);
 }
 
 function originAllowed(url) {
@@ -354,13 +368,189 @@ function originAllowed(url) {
 }
 
 function textAttachmentAllowed(url) {
+  return SharedUtils.isAllowedTextAttachmentUrl(url);
+}
+
+function textAttachmentAllowedInZone(url, zone) {
+  return SharedUtils.isTextAttachmentUrlAllowedInZone(url, zone);
+}
+
+// The zone of the forum page that sent a message; '' for anything else.
+function getSenderForumZone(sender) {
+  var url = (sender && sender.url) || '';
+  return originAllowed(url) ? SharedUtils.getForumUrlZone(url) : '';
+}
+
+function forumUrlAllowedInZone(url, zone) {
+  return !!zone && originAllowed(url) && SharedUtils.getForumUrlZone(url) === zone;
+}
+
+// ---- Forum mirror sites ----
+// Mirrors are optional host permissions granted from the popup prompt or the
+// browser's site-access settings. Chrome's grant list is the only source of
+// truth: the worker mirrors it into SharedUtils for host checks, stores it
+// for content scripts, and registers the manifest content scripts on it.
+const MIRROR_CONTENT_SCRIPT_ID_PREFIX = 'atp-mirror-';
+var mirrorSitesLoaded = !canManageMirrorSites();
+var mirrorSitesChain = Promise.resolve();
+var mirrorSitesReady = Promise.resolve();
+
+function canManageMirrorSites() {
+  return !!(chrome.permissions && typeof chrome.permissions.getAll === 'function');
+}
+
+function getGrantedPermissionOrigins() {
+  return new Promise(function(resolve, reject) {
+    chrome.permissions.getAll(function(result) {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+      resolve(result && Array.isArray(result.origins) ? result.origins : []);
+    });
+  });
+}
+
+function readStoredMirrorSites() {
+  return new Promise(function(resolve) {
+    chrome.storage.local.get(SharedUtils.MIRROR_SITES_STORAGE_KEY, function(result) {
+      if (chrome.runtime.lastError) {
+        resolve(null);
+        return;
+      }
+      var stored = result && result[SharedUtils.MIRROR_SITES_STORAGE_KEY];
+      resolve(stored && Array.isArray(stored.sites) ? SharedUtils.normalizeMirrorSites(stored.sites) : null);
+    });
+  });
+}
+
+function storeMirrorSites(sites) {
+  return new Promise(function(resolve) {
+    var items = {};
+    items[SharedUtils.MIRROR_SITES_STORAGE_KEY] = { sites: sites, updatedAt: Date.now() };
+    chrome.storage.local.set(items, function() {
+      consumeStorageError('镜像站点保存失败');
+      resolve();
+    });
+  });
+}
+
+function getMirrorSitePatternKey(sites) {
+  return sites.map(function(site) { return site.pattern; }).join('\n');
+}
+
+// One dynamic script per manifest content_scripts entry, so mirrors always
+// get the exact files, order, world and timing the built-in sites get.
+function buildMirrorContentScripts(patterns) {
+  var manifest = chrome.runtime.getManifest();
+  return (manifest.content_scripts || []).map(function(script, index) {
+    var registration = {
+      id: MIRROR_CONTENT_SCRIPT_ID_PREFIX + index,
+      matches: patterns.slice(),
+      js: (script.js || []).slice(),
+      runAt: script.run_at || 'document_idle',
+      allFrames: script.all_frames === true,
+      persistAcrossSessions: true
+    };
+    if (script.css && script.css.length) registration.css = script.css.slice();
+    if (script.world) registration.world = script.world;
+    return registration;
+  });
+}
+
+async function syncMirrorContentScripts(sites) {
+  if (!chrome.scripting || typeof chrome.scripting.getRegisteredContentScripts !== 'function') return false;
+  var wanted = sites.length ? buildMirrorContentScripts(sites.map(function(site) { return site.pattern; })) : [];
+  var wantedIds = {};
+  wanted.forEach(function(script) { wantedIds[script.id] = true; });
+  var existing = {};
+  var stale = [];
+  (await chrome.scripting.getRegisteredContentScripts() || []).forEach(function(script) {
+    if (!script || typeof script.id !== 'string' || script.id.indexOf(MIRROR_CONTENT_SCRIPT_ID_PREFIX) !== 0) return;
+    existing[script.id] = true;
+    if (!wantedIds[script.id]) stale.push(script.id);
+  });
+  if (stale.length) await chrome.scripting.unregisterContentScripts({ ids: stale });
+  var updates = wanted.filter(function(script) { return existing[script.id]; });
+  var additions = wanted.filter(function(script) { return !existing[script.id]; });
+  if (updates.length) await chrome.scripting.updateContentScripts(updates);
+  if (additions.length) await chrome.scripting.registerContentScripts(additions);
+  return true;
+}
+
+// force: re-apply registrations even when the grant list is unchanged
+// (install, update, browser start, permission events). A plain worker wake
+// only compares against the stored list, so it stays cheap.
+function refreshMirrorSites(reason, force) {
+  var run = mirrorSitesChain.then(async function() {
+    var sites = SharedUtils.getMirrorSitesFromOrigins(await getGrantedPermissionOrigins());
+    SharedUtils.setMirrorSites(sites);
+    mirrorSitesLoaded = true;
+    var stored = await readStoredMirrorSites();
+    var changed = !stored || getMirrorSitePatternKey(stored) !== getMirrorSitePatternKey(sites);
+    if (changed) await storeMirrorSites(sites);
+    var registered = true;
+    if (changed || force) {
+      try {
+        registered = await syncMirrorContentScripts(sites);
+      } catch (e) {
+        registered = false;
+        BGLOG.warn('镜像站点脚本注册失败', e && e.message ? e.message : String(e));
+      }
+      if (changed) BGLOG.info('镜像站点', reason + ' ' + sites.length + '个');
+    }
+    return { sites: sites, registered: registered };
+  });
+  mirrorSitesChain = run.catch(function() {});
+  return run;
+}
+
+function refreshMirrorSitesInBackground(reason, force) {
+  if (!canManageMirrorSites()) return;
+  refreshMirrorSites(reason, force).catch(function(e) {
+    mirrorSitesLoaded = true;
+    BGLOG.warn('镜像站点读取失败', e && e.message ? e.message : String(e));
+  });
+}
+
+if (canManageMirrorSites()) {
+  mirrorSitesReady = refreshMirrorSites('worker_start', false).catch(function(e) {
+    mirrorSitesLoaded = true;
+    BGLOG.warn('镜像站点读取失败', e && e.message ? e.message : String(e));
+  });
+  if (chrome.permissions.onAdded && typeof chrome.permissions.onAdded.addListener === 'function') {
+    chrome.permissions.onAdded.addListener(function() { refreshMirrorSitesInBackground('permission_added', true); });
+    chrome.permissions.onRemoved.addListener(function() { refreshMirrorSitesInBackground('permission_removed', true); });
+  }
+  if (chrome.runtime.onStartup && typeof chrome.runtime.onStartup.addListener === 'function') {
+    chrome.runtime.onStartup.addListener(function() { refreshMirrorSitesInBackground('browser_start', true); });
+  }
+}
+
+function isExtensionPageSender(sender) {
+  if (!sender || sender.tab || typeof sender.url !== 'string') return false;
   try {
-    var u = new URL(url);
-    if (u.protocol !== 'https:') return false;
-    if (isAllowedOriginHost(u.hostname)) return true;
-    if (u.hostname === 'xia.ewrewej.la') return true;
-    return u.hostname === 'dl.ldkms.la' && /\.txt$/i.test(u.pathname);
-  } catch (e) { return false; }
+    return sender.url.indexOf(chrome.runtime.getURL('')) === 0;
+  } catch (e) {
+    return false;
+  }
+}
+
+var floatingPanelCssPromise = null;
+
+// Mirror pages cannot load the web-accessible stylesheet (its matches stay
+// limited to the built-in sites), so the panel asks the worker for the text.
+function getFloatingPanelCss() {
+  if (!floatingPanelCssPromise) {
+    floatingPanelCssPromise = fetch(chrome.runtime.getURL('floating-panel.css')).then(function(resp) {
+      if (!resp || !resp.ok) throw new Error('floating-panel.css HTTP ' + (resp && resp.status));
+      return resp.text();
+    }).catch(function(e) {
+      floatingPanelCssPromise = null;
+      throw e;
+    });
+  }
+  return floatingPanelCssPromise;
 }
 
 function makeTextResourceFetchStatus(resources, attemptedCount, unresolvedCount, retryableCount) {
@@ -541,7 +731,8 @@ function clearArticleFetchControl(control) {
   }
 }
 
-const BG_QUOTA_BYTES = 10485760;
+// storage.local is 10 MB from Chrome 114 but 5 MB on 111-113.
+const BG_QUOTA_BYTES = (chrome.storage && chrome.storage.local && chrome.storage.local.QUOTA_BYTES) || 10485760;
 const BG_HIGH_WATERMARK = Math.floor(BG_QUOTA_BYTES * 0.85);
 const BG_TARGET_WATERMARK = Math.floor(BG_QUOTA_BYTES * 0.75);
 var bgEvictionCheckTimer = null;
@@ -664,6 +855,258 @@ function queueSettingsPatch(patch) {
   });
   return SETTINGS_WRITE_CHAIN;
 }
+
+// ---- Marked resources and the daily backup ----
+// The worker is the only writer. Marks from forum pages and the popup's
+// export and clear actions run here one at a time, so two tabs never
+// overwrite each other. A page may only mark threads of its own site; the
+// popup may export, copy, remove and clear, never add.
+var MARKS_WRITE_CHAIN = Promise.resolve();
+var MARKS_COPY_SCOPE_RE = /^(?:all|passwords|type:[a-z0-9]{1,16})$/;
+
+function queueMarksWrite(task) {
+  var run = MARKS_WRITE_CHAIN.catch(function() {}).then(task);
+  MARKS_WRITE_CHAIN = run.catch(function() {});
+  return run;
+}
+
+function marksError(code) {
+  var error = new Error(code);
+  error.code = code;
+  return error;
+}
+
+function marksStorageGet(keys) {
+  return new Promise(function(resolve, reject) {
+    chrome.storage.local.get(keys, function(items) {
+      if (chrome.runtime.lastError) {
+        reject(marksError('storage_read_failed'));
+        return;
+      }
+      resolve(items || {});
+    });
+  });
+}
+
+function marksStorageSet(items) {
+  return new Promise(function(resolve, reject) {
+    chrome.storage.local.set(items, function() {
+      if (chrome.runtime.lastError) {
+        reject(marksError('storage_write_failed'));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+function marksStorageRemove(keys) {
+  return new Promise(function(resolve, reject) {
+    if (!keys.length) {
+      resolve();
+      return;
+    }
+    chrome.storage.local.remove(keys, function() {
+      if (chrome.runtime.lastError) {
+        reject(marksError('storage_write_failed'));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+function updateMarksBadge(index) {
+  if (!chrome.action || typeof chrome.action.setBadgeText !== 'function') return;
+  var count = ATPMarks.countUnexported(index);
+  try {
+    chrome.action.setBadgeText({ text: count ? (count > 999 ? '999+' : String(count)) : '' });
+    if (typeof chrome.action.setBadgeBackgroundColor === 'function') chrome.action.setBadgeBackgroundColor({ color: '#c0392b' });
+  } catch (e) {}
+}
+
+function refreshMarksBadge() {
+  marksStorageGet(ATPMarks.KEYS.INDEX).then(function(items) {
+    updateMarksBadge(ATPMarks.readIndex(items[ATPMarks.KEYS.INDEX]));
+  }).catch(function() {});
+}
+
+function putMarksIndexEntry(index, record, bytes) {
+  var entry = ATPMarks.makeIndexEntry(record);
+  entry.bytes = bytes;
+  for (var i = 0; i < index.items.length; i++) {
+    if (index.items[i].id === record.id) {
+      index.items[i] = entry;
+      return;
+    }
+  }
+  index.items.push(entry);
+}
+
+async function saveMarkSnapshot(op, snapshot, now) {
+  var INDEX = ATPMarks.KEYS.INDEX;
+  var key = ATPMarks.itemKey(snapshot.id);
+  var stored = await marksStorageGet([INDEX, key]);
+  var index = ATPMarks.readIndex(stored[INDEX]);
+  var existing = stored[key] && typeof stored[key] === 'object' ? stored[key] : null;
+  if (op === 'update' && !existing) return { ok: true, marked: false };
+  if (!existing && index.items.length >= ATPMarks.LIMITS.MARKS) throw marksError('limit_count');
+  var merged = ATPMarks.mergeRecord(existing, snapshot, now);
+  if (existing && !merged.changed) return { ok: true, marked: true, unchanged: true };
+  var record = merged.record;
+  var bytes = JSON.stringify(record).length;
+  if (existing && !merged.contentChanged) {
+    // Only the read times moved: keep them, and the mark stays exported.
+    var touched = {};
+    touched[key] = record;
+    await marksStorageSet(touched);
+    return { ok: true, marked: true, unchanged: true };
+  }
+  var totalBytes = bytes;
+  index.items.forEach(function(item) {
+    if (item.id !== record.id) totalBytes += Number(item.bytes) || 0;
+  });
+  if (totalBytes > ATPMarks.LIMITS.MARKS_BYTES) throw marksError('limit_bytes');
+  putMarksIndexEntry(index, record, bytes);
+  index.rev++;
+  var out = {};
+  out[key] = record;
+  out[INDEX] = index;
+  await marksStorageSet(out);
+  updateMarksBadge(index);
+  return { ok: true, marked: true, created: !existing, links: ATPMarks.makeIndexEntry(record).links };
+}
+
+async function removeMarks(filter, expectedRev) {
+  var INDEX = ATPMarks.KEYS.INDEX;
+  var stored = await marksStorageGet(INDEX);
+  var index = ATPMarks.readIndex(stored[INDEX]);
+  if (typeof expectedRev === 'number' && expectedRev !== index.rev) throw marksError('stale');
+  var removed = [];
+  index.items = index.items.filter(function(item) {
+    if (!filter(item)) return true;
+    removed.push(item.id);
+    return false;
+  });
+  if (!removed.length) return { ok: true, removed: 0 };
+  index.rev++;
+  var out = {};
+  out[INDEX] = index;
+  await marksStorageSet(out);
+  await marksStorageRemove(removed.map(ATPMarks.itemKey)).catch(function() {});
+  updateMarksBadge(index);
+  return { ok: true, removed: removed.length };
+}
+
+async function addToDailyBackup(snapshots, event) {
+  if (!snapshots.length) return { ok: true, added: 0 };
+  var date = ATPMarks.formatDate(event.at);
+  var DAYS = ATPMarks.KEYS.DAYS;
+  var dayKey = ATPMarks.dayKey(date);
+  var stored = await marksStorageGet([DAYS, dayKey]);
+  var day = ATPMarks.readDay(stored[dayKey], date);
+  var days = ATPMarks.readDays(stored[DAYS]);
+  snapshots.forEach(function(snapshot) { ATPMarks.addToDay(day, snapshot, event); });
+  days.days[date] = Object.assign({ updatedAt: event.at }, ATPMarks.summarizeDay(day));
+  var out = {};
+  out[dayKey] = day;
+  out[DAYS] = days;
+  await marksStorageSet(out);
+  return { ok: true, added: snapshots.length, date: date };
+}
+
+// The popup exported or copied these marks ({ id, updatedAt } as it read
+// them): each goes into today's backup, and a mark unchanged since that read
+// counts as exported.
+async function recordMarksHandedOut(seen, kind) {
+  var INDEX = ATPMarks.KEYS.INDEX;
+  var now = Date.now();
+  var keys = [INDEX];
+  var wanted = {};
+  seen.forEach(function(entry) {
+    if (!entry || typeof entry.id !== 'string' || wanted[entry.id]) return;
+    wanted[entry.id] = Number(entry.updatedAt) || 0;
+    keys.push(ATPMarks.itemKey(entry.id));
+  });
+  var stored = await marksStorageGet(keys);
+  var index = ATPMarks.readIndex(stored[INDEX]);
+  var snapshots = [];
+  var out = {};
+  var exported = 0;
+  Object.keys(wanted).forEach(function(id) {
+    var record = stored[ATPMarks.itemKey(id)];
+    if (!record || typeof record !== 'object' || !Array.isArray(record.links)) return;
+    snapshots.push(ATPMarks.recordToSnapshot(record));
+    if (kind === 'export' && Number(record.updatedAt) === wanted[id]) {
+      record = Object.assign({}, record, { exportedAt: now });
+      out[ATPMarks.itemKey(id)] = record;
+      putMarksIndexEntry(index, record, JSON.stringify(record).length);
+      exported++;
+    }
+  });
+  if (exported) {
+    index.rev++;
+    out[INDEX] = index;
+    await marksStorageSet(out);
+    updateMarksBadge(index);
+  }
+  var backup = await addToDailyBackup(snapshots, { at: now, kind: kind, scope: kind === 'copy' ? 'marks' : 'all' });
+  return { ok: true, exported: exported, backedUp: backup.added, date: backup.date || '' };
+}
+
+// The popup, or the popup page opened in a tab: this extension's own page.
+function isOwnExtensionPageSender(sender) {
+  if (!sender || typeof sender.url !== 'string') return false;
+  if (sender.id && chrome.runtime.id && sender.id !== chrome.runtime.id) return false;
+  try {
+    return sender.url.indexOf(chrome.runtime.getURL('')) === 0;
+  } catch (e) {
+    return false;
+  }
+}
+
+function handleMarksMutation(msg, sender) {
+  var op = String(msg.op || '');
+  var now = Date.now();
+  if (isOwnExtensionPageSender(sender)) {
+    if (op === 'exported' || op === 'copiedMarks') {
+      var seen = Array.isArray(msg.marks) ? msg.marks.slice(0, ATPMarks.LIMITS.MARKS) : [];
+      return queueMarksWrite(function() { return recordMarksHandedOut(seen, op === 'exported' ? 'export' : 'copy'); });
+    }
+    if (op === 'remove') {
+      var ids = Array.isArray(msg.ids) ? msg.ids.filter(function(id) { return typeof id === 'string'; }) : [];
+      return queueMarksWrite(function() { return removeMarks(function(item) { return ids.indexOf(item.id) !== -1; }); });
+    }
+    if (op === 'clearExported') {
+      return queueMarksWrite(function() { return removeMarks(ATPMarks.isExported); });
+    }
+    if (op === 'clearAll') {
+      var rev = Number(msg.rev);
+      if (!isFinite(rev)) return Promise.reject(marksError('stale'));
+      return queueMarksWrite(function() { return removeMarks(function() { return true; }, rev); });
+    }
+    return Promise.reject(marksError('not_allowed'));
+  }
+  var zone = getSenderForumZone(sender);
+  if (!zone) return Promise.reject(marksError('not_allowed'));
+  if (op === 'unmark') {
+    var id = typeof msg.id === 'string' ? msg.id : '';
+    if (id.indexOf(zone + '|') !== 0) return Promise.reject(marksError('site_mismatch'));
+    return queueMarksWrite(function() { return removeMarks(function(item) { return item.id === id; }); });
+  }
+  if (op !== 'mark' && op !== 'update' && op !== 'copied') return Promise.reject(marksError('not_allowed'));
+  var snapshot = ATPMarks.sanitizeSnapshot(msg.snapshot);
+  if (!snapshot) return Promise.reject(marksError('invalid_thread'));
+  if (snapshot.site !== zone) return Promise.reject(marksError('site_mismatch'));
+  if (op === 'copied') {
+    var scope = String(msg.scope || 'all');
+    if (!MARKS_COPY_SCOPE_RE.test(scope)) return Promise.reject(marksError('invalid_scope'));
+    return queueMarksWrite(function() { return addToDailyBackup([snapshot], { at: now, kind: 'copy', scope: scope }); });
+  }
+  return queueMarksWrite(function() { return saveMarkSnapshot(op, snapshot, now); });
+}
+
+refreshMarksBadge();
 
 function removeCacheIndexEntriesAfterStorageRemove(keys, action, callback) {
   SharedUtils.cacheIndex.removeEntries(keys, function(success) {
@@ -948,7 +1391,7 @@ function setStorageWithEviction(d, warnMsg, onSuccess, writeStartedAt) {
   chrome.storage.local.set(d, function() {
     if (chrome.runtime.lastError) {
       console.warn('[BGLOG] ' + warnMsg + '，尝试淘汰后重试:', chrome.runtime.lastError.message);
-      chrome.storage.local.getBytesInUse(null, function(bytesUsed) {
+      SharedUtils.getCacheBytesInUse(function(bytesUsed) {
         if (consumeStorageError('storage用量读取失败')) return;
         var baseline = bytesUsed + estimateWriteBatchBytes(d);
         checkAndEvict(function() {
@@ -981,7 +1424,10 @@ function scheduleBgEvictionCheck() {
   }, 500);
 }
 
+// Discuz attachment URLs carry a per-render aid token, so an entry keyed by one
+// is never read again; the article cache keeps those threads' TXT results.
 function setCachedTextResources(url, resources, writeStartedAt) {
+  if (SharedUtils.isDiscuzAttachmentUrl(url, url)) return;
   var keys = getTextCacheKeys(TEXT_RESOURCE_CACHE_PREFIX, url);
   if (!keys.length) return;
   var primaryKey = keys[0];
@@ -1030,6 +1476,7 @@ function getTextFailCache(url) {
 }
 
 function setTextFailCache(url, writeStartedAt) {
+  if (SharedUtils.isDiscuzAttachmentUrl(url, url)) return;
   var keys = getTextCacheKeys(TEXT_FAIL_CACHE_PREFIX, url);
   if (!keys.length) return;
   var primaryKey = keys[0];
@@ -1055,7 +1502,7 @@ function checkAndEvict(callback, baselineBytes) {
     runBackgroundEviction(callback, baselineBytes);
     return;
   }
-  chrome.storage.local.getBytesInUse(null, function(bytesUsed) {
+  SharedUtils.getCacheBytesInUse(function(bytesUsed) {
     if (consumeStorageError('storage用量读取失败')) {
       if (callback) callback();
       return;
@@ -1089,9 +1536,9 @@ function _bgEvictFromEntries(entries, callback, baseline) {
     if (callback) callback();
     return;
   }
+  var expiredBefore = Date.now() - bgCacheTtlMs;
   cacheEntries.sort(function(a, b) {
-    if (a.priority !== b.priority) return b.priority - a.priority;
-    return a.ts - b.ts;
+    return compareEvictionOrder(a, b, expiredBefore);
   });
   var removeKeys = [];
   var freed = 0;
@@ -1126,7 +1573,7 @@ async function fetchTextAttachmentResource(attachment, depth, deadline, options)
   var manualRetry = !!(options.manualRetry || options.force);
   depth = depth || 0;
   try {
-    if (!textAttachmentAllowed(attachment.url)) return SharedUtils.emptyResources();
+    if (!textAttachmentAllowedInZone(attachment.url, options.zone)) return SharedUtils.emptyResources();
 
     var cached = await getCachedTextResources(attachment.url);
     if (cached) {
@@ -1164,7 +1611,7 @@ async function fetchTextAttachmentResource(attachment, depth, deadline, options)
       }
       var resp = await fetch(attachment.url, fetchOptions);
       var finalAttachmentUrl = resp.url || attachment.url;
-      if (!textAttachmentAllowed(finalAttachmentUrl)) {
+      if (!textAttachmentAllowedInZone(finalAttachmentUrl, options.zone)) {
         BGLOG.debug('TXT附件重定向已拒绝', shortUrl(finalAttachmentUrl));
         return SharedUtils.emptyResources();
       }
@@ -1212,7 +1659,7 @@ async function fetchTextAttachmentResource(attachment, depth, deadline, options)
       if ((htmlLike || downloadLike) && depth < 2) {
         var downloadUrls = SharedUtils.extractTextDownloadUrls(text, resp.url || attachment.url, TEXT_ATTACHMENT_MAX_COUNT);
         for (var d = 0; d < downloadUrls.length; d++) {
-          if (!textAttachmentAllowed(downloadUrls[d]) || downloadUrls[d] === attachment.url) continue;
+          if (!textAttachmentAllowedInZone(downloadUrls[d], options.zone) || downloadUrls[d] === attachment.url) continue;
           var redirectedResources = await fetchTextAttachmentResource({
             url: downloadUrls[d],
             name: attachment.name,
@@ -1242,6 +1689,8 @@ async function fetchTextAttachmentResource(attachment, depth, deadline, options)
       return normalizedResources;
     } finally {
       clearTimeout(t);
+      // Early exits leave the body unread; abort so it stops downloading.
+      if (resp && !resp.bodyUsed) ctrl.abort();
     }
   } catch (e) {
     var isTransient = e.name === 'AbortError' || e.name === 'TypeError';
@@ -1352,6 +1801,7 @@ function makeBackgroundArticleResponse(item) {
     textAttachments: textState.textAttachments,
     hasTextAttachments: textState.hasTextAttachments,
     textAttachmentCount: textState.textAttachmentCount,
+    textAttachmentsLimited: item.textAttachmentsLimited === true,
     textResourcesComplete: item.textResourcesComplete === true,
     textResourcesAttemptedCount: Math.max(0, Number(item.textResourcesAttemptedCount || 0) || 0),
     textResourcesUnresolvedCount: Math.max(0, Number(item.textResourcesUnresolvedCount || 0) || 0),
@@ -1433,9 +1883,13 @@ async function fetchArticle(url, imageSettings, deadline, control) {
     try {
       var resp = await fetch(url, { signal: control.controller.signal, credentials: 'include', headers: { 'Accept': 'text/html' } });
       var finalUrl = resp.url || url;
-      if (!originAllowed(finalUrl)) {
+      if (!originAllowed(finalUrl) || !SharedUtils.isSameForumZoneUrl(finalUrl, url)) {
         BGLOG.warn('文章重定向已拒绝', shortUrl(finalUrl));
         return { ok: false, reason: 'redirect_disallowed', images: [], retryableEmpty: false };
+      }
+      if (SharedUtils.isCloudflareChallengeResponse(resp)) {
+        BGLOG.warn('文章返回 Cloudflare 验证', 'HTTP' + resp.status + ' ' + shortUrl(url));
+        return { ok: false, reason: 'cloudflare', images: [], retryableEmpty: true, retryAfter: SharedUtils.parseRetryAfterHeader(resp.headers) };
       }
       if (!resp.ok) {
         var retryableHttp = resp.status === 401 || resp.status === 403 || resp.status === 429 || (resp.status >= 500 && resp.status <= 599);
@@ -1473,9 +1927,18 @@ async function fetchArticle(url, imageSettings, deadline, control) {
       var extractionContext = SharedUtils.prepareArticleExtractionContext(html);
       var resources = SharedUtils.extractResources(html, finalUrl, 'html', extractionContext);
       var textAttachments = SharedUtils.extractTextAttachments(html, finalUrl, TEXT_ATTACHMENT_MAX_COUNT, extractionContext);
-      return { ok: true, images: images, resources: resources, textAttachments: textAttachments, partial: htmlTruncated };
+      if (!images.length && !SharedUtils.hasResourcePayload(resources) && !textAttachments.length) {
+        var emptyPage = SharedUtils.classifyEmptyArticlePage(html);
+        if (emptyPage && emptyPage.retryable) {
+          BGLOG.warn('正文返回非帖子页', emptyPage.reason + ' title="' + SharedUtils.getHtmlPageTitle(html) + '" ' + html.length + '字符 ' + shortUrl(url));
+          return { ok: false, reason: emptyPage.reason, images: [], retryableEmpty: true };
+        }
+      }
+      return { ok: true, images: images, resources: resources, textAttachments: textAttachments, textAttachmentsLimited: !!textAttachments.limited, partial: htmlTruncated };
     } finally {
       if (ownsControl) clearArticleFetchControl(control);
+      // Early exits leave the body unread; abort so it stops downloading.
+      if (resp && !resp.bodyUsed) control.controller.abort();
     }
   } catch (e) {
     var retryableError = e.name === 'AbortError' || e.name === 'TypeError';
@@ -1590,8 +2053,62 @@ function handleCacheIndexMutationMessage(msg, sendResponse) {
   sendResponse({ ok: false });
 }
 
+// Host checks for these messages depend on the mirror grant list, which a
+// freshly woken worker is still reading; hold them instead of denying.
+var MIRROR_GATED_MESSAGE_TYPES = {};
+MIRROR_GATED_MESSAGE_TYPES[SharedUtils.MESSAGE_TYPES.FETCH_IMAGES] = true;
+MIRROR_GATED_MESSAGE_TYPES[SharedUtils.MESSAGE_TYPES.FETCH_TEXT_ATTACHMENTS_FRESH] = true;
+MIRROR_GATED_MESSAGE_TYPES[SharedUtils.MESSAGE_TYPES.FETCH_TEXT_RESOURCES] = true;
+MIRROR_GATED_MESSAGE_TYPES[SharedUtils.MESSAGE_TYPES.GET_FLOATING_PANEL_CSS] = true;
+MIRROR_GATED_MESSAGE_TYPES[SharedUtils.MESSAGE_TYPES.MARKS_MUTATION] = true;
+
 chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
   if (!msg || typeof msg !== 'object') return false;
+  if (!mirrorSitesLoaded && MIRROR_GATED_MESSAGE_TYPES[msg.type] === true) {
+    mirrorSitesReady.then(function() {
+      handleRuntimeMessage(msg, sender, sendResponse);
+    });
+    return true;
+  }
+  return handleRuntimeMessage(msg, sender, sendResponse);
+});
+
+function handleRuntimeMessage(msg, sender, sendResponse) {
+  if (msg.type === SharedUtils.MESSAGE_TYPES.MIRROR_SITES_SYNC) {
+    if (!isExtensionPageSender(sender) || !canManageMirrorSites()) {
+      sendResponse({ ok: false, error: 'mirror_sync_not_allowed' });
+      return true;
+    }
+    refreshMirrorSites('popup', true).then(function(result) {
+      sendResponse({ ok: true, sites: result.sites, registered: result.registered });
+    }).catch(function(e) {
+      sendResponse({ ok: false, error: e && e.message ? e.message : String(e) });
+    });
+    return true;
+  }
+  if (msg.type === SharedUtils.MESSAGE_TYPES.GET_FLOATING_PANEL_CSS) {
+    if (!getSenderForumZone(sender)) {
+      sendResponse({ ok: false });
+      return true;
+    }
+    getFloatingPanelCss().then(function(css) {
+      sendResponse({ ok: true, css: css });
+    }).catch(function(e) {
+      BGLOG.warn('浮窗样式读取失败', e && e.message ? e.message : String(e));
+      sendResponse({ ok: false });
+    });
+    return true;
+  }
+  if (msg.type === SharedUtils.MESSAGE_TYPES.MARKS_MUTATION) {
+    handleMarksMutation(msg, sender).then(function(result) {
+      sendResponse(result);
+    }, function(e) {
+      var code = e && e.code ? e.code : 'failed';
+      if (!e || !e.code) BGLOG.warn('标记资源保存失败', e && e.message ? e.message : String(e));
+      sendResponse({ ok: false, error: code });
+    });
+    return true;
+  }
   if (msg.type === SharedUtils.MESSAGE_TYPES.CACHE_INDEX_MUTATION) {
     handleCacheIndexMutationMessage(msg, sendResponse);
     return true;
@@ -1607,12 +2124,13 @@ chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
   }
   if (msg.type === SharedUtils.MESSAGE_TYPES.FETCH_IMAGES) {
     if (!originAllowed((sender && sender.url) || '')) { sendResponse({}); return true; }
+    var imageSenderZone = getSenderForumZone(sender);
     var sourceUrls = Array.isArray(msg.urls) ? msg.urls : [];
     var maxSourceUrls = Math.max(0, Number(SharedUtils.BG_FETCH_MAX_URLS) || 60);
     var urls = [];
     var deniedImageResponses = {};
     for (var ui = 0; ui < sourceUrls.length && ui < maxSourceUrls; ui++) {
-      if (originAllowed(sourceUrls[ui])) urls.push(sourceUrls[ui]);
+      if (forumUrlAllowedInZone(sourceUrls[ui], imageSenderZone)) urls.push(sourceUrls[ui]);
       else if (sourceUrls[ui]) deniedImageResponses[sourceUrls[ui]] = makeOriginDisallowedArticleResponse();
     }
     if (!urls.length) { sendResponse(deniedImageResponses); return true; }
@@ -1627,7 +2145,7 @@ chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
   }
   if (msg.type === SharedUtils.MESSAGE_TYPES.FETCH_TEXT_ATTACHMENTS_FRESH) {
     var freshUrl = typeof msg.url === 'string' ? msg.url : '';
-    if (!originAllowed((sender && sender.url) || '') || !originAllowed(freshUrl)) {
+    if (!originAllowed((sender && sender.url) || '') || !forumUrlAllowedInZone(freshUrl, getSenderForumZone(sender))) {
       sendResponse({ ok: false, textAttachments: [] });
       return true;
     }
@@ -1660,13 +2178,14 @@ chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
       sendResponse(makeTextResourceFetchStatus(SharedUtils.emptyResources(), deniedTextAttempted, deniedTextAttempted, deniedTextAttempted));
       return true;
     }
+    var textSenderZone = getSenderForumZone(sender);
     var sourceAttachments = Array.isArray(msg.attachments) ? msg.attachments : [];
     var maxSourceAttachments = Math.max(0, Number(SharedUtils.BG_FETCH_MAX_TEXT_ATTACHMENTS) || 30);
     var attachments = [];
     var seenAttachments = {};
     for (var ai = 0; ai < sourceAttachments.length && ai < maxSourceAttachments && attachments.length < TEXT_ATTACHMENT_MAX_COUNT; ai++) {
       var attachment = sourceAttachments[ai];
-      if (!attachment || !attachment.url || !textAttachmentAllowed(attachment.url)) continue;
+      if (!attachment || !attachment.url || !textAttachmentAllowedInZone(attachment.url, textSenderZone)) continue;
       var attachmentKey = SharedUtils.normalizeTextAttachmentUrl(attachment.url);
       if (!attachmentKey || seenAttachments[attachmentKey]) continue;
       seenAttachments[attachmentKey] = true;
@@ -1674,7 +2193,7 @@ chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
     }
     var textDeadline = Number(msg.deadline) || (Date.now() + SharedUtils.getTextAttachmentBackgroundTimeout(attachments.length));
     var manualRetry = !!msg.manualRetry;
-    enqueueTextResourceMessage(attachments, textDeadline, { manualRetry: manualRetry, owner: sender && sender.tab && sender.tab.id }).then(function(status) {
+    enqueueTextResourceMessage(attachments, textDeadline, { manualRetry: manualRetry, owner: sender && sender.tab && sender.tab.id, zone: textSenderZone }).then(function(status) {
       sendResponse({
         resources: SharedUtils.normalizeResources(status.resources),
         attemptedCount: status.attemptedCount,
@@ -1696,7 +2215,7 @@ chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
   }
   sendResponse({});
   return false;
-});
+}
 
 async function handleFetch(urls, imageSettings, deadline) {
   imageSettings = normalizeImageExtractionSettings(imageSettings);

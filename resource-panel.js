@@ -16,6 +16,20 @@
   var RESOURCE_NARROW_QUERY = '(max-width: 1024px)';
   var resourceLayoutMedia = null;
   var resourceLayoutListenerBound = false;
+  // Marked threads (site|tid ids) as the worker last stored them.
+  var markedIds = Object.create(null);
+  var marksListenerBound = false;
+  var MARK_UPDATE_DELAY_MS = 800;
+  var MARK_ERROR_TEXT = {
+    limit_count: '已达 300 帖上限，请先导出并清空',
+    limit_bytes: '标记内容已满，请先导出并清空',
+    storage_write_failed: '保存失败：存储空间不足',
+    storage_read_failed: '保存失败：无法读取标记',
+    invalid_thread: '无法识别本帖，未标记',
+    site_mismatch: '无法识别本帖，未标记',
+    context_invalidated: '扩展已更新，请刷新页面',
+    no_response: '保存失败，请重试'
+  };
 
   function isEnabled() {
     if (!window.ATPConfig || !ATPConfig.loaded || !ATPConfig.isEnabled()) return false;
@@ -253,6 +267,218 @@
     if (isEnabled()) return ensureResourceTrigger(panel, threadState);
     removeResourceTrigger(panel);
     return null;
+  }
+
+  // ---- Marking ----
+
+  function isMarkingEnabled() {
+    return !!(window.ATPConfig && ATPConfig.loaded && ATPConfig.isEnabled() && window.ATPMarks);
+  }
+
+  function isThreadMarked(threadState) {
+    return !!(threadState && threadState.markIdentity && markedIds[threadState.markIdentity.id]);
+  }
+
+  function readMarkedIds(index) {
+    var next = Object.create(null);
+    var items = index && Array.isArray(index.items) ? index.items : [];
+    for (var i = 0; i < items.length; i++) {
+      if (items[i] && typeof items[i].id === 'string') next[items[i].id] = true;
+    }
+    markedIds = next;
+  }
+
+  function loadMarkedIds() {
+    if (!window.ATPMarks || typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return;
+    try {
+      chrome.storage.local.get(ATPMarks.KEYS.INDEX, function(items) {
+        if (chrome.runtime.lastError) return;
+        readMarkedIds(items && items[ATPMarks.KEYS.INDEX]);
+        refreshMarkToggles();
+      });
+    } catch (e) {}
+  }
+
+  function handleMarksStorageChange(changes, areaName) {
+    if (areaName !== 'local' || !changes || !window.ATPMarks || !changes[ATPMarks.KEYS.INDEX]) return;
+    readMarkedIds(changes[ATPMarks.KEYS.INDEX].newValue);
+    refreshMarkToggles();
+  }
+
+  function handleMarksPageShow(e) {
+    if (e && e.persisted) loadMarkedIds();
+  }
+
+  function bindMarksListener() {
+    if (marksListenerBound || !window.ATPMarks) return;
+    marksListenerBound = true;
+    try {
+      if (chrome.storage && chrome.storage.onChanged) chrome.storage.onChanged.addListener(handleMarksStorageChange);
+    } catch (e) {}
+    // Marks made in other tabs while this page sat in the back/forward cache.
+    if (window.addEventListener) window.addEventListener('pageshow', handleMarksPageShow);
+    loadMarkedIds();
+  }
+
+  function sendMarksMessage(payload) {
+    return new Promise(function(resolve) {
+      try {
+        if (!chrome.runtime || !chrome.runtime.id) {
+          resolve({ ok: false, error: 'context_invalidated' });
+          return;
+        }
+        chrome.runtime.sendMessage(Object.assign({ type: SharedUtils.MESSAGE_TYPES.MARKS_MUTATION }, payload), function(response) {
+          if (chrome.runtime.lastError) {
+            resolve({ ok: false, error: 'no_response' });
+            return;
+          }
+          resolve(response && typeof response === 'object' ? response : { ok: false, error: 'no_response' });
+        });
+      } catch (e) {
+        resolve({ ok: false, error: 'context_invalidated' });
+      }
+    });
+  }
+
+  function getMarkToggle(panel) {
+    return panel && panel.querySelector ? panel.querySelector('[data-mark-toggle]') : null;
+  }
+
+  function updateMarkToggle(btn, threadState) {
+    if (!btn || btn.__atpMarkBusy || btn.__atpMarkMessageTimer) return;
+    var marked = isThreadMarked(threadState);
+    var title = (threadState && threadState.title) || '本帖';
+    btn.textContent = marked ? '已标记' : '标记';
+    btn.setAttribute('aria-pressed', marked ? 'true' : 'false');
+    btn.setAttribute('aria-label', (marked ? '取消标记：' : '标记资源：') + title);
+    btn.title = marked
+      ? '已保存本帖标题、链接和密码；再次点击取消标记'
+      : '保存本帖标题、链接和密码，稍后在扩展弹窗中导出';
+  }
+
+  function refreshMarkToggles() {
+    if (typeof document === 'undefined' || !document.querySelectorAll) return;
+    var buttons = document.querySelectorAll('[data-mark-toggle]');
+    for (var i = 0; i < buttons.length; i++) {
+      var panel = buttons[i].closest ? buttons[i].closest('.atp-thread-panel') : null;
+      var threadState = panel && panel.__atpResourceThread;
+      updateMarkToggle(buttons[i], threadState);
+      // A marked thread on this page brings its mark up to date once.
+      if (threadState) scheduleMarkUpdate(threadState);
+    }
+    if (currentThread) renderThread(currentThread);
+  }
+
+  function showMarkError(btn, threadState, code) {
+    if (!btn) return;
+    if (btn.__atpMarkMessageTimer) clearTimeout(btn.__atpMarkMessageTimer);
+    var text = MARK_ERROR_TEXT[code] || '保存失败，请重试';
+    btn.textContent = text;
+    btn.setAttribute('role', 'alert');
+    btn.__atpMarkMessageTimer = setTimeout(function() {
+      btn.__atpMarkMessageTimer = null;
+      btn.removeAttribute('role');
+      updateMarkToggle(btn, threadState);
+    }, 2500);
+  }
+
+  function toggleThreadMark(panel, btn) {
+    // The panel's own thread at the moment of the click, never the sidebar's.
+    var threadState = panel && panel.__atpResourceThread;
+    if (!threadState || !threadState.markIdentity || !btn || btn.__atpMarkBusy || !isMarkingEnabled()) return;
+    var marking = !isThreadMarked(threadState);
+    var identity = threadState.markIdentity;
+    var payload;
+    if (marking) {
+      var snapshot = ATPMarks.buildSnapshot(threadState, identity, 'all');
+      if (!snapshot) {
+        showMarkError(btn, threadState, 'invalid_thread');
+        return;
+      }
+      payload = { op: 'mark', snapshot: snapshot };
+      threadState.__atpMarkSentSignature = markSnapshotSignature(snapshot);
+    } else {
+      payload = { op: 'unmark', id: identity.id };
+    }
+    if (btn.__atpMarkMessageTimer) {
+      clearTimeout(btn.__atpMarkMessageTimer);
+      btn.__atpMarkMessageTimer = null;
+      btn.removeAttribute('role');
+    }
+    btn.__atpMarkBusy = true;
+    btn.setAttribute('aria-disabled', 'true');
+    btn.textContent = marking ? '保存中…' : '取消中…';
+    sendMarksMessage(payload).then(function(result) {
+      btn.__atpMarkBusy = false;
+      btn.removeAttribute('aria-disabled');
+      if (result && result.ok) {
+        if (marking) markedIds[identity.id] = true;
+        else delete markedIds[identity.id];
+        updateMarkToggle(btn, threadState);
+        if (currentThread === threadState) renderThread(threadState);
+        return;
+      }
+      threadState.__atpMarkSentSignature = '';
+      showMarkError(btn, threadState, result && result.error);
+    });
+  }
+
+  function syncMarkToggle(panel, threadState) {
+    var btn = getMarkToggle(panel);
+    if (!isMarkingEnabled() || !threadState || !threadState.markIdentity) {
+      if (btn && btn.parentNode) btn.parentNode.removeChild(btn);
+      return null;
+    }
+    bindMarksListener();
+    var toolbar = panel.querySelector ? panel.querySelector('.atp-toolbar') : null;
+    if (!toolbar) return null;
+    if (!btn) {
+      btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'atp-mark-toggle';
+      btn.setAttribute('data-mark-toggle', '1');
+      toolbar.appendChild(btn);
+      btn.addEventListener('click', function(e) {
+        if (e && e.stopPropagation) e.stopPropagation();
+        toggleThreadMark(panel, btn);
+      });
+    }
+    updateMarkToggle(btn, threadState);
+    return btn;
+  }
+
+  // What a marked thread holds, minus the read time: a new read of the same
+  // content is not a change worth sending.
+  function markSnapshotSignature(snapshot) {
+    return JSON.stringify([snapshot.title, snapshot.links, snapshot.passwords, snapshot.excludedLinks,
+      snapshot.textAttachments, snapshot.textUnresolved, snapshot.partial, snapshot.importedText, snapshot.complete]);
+  }
+
+  // A marked thread shown again or grown by its TXT attachments: the worker
+  // adds what is new to the mark (it never removes anything).
+  function scheduleMarkUpdate(threadState) {
+    if (!isThreadMarked(threadState) || threadState.__atpMarkUpdateTimer) return;
+    threadState.__atpMarkUpdateTimer = setTimeout(function() {
+      threadState.__atpMarkUpdateTimer = null;
+      if (!isThreadMarked(threadState) || !isThreadAttached(threadState) || !isMarkingEnabled()) return;
+      var snapshot = ATPMarks.buildSnapshot(threadState, threadState.markIdentity, 'all');
+      if (!snapshot) return;
+      var signature = markSnapshotSignature(snapshot);
+      if (signature === threadState.__atpMarkSentSignature) return;
+      threadState.__atpMarkSentSignature = signature;
+      sendMarksMessage({ op: 'update', snapshot: snapshot }).then(function(result) {
+        if (!result || !result.ok) threadState.__atpMarkSentSignature = '';
+      });
+    }, MARK_UPDATE_DELAY_MS);
+  }
+
+  // Everything copied goes into today's backup with the thread's title.
+  function recordCopy(threadState, scope) {
+    if (!isMarkingEnabled()) return Promise.resolve({ ok: true, skipped: true });
+    if (!threadState || !threadState.markIdentity) return Promise.resolve({ ok: false, error: 'invalid_thread' });
+    var snapshot = ATPMarks.buildSnapshot(threadState, threadState.markIdentity, scope);
+    if (!snapshot) return Promise.resolve({ ok: false, error: 'invalid_thread' });
+    return sendMarksMessage({ op: 'copied', scope: scope, snapshot: snapshot });
   }
 
   function focusFirstSidebarAction() {
@@ -749,6 +975,8 @@
     if (!threadState) return 'empty';
     var parts = [
       threadState.id || threadState.link || '',
+      threadState.title || '',
+      isThreadMarked(threadState) ? 'm1' : 'm0',
       pinnedThread === threadState ? 'p1' : 'p0',
       resourcesHaveTxtFromNormalized(resources) ? 'txt1' : 'txt0',
       resources.passwords.length,
@@ -899,6 +1127,11 @@
     if (resourcesHaveTxtFromNormalized(resources)) html += '<span class="atp-resource-source-badge">含 TXT 提取</span>';
     html += getPinToggleHtml(threadState, 'atp-resource-sidebar-pin', 'data-sidebar-pin-toggle');
     html += '</div>';
+    if (threadState.title) {
+      html += '<div class="atp-resource-thread-title" title="' + esc(threadState.title) + '">' + esc(threadState.title);
+      if (isThreadMarked(threadState)) html += '<span class="atp-resource-mark-badge">已标记</span>';
+      html += '</div>';
+    }
     if (!groups.length) {
       if (resources.passwords.length) {
         html += '<div class="atp-resource-passwords">附带密码 ' + esc(resources.passwords.length) + ' 个</div>';
@@ -1019,6 +1252,7 @@
     for (var i = 0; i < items.length; i++) {
       lines.push(items[i].url);
       if (items[i].code) lines.push('提取码: ' + items[i].code);
+      if (items[i].altCodes && items[i].altCodes.length) lines.push('帖内另见提取码: ' + items[i].altCodes.join('、'));
       if (i < items.length - 1) lines.push('');
     }
     return lines.join('\n');
@@ -1064,19 +1298,33 @@
     return parts.join('\n\n');
   }
 
+  // The copy happens either way; a copy that could not be backed up says so.
+  function copyAndRecord(threadState, text, sourceEl, scope) {
+    return copyText(text, sourceEl).then(function(copied) {
+      if (!copied) return false;
+      return recordCopy(threadState, scope).then(function(result) {
+        if (!result || !result.ok) {
+          var why = result && result.error === 'invalid_thread' ? '无法识别本帖' : ((result && MARK_ERROR_TEXT[result.error]) || '请重试');
+          showMessage('已复制，但未能备份：' + why, sourceEl, true);
+        }
+        return copied;
+      });
+    });
+  }
+
   function copyType(type, sourceEl) {
     if (!currentThread) return;
-    copyText(formatTypeText(currentThread.resources, type), sourceEl);
+    copyAndRecord(currentThread, formatTypeText(currentThread.resources, type), sourceEl, 'type:' + type);
   }
 
   function copyAllLinks(sourceEl) {
     if (!currentThread) return;
-    copyText(formatAllText(currentThread.resources), sourceEl);
+    copyAndRecord(currentThread, formatAllText(currentThread.resources), sourceEl, 'all');
   }
 
   function copyPasswordsOnly(sourceEl) {
     if (!currentThread) return;
-    copyText(formatPasswordsOnly(currentThread.resources), sourceEl);
+    copyAndRecord(currentThread, formatPasswordsOnly(currentThread.resources), sourceEl, 'passwords');
   }
 
   function copyText(text, sourceEl) {
@@ -1192,6 +1440,8 @@
       panel.removeAttribute('aria-expanded');
       if (panel.getAttribute('tabindex') === '0') panel.removeAttribute('tabindex');
       syncResourceTrigger(panel, threadState);
+      syncMarkToggle(panel, threadState);
+      scheduleMarkUpdate(threadState);
       renderInline(panel, threadState);
       if (!panel.__atpResourcePanelBound) {
         panel.__atpResourcePanelBound = true;
@@ -1224,8 +1474,10 @@
       }
       if (threadState.panel) {
         syncResourceTrigger(threadState.panel, threadState);
+        syncMarkToggle(threadState.panel, threadState);
         renderInline(threadState.panel, threadState);
       }
+      scheduleMarkUpdate(threadState);
       if (currentThread === threadState || pinnedThread === threadState || hoverThread === threadState) {
         renderThread(threadState);
       }
@@ -1252,6 +1504,11 @@
     ATPResourcePanel._verifyRequestTextResourceManualLoad = requestTextResourceManualLoad;
     ATPResourcePanel._verifyShouldShowTextFallbackActions = shouldShowTextFallbackActions;
     ATPResourcePanel._verifyCopyText = copyText;
+    ATPResourcePanel._verifyToggleThreadMark = toggleThreadMark;
+    ATPResourcePanel._verifyReadMarkedIds = readMarkedIds;
+    ATPResourcePanel._verifyIsThreadMarked = isThreadMarked;
+    ATPResourcePanel._verifyCopyAndRecord = copyAndRecord;
+    ATPResourcePanel._verifySetCurrentThread = function(threadState) { currentThread = threadState; };
   }
 
   window.ATPResourcePanel = ATPResourcePanel;

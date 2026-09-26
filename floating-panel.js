@@ -257,11 +257,30 @@ class FloatingPanel {
     document.body.appendChild(this._root);
   }
 
+  // The stylesheet is web-accessible only to the built-in forum sites, so it
+  // is never exposed to arbitrary pages; on an approved mirror the worker
+  // reads it and sends the text instead.
+  _readCSS() {
+    const onMirror = typeof SharedUtils !== 'undefined' && SharedUtils.getMirrorForumRoot &&
+      !!SharedUtils.getMirrorForumRoot(location.hostname);
+    if (!onMirror) {
+      return fetch(chrome.runtime.getURL('floating-panel.css')).then((resp) => resp.text());
+    }
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ type: SharedUtils.MESSAGE_TYPES.GET_FLOATING_PANEL_CSS }, (response) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError || !response || !response.ok || typeof response.css !== 'string') {
+          reject(new Error(runtimeError ? runtimeError.message : 'floating panel CSS unavailable'));
+          return;
+        }
+        resolve(response.css);
+      });
+    });
+  }
+
   async _loadCSS() {
     try {
-      const url = chrome.runtime.getURL('floating-panel.css');
-      const resp = await fetch(url);
-      const css = await resp.text();
+      const css = await this._readCSS();
       if (this._destroyed) return;
       const style = document.createElement('style');
       style.textContent = css;
