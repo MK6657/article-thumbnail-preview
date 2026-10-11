@@ -413,6 +413,14 @@ const Logger = (function() {
       ms: typeof fields.ms === 'number' ? fields.ms : undefined
     };
     if (isImageFailureEntry(entry) && fields.url) compact.url = sanitizeLogUrl(fields.url);
+    if (entry.type === 'txt_request' || entry.type === 'txt_result') {
+      ['attachmentId', 'stage', 'outcome', 'failureClass'].forEach(function(key) {
+        if (typeof fields[key] === 'string') compact[key] = fields[key].substring(0, 80);
+      });
+      ['runId', 'remainingMs', 'attemptedCount', 'unresolvedCount', 'retryableCount', 'fetchedResources', 'addedResources', 'totalResources'].forEach(function(key) {
+        if (typeof fields[key] === 'number' && isFinite(fields[key])) compact[key] = fields[key];
+      });
+    }
     return compact;
   }
 
@@ -422,7 +430,10 @@ const Logger = (function() {
   }
 
   function isIncidentEntry(entry) {
-    return !!(entry && (isImageFailureEntry(entry) || entry.lv === 'WARN' || entry.lv === 'ERROR'));
+    var fields = entry && entry.fields || {};
+    var textFailure = entry && entry.type === 'txt_request' &&
+      (fields.outcome === 'failed' || (fields.outcome === 'skipped' && /(?:^|_)deadline$/.test(fields.failureClass || '')));
+    return !!(entry && (isImageFailureEntry(entry) || textFailure || entry.lv === 'WARN' || entry.lv === 'ERROR'));
   }
 
   function rememberIncident(entry) {

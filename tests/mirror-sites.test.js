@@ -191,9 +191,11 @@ function loadBackground(options) {
   options = options || {};
   const storage = Object.assign({}, options.storage || {});
   const granted = (options.origins || []).slice();
-  const registered = {};
+  const registered = JSON.parse(JSON.stringify(options.registered || {}));
   const scriptingCalls = [];
   const listeners = {};
+  let registerFailures = options.registerFailures || 0;
+  let updateFailures = options.updateFailures || 0;
   let deferGetAll = !!options.deferGetAll;
   let pendingGetAll = [];
 
@@ -233,6 +235,7 @@ function loadBackground(options) {
         },
         registerContentScripts: async function(scripts) {
           scriptingCalls.push(['register', scripts.map(function(s) { return s.id; })]);
+          if (registerFailures-- > 0) throw new Error('Temporary registration failure');
           scripts.forEach(function(script) {
             if (registered[script.id]) throw new Error('Duplicate script ID ' + script.id);
             registered[script.id] = JSON.parse(JSON.stringify(script));
@@ -240,6 +243,7 @@ function loadBackground(options) {
         },
         updateContentScripts: async function(scripts) {
           scriptingCalls.push(['update', scripts.map(function(s) { return s.id; })]);
+          if (updateFailures-- > 0) throw new Error('Temporary update failure');
           scripts.forEach(function(script) {
             if (!registered[script.id]) throw new Error('Missing script ID ' + script.id);
             registered[script.id] = JSON.parse(JSON.stringify(script));
@@ -362,6 +366,46 @@ async function checkBackgroundRegistration() {
 
   const denied = await bg.send({ type: 'MIRROR_SITES_SYNC' }, { url: MIRROR_PAGE, tab: { id: 3 } });
   assert.strictEqual(denied.ok, false, 'content scripts must not drive mirror registration');
+}
+
+async function checkRegistrationFailureRecovery() {
+  const failed = loadBackground({
+    origins: MANIFEST.host_permissions.concat([MIRROR_PATTERN]), registerFailures: 1
+  });
+  await flush();
+  const key = failed.sandbox.SharedUtils.MIRROR_SITES_STORAGE_KEY;
+  assert.strictEqual(failed.storage[key].scriptsRegistered, false,
+    'a failed registration must persist pending status, not just the grant list');
+  assert.strictEqual(Object.keys(failed.registered).length, 0);
+
+  // A real worker restart loses all in-memory retry state.
+  const recovered = loadBackground({ origins: failed.granted, storage: failed.storage });
+  await flush();
+  assert.deepStrictEqual(plain(recovered.scriptingCalls), [['register', ['atp-mirror-0', 'atp-mirror-1']]],
+    'an unchanged grant list must retry registration after a failed previous worker');
+  assert.strictEqual(recovered.storage[key].scriptsRegistered, true);
+
+  const forced = loadBackground({
+    origins: recovered.granted, storage: recovered.storage,
+    registered: recovered.registered, updateFailures: 1
+  });
+  await flush();
+  assert.strictEqual(forced.scriptingCalls.length, 0, 'successful unchanged registrations need no extra writes');
+  forced.listeners.startup();
+  await flush();
+  assert.strictEqual(forced.storage[key].scriptsRegistered, false,
+    'a failed forced update must invalidate the old successful status');
+  const retry = await forced.sandbox.refreshMirrorSites('worker_start', false);
+  assert.strictEqual(retry.registered, true);
+  assert.strictEqual(forced.scriptingCalls.length, 2, 'a plain wake must retry the failed update');
+  assert.strictEqual(forced.storage[key].scriptsRegistered, true);
+
+  const legacyStorage = JSON.parse(JSON.stringify(recovered.storage));
+  delete legacyStorage[key].scriptsRegistered;
+  const legacy = loadBackground({ origins: recovered.granted, storage: legacyStorage });
+  await flush();
+  assert.strictEqual(Object.keys(legacy.registered).length, 2,
+    'old stored lists without registration evidence must be repaired once');
 }
 
 async function checkBackgroundZoneBoundary() {
@@ -602,6 +646,7 @@ async function checkPopupFlow() {
 
 (async function main() {
   await checkBackgroundRegistration();
+  await checkRegistrationFailureRecovery();
   await checkBackgroundZoneBoundary();
   await checkPopupFlow();
   console.log('mirror-sites tests passed');

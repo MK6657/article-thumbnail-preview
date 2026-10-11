@@ -1231,11 +1231,18 @@
   // it back toward the start. Only images started after the last narrowing
   // count, so one slow batch narrows it once.
   function getLargeLaneCeiling(settings, base) {
+    var laneHostLimit = ATPLoadPolicy.getOrdinaryHostConcurrency(settings);
     var hostLimit = Math.min(
-      ATPLoadPolicy.getOrdinaryHostConcurrency(settings),
+      laneHostLimit,
       getOrdinaryImageSlotLimit(ATPLoader.getConc())
     );
-    return Math.max(base, Math.min(Math.floor(ATPLoadPolicy.getOrdinaryHostConcurrency(settings) / 2), hostLimit - 1));
+    if (settings && settings.autoLoadOffscreenFirstRowsEnabled === true) {
+      // Full-list loading caps the whole host at six. Size its GIF share
+      // from that usable capacity, not a larger configured host limit.
+      hostLimit = Math.min(hostLimit, 6);
+      laneHostLimit = hostLimit;
+    }
+    return Math.max(base, Math.min(Math.floor(laneHostLimit / 2), hostLimit - 1));
   }
 
   function getAdaptiveLargeLaneLimit(stats, settings) {

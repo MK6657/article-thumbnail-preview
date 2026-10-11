@@ -717,6 +717,7 @@
       var run = {
         id: Math.max(0, Number(threadState.textResourcesRunId || 0) || 0) + 1,
         automatic: !!threadState.textResourcesAutoActive,
+        startedAt: writeStartedAt,
         released: false
       };
       threadState.textResourcesRunId = run.id;
@@ -735,6 +736,20 @@
         return threadState.textResourcesRun === run && isThreadCurrent(threadState);
       };
 
+      var logTextResourceResult = function(outcome, fields) {
+        if (typeof Logger.event !== 'function') return;
+        Logger.event('txt_result', Object.assign({
+          threadId: threadState.id || '',
+          url: threadState.link,
+          runId: run.id,
+          automatic: run.automatic,
+          manualRetry: !!manualRetry,
+          outcome: outcome,
+          reason: outcome,
+          ms: Math.max(0, Date.now() - run.startedAt)
+        }, fields), outcome === 'complete' ? 'INFO' : 'WARN');
+      };
+
       var failTextResourceLoad = function(message, e) {
         if (!isRunCurrent()) {
           releaseAutomaticTextResourceSlot(threadState, run);
@@ -749,7 +764,7 @@
         if (window.ATPResourcePanel) {
           ATPResourcePanel.updateThread(threadState);
         }
-        Logger.debug(message, threadState.link + ' ' + (e && e.message ? e.message : e || 'unknown error'));
+        logTextResourceResult('failed', { failureClass: 'processing_error', fetchedResources: 0 });
       };
 
       var hasCachedAttachments = threadState.textAttachments && threadState.textAttachments.length;
@@ -763,9 +778,10 @@
         }
         var fetchPromise;
         try {
+          var fetchOptions = { manualRetry: !!manualRetry, diagnosticThreadId: threadState.id || '', diagnosticRunId: run.id };
           fetchPromise = ATPFetcher.fetchTextAttachmentResourcesWithStatus
-            ? ATPFetcher.fetchTextAttachmentResourcesWithStatus(attachments, { manualRetry: !!manualRetry })
-            : ATPFetcher.fetchTextAttachmentResources(attachments, { manualRetry: !!manualRetry });
+            ? ATPFetcher.fetchTextAttachmentResourcesWithStatus(attachments, fetchOptions)
+            : ATPFetcher.fetchTextAttachmentResources(attachments, fetchOptions);
         } catch (e) {
           failTextResourceLoad('TXT 资源解析失败', e);
           return;
@@ -790,6 +806,7 @@
           threadState.textResourcesAttemptedCount = textStatus.attemptedCount;
           threadState.textResourcesUnresolvedCount = unresolvedCount;
           threadState.textResourcesRetryableCount = retryableCount;
+          var previousResourceCount = SharedUtils.countResources(threadState.resources);
           threadState.resources = SharedUtils.mergeResources(threadState.resources, resources);
           if (unresolvedCount > 0 && hasFetchedResources) {
             threadState.textResourceMessage = '已解析部分 TXT 资源，仍有 ' + unresolvedCount + ' 个附件待重试';
@@ -835,7 +852,15 @@
             textResourcesImported: threadState.textResourcesImported,
             textAttachmentsLimited: threadState.textAttachmentsLimited
           }, imageDone && !threadState.partial, writeStartedAt);
-          Logger.debug('TXT资源补齐', threadState.link + ' 资源' + SharedUtils.countResources(threadState.resources));
+          var totalResourceCount = SharedUtils.countResources(threadState.resources);
+          logTextResourceResult(threadState.textResourcesDone ? 'complete' : (hasFetchedResources ? 'partial' : 'failed'), {
+            attemptedCount: textStatus.attemptedCount,
+            unresolvedCount: unresolvedCount,
+            retryableCount: retryableCount,
+            fetchedResources: SharedUtils.countResources(resources),
+            addedResources: Math.max(0, totalResourceCount - previousResourceCount),
+            totalResources: totalResourceCount
+          });
         }, function(e) {
           failTextResourceLoad('TXT 资源解析失败', e);
         }).catch(function(e) {
@@ -912,8 +937,9 @@
           }
           var attachments = mergeTextAttachments(threadState.textAttachments, freshAttachments, threadState.link);
           threadState.textAttachments = attachments;
-          threadState.hasTextAttachments = false;
           threadState.textAttachmentCount = Math.max(Number(threadState.textAttachmentCount || 0) || 0, attachments.length);
+          var missingAttachmentCount = Math.max(0, threadState.textAttachmentCount - attachments.length);
+          threadState.hasTextAttachments = missingAttachmentCount > 0;
           if (!attachments.length) {
             threadState.textResourcesLoading = false;
             threadState.textResourcesDone = false;
@@ -925,7 +951,7 @@
             }
             return;
           }
-          doFetch(attachments);
+          doFetch(attachments, missingAttachmentCount);
         }, function(e) {
           fallbackToCachedAttachmentsAfterFreshFailure('TXT 附件链接提取失败', e);
         }).catch(function(e) {

@@ -354,8 +354,8 @@ const SharedUtils = {
 
   CACHE_PREFIXES: {
     IMAGE: 'thumb_cache_v2_',
-    ARTICLE: 'article_cache_v12_',
-    TEXT_RESOURCE: 'txt_resource_cache_v3_',
+    ARTICLE: 'article_cache_v13_',
+    TEXT_RESOURCE: 'txt_resource_cache_v4_',
     TEXT_FAIL: 'atp_text_fail_v1_',
     TEXT_FAIL_BASE: 'atp_text_fail_',
     NEGATIVE: 'atp_empty_v9_',
@@ -1303,7 +1303,10 @@ const SharedUtils = {
       for (var j = 0; j < items.length; j++) {
         var item = typeof items[j] === 'string' ? { type: type, url: items[j] } : Object.assign({}, items[j]);
         item.type = item.type || type;
-        item.url = this.cleanResourceUrl(this.decodeHtmlEntities(this.restoreProtectedEmails(item.url || '')));
+        // Resource objects already contain URL values, not HTML attributes.
+        // Decode entities only when reading HTML, so cache/merge/render passes
+        // cannot change a literal '&amp;' in a signed URL.
+        item.url = this.cleanResourceUrl(item.url || '');
         var normalizedPan = this.normalizePanResourceUrlCode(type, item.url, item.code);
         item.url = normalizedPan.url;
         if (normalizedPan.code) item.code = normalizedPan.code;
@@ -1455,7 +1458,7 @@ const SharedUtils = {
     function makeCandidate(href, name, source) {
       var cleanedHref = SharedUtils.cleanResourceUrl(String(href || '').replace(/\\\//g, '/'));
       if (!cleanedHref) return null;
-      var url = SharedUtils.resolveUrl(baseUrl, cleanedHref);
+      var url = SharedUtils.resolveUrl(baseUrl, cleanedHref, true);
       if (!url) return null;
       if (!SharedUtils.isAllowedTextAttachmentUrl(url, baseUrl)) return null;
       var key = SharedUtils.normalizeTextAttachmentUrl(url);
@@ -1477,12 +1480,48 @@ const SharedUtils = {
       return /^(?:javascript|mailto|ed2k|magnet):/i.test(href);
     }
 
+    function hasNonTextFileName(value) {
+      return /\.(?:jpe?g|png|gif|webp|bmp|svg|ico|zip|rar|7z|torrent|pdf|mp4|mkv|avi|webm|mp3|flac|docx?|xlsx?|pptx?)(?:$|[^A-Za-z0-9.])/i.test(value);
+    }
+
+    // A filename beside a generic download button must belong to its own
+    // attachment block. Never borrow one across neighbouring attachment rows.
+    function getAttachmentContext(start, end) {
+      var from = Math.max(0, start - 1500);
+      var to = Math.min(decoded.length, end + 1500);
+      var before = decoded.slice(from, start);
+      var boundary = /<\/?(?:dl|li|tr|div|ignore_js_op)\b[^<>]*>/gi;
+      var edge;
+      while ((edge = boundary.exec(before)) !== null) from = Math.max(0, start - 1500) + boundary.lastIndex;
+      var after = decoded.slice(end, to);
+      boundary.lastIndex = 0;
+      edge = boundary.exec(after);
+      if (edge) to = end + edge.index;
+      return decoded.slice(from, to);
+    }
+
+    function getContextTextFileName(start, end) {
+      var slice = getAttachmentContext(start, end);
+      var attachmentLinks = 0;
+      SharedUtils.forEachAnchorTag(slice, function(attrs) {
+        if (isAttachmentHref(SharedUtils.extractHtmlAttr(attrs, 'href'))) attachmentLinks++;
+      });
+      if (attachmentLinks > 1) return '';
+      var text = SharedUtils.htmlToText(slice).trim();
+      if (hasNonTextFileName(text)) return '';
+      var name = text.match(/[^\s<>"'：:，,。；;（）()【】\[\]]{1,120}\.txt(?![A-Za-z0-9.])/i);
+      if (name) return name[0];
+      return /(?:filetype|attach(?:ment)?)[^>]{0,160}(?:txt|text)/i.test(slice) ? 'attachment.txt' : '';
+    }
+
     // Single pass: collect direct and context candidates in DOM order
     var directCandidates = [];
     var contextCandidates = [];
+    var anchorRanges = [];
     var m;
     SharedUtils.forEachAnchorTag(decoded, function(attrs, body, openIndex, endIndex) {
       if (Date.now() - startedAt > MAX_SCAN_MS) return false;
+      anchorRanges.push([openIndex, endIndex]);
       var href = SharedUtils.extractHtmlAttr(attrs, 'href');
       if (!href || isBlockedProtocol(href)) return;
 
@@ -1504,38 +1543,9 @@ const SharedUtils = {
 
       // Context check: attachment links with nearby .txt indicators
       if (!isAttachmentHref(href)) return;
-
-      var ctxStart = Math.max(0, openIndex - 1500);
-      var ctxEnd = Math.min(decoded.length, endIndex + 1500);
-      var contextSlice = decoded.slice(ctxStart, ctxEnd);
-      if (!/\.txt/i.test(contextSlice) && !/(?:filetype|attach(?:ment)?)[^>]{0,160}(?:txt|text)/i.test(contextSlice)) return;
-
-      // Context name: prefer tag attributes, then narrow window, then block, then fallback
-      var ctxName = download || title || label || '';
-      if (!/\.txt/i.test(ctxName)) {
-        // Narrow window ±200 chars around anchor
-        var narrowStart = Math.max(0, openIndex - 200);
-        var narrowEnd = Math.min(decoded.length, endIndex + 200);
-        var narrowText = SharedUtils.htmlToText(decoded.slice(narrowStart, narrowEnd)).trim();
-        var narrowMatch = narrowText.match(/[^\s<>"'：:，,。；;（）()【】\[\]]{1,120}\.txt/i);
-        if (narrowMatch) {
-          ctxName = narrowMatch[0];
-        } else {
-          // Same attachment block: nearest enclosing dl/li/tr/div
-          var blockStart = Math.max(0, openIndex - 800);
-          var blockEnd = Math.min(decoded.length, endIndex + 800);
-          var blockText = SharedUtils.htmlToText(decoded.slice(blockStart, blockEnd)).trim();
-          var blockMatch = blockText.match(/[^\s<>"'：:，,。；;（）()【】\[\]]{1,120}\.txt/i);
-          if (blockMatch) {
-            ctxName = blockMatch[0];
-          } else {
-            // Full window fallback
-            var contextText = SharedUtils.htmlToText(contextSlice).trim();
-            var fallbackMatch = contextText.match(/[^\s<>"'：:，,。；;（）()【】\[\]]{1,120}\.txt/i);
-            ctxName = (fallbackMatch && fallbackMatch[0]) || '';
-          }
-        }
-      }
+      if (hasNonTextFileName([label, title, download].join(' '))) return;
+      var ctxName = getContextTextFileName(openIndex, endIndex);
+      if (!ctxName) return;
       var ctxCand = makeCandidate(href, ctxName || label || href, 'txt-attachment-context');
       if (ctxCand) contextCandidates.push(ctxCand);
     });
@@ -1575,31 +1585,24 @@ const SharedUtils = {
       if (signedCand) addCandidate(signedCand);
     }
 
-    // Raw URL fallback: standalone attachment URLs in text
+    // Raw URL fallback: standalone attachment URLs in text. Already inspected
+    // anchors and tag attributes must not re-enter through this fallback.
+    var anchorRangeIndex = 0;
+    var rawScanCursor = 0;
+    var rawInsideTag = false;
     SharedUtils.forEachRawAttachmentUrl(decoded, function(matchedUrl, matchStart, matchEnd) {
       if (attachments.length >= maxCount || Date.now() - startedAt > MAX_SCAN_MS) return false;
+      while (anchorRangeIndex < anchorRanges.length && anchorRanges[anchorRangeIndex][1] <= matchStart) anchorRangeIndex++;
+      if (anchorRangeIndex < anchorRanges.length && anchorRanges[anchorRangeIndex][0] <= matchStart) return;
+      for (; rawScanCursor < matchStart; rawScanCursor++) {
+        if (decoded.charAt(rawScanCursor) === '<') rawInsideTag = true;
+        else if (decoded.charAt(rawScanCursor) === '>') rawInsideTag = false;
+      }
+      if (rawInsideTag) return;
       var rawUrl = matchedUrl.replace(/\\\//g, '/');
-      var rawCtxStart = Math.max(0, matchStart - 1500);
-      var rawCtxEnd = Math.min(decoded.length, matchEnd + 1500);
-      var rawSlice = decoded.slice(rawCtxStart, rawCtxEnd);
-      if (!/\.txt/i.test(rawSlice) && !/(?:filetype|attach(?:ment)?)[^>]{0,160}(?:txt|text)/i.test(rawSlice)) return;
-
-      // Raw name: narrow window first, then block, then full window (same as context)
-      var rawNarrowStart = Math.max(0, matchStart - 200);
-      var rawNarrowEnd = Math.min(decoded.length, matchEnd + 200);
-      var rawNarrowText = SharedUtils.htmlToText(decoded.slice(rawNarrowStart, rawNarrowEnd)).trim();
-      var rawNameMatch = rawNarrowText.match(/[^\s<>"'：:，,。；;（）()【】\[\]]{1,120}\.txt/i);
-      if (!rawNameMatch) {
-        var rawBlockStart = Math.max(0, matchStart - 800);
-        var rawBlockEnd = Math.min(decoded.length, matchEnd + 800);
-        var rawBlockText = SharedUtils.htmlToText(decoded.slice(rawBlockStart, rawBlockEnd)).trim();
-        rawNameMatch = rawBlockText.match(/[^\s<>"'：:，,。；;（）()【】\[\]]{1,120}\.txt/i);
-      }
-      if (!rawNameMatch) {
-        var rawText = SharedUtils.htmlToText(rawSlice).trim();
-        rawNameMatch = rawText.match(/[^\s<>"'：:，,。；;（）()【】\[\]]{1,120}\.txt/i);
-      }
-      var rawCand = makeCandidate(rawUrl, (rawNameMatch && rawNameMatch[0]) || rawUrl, 'txt-attachment-raw');
+      var rawName = getContextTextFileName(matchStart, matchEnd);
+      if (!rawName) return;
+      var rawCand = makeCandidate(rawUrl, rawName, 'txt-attachment-raw');
       if (rawCand) addCandidate(rawCand);
     });
 
@@ -1618,7 +1621,7 @@ const SharedUtils = {
     var seen = {};
     var decoded = this.decodeHtmlEntities(this.restoreProtectedEmails(String(html || '')));
     var baseKey = '';
-    var baseResolved = SharedUtils.resolveUrl(baseUrl, baseUrl);
+    var baseResolved = SharedUtils.resolveUrl(baseUrl, baseUrl, true);
     if (baseResolved) baseKey = SharedUtils.normalizeTextAttachmentUrl(baseResolved);
 
     function looksLikeTextUrl(raw) {
@@ -1637,7 +1640,7 @@ const SharedUtils = {
       if (!raw || urls.length >= maxCount) return;
       raw = SharedUtils.cleanResourceUrl(String(raw).replace(/\\\//g, '/'));
       if (!looksLikeTextUrl(raw) && !looksLikeAttachmentUrl(raw) && !looksLikeSignedTextDownloadUrl(raw)) return;
-      var url = SharedUtils.resolveUrl(baseUrl, raw);
+      var url = SharedUtils.resolveUrl(baseUrl, raw, true);
       if (!url) return;
       if (!SharedUtils.isAllowedTextAttachmentUrl(url, baseUrl)) return;
       var key = SharedUtils.normalizeTextAttachmentUrl(url);
@@ -1728,7 +1731,7 @@ const SharedUtils = {
     return {
       rawHtml: rawHtml,
       decoded: decoded,
-      text: this.htmlToText(decoded)
+      text: this.decodeHtmlEntities(this.htmlToText(rawHtml))
     };
   },
 
@@ -1737,16 +1740,20 @@ const SharedUtils = {
     var resources = this.emptyResources();
     var seen = {};
     var rawHtml, decoded, text;
-    if (context && typeof context.rawHtml === 'string' && typeof context.decoded === 'string' && typeof context.text === 'string') {
+    if (source === 'txt') {
+      // TXT is literal text: angle brackets and entity-looking strings can be
+      // part of a resource URL or password and must never be parsed as HTML.
+      rawHtml = this.limitArticleHtml(html);
+      decoded = rawHtml;
+      text = rawHtml;
+    } else if (context && typeof context.rawHtml === 'string' && typeof context.decoded === 'string' && typeof context.text === 'string') {
       rawHtml = context.rawHtml;
       decoded = context.decoded;
       text = context.text;
     } else {
-      rawHtml = source === 'txt'
-        ? this.restoreProtectedEmails(this.limitArticleHtml(html))
-        : this.stripNonRenderedHtmlRegions(this.restoreProtectedEmails(this.limitArticleHtml(html)));
+      rawHtml = this.stripNonRenderedHtmlRegions(this.restoreProtectedEmails(this.limitArticleHtml(html)));
       decoded = this.decodeHtmlEntities(rawHtml);
-      text = this.htmlToText(decoded);
+      text = this.decodeHtmlEntities(this.htmlToText(rawHtml));
     }
 
     // Codes come from the link's own query here (?pwd=...); codes written
@@ -1780,7 +1787,7 @@ const SharedUtils = {
       if (/^(?:(?:www\.)?pan\.baidu\.com|(?:www\.)?yun\.baidu\.com|(?:www\.)?pan\.quark\.cn|(?:www\.)?115\.com|(?:www\.)?(?:aliyundrive|alipan)\.com|(?:www\.)?drive\.uc\.cn|(?:www\.)?pan\.xunlei\.com)\//i.test(raw)) {
         return 'https://' + raw;
       }
-      return SharedUtils.resolveUrl(baseUrl, raw) || raw;
+      return SharedUtils.resolveUrl(baseUrl, raw, true) || raw;
     }
 
     function addResourceCandidate(raw) {
@@ -1829,10 +1836,13 @@ const SharedUtils = {
       }
     }
 
-    scanResourceText(text);
+    // Displayed HTML examples (e.g. &lt;a href="..."&gt;) do not
+    // contribute attribute URLs. Password extraction below keeps their
+    // displayed characters, while TXT always remains literal text.
+    scanResourceText(source === 'txt' ? text : this.htmlToText(decoded));
     var hrefTagRegex = /<(?:a|area)\b([^>]*)>/gi;
     var hrefTagMatch;
-    while ((hrefTagMatch = hrefTagRegex.exec(rawHtml)) !== null) {
+    while (source !== 'txt' && (hrefTagMatch = hrefTagRegex.exec(rawHtml)) !== null) {
       var tagHref = SharedUtils.extractHtmlAttr(hrefTagMatch[1] || '', 'href');
       if (tagHref) {
         var decodedHref = SharedUtils.decodeHtmlEntities(tagHref);
@@ -1841,7 +1851,7 @@ const SharedUtils = {
     }
 
     var resourceAnchors = [];
-    SharedUtils.forEachAnchorTag(rawHtml, function(attrs, body, openIndex, endIndex) {
+    if (source !== 'txt') SharedUtils.forEachAnchorTag(rawHtml, function(attrs, body, openIndex, endIndex) {
       var href = SharedUtils.decodeHtmlEntities(SharedUtils.extractHtmlAttr(attrs, 'href'));
       if (!href || !SharedUtils.classifyResourceUrl(href)) return;
       resourceAnchors.push({ href: href, openIndex: openIndex, endIndex: endIndex });
@@ -1850,8 +1860,8 @@ const SharedUtils = {
       addResourceCandidate(resourceAnchors[ai].href);
     }
 
-    resources.passwords = this.mergeUniqueLimited(
-      this.extractArchivePasswordsFromHtml(decoded),
+    resources.passwords = source === 'txt' ? this.extractArchivePasswords(text) : this.mergeUniqueLimited(
+      this.extractArchivePasswordsFromHtml(rawHtml),
       this.extractArchivePasswords(text),
       5
     );
@@ -2142,7 +2152,7 @@ const SharedUtils = {
     var prepared = SharedUtils.preparePanResourceUrlForParse(cleaned);
     var type = SharedUtils.classifyResourceUrl(prepared);
     if (!type || !SharedUtils.isPanResourceType(type)) return '';
-    if (!/^https?:\/\//i.test(prepared)) prepared = SharedUtils.resolveUrl(baseUrl, prepared) || prepared;
+    if (!/^https?:\/\//i.test(prepared)) prepared = SharedUtils.resolveUrl(baseUrl, prepared, true) || prepared;
     var url = SharedUtils.normalizePanResourceUrlCode(type, prepared, '').url;
     return url ? { type: type, key: SharedUtils.getResourceDedupKey(type, url) } : '';
   },
@@ -2184,9 +2194,10 @@ const SharedUtils = {
     var last = 0;
     function pushText(slice) {
       // Nor are anchor marks written as entities (&#57344;).
-      parts.push(SharedUtils.decodeHtmlEntities(slice).replace(ANCHOR_MARKS_RE, ' '));
+      var visible = source === 'txt' ? slice : SharedUtils.htmlToText(SharedUtils.decodeHtmlEntities(slice));
+      parts.push(visible.replace(ANCHOR_MARKS_RE, ' '));
     }
-    SharedUtils.forEachAnchorTag(rawHtml, function(attrs, body, openIndex) {
+    if (source !== 'txt') SharedUtils.forEachAnchorTag(rawHtml, function(attrs, body, openIndex) {
       var href = SharedUtils.decodeHtmlEntities(SharedUtils.extractHtmlAttr(attrs, 'href')).trim();
       if (!href) return;
       var pan = SharedUtils.getPanShareKey(href, baseUrl);
@@ -2206,7 +2217,7 @@ const SharedUtils = {
       last = tagEnd + 1;
     });
     pushText(rawHtml.slice(last));
-    var text = SharedUtils.htmlToText(parts.join(''));
+    var text = parts.join('');
 
     var tokens = [];
     var m;
@@ -2612,7 +2623,7 @@ const SharedUtils = {
       var boundary = rest.search(/(?:<\s*br\s*\/?\s*>|<\/(?:p|div|li|tr|td|th)>|\n|(?:链接|下载链接|提取码|提取密码|访问码|ed2k:\/\/|magnet:\?|https?:\/\/))/i);
       var raw = boundary === -1 ? rest : rest.slice(0, boundary);
       var restored = this.restoreMailtoPassword(raw);
-      var val = this.cleanPasswordValue(restored || this.htmlToText(this.decodeHtmlEntities(raw)));
+      var val = this.cleanPasswordValue(restored || this.decodeHtmlEntities(this.htmlToText(raw)));
       if (!val || seen[val]) continue;
       seen[val] = true;
       result.push(val);

@@ -32,6 +32,12 @@
   // minutes.
   var STORE_KEY = 'atp.forumPacer.v2';
   var STORE_MAX_AGE_MS = 300000;
+  var PROBE_KEY = 'atp.forumPacer.probe.v1';
+  var PROBE_LOCK = 'atp.forumPacer.probe.v1';
+  var probeOwner = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+  var probeSeq = 0;
+  var probeGrantPending = false;
+  var probeLocksUnavailable = false;
   // What a challenge taught about this forum: the pace never relaxes back to
   // the one that tripped it, for a day after the last challenge.
   var LIMIT_KEY = 'atp.forumPacer.limits.v1';
@@ -85,7 +91,8 @@
       clearedAt: 0,
       // Successful probes since the last challenge, counted across tabs.
       calm: 0,
-      relax: 0
+      relax: 0,
+      resetId: ''
     };
   }
 
@@ -104,6 +111,53 @@
 
   function getStore() {
     return safeCall(function() { return window.localStorage || null; }, null);
+  }
+
+  function getProbeLocks() {
+    if (probeLocksUnavailable) return null;
+    return safeCall(function() {
+      return typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function'
+        ? navigator.locks : null;
+    }, null);
+  }
+
+  function readProbeLease(now) {
+    var store = getStore();
+    if (!store) return null;
+    var lease = safeCall(function() { return JSON.parse(store.getItem(PROBE_KEY) || 'null'); }, null);
+    if (!lease || typeof lease.id !== 'string' || !(lease.at <= now) ||
+        !(lease.until > now) || lease.until > lease.at + TICKET_MAX_AGE_MS) return null;
+    return lease;
+  }
+
+  function clearProbeLease(id) {
+    var clear = function() {
+      var store = getStore();
+      if (!store) return;
+      var lease = safeCall(function() { return JSON.parse(store.getItem(PROBE_KEY) || 'null'); }, null);
+      if (lease && lease.id === id) {
+        if (!safeCall(function() { store.removeItem(PROBE_KEY); return true; }, false)) {
+          safeCall(function() { store.setItem(PROBE_KEY, 'null'); }, null);
+        }
+      }
+    };
+    var locks = getProbeLocks();
+    if (!locks) { clear(); schedulePump(0); return; }
+    // The lock covers only the storage transaction, never the network wait:
+    // a page can enter BFCache, and a crashed/frozen owner expires in 90 s.
+    try {
+      Promise.resolve(locks.request(PROBE_LOCK, clear)).then(function() {
+        schedulePump(0);
+      }, function() {
+        probeLocksUnavailable = true;
+        clear();
+        schedulePump(0);
+      });
+    } catch (e) {
+      probeLocksUnavailable = true;
+      clear();
+      schedulePump(0);
+    }
   }
 
   function loadLimits(now, store) {
@@ -167,6 +221,7 @@
     state.clearedAt = Math.min(now, Math.max(state.clearedAt, clampNumber(saved.clearedAt, 0, now, 0)));
     state.calm = Math.round(clampNumber(saved.calm, 0, RECOVERY_SUCCESSES, 0));
     state.relax = Math.round(clampNumber(saved.relax, 0, RELAX_AFTER_SUCCESSES, 0));
+    state.resetId = typeof saved.resetId === 'string' ? saved.resetId.slice(0, 120) : '';
     if (skewed) save(now);
   }
 
@@ -225,7 +280,7 @@
   function getStartDelay(now, cost, reserve) {
     var pauseUntil = getPauseUntil(now);
     if (now < pauseUntil) return pauseUntil - now;
-    if (state.level > 0 && countActive(now) > 0) return -1;
+    if (state.level > 0 && (countActive(now) > 0 || readProbeLease(now))) return -1;
     // The allowance may have shrunk since this request queued.
     var need = Math.min(cost, state.burst) + (reserve || 0);
     refill(now);
@@ -285,15 +340,22 @@
     save(now);
   }
 
-  function grant(cost, waitStartedAt) {
+  function grant(cost, waitStartedAt, probeId) {
     var now = Date.now();
     cost = Math.min(cost, state.burst);
     refill(now);
     state.tokens = Math.max(0, state.tokens - cost);
     save(now);
-    var entry = { startedAt: now };
+    var entry = { startedAt: now, resetId: state.resetId };
     active.push(entry);
     var settled = false;
+    var expired = false;
+    var probeTimer = probeId ? setTimeout(function() {
+      expired = true;
+      var index = active.indexOf(entry);
+      if (index !== -1) active.splice(index, 1);
+      clearProbeLease(probeId);
+    }, TICKET_MAX_AGE_MS) : null;
     return {
       startedAt: now,
       waitMs: Math.max(0, now - (waitStartedAt || now)),
@@ -303,8 +365,15 @@
       done: function(outcome, retryAfter) {
         if (settled) return;
         settled = true;
+        if (probeTimer) clearTimeout(probeTimer);
         var index = active.indexOf(entry);
         if (index !== -1) active.splice(index, 1);
+        if (probeId) clearProbeLease(probeId);
+        // An expired probe no longer owns recovery. Its late answer must not
+        // count toward another tab's successful probes or refund old tokens.
+        if (expired || (probeId && Date.now() - entry.startedAt >= TICKET_MAX_AGE_MS)) return;
+        load(Date.now());
+        if (entry.resetId !== state.resetId) return;
         if (outcome === 'unused') {
           var at = Date.now();
           load(at);
@@ -365,6 +434,56 @@
     pumpTimer = setTimeout(pump, Math.max(0, delay));
   }
 
+  function grantNextProbe() {
+    var now = Date.now();
+    load(now);
+    releaseDroppedWaiters(now);
+    if (!waiters.length) return false;
+    var index = pickNextWaiter();
+    var waiter = waiters[index];
+    if (getStartDelay(now, waiter.cost, getReserve(waiter.rankedPriority, waiter.cost)) !== 0) return false;
+    var probeId = '';
+    if (state.level > 0) {
+      probeId = probeOwner + '-' + (++probeSeq);
+      var store = getStore();
+      if (store) safeCall(function() {
+        store.setItem(PROBE_KEY, JSON.stringify({ id: probeId, at: now, until: now + TICKET_MAX_AGE_MS }));
+      }, null);
+    }
+    waiters.splice(index, 1);
+    waiter.resolve(grant(waiter.cost, waiter.queuedAt, probeId));
+    return true;
+  }
+
+  function requestProbeGrant() {
+    if (probeGrantPending) return;
+    var locks = getProbeLocks();
+    if (!locks) {
+      // Older/restricted contexts retain a shared expiring lease. Only Web
+      // Locks can make its read-and-claim atomic across renderer processes.
+      grantNextProbe();
+      if (waiters.length) schedulePump(WAIT_POLL_MS);
+      return;
+    }
+    probeGrantPending = true;
+    function finish(granted) {
+      probeGrantPending = false;
+      if (waiters.length) schedulePump(granted ? 0 : WAIT_POLL_MS);
+    }
+    function failed() {
+      probeLocksUnavailable = true;
+      probeGrantPending = false;
+      schedulePump(0);
+    }
+    try {
+      // Do not queue a Web Lock while hidden: retry polls retain the normal
+      // cancellation/deadline rules, then recheck them inside the lock.
+      Promise.resolve(locks.request(PROBE_LOCK, { ifAvailable: true }, function(lock) {
+        return lock ? grantNextProbe() : false;
+      })).then(finish, failed);
+    } catch (e) { failed(); }
+  }
+
   function pump() {
     if (pumpTimer) {
       clearTimeout(pumpTimer);
@@ -387,6 +506,10 @@
         // Keep polling so cancelled waiters (page hidden, rescan) let go
         // promptly and other tabs' changes are picked up.
         schedulePump(delay < 0 ? WAIT_POLL_MS : Math.min(delay, WAIT_POLL_MS));
+        return;
+      }
+      if (state.level > 0) {
+        requestProbeGrant();
         return;
       }
       var waiter = waiters.splice(index, 1)[0];
@@ -503,7 +626,10 @@
       }
     }
     var clearedAt = Math.min(state.clearedAt, now);
+    var oldProbe = readProbeLease(now);
+    if (oldProbe) clearProbeLease(oldProbe.id);
     state = makeDefaultState(now);
+    state.resetId = probeOwner + '-reset-' + (++probeSeq);
     state.clearedAt = clearedAt;
     save(now);
   }

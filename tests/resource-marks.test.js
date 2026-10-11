@@ -301,4 +301,66 @@ const manyTxtText = ATPMarks.formatExport([manyTxtRecord], { now: 1 });
 assert(manyTxtText.indexOf('本帖 TXT 附件超过 3 个') !== -1 && manyTxtText.indexOf('需注意 1 帖') !== -1 && ATPMarks.makeIndexEntry(manyTxtRecord).attention === true,
   'unread TXT attachments must count as needing attention');
 
+// A delayed older tab may add captured resources, but cannot undo a newer
+// title or turn a link known to be absent back into a current link.
+const delayedOld = plain(clean);
+delayedOld.links.push({ type: 'baidu', url: 'https://pan.baidu.com/s/1oldextra' });
+delayedOld.passwords.push('old-extra-password');
+const afterDelayedOld = ATPMarks.mergeRecord(merged.record, delayedOld, 100000).record;
+assert.strictEqual(afterDelayedOld.title, merged.record.title, 'an older read cannot restore an old title');
+assert.strictEqual(afterDelayedOld.readAt, merged.record.readAt);
+assert(afterDelayedOld.links.find(function(link) { return link.url === Q; }).missing,
+  'an older read cannot resurrect a link missing from a newer complete read');
+assert(afterDelayedOld.links.some(function(link) { return link.url === 'https://pan.baidu.com/s/1oldextra'; }) &&
+  afterDelayedOld.passwords.indexOf('old-extra-password') !== -1, 'older reads may still add previously captured links and passwords');
+const returningLink = plain(later);
+returningLink.readAt++;
+returningLink.links.push({ type: 'quark', url: Q });
+assert(!ATPMarks.mergeRecord(afterDelayedOld, returningLink, 100001).record.links.find(function(link) { return link.url === Q; }).missing,
+  'a newer read that sees the link again must restore it');
+
+// Popup backups preserve missing flags and can export saved mirror records
+// after the user removes that mirror from the currently configured sites.
+const backupSnapshot = ATPMarks.sanitizeBackupSnapshot(ATPMarks.recordToSnapshot(merged.record));
+assert(backupSnapshot.links.find(function(link) { return link.url === Q; }).missing);
+const mirrorBackup = ATPMarks.recordToSnapshot(ATPMarks.mergeRecord(null,
+  ATPMarks.buildSnapshot(threadState(), onMirror, 'all'), 1000).record);
+SharedUtils.setMirrorSites([]);
+assert(ATPMarks.sanitizeBackupSnapshot(mirrorBackup), 'removing a mirror must not prevent backing up saved marks');
+assert.strictEqual(ATPMarks.sanitizeSnapshot(mirrorBackup), null, 'live page snapshots still need an enabled mirror');
+assert.strictEqual(ATPMarks.sanitizeBackupSnapshot(Object.assign({}, mirrorBackup, { host: 'unrelated.example' })), null);
+SharedUtils.setMirrorSites([SharedUtils.makeMirrorSite('mirror.example', true)]);
+
+// A saved mark can legitimately report links rejected on an earlier read.
+// Rechecking that record must preserve its warnings and every export field,
+// while still rejecting a new malformed link in the hand-out payload.
+const warnedRecord = Object.assign(plain(merged.record), {
+  droppedLinks: 7, excludedLinks: 2, overCapLinks: 3,
+  textAttachments: 3, textUnresolved: 2, textLimited: true,
+  partial: true, importedText: true
+});
+const warnedSnapshot = ATPMarks.recordToSnapshot(warnedRecord);
+const warnedRoundTrip = ATPMarks.sanitizeBackupSnapshot(warnedSnapshot);
+assert(warnedRoundTrip && warnedRoundTrip.droppedLinks === 7,
+  'historical rejected-link counts do not invalidate a valid saved snapshot');
+assert.strictEqual(ATPMarks.formatExport([warnedRoundTrip], { now: 100000 }), ATPMarks.formatExport([warnedRecord], { now: 100000 }),
+  'snapshot validation must retain all fields the actual exported file shows');
+const malformedWithHistory = plain(warnedSnapshot);
+malformedWithHistory.links.push({ type: 'baidu', url: 'javascript:alert(1)' });
+assert.strictEqual(ATPMarks.sanitizeBackupSnapshot(malformedWithHistory), null,
+  'a large historical droppedLinks count must not mask a newly rejected link');
+assert.strictEqual(ATPMarks.sanitizeSnapshot(warnedRecord).droppedLinks, 7, 'rechecking preserves historical warning counts');
+const warnedDay = ATPMarks.addToDay(ATPMarks.emptyDay('2026-10-11'), warnedRoundTrip, { at: 100000, kind: 'export', scope: 'all' });
+const warnedBackupText = ATPMarks.formatDayBackup([warnedDay], { now: 100000 });
+const originalExportLines = ATPMarks.formatExport([warnedRecord], { now: 100000 }).split('\r\n');
+originalExportLines.filter(function(line) { return /^(?:曾用标题:|标记:|注意:)/.test(line); }).forEach(function(line) {
+  assert(warnedBackupText.indexOf(line.replace('条未保存', '条未备份')) !== -1,
+    'daily backup must retain the exported history/read time/caution: ' + line);
+});
+warnedRecord.links[0].url = 'changed-after-snapshot';
+warnedRecord.passwords.push('changed-after-snapshot');
+warnedRecord.previousTitles.push('changed-after-snapshot');
+assert(warnedSnapshot.links[0].url !== 'changed-after-snapshot' && warnedSnapshot.passwords.indexOf('changed-after-snapshot') === -1 &&
+  warnedSnapshot.previousTitles.indexOf('changed-after-snapshot') === -1, 'a hand-out snapshot must not share mutable arrays or links with its source');
+
 console.log('resource marks tests ok');

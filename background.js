@@ -419,17 +419,25 @@ function readStoredMirrorSites() {
         return;
       }
       var stored = result && result[SharedUtils.MIRROR_SITES_STORAGE_KEY];
-      resolve(stored && Array.isArray(stored.sites) ? SharedUtils.normalizeMirrorSites(stored.sites) : null);
+      resolve(stored && Array.isArray(stored.sites) ? {
+        sites: SharedUtils.normalizeMirrorSites(stored.sites),
+        scriptsRegistered: stored.scriptsRegistered === true
+      } : null);
     });
   });
 }
 
-function storeMirrorSites(sites) {
-  return new Promise(function(resolve) {
+function storeMirrorSites(sites, scriptsRegistered) {
+  return new Promise(function(resolve, reject) {
     var items = {};
-    items[SharedUtils.MIRROR_SITES_STORAGE_KEY] = { sites: sites, updatedAt: Date.now() };
+    items[SharedUtils.MIRROR_SITES_STORAGE_KEY] = {
+      sites: sites, updatedAt: Date.now(), scriptsRegistered: scriptsRegistered === true
+    };
     chrome.storage.local.set(items, function() {
-      consumeStorageError('镜像站点保存失败');
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
       resolve();
     });
   });
@@ -480,19 +488,23 @@ async function syncMirrorContentScripts(sites) {
 
 // force: re-apply registrations even when the grant list is unchanged
 // (install, update, browser start, permission events). A plain worker wake
-// only compares against the stored list, so it stays cheap.
+// compares against the stored list and the last successful registration.
 function refreshMirrorSites(reason, force) {
   var run = mirrorSitesChain.then(async function() {
     var sites = SharedUtils.getMirrorSitesFromOrigins(await getGrantedPermissionOrigins());
     SharedUtils.setMirrorSites(sites);
     mirrorSitesLoaded = true;
     var stored = await readStoredMirrorSites();
-    var changed = !stored || getMirrorSitePatternKey(stored) !== getMirrorSitePatternKey(sites);
-    if (changed) await storeMirrorSites(sites);
+    var changed = !stored || getMirrorSitePatternKey(stored.sites) !== getMirrorSitePatternKey(sites);
     var registered = true;
-    if (changed || force) {
+    if (changed || force || !stored.scriptsRegistered) {
+      // Persist pending before touching registrations. A failed registration
+      // (or a worker stopped between awaits) must retry on the next wake,
+      // including forced updates whose permission list did not change.
+      await storeMirrorSites(sites, false);
       try {
         registered = await syncMirrorContentScripts(sites);
+        if (registered) await storeMirrorSites(sites, true);
       } catch (e) {
         registered = false;
         BGLOG.warn('镜像站点脚本注册失败', e && e.message ? e.message : String(e));
@@ -590,6 +602,42 @@ function shortUrl(url) {
   } catch (e) {
     return String(url || '').replace(/[?#].*$/, '').substring(0, 120);
   }
+}
+
+var bgTextDiagnosticSequence = 0;
+
+function withBackgroundTextDiagnosticId(attachment) {
+  if (!attachment || !attachment.url) return attachment;
+  if (/^txt_[a-z0-9_]{1,64}$/.test(attachment.diagnosticId || '')) return attachment;
+  return Object.assign({}, attachment, { diagnosticId: 'txt_bg_' + Date.now().toString(36) + '_' +
+    (++bgTextDiagnosticSequence).toString(36) + '_' + Math.random().toString(36).slice(2, 10) });
+}
+
+function logBackgroundTextDiagnostic(attachment, outcome, failureClass, deadline, details) {
+  if (!attachment || !/^txt_[a-z0-9_]{1,64}$/.test(attachment.diagnosticId || '')) return;
+  if (BGLOG.isEnabled && !BGLOG.isEnabled('DEBUG')) return;
+  var fields = { attachmentId: attachment.diagnosticId, stage: 'background_fetch', outcome: outcome,
+    failureClass: failureClass || '', remainingMs: Number.isFinite(Number(deadline)) && Number(deadline) > 0
+      ? Math.max(0, Math.min(100000000, Math.round(deadline - Date.now()))) : null };
+  if (/^t_[0-9]{1,20}_[A-Za-z0-9]{1,24}$/.test(attachment.diagnosticThreadId || '') &&
+      Number.isSafeInteger(attachment.diagnosticRunId) && attachment.diagnosticRunId > 0) {
+    fields.threadId = attachment.diagnosticThreadId;
+    fields.runId = attachment.diagnosticRunId;
+  }
+  details = details || {};
+  ['status', 'resources', 'elapsedMs', 'depth'].forEach(function(key) {
+    if (Number.isFinite(details[key])) fields[key] = Math.max(0, Math.min(100000000, Math.round(details[key])));
+  });
+  try { BGLOG.debug('txt_request', fields); } catch (e) {}
+}
+
+function backgroundTextFailureClass(error, status) {
+  if (status === 401 || status === 403) return 'auth_or_forbidden';
+  if (status === 429 || status === 503) return 'throttle_or_unavailable';
+  if (status >= 400) return 'http_error';
+  if (error && error.name === 'AbortError') return 'timeout';
+  if (error && error.name === 'TypeError') return 'transport';
+  return 'request_error';
 }
 
 const TEXT_ATTACHMENT_MAX_COUNT = SharedUtils.TEXT_ATTACHMENT_MAX_COUNT;
@@ -998,7 +1046,7 @@ async function removeMarks(filter, expectedRev) {
   return { ok: true, removed: removed.length };
 }
 
-async function addToDailyBackup(snapshots, event) {
+async function addToDailyBackup(snapshots, event, extraItems) {
   if (!snapshots.length) return { ok: true, added: 0 };
   var date = ATPMarks.formatDate(event.at);
   var DAYS = ATPMarks.KEYS.DAYS;
@@ -1008,16 +1056,16 @@ async function addToDailyBackup(snapshots, event) {
   var days = ATPMarks.readDays(stored[DAYS]);
   snapshots.forEach(function(snapshot) { ATPMarks.addToDay(day, snapshot, event); });
   days.days[date] = Object.assign({ updatedAt: event.at }, ATPMarks.summarizeDay(day));
-  var out = {};
+  var out = Object.assign({}, extraItems || {});
   out[dayKey] = day;
   out[DAYS] = days;
   await marksStorageSet(out);
   return { ok: true, added: snapshots.length, date: date };
 }
 
-// The popup exported or copied these marks ({ id, updatedAt } as it read
-// them): each goes into today's backup, and a mark unchanged since that read
-// counts as exported.
+// Back up exactly what the popup handed out, even if its mark was removed
+// or changed while the clipboard/download operation was in progress.
+// A surviving mark unchanged since that read also counts as exported.
 async function recordMarksHandedOut(seen, kind) {
   var INDEX = ATPMarks.KEYS.INDEX;
   var now = Date.now();
@@ -1025,7 +1073,9 @@ async function recordMarksHandedOut(seen, kind) {
   var wanted = {};
   seen.forEach(function(entry) {
     if (!entry || typeof entry.id !== 'string' || wanted[entry.id]) return;
-    wanted[entry.id] = Number(entry.updatedAt) || 0;
+    var snapshot = ATPMarks.sanitizeBackupSnapshot(entry.snapshot);
+    if (!snapshot || snapshot.id !== entry.id) throw marksError('invalid_snapshot');
+    wanted[entry.id] = { updatedAt: Number(entry.updatedAt) || 0, snapshot: snapshot };
     keys.push(ATPMarks.itemKey(entry.id));
   });
   var stored = await marksStorageGet(keys);
@@ -1034,10 +1084,13 @@ async function recordMarksHandedOut(seen, kind) {
   var out = {};
   var exported = 0;
   Object.keys(wanted).forEach(function(id) {
+    snapshots.push(wanted[id].snapshot);
     var record = stored[ATPMarks.itemKey(id)];
     if (!record || typeof record !== 'object' || !Array.isArray(record.links)) return;
-    snapshots.push(ATPMarks.recordToSnapshot(record));
-    if (kind === 'export' && Number(record.updatedAt) === wanted[id]) {
+    var currentSnapshot = ATPMarks.sanitizeBackupSnapshot(record);
+    if (kind === 'export' && Number(record.updatedAt) === wanted[id].updatedAt &&
+        currentSnapshot && ATPMarks.recordContentSignature(currentSnapshot) === ATPMarks.recordContentSignature(wanted[id].snapshot) &&
+        index.items.some(function(item) { return item.id === id; })) {
       record = Object.assign({}, record, { exportedAt: now });
       out[ATPMarks.itemKey(id)] = record;
       putMarksIndexEntry(index, record, JSON.stringify(record).length);
@@ -1047,10 +1100,11 @@ async function recordMarksHandedOut(seen, kind) {
   if (exported) {
     index.rev++;
     out[INDEX] = index;
-    await marksStorageSet(out);
-    updateMarksBadge(index);
   }
-  var backup = await addToDailyBackup(snapshots, { at: now, kind: kind, scope: kind === 'copy' ? 'marks' : 'all' });
+  // Commit the backup and export state together: a failed backup must not
+  // leave marks eligible for "clear exported".
+  var backup = await addToDailyBackup(snapshots, { at: now, kind: kind, scope: kind === 'copy' ? 'marks' : 'all' }, out);
+  if (exported) updateMarksBadge(index);
   return { ok: true, exported: exported, backedUp: backup.added, date: backup.date || '' };
 }
 
@@ -1569,30 +1623,43 @@ function _bgEvictFromEntries(entries, callback, baseline) {
 
 async function fetchTextAttachmentResource(attachment, depth, deadline, options) {
   options = options || {};
+  attachment = withBackgroundTextDiagnosticId(attachment);
   var writeStartedAt = Date.now();
   var manualRetry = !!(options.manualRetry || options.force);
   depth = depth || 0;
+  var diagnosticOutcome = 'failed';
+  var diagnosticFailure = 'request_error';
+  var diagnosticStatus = 0;
+  var diagnosticResources = 0;
   try {
-    if (!textAttachmentAllowedInZone(attachment.url, options.zone)) return SharedUtils.emptyResources();
+    if (!textAttachmentAllowedInZone(attachment.url, options.zone)) {
+      diagnosticOutcome = 'skipped';
+      diagnosticFailure = 'url_not_allowed';
+      return SharedUtils.emptyResources();
+    }
 
     var cached = await getCachedTextResources(attachment.url);
     if (cached) {
       clearTextFailCache(attachment.url);
-      BGLOG.debug('TXT附件缓存命中', (attachment.name || shortUrl(attachment.url)) + ' 资源' + SharedUtils.countResources(cached));
+      diagnosticOutcome = 'cache_hit';
+      diagnosticFailure = '';
+      diagnosticResources = SharedUtils.countResources(cached);
       return cached;
     }
 
     if (!manualRetry) {
       var failCached = await getTextFailCache(attachment.url);
       if (failCached) {
-        BGLOG.debug('TXT附件失败缓存命中，跳过', shortUrl(attachment.url));
+        diagnosticOutcome = 'skipped';
+        diagnosticFailure = 'failure_cache';
         return SharedUtils.emptyResources();
       }
     }
 
     var fetchTimeout = getDeadlineFetchTimeout(deadline, TEXT_ATTACHMENT_TIMEOUT);
     if (fetchTimeout <= 0) {
-      BGLOG.debug('TXT附件deadline耗尽', attachment && attachment.url ? shortUrl(attachment.url) : '');
+      diagnosticOutcome = 'skipped';
+      diagnosticFailure = 'deadline';
       return SharedUtils.emptyResources();
     }
 
@@ -1610,34 +1677,33 @@ async function fetchTextAttachmentResource(attachment, depth, deadline, options)
         fetchOptions.referrerPolicy = 'strict-origin-when-cross-origin';
       }
       var resp = await fetch(attachment.url, fetchOptions);
+      diagnosticStatus = resp.status;
       var finalAttachmentUrl = resp.url || attachment.url;
       if (!textAttachmentAllowedInZone(finalAttachmentUrl, options.zone)) {
-        BGLOG.debug('TXT附件重定向已拒绝', shortUrl(finalAttachmentUrl));
+        diagnosticFailure = 'redirect_not_allowed';
         return SharedUtils.emptyResources();
       }
 
       if (!resp.ok) {
         var status = resp.status;
+        diagnosticFailure = backgroundTextFailureClass(null, status);
         if (status === 401 || status === 403) {
-          BGLOG.debug('TXT附件站点拒绝', 'HTTP' + status + ' ' + shortUrl(attachment.url));
           setTextFailCache(attachment.url, writeStartedAt);
           return SharedUtils.emptyResources();
         }
         if (status === 429) {
-          BGLOG.debug('TXT附件限流', shortUrl(attachment.url));
           return SharedUtils.emptyResources();
         }
-        BGLOG.debug('TXT附件跳过', 'HTTP' + status + ' ' + shortUrl(attachment.url));
         return SharedUtils.emptyResources();
       }
       if (resp.redirected && /\/login|\/signin|\/member|\/register/.test(resp.url)) {
-        BGLOG.debug('TXT附件登录页', shortUrl(resp.url));
+        diagnosticFailure = 'login_redirect';
         return SharedUtils.emptyResources();
       }
 
       var len = parseInt(resp.headers.get('content-length') || '0', 10);
       if (len > TEXT_ATTACHMENT_MAX_BYTES) {
-        BGLOG.debug('TXT附件过大', attachment.name + ' ' + len + '字节');
+        diagnosticFailure = 'response_too_large';
         return SharedUtils.emptyResources();
       }
 
@@ -1647,7 +1713,7 @@ async function fetchTextAttachmentResource(attachment, depth, deadline, options)
         buffer = await SharedUtils.readResponseArrayBufferLimited(resp, TEXT_ATTACHMENT_MAX_BYTES);
       } catch (readError) {
         if (readError && readError.name === 'ResponseTooLargeError') {
-          BGLOG.debug('TXT附件过大', attachment.name + ' 超过' + TEXT_ATTACHMENT_MAX_BYTES + '字节');
+          diagnosticFailure = 'response_too_large';
           return SharedUtils.emptyResources();
         }
         throw readError;
@@ -1664,18 +1730,25 @@ async function fetchTextAttachmentResource(attachment, depth, deadline, options)
             url: downloadUrls[d],
             name: attachment.name,
             source: 'txt-download-url',
-            pageUrl: attachment.pageUrl || resp.url || attachment.url
+            pageUrl: attachment.pageUrl || resp.url || attachment.url,
+            diagnosticId: attachment.diagnosticId,
+            diagnosticThreadId: attachment.diagnosticThreadId,
+            diagnosticRunId: attachment.diagnosticRunId
           }, depth + 1, deadline, options);
           if (SharedUtils.hasResourcePayload(redirectedResources)) {
+            diagnosticOutcome = 'success';
+            diagnosticFailure = '';
+            diagnosticResources = SharedUtils.countResources(redirectedResources);
             setCachedTextResources(attachment.url, redirectedResources, writeStartedAt);
             clearTextFailCache(attachment.url);
             return redirectedResources;
           }
         }
+        diagnosticFailure = 'intermediary_unresolved';
       }
 
       if (!text || SharedUtils.isUnavailableTextDocument(text) || htmlLike) {
-        BGLOG.debug('TXT附件不可解析', attachment.name || shortUrl(attachment.url));
+        if (diagnosticFailure !== 'intermediary_unresolved') diagnosticFailure = 'unavailable_document';
         return SharedUtils.emptyResources();
       }
 
@@ -1685,7 +1758,9 @@ async function fetchTextAttachmentResource(attachment, depth, deadline, options)
         setCachedTextResources(attachment.url, normalizedResources, writeStartedAt);
         clearTextFailCache(attachment.url);
       }
-      BGLOG.debug('TXT附件资源', (attachment.name || shortUrl(attachment.url)) + ' 资源' + SharedUtils.countResources(normalizedResources));
+      diagnosticResources = SharedUtils.countResources(normalizedResources);
+      diagnosticOutcome = SharedUtils.hasResourcePayload(normalizedResources) ? 'success' : 'empty';
+      diagnosticFailure = SharedUtils.hasResourcePayload(normalizedResources) ? '' : 'no_resource_links';
       return normalizedResources;
     } finally {
       clearTimeout(t);
@@ -1693,13 +1768,11 @@ async function fetchTextAttachmentResource(attachment, depth, deadline, options)
       if (resp && !resp.bodyUsed) ctrl.abort();
     }
   } catch (e) {
-    var isTransient = e.name === 'AbortError' || e.name === 'TypeError';
-    if (isTransient) {
-      BGLOG.debug('TXT附件临时异常，不写失败缓存', (attachment && attachment.url ? shortUrl(attachment.url) : '') + ' ' + e.message);
-    } else {
-      BGLOG.debug('TXT附件异常，不写失败缓存', (attachment && attachment.url ? shortUrl(attachment.url) : '') + ' ' + e.message);
-    }
+    diagnosticFailure = backgroundTextFailureClass(e);
     return SharedUtils.emptyResources();
+  } finally {
+    logBackgroundTextDiagnostic(attachment, diagnosticOutcome, diagnosticFailure, deadline,
+      { status: diagnosticStatus, resources: diagnosticResources, elapsedMs: Date.now() - writeStartedAt, depth: depth });
   }
 }
 

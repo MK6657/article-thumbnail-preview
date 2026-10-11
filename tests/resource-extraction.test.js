@@ -70,6 +70,67 @@ fixtures.resourceCases.forEach(function(testCase) {
   });
 });
 
+// TXT files are literal text. Autolink brackets and entity-looking password
+// characters must survive the same extraction used by downloaded/local TXT.
+const bracketedTxt = SharedUtils.extractResources(
+  '链接：<https://pan.baidu.com/s/1literal>\n提取码：ab12\n' +
+  '<magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567>\n' +
+  '解压密码：abc<123>def&amp;end', baseUrl, 'txt');
+assert.strictEqual(bracketedTxt.groups.baidu[0].url, 'https://pan.baidu.com/s/1literal');
+assert.strictEqual(bracketedTxt.groups.baidu[0].code, 'ab12', 'TXT autolinks must retain their own access codes');
+assert.strictEqual(bracketedTxt.groups.magnet.length, 1, 'TXT autolink brackets must not hide magnet resources');
+assert.deepStrictEqual(plain(bracketedTxt.passwords), ['abc<123>def&amp;end'], 'TXT passwords must preserve literal markup and entities');
+const htmlLiteralPassword = SharedUtils.extractResources('<p>解压密码：abc&lt;123&gt;def&amp;amp;end</p>', baseUrl, 'html');
+assert.deepStrictEqual(plain(htmlLiteralPassword.passwords), ['abc<123>def&amp;end'], 'HTML must strip actual tags before decoding displayed password text');
+const displayedAnchorExample = '&lt;a href="https://pan.baidu.com/s/1fake?pwd=zzzz"&gt;百度网盘&lt;/a&gt;';
+for (const context of [undefined, SharedUtils.prepareArticleExtractionContext(displayedAnchorExample)]) {
+  assert.strictEqual(SharedUtils.extractResources(displayedAnchorExample, baseUrl, 'html', context).groups.baidu.length, 0,
+    'HTML examples displayed as escaped text must not contribute href resources');
+}
+const realLinkAfterExample = SharedUtils.extractResources(displayedAnchorExample + '<br>' +
+  '<a href="https://pan.baidu.com/s/1real">真实下载</a> 提取码：ab12', baseUrl, 'html');
+assert.strictEqual(realLinkAfterExample.groups.baidu.length, 1, 'an escaped HTML example must not add a phantom resource');
+assert.strictEqual(realLinkAfterExample.groups.baidu[0].code, 'ab12', 'escaped markup must not steal a real link\'s access code');
+const manyPasswords = Array.from({ length: 12 }, function(_, index) { return '解压密码：secret' + index; });
+for (const source of ['html', 'txt']) {
+  const passwordInput = source === 'html' ? manyPasswords.map(function(line) { return '<p>' + line + '</p>'; }).join('') : manyPasswords.join('\n');
+  assert.deepStrictEqual(plain(SharedUtils.extractResources(passwordInput, baseUrl, source).passwords),
+    ['secret0', 'secret1', 'secret2', 'secret3', 'secret4'], source + ' extraction must keep the first five distinct passwords');
+}
+
+// Decode an HTML URL once at extraction; normalization/merging and TXT input
+// consume URL values and must not decode literal query fragments again.
+const literalResourceUrl = 'https://files.example/bundle.zip?sig=a&amp;b;tail';
+const literalHtmlUrl = literalResourceUrl.replace(/&/g, '&amp;');
+for (const resources of [
+  SharedUtils.extractResources('<a href="' + literalHtmlUrl + '">download</a>', baseUrl, 'html'),
+  SharedUtils.extractResources(literalHtmlUrl, baseUrl, 'html'),
+  SharedUtils.extractResources(literalResourceUrl, baseUrl, 'txt')
+]) {
+  assert.strictEqual(resources.groups.other[0].url, literalResourceUrl, 'resource extraction must respect its input encoding');
+  assert.strictEqual(SharedUtils.normalizeResources(resources).groups.other[0].url, literalResourceUrl, 'resource normalization must preserve URL values');
+  assert.strictEqual(SharedUtils.mergeResources(resources, resources).groups.other[0].url, literalResourceUrl, 'resource merging must be idempotent for literal entities');
+}
+const literalAttachmentUrl = 'https://dl.ldkms.la/resources.txt?sig=a&amp;b;tail';
+const literalAttachmentHtml = '<a href="' + literalAttachmentUrl.replace(/&/g, '&amp;') + '">resources.txt</a>';
+assert.strictEqual(SharedUtils.extractTextAttachments(literalAttachmentHtml, baseUrl, 3)[0].url, literalAttachmentUrl, 'TXT attachment URLs must be entity-decoded once');
+assert.strictEqual(SharedUtils.extractTextDownloadUrls(literalAttachmentHtml, baseUrl, 3)[0], literalAttachmentUrl, 'TXT intermediary download URLs must be entity-decoded once');
+
+// Nearby images cannot borrow a TXT filename and occupy all three fetch slots.
+const imagesBesideTxt = [1, 2, 3].map(function(id) {
+  return '<div class="attach"><a href="forum.php?mod=attachment&amp;aid=' + id + '">preview' + id + '.jpg</a></div>';
+}).join('') + '<div class="attach">resources.txt <a href="forum.php?mod=attachment&amp;aid=4">下载附件</a></div>';
+const actualTextAttachment = SharedUtils.extractTextAttachments(imagesBesideTxt, baseUrl, 3);
+assert.deepStrictEqual(plain(actualTextAttachment.map(function(item) { return item.url; })), ['https://www.sehuatang.org/forum.php?mod=attachment&aid=4']);
+assert.strictEqual(actualTextAttachment[0].name, 'resources.txt');
+assert(!actualTextAttachment.limited, 'image attachments must not make a single TXT look truncated');
+const genericImagesBesideTxt = '<div class="attach"><strong>preview.jpg</strong><a href="forum.php?mod=attachment&amp;aid=5">下载附件</a></div>' +
+  '<div class="attach">resources.txt <a href="forum.php?mod=attachment&amp;aid=6">下载附件</a></div>';
+assert.deepStrictEqual(plain(SharedUtils.extractTextAttachments(genericImagesBesideTxt, baseUrl, 3).map(function(item) { return item.url; })), ['https://www.sehuatang.org/forum.php?mod=attachment&aid=6'], 'generic download buttons must use their own attachment block');
+const rawImagesBesideTxt = '<div>preview.jpg forum.php?mod=attachment&amp;aid=7</div>' +
+  '<div>resources.txt forum.php?mod=attachment&amp;aid=8</div>';
+assert.deepStrictEqual(plain(SharedUtils.extractTextAttachments(rawImagesBesideTxt, baseUrl, 3).map(function(item) { return item.url; })), ['https://www.sehuatang.org/forum.php?mod=attachment&aid=8'], 'raw URL fallback must obey attachment block boundaries too');
+
 // More TXT attachments than are read are reported, not dropped quietly.
 const fiveTxt = SharedUtils.extractTextAttachments(
   [1, 2, 3, 4, 5].map(function(i) { return '<a href="https://dl.ldkms.la/part' + i + '.txt">part' + i + '.txt</a>'; }).join(''),

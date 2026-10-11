@@ -98,7 +98,7 @@ function checkJsSyntax() {
 }
 
 function checkExternalTestSuites() {
-  const suites = ['tests/resource-extraction.test.js', 'tests/loading-policy.test.js', 'tests/page-fetch-bridge.test.js', 'tests/release-regressions.test.js', 'tests/text-queue.test.js', 'tests/page-fixtures.test.js', 'tests/mirror-sites.test.js', 'tests/resource-marks.test.js'];
+  const suites = ['tests/resource-extraction.test.js', 'tests/loading-policy.test.js', 'tests/page-fetch-bridge.test.js', 'tests/release-regressions.test.js', 'tests/text-queue.test.js', 'tests/page-fixtures.test.js', 'tests/mirror-sites.test.js', 'tests/resource-marks.test.js', 'tests/txt-diagnostics.test.js', 'tests/article-queue.test.js', 'tests/image-lane.test.js'];
   suites.forEach(function(file) {
     const result = spawnSync(process.execPath, [path.join(root, file)], {
       cwd: root,
@@ -917,8 +917,8 @@ function loadPopupSandbox(initialStorage, options) {
       },
       CACHE_PREFIXES: {
         IMAGE: 'thumb_cache_v2_',
-        ARTICLE: 'article_cache_v12_',
-        TEXT_RESOURCE: 'txt_resource_cache_v3_',
+        ARTICLE: 'article_cache_v13_',
+        TEXT_RESOURCE: 'txt_resource_cache_v4_',
         TEXT_FAIL: 'atp_text_fail_v1_',
         NEGATIVE: 'atp_empty_v9_',
         IMAGE_BASE: 'thumb_cache_',
@@ -934,6 +934,8 @@ function loadPopupSandbox(initialStorage, options) {
   vm.runInContext(read('settings-schema.js') + '\nthis.SETTINGS_SCHEMA = SETTINGS_SCHEMA;', sandbox, { filename: 'settings-schema.js' });
   vm.runInContext(read('defaults.js'), sandbox, { filename: 'defaults.js' });
   if (options.withMarks) {
+    sandbox.__marksStorageListeners = [];
+    sandbox.chrome.storage.onChanged = { addListener: function(listener) { sandbox.__marksStorageListeners.push(listener); } };
     // The real resource helpers behind the popup's stubbed ones, and the
     // marks module the popup builds its files with.
     const realSharedUtils = loadSharedUtils();
@@ -3359,6 +3361,31 @@ async function checkResourcePanelClipboardSyncFailureFallback() {
 
 function checkCacheNormalization() {
   const cache = loadCacheSandbox();
+  const shared = cache.__SharedUtils;
+  const literalUrl = 'https://img.example/photo.jpg?sig=a&amp;amp;b;part2';
+  const extractedImages = shared.extractImagesByRegex(
+    '<img src="' + shared.escapeHtml(literalUrl) + '">',
+    'https://www.sehuatang.org/thread-1-1-1.html', 10);
+  assert(extractedImages.length === 1 && extractedImages[0].src === literalUrl,
+    'the image extraction boundary must decode HTML exactly once');
+  extractedImages[0].previewSrc = literalUrl.replace('photo.jpg', 'original.jpg');
+  extractedImages[0].displaySrc = literalUrl.replace('photo.jpg', 'thumb.jpg');
+  const literalAttachment = 'https://dl.ldkms.la/resources.txt?part=a&amp;amp;b;tail';
+  const literalResources = shared.emptyResources();
+  literalResources.groups.other.push({ type: 'other', url: 'https://downloads.example/a.zip?sig=a&amp;amp;b;' });
+  const literalData = {
+    images: extractedImages, loadedUrls: [literalUrl], resources: literalResources,
+    textAttachments: [{ url: literalAttachment, name: 'resources.txt' }]
+  };
+  const once = cache.normalizeArticleData(literalData);
+  const twice = cache.normalizeArticleData(JSON.parse(JSON.stringify(once)));
+  assert(once.images[0].src === literalUrl && once.images[0].previewSrc === extractedImages[0].previewSrc &&
+    once.images[0].displaySrc === extractedImages[0].displaySrc && once.loadedUrls[0] === literalUrl &&
+    once.textAttachments[0].url === literalAttachment &&
+    once.resources.groups.other[0].url === literalResources.groups.other[0].url,
+    'article cache must preserve literal URL values in every payload field');
+  assert(JSON.stringify(once) === JSON.stringify(twice),
+    'a serialized cache round-trip must be idempotent even with nested entity-shaped URL data');
   const data = cache.normalizeArticleData({
     textAttachments: [
       '',
@@ -3994,6 +4021,41 @@ function checkContentLoggerRetentionClearBoundary() {
     'clearing logs must remove old retained incidents even when the session shard remains active');
 }
 
+function checkTextDiagnosticRetention() {
+  for (const debug of [true, false]) {
+    const sandbox = loadLoggerSandbox({ enableGetKeys: true, enableDebug: debug });
+    sandbox.Logger.init('VERIFY');
+    sandbox.Logger.event('txt_request', {
+      attachmentId: 'txt-test-1', stage: 'page_bridge', outcome: 'failed',
+      failureClass: 'network', remainingMs: 9000
+    }, 'DEBUG');
+    sandbox.Logger.event('txt_request', {
+      attachmentId: 'txt-test-2', stage: 'background_dispatch', outcome: 'skipped',
+      failureClass: 'deadline', remainingMs: 0
+    }, 'DEBUG');
+    sandbox.Logger.event('txt_result', {
+      threadId: 'thread-test', outcome: 'failed', reason: 'failed',
+      fetchedResources: 0, addedResources: 0, totalResources: 1,
+      unresolvedCount: 1, retryableCount: 1,
+      url: 'https://www.sehuatang.org/forum.php?mod=attachment&aid=private-token'
+    }, 'WARN');
+    for (let i = 0; i < 650; i++) sandbox.Logger.info('after_txt_' + i);
+    sandbox.Logger.flush();
+    const key = Object.keys(sandbox.__storage).find(function(value) {
+      return /^atp_logs_content_\d+_/.test(value) && Array.isArray(sandbox.__storage[value]);
+    });
+    const evidence = (sandbox.__storage[key] || []).find(function(entry) { return entry.type === 'log_retention'; });
+    assert(evidence && evidence.fields.incidentCount === (debug ? 3 : 1),
+      'TXT final failure must remain an incident even without debug logging; debug request failures and deadlines must also count');
+    const result = evidence.fields.recentIncidents.find(function(entry) { return entry.type === 'txt_result'; });
+    assert(result && result.fetchedResources === 0 && result.totalResources === 1 && result.retryableCount === 1,
+      'TXT retention must distinguish pre-existing links from this attempt and retain retry counts after rollover');
+    if (debug) assert(evidence.fields.firstIncident.attachmentId === 'txt-test-1' && evidence.fields.firstIncident.stage === 'page_bridge',
+      'TXT request retention must preserve its safe correlation id and failure stage');
+    assert(JSON.stringify(evidence).indexOf('private-token') === -1, 'TXT retained incidents must not leak signed attachment URLs');
+  }
+}
+
 async function checkLogExportFlushesActiveTab() {
   const content = loadLoggerSandbox({ enableGetKeys: true, enableDebug: false });
   content.Logger.init('CONTENT');
@@ -4297,7 +4359,7 @@ async function checkBackgroundMessageSafety() {
     type: 'CACHE_INDEX_MUTATION',
     action: 'updateEntries',
     updates: {
-      article_cache_v12_bg_proxy: { t: sandbox.SharedUtils.cacheIndex.TYPE.ARTICLE, ts: 123, b: 10 }
+      article_cache_v13_bg_proxy: { t: sandbox.SharedUtils.cacheIndex.TYPE.ARTICLE, ts: 123, b: 10 }
     }
   }, undefined, function(response) {
     cacheIndexUpdateResponse = response;
@@ -4307,7 +4369,7 @@ async function checkBackgroundMessageSafety() {
   assert(
     sandbox.__storage.atp_cache_index_v1 &&
       sandbox.__storage.atp_cache_index_v1.entries &&
-      sandbox.__storage.atp_cache_index_v1.entries.article_cache_v12_bg_proxy,
+      sandbox.__storage.atp_cache_index_v1.entries.article_cache_v13_bg_proxy,
     'background cacheIndex updateEntries messages must write through the owner queue'
   );
   let malformedCacheIndexResponse = null;
@@ -4348,13 +4410,13 @@ async function checkBackgroundMessageSafety() {
   const cacheIndexRemoveResult = sandbox.__onMessage({
     type: 'CACHE_INDEX_MUTATION',
     action: 'removeEntries',
-    keys: ['article_cache_v12_bg_proxy', 'article_cache_legacy_proxy']
+    keys: ['article_cache_v13_bg_proxy', 'article_cache_legacy_proxy']
   }, undefined, function(response) {
     cacheIndexRemoveResponse = response;
   });
   assert(cacheIndexRemoveResult === true, 'background cacheIndex removeEntries messages must preserve async response semantics');
   assert(cacheIndexRemoveResponse && cacheIndexRemoveResponse.ok === true, 'background cacheIndex removeEntries messages must report success');
-  assert(!sandbox.__storage.atp_cache_index_v1.entries.article_cache_v12_bg_proxy, 'background cacheIndex removeEntries messages must remove requested index keys');
+  assert(!sandbox.__storage.atp_cache_index_v1.entries.article_cache_v13_bg_proxy, 'background cacheIndex removeEntries messages must remove requested index keys');
   assert(!sandbox.__storage.atp_cache_index_v1.entries.article_cache_legacy_proxy, 'background cacheIndex removeEntries messages must accept legacy/base-prefix cleanup keys');
 
   let blockedResponse = null;
@@ -5547,6 +5609,7 @@ async function checkFetcherLateBackgroundLastErrorConsumption() {
   let lastErrorReads = 0;
   const debugMessages = [];
   const pendingTimeouts = [];
+  let logsAfterLocalTimeout = 0;
   sandbox.setTimeout = function(callback) {
     pendingTimeouts.push(callback);
     return pendingTimeouts.length;
@@ -5567,6 +5630,7 @@ async function checkFetcherLateBackgroundLastErrorConsumption() {
     sandbox.__backgroundCalls.push(message);
     const timeoutCallback = pendingTimeouts.shift();
     if (timeoutCallback) timeoutCallback();
+    logsAfterLocalTimeout = debugMessages.length;
     if (callback) callback({ resources: sandbox.SharedUtils.emptyResources() });
   };
 
@@ -5575,7 +5639,7 @@ async function checkFetcherLateBackgroundLastErrorConsumption() {
   ], {});
   assert(status.retryableCount === 1, 'fetcher late TXT timeout test must resolve the local timeout status');
   assert(lastErrorReads >= 1, 'fetcher stale TXT callbacks must still read runtime.lastError to consume Chrome errors');
-  assert(debugMessages.length === 0, 'fetcher stale TXT callbacks must not log late background errors after local timeout');
+  assert(debugMessages.length === logsAfterLocalTimeout, 'fetcher stale TXT callbacks must not append late errors after the local timeout diagnostic');
 
   lastErrorReads = 0;
   debugMessages.length = 0;
@@ -5811,6 +5875,7 @@ async function checkTextResourcePartialSuccessStatus() {
 
   const updates = [];
   const cacheWrites = [];
+  const textResultEvents = [];
   const rendererSandbox = {
     console: console,
     URL: URL,
@@ -5820,7 +5885,9 @@ async function checkTextResourcePartialSuccessStatus() {
     clearTimeout: function(){},
     document: { contains: function(node) { return !(node && node.__detached); } },
     SharedUtils: SharedUtils,
-    Logger: { debug: function(){}, event: function(){} },
+    Logger: { debug: function(){}, event: function(type, fields, level) {
+      if (type === 'txt_result') textResultEvents.push({ fields: fields, level: level });
+    } },
     ATPCache: {
       setCachedArticleData: function(link, data, complete) {
         cacheWrites.push({ link: link, data: data, complete: complete });
@@ -5895,6 +5962,9 @@ async function checkTextResourcePartialSuccessStatus() {
   assert(/仍有 1 个附件待重试/.test(threadState.textResourceMessage), 'renderer TXT partial-success must explain unresolved attachment retry state');
   assert(updates.some(function(update) { return update.retryable === true && update.done === false; }), 'resource panel updates must see partial-success retryable state');
   assert(cacheWrites.length === 1 && cacheWrites[0].data.textAttachmentCount === 2, 'renderer TXT partial-success cache write must keep attachment metadata for retry');
+  assert(textResultEvents.length === 1 && textResultEvents[0].level === 'WARN' && textResultEvents[0].fields.outcome === 'partial' &&
+    textResultEvents[0].fields.fetchedResources === 1 && textResultEvents[0].fields.addedResources === 1 && textResultEvents[0].fields.unresolvedCount === 1,
+    'partial TXT results must report fetched links and unresolved attachments instead of claiming completion');
 
   rendererSandbox.ATPFetcher.fetchTextAttachmentResourcesWithStatus = function(attachments) {
     rendererSandbox.__emptyFetchAttachmentCount = attachments.length;
@@ -5913,7 +5983,7 @@ async function checkTextResourcePartialSuccessStatus() {
     loaded: 0,
     failedCount: 0,
     loadedUrls: [],
-    resources: SharedUtils.emptyResources(),
+    resources: partialResources,
     textAttachments: [
       { url: 'https://dl.ldkms.la/empty-only.txt', name: 'empty-only.txt' }
     ],
@@ -5936,6 +6006,10 @@ async function checkTextResourcePartialSuccessStatus() {
   assert(rendererSandbox.__emptyFetchAttachmentCount === 1, 'renderer TXT empty-status test must pass attachments to the fetcher');
   assert(emptyThreadState.textResourcesDone === false, 'renderer TXT empty status without payload must not close the done contract');
   assert(emptyThreadState.textResourcesRetryable === true, 'renderer TXT empty status without payload must keep manual retry available');
+  const emptyEvent = textResultEvents[textResultEvents.length - 1];
+  assert(emptyEvent.level === 'WARN' && emptyEvent.fields.outcome === 'failed' && emptyEvent.fields.fetchedResources === 0 &&
+    emptyEvent.fields.addedResources === 0 && emptyEvent.fields.totalResources === 1,
+    'an empty TXT attempt must not claim success from an existing article resource');
 
   let freshCalls = 0;
   let mixedFetchUrls = [];
@@ -5979,6 +6053,9 @@ async function checkTextResourcePartialSuccessStatus() {
     'renderer mixed TXT scheduling must merge cached external TXT with freshly extracted Discuz attachments'
   );
   assert(mixedThreadState.textAttachments.length === 2 && mixedThreadState.textAttachmentCount === 2, 'renderer mixed TXT scheduling must keep merged attachment metadata on the thread');
+  const completedTextEvent = textResultEvents[textResultEvents.length - 1];
+  assert(completedTextEvent.level === 'INFO' && completedTextEvent.fields.outcome === 'complete' && completedTextEvent.fields.unresolvedCount === 0,
+    'successful TXT diagnostics must only report completion when no attachments remain unresolved');
   const mixedCacheWrite = cacheWrites[cacheWrites.length - 1];
   assert(
     mixedCacheWrite.data.textAttachments.length === 1 &&
@@ -6054,6 +6131,28 @@ async function checkTextResourcePartialSuccessStatus() {
   assert(nullFreshFetchUrls.length === 1 && nullFreshState.textResourcesDone === false && nullFreshState.textResourcesRetryable === true,
     'a fresh extraction that could not read the thread (null) must parse the cached attachment and keep the rest retryable');
   assert(rendererSandbox.ATPRenderer.scheduleTextResourceLoad(nullFreshState, true) === true, 'the user must still be able to retry the missing TXT attachment');
+  await flushAutomaticTextPromises();
+
+  // A fresh result may be incomplete even though the cached attachment is
+  // readable. Do not turn one successful file into a complete two-file run.
+  rendererSandbox.ATPFetcher.fetchTextAttachmentsFresh = function() { return Promise.resolve([]); };
+  const missingFreshState = Object.assign({}, emptyThreadState, {
+    resources: SharedUtils.emptyResources(),
+    textAttachments: [{ url: 'https://dl.ldkms.la/cached-missing-fresh.txt', name: 'cached.txt' }],
+    hasTextAttachments: true,
+    textAttachmentCount: 2,
+    textResourcesLoading: false,
+    textResourcesDone: false,
+    textResourcesRetryable: false,
+    link: 'https://www.sehuatang.org/thread-missing-fresh-1-1.html',
+    statusEl: { textContent: '' }
+  });
+  assert(rendererSandbox.ATPRenderer.scheduleTextResourceLoad(missingFreshState, false), 'mixed TXT work with missing fresh links must start');
+  await flushAutomaticTextPromises();
+  assert(!missingFreshState.textResourcesDone && missingFreshState.textResourcesRetryable && missingFreshState.hasTextAttachments &&
+    missingFreshState.textResourcesUnresolvedCount === 1, 'a missing fresh TXT link must remain visible and retryable after the cached file succeeds');
+  assert(cacheWrites[cacheWrites.length - 1].data.textResourcesComplete === false, 'mixed incomplete TXT results must not be cached as complete');
+  assert(rendererSandbox.ATPRenderer.scheduleTextResourceLoad(missingFreshState, true), 'missing fresh TXT links must retain manual retry');
   await flushAutomaticTextPromises();
 
   const completedThreadState = Object.assign({}, emptyThreadState, {
@@ -12566,8 +12665,8 @@ async function checkPopupRetainsRolloverEvidence() {
 async function checkPopupStorageKeyDiscoveryUsesGetKeys() {
   const sandbox = loadPopupSandbox({
     thumb_cache_v2_image: { ts: 1 },
-    article_cache_v12_article: { ts: 2 },
-    txt_resource_cache_v3_text: { ts: 3 },
+    article_cache_v13_article: { ts: 2 },
+    txt_resource_cache_v4_text: { ts: 3 },
     atp_empty_v9_negative: { ts: 4 },
     atp_logs_content_1000: [
       { ts: '2026-05-26 12:18:00.000', src: 'CONTENT', lv: 'INFO', msg: 'log key' }
@@ -12578,8 +12677,8 @@ async function checkPopupStorageKeyDiscoveryUsesGetKeys() {
   assert(popupHelpers && typeof popupHelpers.getCacheKeysByTypes === 'function', 'popup must expose cache key discovery in verify mode');
   const cacheKeys = await popupHelpers.getCacheKeysByTypes([0, 2]);
   assert(cacheKeys.indexOf('thumb_cache_v2_image') !== -1, 'popup cache discovery must include image cache keys from storage key names');
-  assert(cacheKeys.indexOf('article_cache_v12_article') !== -1, 'popup cache discovery must include article cache keys from storage key names');
-  assert(cacheKeys.indexOf('txt_resource_cache_v3_text') === -1, 'popup cache discovery must filter cache keys by requested types');
+  assert(cacheKeys.indexOf('article_cache_v13_article') !== -1, 'popup cache discovery must include article cache keys from storage key names');
+  assert(cacheKeys.indexOf('txt_resource_cache_v4_text') === -1, 'popup cache discovery must filter cache keys by requested types');
   assert(cacheKeys.indexOf('atp_logs_content_1000') === -1, 'popup cache discovery must not mix log keys into cache cleanup');
   assert(sandbox.__storageGetKeys.length === 1, 'popup cache discovery must use storage.getKeys when available');
   assert(
@@ -13411,7 +13510,9 @@ async function checkBackgroundMarksStore() {
 
   // Export: a mark unchanged since the popup read it counts as exported;
   // every exported mark goes into today's backup.
-  const seen = bg.__storage[M.KEYS.INDEX].items.map(function(item) { return { id: item.id, updatedAt: item.updatedAt }; });
+  const seen = bg.__storage[M.KEYS.INDEX].items.map(function(item) {
+    return { id: item.id, updatedAt: item.updatedAt, snapshot: M.recordToSnapshot(bg.__storage[M.itemKey(item.id)]) };
+  });
   const bLater = makeMarksTestSnapshot(M, '102', '帖子 B', {
     magnet: [{ url: 'magnet:?xt=urn:btih:' + '1'.repeat(40) }],
     quark: [{ url: 'https://pan.quark.cn/s/qnew', code: 'qqqq' }]
@@ -13434,8 +13535,9 @@ async function checkBackgroundMarksStore() {
     'reading an exported thread again unchanged must keep it exported and store the new read time');
   assert(bg.__storage[M.KEYS.INDEX].rev === revBeforeReread, 'an unchanged re-read must not rewrite the index every tab listens to');
   day = bg.__storage[dayKey];
-  assert(day.threads.length === 2 && day.threads[0].events.length === 2 && day.threads[1].links.length === 2,
-    'the export must be added to today\'s backup, one entry per thread: ' + JSON.stringify(day));
+  assert(day.threads.length === 2 && day.threads[0].events.length === 2 && day.threads[1].links.length === 1 &&
+    day.threads[1].links[0].url === b.links[0].url,
+    'the backup must contain the exported snapshot, not links added after the popup read: ' + JSON.stringify(day));
 
   // Clearing never touches the backup, and "clear all" needs the list the
   // popup showed.
@@ -13459,6 +13561,150 @@ async function checkBackgroundMarksStore() {
   assert(keptKeys.indexOf(dayKey) !== -1 && keptKeys.indexOf(M.KEYS.INDEX) !== -1, 'the kept keys must include the backup days and the index');
   const kept = keptKeys.reduce(function(sum, key) { return sum + (bg.__storage[key] ? key.length + JSON.stringify(bg.__storage[key]).length : 0); }, 0);
   assert(cacheBytes === total - kept && cacheBytes < total, 'cache usage must leave out marks and backups: ' + cacheBytes + ' of ' + total);
+}
+
+async function checkMarksHandOutRaces() {
+  const bg = loadBackgroundSandbox({ enableDebug: false });
+  const M = bg.ATPMarks;
+  const page = { url: 'https://www.sehuatang.org/forum-2-1.html', tab: { id: 7 } };
+  const popup = { url: 'chrome-extension://verify/popup.html' };
+  const send = function(message, sender) { return sendMarksMessageForVerify(bg, message, sender || page); };
+  const original = makeMarksTestSnapshot(M, '303', '实际复制的标题', { baidu: [{ url: 'https://pan.baidu.com/s/1copied' }] }, ['copied-password']);
+  await send({ op: 'mark', snapshot: original });
+  const record = bg.__storage[M.itemKey(original.id)];
+  const handed = { id: record.id, updatedAt: record.updatedAt, snapshot: M.recordToSnapshot(record) };
+  await send({ op: 'unmark', id: original.id });
+  const copied = await send({ op: 'copiedMarks', marks: [handed] }, popup);
+  assert(copied.ok && copied.backedUp === 1 && !bg.__storage[M.itemKey(original.id)],
+    'a copied snapshot must be backed up after its mark is removed, without resurrecting the mark');
+  const saved = bg.__storage[M.dayKey(copied.date)].threads[0];
+  assert(saved.title === original.title && saved.links[0].url === original.links[0].url && saved.passwords[0] === 'copied-password');
+  assert((await send({ op: 'copiedMarks', marks: [{ id: handed.id, updatedAt: handed.updatedAt }] }, popup)).error === 'invalid_snapshot',
+    'a missing hand-out snapshot must not be reported as a successful zero-item backup');
+
+  // The Chrome API returns copies. Preserve those semantics while injecting
+  // a failed backup write so an in-memory alias cannot fake a committed set.
+  const get = bg.chrome.storage.local.get;
+  bg.chrome.storage.local.get = function(keys, callback) {
+    get(keys, function(value) { callback(JSON.parse(JSON.stringify(value))); });
+  };
+  await send({ op: 'mark', snapshot: original });
+  const pending = bg.__storage[M.itemKey(original.id)];
+  const set = bg.chrome.storage.local.set;
+  let failedCommit = null;
+  bg.chrome.storage.local.set = function(items, callback) {
+    if (Object.prototype.hasOwnProperty.call(items, M.KEYS.DAYS)) {
+      failedCommit = items;
+      bg.chrome.runtime.lastError = { message: 'injected backup write failure' };
+      if (callback) callback();
+      bg.chrome.runtime.lastError = null;
+      return;
+    }
+    set(items, callback);
+  };
+  const failed = await send({ op: 'exported', marks: [{ id: pending.id, updatedAt: pending.updatedAt, snapshot: M.recordToSnapshot(pending) }] }, popup);
+  assert(!failed.ok && failed.error === 'storage_write_failed' && failedCommit && failedCommit[M.KEYS.INDEX],
+    'backup and export status must be committed in the same storage write');
+  assert(!M.isExported(bg.__storage[M.itemKey(original.id)]) && !M.isExported(bg.__storage[M.KEYS.INDEX].items[0]),
+    'a failed backup commit must leave the mark unexported');
+  bg.chrome.storage.local.set = set;
+  const beforeReread = bg.__storage[M.itemKey(original.id)];
+  const rereadHanded = { id: beforeReread.id, updatedAt: beforeReread.updatedAt, snapshot: M.recordToSnapshot(beforeReread) };
+  const rereadSnapshot = Object.assign({}, original, { readAt: original.readAt + 1000 });
+  await send({ op: 'update', snapshot: rereadSnapshot });
+  const rereadExport = await send({ op: 'exported', marks: [rereadHanded] }, popup);
+  assert(rereadExport.ok && rereadExport.exported === 1 && M.isExported(bg.__storage[M.itemKey(original.id)]),
+    'read time changes alone must not prevent confirming an otherwise unchanged exported snapshot');
+}
+
+async function checkPopupMarksClearConfirmation() {
+  const shared = {};
+  const bg = loadBackgroundSandbox({ storage: shared, enableDebug: false });
+  const M = bg.ATPMarks;
+  const page = { url: 'https://www.sehuatang.org/forum-2-1.html', tab: { id: 7 } };
+  const sent = [];
+  const mark = function(tid) {
+    return sendMarksMessageForVerify(bg, { op: 'mark', snapshot: makeMarksTestSnapshot(M, tid, '确认测试 ' + tid, {}, []) }, page);
+  };
+  await mark('311');
+  const popup = loadPopupSandbox({}, { sharedStorage: shared, withMarks: true, runtimeMessageHandler: function(message, callback) {
+    if (message.type !== 'MARKS_MUTATION') return false;
+    sent.push(message);
+    bg.__onMessage(message, { url: 'chrome-extension://verify/popup.html' }, callback);
+    return true;
+  } });
+  await popup.__flushPromises(30);
+  const button = popup.__elements.clearAllMarks;
+  button.click();
+  assert(button.__atpConfirmArmed, 'the first click must only arm confirmation');
+  await mark('312');
+  const changes = {};
+  changes[M.KEYS.INDEX] = { newValue: shared[M.KEYS.INDEX] };
+  popup.__marksStorageListeners.forEach(function(listener) { listener(changes, 'local'); });
+  assert(!button.__atpConfirmArmed && /已取消清空确认/.test(popup.__elements.popupStatus.textContent),
+    'a storage change must cancel confirmation immediately, before the delayed refresh');
+  popup.__timers.filter(function(timer) { return !timer.cleared && timer.delay === 150; }).forEach(function(timer) {
+    timer.cleared = true;
+    timer.callback();
+  });
+  await popup.__flushPromises(30);
+  button.click();
+  assert(button.__atpConfirmArmed && sent.length === 0 && shared[M.KEYS.INDEX].items.length === 2,
+    'the click after cancellation must confirm the new two-mark list, not clear it');
+  // Even if onChanged has not arrived, the second click must retain the
+  // first click's revision and let the worker reject the stale operation.
+  const confirmedRev = shared[M.KEYS.INDEX].rev;
+  await mark('313');
+  button.click();
+  await popup.__flushPromises(100);
+  assert(sent.length === 1 && sent[0].rev === confirmedRev && shared[M.KEYS.INDEX].items.length === 3,
+    'a mark added before the storage notification must survive the stale confirmation');
+  assert(/标记刚刚有变化/.test(popup.__elements.popupStatus.textContent));
+  button.click();
+  button.click();
+  await popup.__flushPromises(100);
+  assert(shared[M.KEYS.INDEX].items.length === 0, 'two clicks on an unchanged list must still clear it');
+}
+
+async function checkPopupMarksBackupFeedback() {
+  for (const mode of ['removed', 'failed', 'partial']) {
+    const shared = {};
+    const bg = loadBackgroundSandbox({ storage: shared, enableDebug: false });
+    const M = bg.ATPMarks;
+    const page = { url: 'https://www.sehuatang.org/forum-2-1.html', tab: { id: 7 } };
+    const original = makeMarksTestSnapshot(M, '321', '复制快照', { baidu: [{ url: 'https://pan.baidu.com/s/1clipboard' }] }, ['pw']);
+    await sendMarksMessageForVerify(bg, { op: 'mark', snapshot: original }, page);
+    let sentSnapshot = null;
+    const popup = loadPopupSandbox({}, { sharedStorage: shared, withMarks: true, runtimeMessageHandler: function(message, callback) {
+      if (message.type !== 'MARKS_MUTATION') return false;
+      if (message.op === 'copiedMarks') {
+        sentSnapshot = message.marks[0].snapshot;
+        if (mode === 'failed') { callback({ ok: false, error: 'storage_write_failed' }); return true; }
+        if (mode === 'partial') { callback({ ok: true, backedUp: 0 }); return true; }
+      }
+      bg.__onMessage(message, { url: 'chrome-extension://verify/popup.html' }, callback);
+      return true;
+    } });
+    let clipboard = '';
+    popup.navigator = { clipboard: { writeText: async function(text) {
+      clipboard = text;
+      if (mode === 'removed') await sendMarksMessageForVerify(bg, { op: 'unmark', id: original.id }, page);
+    } } };
+    await popup.__flushPromises(30);
+    popup.__elements.copyMarks.click();
+    await popup.__flushPromises(150);
+    assert(clipboard.indexOf(original.links[0].url) !== -1 && sentSnapshot && sentSnapshot.links[0].url === original.links[0].url,
+      'the popup must send the same resource snapshot it copied');
+    const status = popup.__elements.popupStatus;
+    assert(/已复制 1 帖/.test(status.textContent), 'a completed clipboard copy must be acknowledged even when its backup fails');
+    if (mode === 'removed') {
+      assert(shared[M.KEYS.DAYS] && Object.keys(shared[M.KEYS.DAYS].days).length === 1 && /popup-status-ok/.test(status.className),
+        'copying while a mark is removed must still create its daily backup');
+    } else {
+      assert(/popup-status-warn/.test(status.className) && (mode === 'failed' ? /未能确认备份.*存储写入失败/.test(status.textContent) : /仅确认备份 0\/1 帖/.test(status.textContent)),
+        'failed or incomplete backups must be reported as a visible warning: ' + status.textContent);
+    }
+  }
 }
 
 async function checkPopupMarksExport() {
@@ -13898,7 +14144,7 @@ async function checkCacheIndexErrorHandling() {
       local: {
         get: function(keys, callback) {
           if (keys === null) {
-            callback({ article_cache_v12_rebuild: { ts: 123, images: [] } });
+            callback({ article_cache_v13_rebuild: { ts: 123, images: [] } });
             return;
           }
           callback({});
@@ -13919,7 +14165,7 @@ async function checkCacheIndexErrorHandling() {
   assert(rebuildWriteSetCalls === 1, 'cacheIndex rebuild write-failure test must exercise the index write path');
 
   const updateOk = await new Promise(function(resolve) {
-    SharedUtils.cacheIndex.updateEntries({ 'article_cache_v12_test': { t: SharedUtils.cacheIndex.TYPE.ARTICLE, ts: 123, b: 10 } }, resolve);
+    SharedUtils.cacheIndex.updateEntries({ 'article_cache_v13_test': { t: SharedUtils.cacheIndex.TYPE.ARTICLE, ts: 123, b: 10 } }, resolve);
   });
   assert(updateOk === false, 'cacheIndex updateEntry must report read failure');
   assert(setCalls === 0, 'cacheIndex updateEntry must not write an incomplete index after read failure');
@@ -13947,7 +14193,7 @@ async function checkCacheIndexErrorHandling() {
   };
 
   const writeOk = await new Promise(function(resolve) {
-    WriteSharedUtils.cacheIndex.updateEntries({ 'article_cache_v12_test': { t: WriteSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 123, b: 10 } }, resolve);
+    WriteSharedUtils.cacheIndex.updateEntries({ 'article_cache_v13_test': { t: WriteSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 123, b: 10 } }, resolve);
   });
   assert(writeOk === false, 'cacheIndex updateEntry must report index write failures');
 
@@ -13978,7 +14224,7 @@ async function checkCacheIndexErrorHandling() {
   };
   const batchOk = await new Promise(function(resolve) {
     BatchSharedUtils.cacheIndex.updateEntries({
-      article_cache_v12_a: { t: BatchSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 111, b: 12 },
+      article_cache_v13_a: { t: BatchSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 111, b: 12 },
       image_cache_v9_b: { t: BatchSharedUtils.cacheIndex.TYPE.IMAGE, ts: 222, b: 34 }
     }, resolve);
   });
@@ -13987,7 +14233,7 @@ async function checkCacheIndexErrorHandling() {
   assert(batchGetCalls === 1 && batchSetCalls === 1, 'cacheIndex updateEntries must merge multiple index updates through one read/write cycle');
   assert(
     batchEntries &&
-      batchEntries.article_cache_v12_a &&
+      batchEntries.article_cache_v13_a &&
       batchEntries.image_cache_v9_b &&
       batchEntries.image_cache_v9_b.b === 34,
     'cacheIndex updateEntries must persist every merged index entry'
@@ -14028,14 +14274,14 @@ async function checkCacheIndexErrorHandling() {
   });
   const adjacentUpdatesPromise = Promise.all([
     new Promise(function(resolve) {
-      AdjacentBatchSharedUtils.cacheIndex.updateEntries({ 'article_cache_v12_dupe': { t: AdjacentBatchSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 111, b: 12 } }, function(ok) {
+      AdjacentBatchSharedUtils.cacheIndex.updateEntries({ 'article_cache_v13_dupe': { t: AdjacentBatchSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 111, b: 12 } }, function(ok) {
         adjacentCallbacks.push(ok);
         resolve(ok);
       });
     }),
     new Promise(function(resolve) {
       AdjacentBatchSharedUtils.cacheIndex.updateEntries({
-        article_cache_v12_dupe: { t: AdjacentBatchSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 222, b: 24 },
+        article_cache_v13_dupe: { t: AdjacentBatchSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 222, b: 24 },
         image_cache_v9_adjacent: { t: AdjacentBatchSharedUtils.cacheIndex.TYPE.IMAGE, ts: 333, b: 36 }
       }, function(ok) {
         adjacentCallbacks.push(ok);
@@ -14057,8 +14303,8 @@ async function checkCacheIndexErrorHandling() {
   assert(adjacentBatchGetCalls === 1 && adjacentBatchSetCalls === 2, 'cacheIndex must coalesce adjacent updateEntries queue items into one read/write cycle after the queue barrier');
   assert(
     adjacentBatchEntries &&
-      adjacentBatchEntries.article_cache_v12_dupe &&
-      adjacentBatchEntries.article_cache_v12_dupe.ts === 222 &&
+      adjacentBatchEntries.article_cache_v13_dupe &&
+      adjacentBatchEntries.article_cache_v13_dupe.ts === 222 &&
       adjacentBatchEntries.image_cache_v9_adjacent &&
       adjacentBatchEntries.text_resource_cache_v9_adjacent,
     'cacheIndex adjacent merged updates must persist all entries and let later duplicate keys win'
@@ -14099,10 +14345,10 @@ async function checkCacheIndexErrorHandling() {
   const barrierResults = await Promise.all([
     barrierGate,
     new Promise(function(resolve) {
-      BarrierSharedUtils.cacheIndex.updateEntries({ 'article_cache_v12_barrier': { t: BarrierSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 111, b: 12 } }, resolve);
+      BarrierSharedUtils.cacheIndex.updateEntries({ 'article_cache_v13_barrier': { t: BarrierSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 111, b: 12 } }, resolve);
     }),
     new Promise(function(resolve) {
-      BarrierSharedUtils.cacheIndex.removeEntries(['article_cache_v12_barrier'], function() {
+      BarrierSharedUtils.cacheIndex.removeEntries(['article_cache_v13_barrier'], function() {
         resolve(true);
       });
     }),
@@ -14115,7 +14361,7 @@ async function checkCacheIndexErrorHandling() {
   assert(barrierGetCalls === 3 && barrierSetCalls === 4, 'cacheIndex must not coalesce updateEntries across write/remove barriers');
   assert(
     barrierEntries &&
-      !barrierEntries.article_cache_v12_barrier &&
+      !barrierEntries.article_cache_v13_barrier &&
       barrierEntries.image_cache_v9_barrier,
     'cacheIndex removeEntries must remain a barrier between adjacent update batches'
   );
@@ -14134,7 +14380,7 @@ async function checkCacheIndexErrorHandling() {
           if (keys === null) {
             rebuildBatchGetAllCalls++;
             const allItems = {};
-            allItems.article_cache_v12_old = { ts: 99, images: [] };
+            allItems.article_cache_v13_old = { ts: 99, images: [] };
             callback(allItems);
             return;
           }
@@ -14150,7 +14396,7 @@ async function checkCacheIndexErrorHandling() {
   };
   const rebuildBatchOk = await new Promise(function(resolve) {
     RebuildBatchSharedUtils.cacheIndex.updateEntries({
-      article_cache_v12_new: { t: RebuildBatchSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 111, b: 12 }
+      article_cache_v13_new: { t: RebuildBatchSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 111, b: 12 }
     }, resolve);
   });
   const rebuildBatchEntries = rebuildBatchStorage[RebuildBatchSharedUtils.CACHE_INDEX_KEY] && rebuildBatchStorage[RebuildBatchSharedUtils.CACHE_INDEX_KEY].entries;
@@ -14158,8 +14404,8 @@ async function checkCacheIndexErrorHandling() {
   assert(rebuildBatchGetAllCalls === 1 && rebuildBatchSetCalls === 1, 'cacheIndex updateEntries must rebuild once before merging into a missing index');
   assert(
     rebuildBatchEntries &&
-      rebuildBatchEntries.article_cache_v12_old &&
-      rebuildBatchEntries.article_cache_v12_new,
+      rebuildBatchEntries.article_cache_v13_old &&
+      rebuildBatchEntries.article_cache_v13_new,
     'cacheIndex updateEntries must preserve rebuilt cache entries while merging new updates'
   );
 
@@ -14169,8 +14415,8 @@ async function checkCacheIndexErrorHandling() {
   const removeStorage = {};
   removeStorage[RemoveSharedUtils.CACHE_INDEX_KEY] = {
     entries: {
-      article_cache_v12_keep: { t: RemoveSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 1, b: 10 },
-      article_cache_v12_remove_a: { t: RemoveSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 2, b: 20 },
+      article_cache_v13_keep: { t: RemoveSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 1, b: 10 },
+      article_cache_v13_remove_a: { t: RemoveSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 2, b: 20 },
       image_cache_v9_remove_b: { t: RemoveSharedUtils.cacheIndex.TYPE.IMAGE, ts: 3, b: 30 }
     }
   };
@@ -14196,15 +14442,15 @@ async function checkCacheIndexErrorHandling() {
     }
   };
   const removeOk = await new Promise(function(resolve) {
-    RemoveSharedUtils.cacheIndex.removeEntries(['article_cache_v12_remove_a', 'image_cache_v9_remove_b'], resolve);
+    RemoveSharedUtils.cacheIndex.removeEntries(['article_cache_v13_remove_a', 'image_cache_v9_remove_b'], resolve);
   });
   const removeEntries = removeStorage[RemoveSharedUtils.CACHE_INDEX_KEY] && removeStorage[RemoveSharedUtils.CACHE_INDEX_KEY].entries;
   assert(removeOk === true, 'cacheIndex removeEntries must report successful index writes');
   assert(removeGetCalls === 1 && removeSetCalls === 1, 'cacheIndex removeEntries must delete multiple keys through one read/write cycle');
   assert(
     removeEntries &&
-      removeEntries.article_cache_v12_keep &&
-      !removeEntries.article_cache_v12_remove_a &&
+      removeEntries.article_cache_v13_keep &&
+      !removeEntries.article_cache_v13_remove_a &&
       !removeEntries.image_cache_v9_remove_b,
     'cacheIndex removeEntries must remove every requested key while preserving other entries'
   );
@@ -14219,7 +14465,7 @@ async function checkCacheIndexErrorHandling() {
       local: {
         get: function(keys, callback) {
           const result = {};
-          result[RemoveFailSharedUtils.CACHE_INDEX_KEY] = { entries: { article_cache_v12_remove: { t: RemoveFailSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 1, b: 1 } } };
+          result[RemoveFailSharedUtils.CACHE_INDEX_KEY] = { entries: { article_cache_v13_remove: { t: RemoveFailSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 1, b: 1 } } };
           callback(result);
         },
         set: function(items, callback) {
@@ -14231,7 +14477,7 @@ async function checkCacheIndexErrorHandling() {
     }
   };
   const removeFailOk = await new Promise(function(resolve) {
-    RemoveFailSharedUtils.cacheIndex.removeEntries(['article_cache_v12_remove'], resolve);
+    RemoveFailSharedUtils.cacheIndex.removeEntries(['article_cache_v13_remove'], resolve);
   });
   assert(removeFailOk === false, 'cacheIndex removeEntries must report index write failures');
 
@@ -14257,7 +14503,7 @@ async function checkCacheIndexErrorHandling() {
     }
   };
   const removeReadFailArgs = await new Promise(function(resolve) {
-    RemoveReadFailSharedUtils.cacheIndex.removeEntries(['article_cache_v12_missing'], function() {
+    RemoveReadFailSharedUtils.cacheIndex.removeEntries(['article_cache_v13_missing'], function() {
       resolve(Array.prototype.slice.call(arguments));
     });
   });
@@ -14281,7 +14527,7 @@ async function checkCacheIndexErrorHandling() {
     }
   };
   const removeMissingArgs = await new Promise(function(resolve) {
-    RemoveMissingSharedUtils.cacheIndex.removeEntries(['article_cache_v12_missing'], function() {
+    RemoveMissingSharedUtils.cacheIndex.removeEntries(['article_cache_v13_missing'], function() {
       resolve(Array.prototype.slice.call(arguments));
     });
   });
@@ -14298,7 +14544,7 @@ async function checkCacheIndexErrorHandling() {
       sendMessage: function(message, callback) {
         proxyMessages.push(message);
         if (message.action === 'rebuild') {
-          callback({ ok: true, entries: { article_cache_v12_proxy_rebuilt: { t: ProxySharedUtils.cacheIndex.TYPE.ARTICLE, ts: 1, b: 1 } } });
+          callback({ ok: true, entries: { article_cache_v13_proxy_rebuilt: { t: ProxySharedUtils.cacheIndex.TYPE.ARTICLE, ts: 1, b: 1 } } });
           return;
         }
         callback({ ok: true });
@@ -14317,21 +14563,21 @@ async function checkCacheIndexErrorHandling() {
   assert(proxyEmptyOk === true && proxyMessages.length === 0, 'cacheIndex empty updateEntries must not proxy or touch storage');
   const proxyUpdateOk = await new Promise(function(resolve) {
     ProxySharedUtils.cacheIndex.updateEntries({
-      article_cache_v12_proxy: { t: ProxySharedUtils.cacheIndex.TYPE.ARTICLE, ts: 123, b: 10 }
+      article_cache_v13_proxy: { t: ProxySharedUtils.cacheIndex.TYPE.ARTICLE, ts: 123, b: 10 }
     }, resolve);
   });
   const proxyRemoveOk = await new Promise(function(resolve) {
-    ProxySharedUtils.cacheIndex.removeEntries(['article_cache_v12_proxy'], resolve);
+    ProxySharedUtils.cacheIndex.removeEntries(['article_cache_v13_proxy'], resolve);
   });
   const proxyRebuildEntries = await new Promise(function(resolve) {
     ProxySharedUtils.cacheIndex.rebuild(resolve);
   });
   assert(proxyUpdateOk === true && proxyRemoveOk === true, 'cacheIndex proxy mutations must return background success');
-  assert(proxyRebuildEntries && proxyRebuildEntries.article_cache_v12_proxy_rebuilt, 'cacheIndex proxy rebuild must return background entries');
+  assert(proxyRebuildEntries && proxyRebuildEntries.article_cache_v13_proxy_rebuilt, 'cacheIndex proxy rebuild must return background entries');
   assert(proxyStorageTouched === false, 'cacheIndex proxied mutations must not write through local storage');
   assert(proxyMessages.length === 3, 'cacheIndex proxy test must send one message per non-empty mutation');
   assert(proxyMessages[0].type === 'CACHE_INDEX_MUTATION' && proxyMessages[0].action === 'updateEntries', 'cacheIndex updateEntries must proxy to the background owner');
-  assert(proxyMessages[1].action === 'removeEntries' && proxyMessages[1].keys[0] === 'article_cache_v12_proxy', 'cacheIndex removeEntries must proxy requested keys');
+  assert(proxyMessages[1].action === 'removeEntries' && proxyMessages[1].keys[0] === 'article_cache_v13_proxy', 'cacheIndex removeEntries must proxy requested keys');
   assert(proxyMessages[2].action === 'rebuild', 'cacheIndex rebuild must proxy to the background owner');
 
   const proxyFailSandbox = loadSharedUtilsSandbox({ backgroundOwner: false });
@@ -14343,7 +14589,7 @@ async function checkCacheIndexErrorHandling() {
     }
   };
   const proxyFailOk = await new Promise(function(resolve) {
-    ProxyFailSharedUtils.cacheIndex.removeEntries(['article_cache_v12_proxy_fail'], resolve);
+    ProxyFailSharedUtils.cacheIndex.removeEntries(['article_cache_v13_proxy_fail'], resolve);
   });
   assert(proxyFailOk === false, 'cacheIndex proxy mutations must report background failures');
 
@@ -14365,11 +14611,11 @@ async function checkCacheIndexErrorHandling() {
   });
   const noProxyUpdateOk = await new Promise(function(resolve) {
     NoProxySharedUtils.cacheIndex.updateEntries({
-      article_cache_v12_no_proxy: { t: NoProxySharedUtils.cacheIndex.TYPE.ARTICLE, ts: 1, b: 1 }
+      article_cache_v13_no_proxy: { t: NoProxySharedUtils.cacheIndex.TYPE.ARTICLE, ts: 1, b: 1 }
     }, resolve);
   });
   const noProxyRemoveOk = await new Promise(function(resolve) {
-    NoProxySharedUtils.cacheIndex.removeEntries(['article_cache_v12_no_proxy'], resolve);
+    NoProxySharedUtils.cacheIndex.removeEntries(['article_cache_v13_no_proxy'], resolve);
   });
   const noProxyRebuildEntries = await new Promise(function(resolve) {
     NoProxySharedUtils.cacheIndex.rebuild(resolve);
@@ -14403,7 +14649,7 @@ async function checkCacheIndexErrorHandling() {
     }
   };
   let throwingCallbackCalled = false;
-  ThrowingSharedUtils.cacheIndex.updateEntries({ 'article_cache_v12_throw': { t: ThrowingSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 1, b: 1 } }, function() {
+  ThrowingSharedUtils.cacheIndex.updateEntries({ 'article_cache_v13_throw': { t: ThrowingSharedUtils.cacheIndex.TYPE.ARTICLE, ts: 1, b: 1 } }, function() {
     throwingCallbackCalled = true;
     throw new Error('intentional callback failure');
   });
@@ -15387,7 +15633,7 @@ function checkCriticalStaticRules() {
   assert(renderer.indexOf('var fallbackToCachedAttachmentsAfterFreshFailure = function(message, e)') !== -1, 'renderer must fall back to cached TXT attachments when mixed-state fresh extraction fails');
   assert(renderer.indexOf("threadState.textResourceMessage = 'TXT 附件重新提取失败，解析已缓存附件'") !== -1, 'renderer mixed TXT fresh-failure fallback must expose a transient fallback status');
   assert(renderer.indexOf('doFetch(threadState.textAttachments);') !== -1, 'renderer mixed TXT fresh-failure fallback must parse cached TXT attachments');
-  assert(renderer.indexOf('doFetch(attachments);') !== -1, 'renderer must fetch the merged TXT attachment set after fresh extraction');
+  assert(renderer.indexOf('doFetch(attachments, missingAttachmentCount);') !== -1, 'renderer must fetch the merged TXT attachment set and retain missing attachment counts after fresh extraction');
   assert(renderer.indexOf("heavyThumbnailClarity === 'lightweight'") !== -1, 'renderer must detect lightweight heavy thumbnail mode');
   assert(renderer.indexOf('var visibleRowsForRender = heavyPlan.enabled && !heavyPlan.lightweight ? 1 : visRows') !== -1, 'lightweight heavy thumbnails must use the ordinary visible row count');
   assert(renderer.indexOf('overflow-y:auto;overflow-x:auto') !== -1, 'thumbnail viewport must allow horizontal access when configured columns exceed a narrow container');
@@ -15441,7 +15687,7 @@ function checkCriticalStaticRules() {
   assert(fetcher.indexOf('new URL(attachments[a].url).origin') === -1, 'TXT attachment partitioning must not duplicate URL origin parsing');
   assert(fetcher.indexOf('new URL(downloadUrls[d]).origin') === -1, 'TXT intermediary downloads must not duplicate URL origin parsing');
   assert(fetcher.indexOf('new URL(url).origin !== location.origin') === -1, 'fresh TXT attachment fetches must not duplicate URL origin parsing');
-  assert(fetcher.indexOf('TXT附件重定向已拒绝') !== -1, 'content TXT fetch must reject disallowed redirects');
+  assert(/if \(!isAllowedTextAttachmentFinalUrl\(finalAttachmentUrl\)\) \{\s+diagnosticFailure = 'redirect_not_allowed';\s+return SharedUtils\.emptyResources\(\);/.test(fetcher), 'content TXT fetch must reject disallowed redirects and classify the failure');
   assert(sharedUtils.indexOf("SIGNED_TEXT_DOWNLOAD_HOSTS: Object.freeze(['xia.ewrewej.la'])") !== -1 &&
     sharedUtils.indexOf('SharedUtils.SIGNED_TEXT_DOWNLOAD_HOSTS.indexOf(u.hostname) !== -1') !== -1 &&
     fetcher.indexOf('SharedUtils.isTextAttachmentUrlAllowedInZone') !== -1, 'content TXT fetch must allow signed xia.ewrewej.la download URLs through the shared allowlist');
@@ -15514,7 +15760,7 @@ function checkCriticalStaticRules() {
   assert(background.indexOf('const TEXT_RESOURCE_MESSAGE_CONCURRENCY = 2;') !== -1 && background.indexOf('function enqueueTextResourceMessage(attachments, deadline, options)') !== -1, 'background TXT messages must share an extension-level concurrency cap of two');
   assert(background.indexOf('enqueueTextResourceMessage(attachments, textDeadline, { manualRetry: manualRetry, owner: sender && sender.tab && sender.tab.id, zone: textSenderZone })') !== -1, 'background TXT message handler must enqueue work with trusted tab ownership, manual retry state and the sender site zone');
   assert(!/if \(status === 429\) \{[\s\S]*?setTextFailCache\(attachment\.url\);[\s\S]*?\n        \}/.test(background), 'background TXT HTTP 429 must not write TEXT_FAIL cache');
-  assert(background.indexOf('TXT附件异常，不写失败缓存') !== -1, 'background TXT unexpected exceptions must remain retryable instead of writing TEXT_FAIL cache');
+  assert(/catch \(e\) \{\s+diagnosticFailure = backgroundTextFailureClass\(e\);\s+return SharedUtils\.emptyResources\(\);\s+\} finally \{\s+logBackgroundTextDiagnostic/.test(background), 'background TXT unexpected exceptions must remain retryable instead of writing TEXT_FAIL cache');
   assert(background.indexOf('(msg.attachments || []).filter(function(a)') === -1, 'background TXT message handler must not allocate filtered attachment arrays');
   assert(background.indexOf('}).slice(0, TEXT_ATTACHMENT_MAX_COUNT)') === -1, 'background TXT message handler must not slice filtered attachment arrays');
   assert(fetcher.indexOf('if (cached.textAttachments.length)') !== -1, 'fetcher must always scrub cached Discuz TXT URLs before returning cached article data');
@@ -15625,7 +15871,8 @@ function checkCriticalStaticRules() {
   assert(sharedUtils.indexOf('forEachHrefValue: function(html, callback)') !== -1, 'shared utils must expose streaming href iteration for hot extraction paths');
   assert(sharedUtils.indexOf('this.forEachHrefValue(decoded, function(href)') !== -1, 'resource and TXT extraction must iterate href values without building arrays first');
   assert(sharedUtils.indexOf('mergeUniqueLimited: function(primary, secondary, limit)') !== -1, 'resource password extraction must support bounded password merging');
-  assert(sharedUtils.indexOf('resources.passwords = this.mergeUniqueLimited(') !== -1, 'resource password extraction must cap merged passwords without slicing a full merged list');
+  assert(/resources\.passwords = source === 'txt' \? this\.extractArchivePasswords\(text\) : this\.mergeUniqueLimited\(\s*this\.extractArchivePasswordsFromHtml\(rawHtml\),\s*this\.extractArchivePasswords\(text\),\s*5\s*\);/.test(sharedUtils),
+    'resource password extraction must keep literal TXT extraction separate and cap HTML password merging at five without slicing a full merged list');
   assert(sharedUtils.indexOf(').slice(0, 5)') === -1, 'resource password extraction must not allocate a sliced merged password list');
   assert(sharedUtils.indexOf('var separator = /\\s+/.exec(v);') !== -1, 'resource password cleanup must find the first whitespace separator without splitting');
   assert(sharedUtils.indexOf('v.substring(separator.index + separator[0].length)') !== -1, 'resource password cleanup must inspect only the password suffix after the first separator');
@@ -16027,7 +16274,7 @@ function checkCriticalStaticRules() {
   assert(renderer.indexOf('var failTextResourceLoad = function(message, e)') !== -1, 'renderer TXT scheduling must centralize local fetch startup failures');
   assert(renderer.indexOf("if (!fetchPromise || typeof fetchPromise.then !== 'function')") !== -1, 'renderer TXT scheduling must reject non-promise TXT fetcher results without getting stuck loading');
   assert(renderer.indexOf("if (!freshPromise || typeof freshPromise.then !== 'function')") !== -1, 'renderer TXT scheduling must reject non-promise fresh attachment results without getting stuck loading');
-  assert(renderer.indexOf('ATPFetcher.fetchTextAttachmentResourcesWithStatus(attachments, { manualRetry: !!manualRetry })') !== -1, 'renderer TXT scheduling must pass manual retry state to the status-aware fetcher');
+  assert(/var fetchOptions = \{ manualRetry: !!manualRetry,[^\n]+\};/.test(renderer) && renderer.indexOf('ATPFetcher.fetchTextAttachmentResourcesWithStatus(attachments, fetchOptions)') !== -1, 'renderer TXT scheduling must pass manual retry state to the status-aware fetcher');
   assert(resourcePanel.indexOf('|| threadState.textResourcesRetryable') !== -1, 'resource panel must keep TXT parse actions visible for retryable failures');
   assert(resourcePanel.indexOf('if (threadState.textResourcesDone && !threadState.textResourcesRetryable) return false;') !== -1, 'resource panel must keep TXT parse actions visible for done-but-retryable states');
   assert(resourcePanel.indexOf('function requestTextResourceManualLoad(threadState)') !== -1, 'resource panel TXT parse actions must route through one guarded manual scheduling helper');
@@ -16355,7 +16602,7 @@ function checkCriticalStaticRules() {
   assert(cache.indexOf("Logger.warn('LRU淘汰跳过'") !== -1, 'content LRU eviction must warn when cacheIndex rebuild fails');
   assert(/if \(!entries\) \{[\s\S]*?pendingEvictBaseline = 0;[\s\S]*?evictionInProgress = false;/.test(cache), 'content LRU rebuild failure must clear pending eviction baseline before releasing callbacks');
   assert(cache.indexOf('function normalizeCachedImage(image)') !== -1, 'article cache must normalize cached image URLs before loading');
-  assert(cache.indexOf('SharedUtils.decodeHtmlEntities(String(item.src))') !== -1, 'article cache must repair entity-encoded image URLs from older cache entries');
+  assert(cache.indexOf('SharedUtils.decodeHtmlEntities(String(item.src))') === -1, 'article cache must not decode already extracted image URLs again');
   assert(cache.indexOf('images: normalizeCachedImages(data.images)') !== -1, 'article data normalization must filter and repair cached image candidates');
   assert(cache.indexOf('function normalizeCachedTextAttachments(attachments)') !== -1, 'article cache normalization must sanitize cached TXT attachment arrays');
   assert(sharedUtils.indexOf('isAllowedTextAttachmentUrl: function(url, baseUrl)') !== -1, 'shared utils must centralize TXT attachment fetch allowlist checks');
@@ -19068,7 +19315,7 @@ function loadForumPacerSandbox(options) {
     Date: { now: function() { return options.sharedClock ? sharedClock.now : clock; } },
     setTimeout: function(fn, delay) {
       const id = ++timerSeq;
-      timers.set(id, { fn: fn, at: clock + Math.max(0, Number(delay) || 0) });
+      timers.set(id, { fn: fn, at: (options.sharedClock ? sharedClock.now : clock) + Math.max(0, Number(delay) || 0) });
       return id;
     },
     clearTimeout: function(id) { timers.delete(id); },
@@ -19078,6 +19325,7 @@ function loadForumPacerSandbox(options) {
     }
   };
   if (options.localStorage) sandbox.localStorage = options.localStorage;
+  if (options.navigator) sandbox.navigator = options.navigator;
   if (options.chrome) sandbox.chrome = options.chrome;
   if (options.location) sandbox.location = options.location;
   if (options.forumPage) {
@@ -19090,6 +19338,7 @@ function loadForumPacerSandbox(options) {
     for (let i = 0; i < 6; i++) await Promise.resolve();
   }
   async function advance(ms) {
+    clock = options.sharedClock ? sharedClock.now : clock;
     const until = clock + ms;
     for (;;) {
       let nextId = 0;
@@ -19103,10 +19352,12 @@ function loadForumPacerSandbox(options) {
       if (!next) break;
       timers.delete(nextId);
       clock = Math.max(clock, next.at);
+      if (options.sharedClock) sharedClock.now = clock;
       next.fn();
       await flush();
     }
     clock = until;
+    if (options.sharedClock) sharedClock.now = clock;
     await flush();
   }
   return {
@@ -19114,7 +19365,7 @@ function loadForumPacerSandbox(options) {
     advance: advance,
     flush: flush,
     logs: logs,
-    now: function() { return clock; }
+    now: function() { return options.sharedClock ? sharedClock.now : clock; }
   };
 }
 
@@ -19572,6 +19823,133 @@ async function checkForumPacerBehavior() {
   assert(next, 'an unsettled ticket must stop counting after its maximum age');
 }
 
+async function checkForumPacerSharedProbeLease() {
+  function makeLocks() {
+    const held = new Set();
+    const waiting = [];
+    let active = 0;
+    let maximum = 0;
+    function drain() {
+      for (let i = 0; i < waiting.length; i++) {
+        const job = waiting[i];
+        if (held.has(job.name)) continue;
+        waiting.splice(i, 1);
+        held.add(job.name);
+        active++;
+        maximum = Math.max(maximum, active);
+        Promise.resolve().then(function() { return job.callback({ name: job.name }); }).then(function(value) {
+          held.delete(job.name); active--; job.resolve(value); drain();
+        }, function(error) {
+          held.delete(job.name); active--; job.reject(error); drain();
+        });
+        i--;
+      }
+    }
+    return {
+      request: function(name, options, callback) {
+        if (typeof options === 'function') { callback = options; options = {}; }
+        if (options.ifAvailable && held.has(name)) return Promise.resolve().then(function() { return callback(null); });
+        return new Promise(function(resolve, reject) {
+          waiting.push({ name: name, callback: callback, resolve: resolve, reject: reject });
+          drain();
+        });
+      },
+      heldCount: function() { return held.size; },
+      maximum: function() { return maximum; }
+    };
+  }
+  function pair(locks) {
+    const clock = { now: 15000000 };
+    const storage = {
+      items: {},
+      getItem: function(key) { return this.items[key] || null; },
+      setItem: function(key, value) { this.items[key] = String(value); },
+      removeItem: function(key) { delete this.items[key]; }
+    };
+    storage.setItem('atp.forumPacer.v2', JSON.stringify({
+      at: clock.now, tokens: 5, tokensAt: clock.now, burst: 5, refillMs: 3000,
+      level: 1, pauseUntil: clock.now - 1, lastFloodAt: clock.now - 20000, clearedAt: 0, calm: 0, relax: 0
+    }));
+    const options = { localStorage: storage, sharedClock: clock, navigator: locks ? { locks: locks } : {} };
+    return { clock: clock, storage: storage, a: loadForumPacerSandbox(options), b: loadForumPacerSandbox(options) };
+  }
+  async function flush() { for (let i = 0; i < 30; i++) await Promise.resolve(); }
+  const locks = makeLocks();
+  const run = pair(locks);
+  let first = null, second = null;
+  run.a.pacer.acquire({ priority: 0 }).then(function(ticket) { first = ticket; });
+  run.b.pacer.acquire({ priority: 0 }).then(function(ticket) { second = ticket; });
+  await flush();
+  assert(first && !second, 'two independent tabs sharing a lock manager must grant only one recovery probe');
+  assert(locks.maximum() === 1 && locks.heldCount() === 0, 'the coordination lock must be exclusive and released before network work (BFCache-safe)');
+  assert(!run.b.pacer.canStartNow(0), 'another tab must see the in-flight shared probe lease');
+  await run.b.advance(5000);
+  assert(!second, 'refilled tokens must not admit a second tab while the shared probe is active');
+  first.done('');
+  await flush();
+  await run.b.advance(500);
+  await flush();
+  assert(second, 'settling the first tab probe must allow the other tab to recover');
+  second.done('');
+  await flush();
+
+  const cancelled = pair(makeLocks());
+  let cancel = false, cancelledResult;
+  cancelled.a.pacer.acquire({ priority: 0, isCancelled: function() { return cancel; } }).then(function(ticket) { cancelledResult = ticket; });
+  cancel = true;
+  await flush();
+  assert(cancelledResult === null && !cancelled.storage.getItem('atp.forumPacer.probe.v1'),
+    'cancellation while the native lock is being acquired must not leave a lease or send a probe');
+
+  const deadline = pair(makeLocks());
+  let deadlineResult;
+  deadline.a.pacer.acquire({ priority: 0, deadline: deadline.clock.now + 1 }).then(function(ticket) { deadlineResult = ticket; });
+  deadline.clock.now += 2;
+  await flush();
+  assert(deadlineResult === null && !deadline.storage.getItem('atp.forumPacer.probe.v1'),
+    'a deadline reached before the native lock callback runs must cancel the request without claiming a lease');
+
+  // A crashed or frozen page cannot run its timer or done callback. The
+  // other tab must reclaim an expired lease using only shared storage/time.
+  const expired = pair(makeLocks());
+  const oldTicket = await expired.a.pacer.acquire({ priority: 0 });
+  await flush();
+  expired.clock.now += 90001;
+  const replacement = await expired.b.pacer.acquire({ priority: 0 });
+  const replacementLease = expired.storage.getItem('atp.forumPacer.probe.v1');
+  oldTicket.done('flood');
+  await flush();
+  assert(expired.storage.getItem('atp.forumPacer.probe.v1') === replacementLease && expired.b.pacer.getState().level === 1,
+    'an expired ticket must neither erase the replacement lease nor apply a late recovery outcome');
+  replacement.done('');
+  await flush();
+
+  const reset = pair(makeLocks());
+  const beforeReset = await reset.a.pacer.acquire({ priority: 0 });
+  reset.b.pacer.reset();
+  beforeReset.done('flood');
+  await flush();
+  assert(reset.a.pacer.getState().level === 0 && !reset.storage.getItem('atp.forumPacer.probe.v1'),
+    'a ticket issued before another tab reset must not reinstate the old pause or retain its probe lease');
+
+  // No Web Locks: the expiring lease still guards sequential tab admission;
+  // cross-process atomicity is guaranteed only on the supported lock path.
+  for (const fallbackLocks of [null, { request: function() { return Promise.reject(new Error('Web Locks unavailable')); } }]) {
+    const fallback = pair(fallbackLocks);
+    let one = null, two = null;
+    fallback.a.pacer.acquire({ priority: 0 }).then(function(ticket) { one = ticket; });
+    await flush(); await fallback.a.advance(0); await flush();
+    fallback.b.pacer.acquire({ priority: 0 }).then(function(ticket) { two = ticket; });
+    await flush();
+    assert(one && !two, 'an absent/rejected lock API must retain the shared lease instead of hanging or issuing duplicate sequential probes');
+    one.done('');
+    await flush(); await fallback.b.advance(500); await flush(); await fallback.b.advance(0); await flush();
+    assert(two, 'the lease fallback must recover after its owner settles');
+    two.done('');
+    await flush();
+  }
+}
+
 async function checkFetcherForumPacing() {
   const challengeHtml = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>泰戈尔</title><script>var a=1;</script></head><body><p>' +
     '生如夏花之绚烂，死如秋叶之静美。'.repeat(20) + '</p></body></html>';
@@ -19632,6 +20010,20 @@ async function checkFetcherForumPacing() {
   const attachments = await fresh.ATPFetcher.fetchTextAttachmentsFresh('https://www.sehuatang.org/thread-72-1-1.html');
   assert(attachments === null, 'a challenge page must not be read as a thread without TXT attachments');
   assert(fresh.ATPForumPacer.getState().level === 1, 'a challenged TXT re-extraction must pause the pacer as well');
+
+  const notice = loadFetcherPacerSandbox();
+  for (const html of [
+    '<html><head><title>提示信息</title></head><body><div id="messagetext" class="alert_info">论坛正在维护，请返回首页。</div></body></html>',
+    '<html><head><title>Maintenance</title></head><body>Service temporarily unavailable</body></html>'
+  ]) {
+    notice.fetch = async function(url) { return makeHtmlResponse(html, { url: url }); };
+    assert(await notice.ATPFetcher.fetchTextAttachmentsFresh('https://www.sehuatang.org/thread-75-1-1.html') === null,
+      'a retryable non-thread notice must not be treated as a successful empty TXT attachment list');
+    assert(notice.ATPForumPacer.getState().level === 0, 'ordinary maintenance notices must not trigger forum rate-limit recovery');
+  }
+  notice.fetch = async function(url) { return makeHtmlResponse('<html><body><div id="postlist"><div id="postmessage_75">普通正文，没有附件</div></div></body></html>', { url: url }); };
+  const noAttachments = await notice.ATPFetcher.fetchTextAttachmentsFresh('https://www.sehuatang.org/thread-75-1-1.html');
+  assert(Array.isArray(noAttachments) && noAttachments.length === 0, 'a confirmed thread without TXT links must still return an empty attachment list');
 
   // After a challenge only one request may be in flight; following a
   // same-origin download link must not wait on its own parent request.
@@ -19784,6 +20176,7 @@ async function main() {
   checkLogSanitization();
   checkContentLoggerRetentionUnderLargeGallery();
   checkContentLoggerRetentionWithDebugEnabled();
+  checkTextDiagnosticRetention();
   checkContentLoggerRetentionClearBoundary();
   await checkLogExportFlushesActiveTab();
   checkContentLoggerTimezoneCache();
@@ -19817,6 +20210,7 @@ async function main() {
   await checkContentArticleFloodBackoff();
   await checkContentArticleDispatch();
   await checkForumPacerBehavior();
+  await checkForumPacerSharedProbeLease();
   await checkFetcherForumPacing();
   checkViewportPageProximityGate();
   checkLinearUrlScanners();
@@ -19882,6 +20276,9 @@ async function main() {
   await checkPopupSaveRefreshFailureFeedback();
   await checkPopupForumPacerReset();
   await checkBackgroundMarksStore();
+  await checkMarksHandOutRaces();
+  await checkPopupMarksClearConfirmation();
+  await checkPopupMarksBackupFeedback();
   await checkPopupMarksExport();
   await checkResourcePanelMarkToggle();
   await checkPopupHotReloadAvoidsPageReload();

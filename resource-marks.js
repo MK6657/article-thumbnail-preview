@@ -241,19 +241,24 @@ var ATPMarks = (function() {
   // The worker re-checks everything a page sends: the thread identity is
   // rebuilt from the host and number, every link goes through the resource
   // normalizer again, and text is cleaned and capped.
-  function sanitizeSnapshot(raw) {
+  function sanitizeSnapshot(raw, storedSnapshot) {
     if (!raw || typeof raw !== 'object') return null;
     var site = String(raw.site || '');
     var tid = String(raw.tid || '');
     var host = String(raw.host || '').toLowerCase();
     if (!SITE_RE.test(site) || !TID_RE.test(tid) || !/^[a-z0-9.-]{1,253}$/.test(host)) return null;
-    if (SharedUtils.getForumSiteZone(host) !== site) return null;
+    if (SharedUtils.getForumSiteZone(host) !== site) {
+      // An already saved mark remains exportable after its mirror is removed.
+      var mirrorRoot = site.indexOf('mirror:') === 0 ? site.slice(7) : '';
+      if (!storedSnapshot || !mirrorRoot || (host !== mirrorRoot && host.slice(-(mirrorRoot.length + 1)) !== '.' + mirrorRoot)) return null;
+    }
     if (raw.id !== site + '|' + tid) return null;
     var url = makeThreadUrl(host, tid);
     var groups = SharedUtils.emptyResources().groups;
     var allLinks = Array.isArray(raw.links) ? raw.links : [];
     var rawLinks = allLinks.slice(0, LIMITS.LINKS_PER_THREAD);
     var flags = {};
+    var missing = {};
     for (var i = 0; i < rawLinks.length; i++) {
       var link = rawLinks[i];
       if (!link || typeof link !== 'object' || !Object.prototype.hasOwnProperty.call(groups, link.type)) continue;
@@ -264,10 +269,12 @@ var ATPMarks = (function() {
       if (Array.isArray(link.altCodes)) item.altCodes = link.altCodes.filter(function(code) { return typeof code === 'string'; }).slice(0, 3);
       groups[link.type].push(item);
       flags[link.type + '|' + link.url] = !!link.temporary;
+      if (storedSnapshot && link.missing) missing[SharedUtils.getResourceDedupKey(link.type, link.url)] = true;
     }
     var extracted = linksFromResources({ groups: groups, passwords: Array.isArray(raw.passwords) ? raw.passwords.filter(function(p) { return typeof p === 'string'; }) : [] }, url);
     extracted.links.forEach(function(link) {
       if (flags[link.type + '|' + link.url]) link.temporary = true;
+      if (missing[linkKey(link)]) link.missing = true;
     });
     var dropped = Math.max(0, rawLinks.length - extracted.links.length - extracted.excluded - extracted.overCap);
     return {
@@ -283,7 +290,7 @@ var ATPMarks = (function() {
       passwords: extracted.passwords,
       excludedLinks: toCount(raw.excludedLinks, 10000) + extracted.excluded,
       overCapLinks: toCount(raw.overCapLinks, 100000) + extracted.overCap + Math.max(0, allLinks.length - rawLinks.length),
-      droppedLinks: dropped,
+      droppedLinks: Math.max(toCount(raw.droppedLinks, 100000), dropped),
       textAttachments: toCount(raw.textAttachments, 1000),
       textUnresolved: toCount(raw.textUnresolved, 1000),
       textLimited: !!raw.textLimited,
@@ -340,7 +347,7 @@ var ATPMarks = (function() {
   // same thread again changes nothing worth another export.
   function recordContentSignature(record) {
     return JSON.stringify([
-      record.title,
+      record.title, record.previousTitles || [],
       (record.links || []).map(function(link) {
         return [link.type, link.url, link.code || '', link.altCodes || [], !!link.txt, !!link.temporary, !!link.imported, !!link.missing];
       }),
@@ -371,7 +378,8 @@ var ATPMarks = (function() {
     var before = recordContentSignature(record);
     var beforeTimes = recordTimesSignature(record);
     var rejectedForCap = 0;
-    if (snapshot.title && snapshot.title !== record.title) {
+    var currentRead = snapshot.readAt >= (Number(record.readAt) || 0);
+    if (currentRead && snapshot.title && snapshot.title !== record.title) {
       var previous = Array.isArray(record.previousTitles) ? record.previousTitles : [];
       if (record.title && previous.indexOf(record.title) === -1) previous = previous.concat([record.title]).slice(-3);
       record.previousTitles = previous;
@@ -396,7 +404,7 @@ var ATPMarks = (function() {
       }
       mergeLinkInto(target, link);
       if (snapshot.readAt > (Number(target.lastSeenAt) || 0)) target.lastSeenAt = snapshot.readAt;
-      if (target.missing) delete target.missing;
+      if (currentRead && target.missing) delete target.missing;
     });
     // A complete read (thread and every TXT attachment, nothing left out for
     // the cap) that no longer shows a link: kept, listed apart.
@@ -519,6 +527,20 @@ var ATPMarks = (function() {
       if (thread.title && previous.indexOf(thread.title) === -1) thread.previousTitles = previous.concat([thread.title]).slice(-3);
       thread.title = snapshot.title;
     }
+    (snapshot.previousTitles || []).forEach(function(title) {
+      var previous = thread.previousTitles || [];
+      if (title && title !== thread.title && previous.indexOf(title) === -1) thread.previousTitles = previous.concat([title]).slice(-3);
+    });
+    if (snapshot.markedAt) thread.markedAt = snapshot.markedAt;
+    if (snapshot.readAt) thread.readAt = snapshot.readAt;
+    // A day's merged backup retains the cautions attached to any of the
+    // snapshots it contains, including captures made before TXT completed.
+    ['excludedLinks', 'droppedLinks', 'textAttachments', 'textUnresolved'].forEach(function(key) {
+      thread[key] = Math.max(Number(thread[key]) || 0, Number(snapshot[key]) || 0);
+    });
+    ['textLimited', 'partial', 'importedText'].forEach(function(key) {
+      thread[key] = !!(thread[key] || snapshot[key]);
+    });
     thread.lastAt = Math.max(Number(thread.lastAt) || 0, event.at);
     if (thread.events.length < LIMITS.EVENTS_PER_THREAD_DAY) thread.events.push({ at: event.at, kind: event.kind, scope: event.scope || 'all' });
     var byKey = {};
@@ -557,10 +579,38 @@ var ATPMarks = (function() {
       host: record.host,
       url: record.url,
       title: record.title,
-      links: record.links.slice(),
-      passwords: record.passwords || [],
-      overCapLinks: Number(record.overCapLinks) || 0
+      previousTitles: (record.previousTitles || []).slice(),
+      markedAt: Number(record.markedAt) || 0,
+      readAt: Number(record.readAt) || 0,
+      links: record.links.map(function(link) {
+        var copy = Object.assign({}, link);
+        if (link.altCodes) copy.altCodes = link.altCodes.slice();
+        return copy;
+      }),
+      passwords: (record.passwords || []).slice(),
+      excludedLinks: Number(record.excludedLinks) || 0,
+      overCapLinks: Number(record.overCapLinks) || 0,
+      droppedLinks: Number(record.droppedLinks) || 0,
+      textAttachments: Number(record.textAttachments) || 0,
+      textUnresolved: Number(record.textUnresolved) || 0,
+      textLimited: !!record.textLimited,
+      partial: !!record.partial,
+      importedText: !!record.importedText
     };
+  }
+
+  function sanitizeBackupSnapshot(raw) {
+    if (!raw || !Array.isArray(raw.links) || !Array.isArray(raw.passwords)) return null;
+    // Historical warnings describe links already absent from the saved
+    // record. Only links rejected by this recheck invalidate the hand-out.
+    var snapshot = sanitizeSnapshot(Object.assign({}, raw, { droppedLinks: 0 }), true);
+    if (!snapshot || snapshot.droppedLinks || snapshot.links.length !== raw.links.length) return null;
+    snapshot.droppedLinks = toCount(raw.droppedLinks, 100000);
+    snapshot.markedAt = toCount(raw.markedAt, 8640000000000000);
+    snapshot.previousTitles = (Array.isArray(raw.previousTitles) ? raw.previousTitles : []).slice(-3).map(function(title) {
+      return sanitizeText(title, LIMITS.TITLE_CHARS);
+    }).filter(function(title) { return !!title; });
+    return recordToSnapshot(snapshot);
   }
 
   function readDays(value) {
@@ -697,8 +747,12 @@ var ATPMarks = (function() {
           lines.push('', '#' + number + ' 标题: ' + (thread.title || TITLE_FALLBACK));
           if (thread.previousTitles && thread.previousTitles.length) lines.push('曾用标题: ' + thread.previousTitles.join(' / '));
           lines.push('帖子: ' + thread.url);
+          if (thread.markedAt || thread.readAt) {
+            lines.push((thread.markedAt ? '标记: ' + formatDateTime(thread.markedAt) + ' · ' : '') +
+              '内容读取: ' + formatDateTime(thread.readAt || thread.markedAt));
+          }
           lines.push('记录: ' + (thread.events || []).map(describeEvent).join('，'));
-          if (thread.overCapLinks) lines.push('注意: 本帖链接超过 ' + LIMITS.LINKS_PER_THREAD + ' 条，另有 ' + thread.overCapLinks + ' 条未备份，请回原帖查看');
+          noteLines(thread).forEach(function(note) { lines.push(note.replace('条未保存', '条未备份')); });
           if (thread.links.some(function(link) { return !link.missing; })) pushLinks(lines, thread.links, false);
           else lines.push('（未复制链接）');
           pushPasswords(lines, thread.passwords);
@@ -722,8 +776,10 @@ var ATPMarks = (function() {
     getSiteLabel: getSiteLabel,
     buildSnapshot: buildSnapshot,
     sanitizeSnapshot: sanitizeSnapshot,
+    sanitizeBackupSnapshot: sanitizeBackupSnapshot,
     mergeRecord: mergeRecord,
     recordToSnapshot: recordToSnapshot,
+    recordContentSignature: recordContentSignature,
     isExported: isExported,
     needsAttention: needsAttention,
     makeIndexEntry: makeIndexEntry,

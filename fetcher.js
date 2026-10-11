@@ -10,6 +10,58 @@
   var articleParseRunning = false;
   // 同一帖子并发抓取去重（如 AJAX 换页触发的新旧 scan 交叠时），与后台侧的 in-flight 去重对应
   var ARTICLE_FETCH_IN_FLIGHT = {};
+  var textDiagnosticSequence = 0;
+
+  function withTextDiagnosticId(attachment, options) {
+    if (!attachment || !attachment.url) return attachment;
+    var next = Object.assign({}, attachment);
+    if (!/^txt_[a-z0-9_]{1,64}$/.test(next.diagnosticId || '')) {
+      next.diagnosticId = 'txt_' + Date.now().toString(36) + '_' + (++textDiagnosticSequence).toString(36) + '_' + Math.random().toString(36).slice(2, 10);
+    }
+    var threadId = options && options.diagnosticThreadId !== undefined ? options.diagnosticThreadId : next.diagnosticThreadId;
+    var runId = options && options.diagnosticRunId !== undefined ? options.diagnosticRunId : next.diagnosticRunId;
+    delete next.diagnosticThreadId;
+    delete next.diagnosticRunId;
+    if (/^t_[0-9]{1,20}_[A-Za-z0-9]{1,24}$/.test(threadId || '') && Number.isSafeInteger(runId) && runId > 0) {
+      next.diagnosticThreadId = threadId;
+      next.diagnosticRunId = runId;
+    }
+    return next;
+  }
+
+  // Only fixed categories and bounded numeric fields leave this boundary.
+  // In particular, never log attachment URLs, filenames or exception messages.
+  function logTextDiagnostic(attachment, stage, outcome, failureClass, deadline, details) {
+    if (!attachment || !/^txt_[a-z0-9_]{1,64}$/.test(attachment.diagnosticId || '')) return;
+    if (Logger.isEnabled && !Logger.isEnabled('DEBUG')) return;
+    var fields = { attachmentId: attachment.diagnosticId, stage: stage, outcome: outcome,
+      failureClass: failureClass || '', remainingMs: Number.isFinite(Number(deadline)) && Number(deadline) > 0
+        ? Math.max(0, Math.min(100000000, Math.round(deadline - Date.now()))) : null };
+    if (/^t_[0-9]{1,20}_[A-Za-z0-9]{1,24}$/.test(attachment.diagnosticThreadId || '') &&
+        Number.isSafeInteger(attachment.diagnosticRunId) && attachment.diagnosticRunId > 0) {
+      fields.threadId = attachment.diagnosticThreadId;
+      fields.runId = attachment.diagnosticRunId;
+    }
+    details = details || {};
+    ['status', 'resources', 'elapsedMs', 'depth'].forEach(function(key) {
+      if (Number.isFinite(details[key])) fields[key] = Math.max(0, Math.min(100000000, Math.round(details[key])));
+    });
+    try {
+      if (Logger.event) Logger.event('txt_request', fields, 'DEBUG');
+      else Logger.debug('txt_request', fields);
+    } catch (e) {}
+  }
+
+  function textFailureClass(error, status) {
+    if (status === 401 || status === 403) return 'auth_or_forbidden';
+    if (status === 429 || status === 503) return 'throttle_or_unavailable';
+    if (status >= 400) return 'http_error';
+    var reason = typeof error === 'string' ? error : (error && error.name) || '';
+    if (reason === 'AbortError' || reason === 'timeout') return 'timeout';
+    if (reason === 'TypeError' || reason === 'Failed to fetch') return 'transport';
+    if (reason === 'url_not_allowed' || reason === 'redirect_not_allowed' || reason === 'response_too_large') return reason;
+    return reason ? 'request_error' : 'bridge_no_response';
+  }
 
   function getParseClock() {
     return typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
@@ -331,16 +383,20 @@
   async function fetchTextAttachmentResourceViaPage(attachment, timeoutMs, writeStartedAt, options) {
     var ticket = await acquireForumTurn(getTextPaceOptions(options, 1));
     // Out of time while queued: unresolved this round, nothing was sent.
-    if (!ticket) return { handled: true, resources: SharedUtils.emptyResources() };
+    if (!ticket) {
+      logTextDiagnostic(attachment, 'page_bridge', 'skipped', 'pace_deadline', options.deadline);
+      return { handled: true, resources: SharedUtils.emptyResources() };
+    }
     var report = { outcome: '' };
     try {
-      return await readTextAttachmentViaPage(attachment, timeoutMs, writeStartedAt, report);
+      return await readTextAttachmentViaPage(attachment, timeoutMs, writeStartedAt, report, options.deadline);
     } finally {
       ticket.done(report.outcome);
     }
   }
 
-  async function readTextAttachmentViaPage(attachment, timeoutMs, writeStartedAt, report) {
+  async function readTextAttachmentViaPage(attachment, timeoutMs, writeStartedAt, report, deadline) {
+    var startedAt = Date.now();
     var response = await requestTextAttachmentFromPage(attachment, timeoutMs);
     if (!response || response.ok !== true) {
       // The forum's HTTP answer is final for this attempt: repeating it through
@@ -350,7 +406,8 @@
       var httpStatus = response ? Number(response.status) || 0 : 0;
       if (httpStatus === 429 || httpStatus === 503) report.outcome = 'flood';
       if (httpStatus >= 400 || (response && response.error === 'response_too_large')) {
-        Logger.debug('TXT页面会话读取失败，本轮不再回退', (httpStatus ? 'HTTP' + httpStatus : response.error) + ' ' + logUrl(attachment.url));
+        logTextDiagnostic(attachment, 'page_bridge', 'failed', textFailureClass(response && response.error, httpStatus), deadline,
+          { status: httpStatus, elapsedMs: Date.now() - startedAt });
         return { handled: true, resources: SharedUtils.emptyResources(), finalFailure: true };
       }
       // Once the page's own request reached the forum and failed in transport
@@ -358,26 +415,35 @@
       // world's fetch fails the same way under the page's CORS; only the
       // worker can follow, so go there directly instead of asking again.
       var sentRequest = !!response && response.error !== 'url_not_allowed';
+      logTextDiagnostic(attachment, 'page_bridge', 'fallback', textFailureClass(response && response.error, httpStatus), deadline,
+        { status: httpStatus, elapsedMs: Date.now() - startedAt });
       return { handled: false, resources: SharedUtils.emptyResources(), skipDirect: sentRequest };
     }
     var finalUrl = response.finalUrl || attachment.url;
-    if (!isAllowedTextAttachmentFinalUrl(finalUrl)) return { handled: false, resources: SharedUtils.emptyResources(), skipDirect: true };
+    if (!isAllowedTextAttachmentFinalUrl(finalUrl)) {
+      logTextDiagnostic(attachment, 'page_bridge', 'fallback', 'redirect_not_allowed', deadline);
+      return { handled: false, resources: SharedUtils.emptyResources(), skipDirect: true };
+    }
     var buffer = decodeBase64Buffer(response.base64);
-    if (!buffer) return { handled: false, resources: SharedUtils.emptyResources() };
+    if (!buffer) {
+      logTextDiagnostic(attachment, 'page_bridge', 'fallback', 'invalid_bridge_payload', deadline);
+      return { handled: false, resources: SharedUtils.emptyResources() };
+    }
     var text = SharedUtils.decodeTextBuffer(buffer, response.contentType || '');
     var htmlLike = SharedUtils.looksLikeHtmlDocument(text);
     if (htmlLike && SharedUtils.isForumChallengePage(text)) {
       // Every other route would get the same challenge page.
       report.outcome = 'flood';
-      Logger.debug('TXT页面会话读取返回论坛验证页', attachment.name || logUrl(attachment.url));
+      logTextDiagnostic(attachment, 'page_bridge', 'failed', 'forum_challenge', deadline);
       return { handled: true, resources: SharedUtils.emptyResources(), finalFailure: true };
     }
     report.outcome = 'ok';
     if (htmlLike || SharedUtils.looksLikeDownloadIntermediary(text)) {
-      Logger.debug('TXT页面会话读取返回中转页', attachment.name || logUrl(attachment.url));
+      logTextDiagnostic(attachment, 'page_bridge', 'fallback', 'download_intermediary', deadline);
       return { handled: false, resources: SharedUtils.emptyResources() };
     }
     if (!text || SharedUtils.isUnavailableTextDocument(text)) {
+      logTextDiagnostic(attachment, 'page_bridge', 'empty', 'unavailable_document', deadline);
       return { handled: true, resources: SharedUtils.emptyResources() };
     }
     var resources = SharedUtils.normalizeResources(SharedUtils.extractResources(text, finalUrl, 'txt'));
@@ -385,7 +451,9 @@
       ATPCache.setCachedTextResources(attachment.url, resources, writeStartedAt);
       ATPCache.clearTextFailCache(attachment.url);
     }
-    Logger.debug('TXT页面会话读取', (attachment.name || logUrl(attachment.url)) + ' 资源' + SharedUtils.countResources(resources));
+    logTextDiagnostic(attachment, 'page_bridge', hasResourcePayload(resources) ? 'success' : 'empty',
+      hasResourcePayload(resources) ? '' : 'no_resource_links', deadline,
+      { resources: SharedUtils.countResources(resources), elapsedMs: Date.now() - startedAt });
     return { handled: true, resources: resources };
   }
 
@@ -424,7 +492,7 @@
         var attachmentKey = SharedUtils.normalizeTextAttachmentUrl(attachment.url);
         if (!attachmentKey || seenAttachments[attachmentKey]) continue;
         seenAttachments[attachmentKey] = true;
-        attachments.push(attachment);
+        attachments.push(withTextDiagnosticId(attachment, options));
       }
       if (!attachments.length) return makeTextResourceFetchStatus(SharedUtils.emptyResources(), 0, 0, 0);
       var deadline = getTextResourceDeadline(options, attachments.length);
@@ -467,7 +535,6 @@
           results.push(sameMerged);
         }
         if (sameFallback.length) {
-          Logger.debug('TXT附件同源部分无结果', '回退到后台代理 ' + sameFallback.length + ' 个（跳过硬失败' + hardFailsInSame + '个）');
           backgroundFallbackAttempted = true;
           var bgFallback = await ATPFetcher.fetchTextAttachmentResourcesByBackgroundWithStatus(sameFallback, options);
           unresolvedCount += bgFallback.unresolvedCount;
@@ -553,9 +620,10 @@
 
     fetchTextAttachmentResourcesByBackgroundWithStatus: async function(attachments, options) {
       options = options || {};
-      attachments = attachments || [];
+      attachments = (attachments || []).map(function(attachment) { return withTextDiagnosticId(attachment, options); });
       var deadline = getTextResourceDeadline(options, attachments.length);
       if (isTextResourceDeadlineExhausted(deadline)) {
+        attachments.forEach(function(attachment) { logTextDiagnostic(attachment, 'background_dispatch', 'skipped', 'deadline', deadline); });
         return makeTextResourceFetchStatus(SharedUtils.emptyResources(), attachments.length, attachments.length, attachments.length);
       }
       // The worker's requests reach the forum from the same browser, so the
@@ -569,6 +637,7 @@
         : UNPACED_TICKET;
       if (!ticket || isTextResourceDeadlineExhausted(deadline)) {
         if (ticket) ticket.done('unused');
+        attachments.forEach(function(attachment) { logTextDiagnostic(attachment, 'background_dispatch', 'skipped', 'pace_deadline', deadline); });
         return makeTextResourceFetchStatus(SharedUtils.emptyResources(), attachments.length, attachments.length, attachments.length);
       }
       try {
@@ -587,10 +656,12 @@
           if (!done) {
             done = true;
             timer = null;
+            attachments.forEach(function(attachment) { logTextDiagnostic(attachment, 'background_dispatch', 'failed', 'message_deadline', deadline); });
             resolve(makeTextResourceFetchStatus(SharedUtils.emptyResources(), attachments.length, attachments.length, attachments.length));
           }
         }, timeoutMs);
         try {
+          attachments.forEach(function(attachment) { logTextDiagnostic(attachment, 'background_dispatch', 'sent', '', deadline); });
           chrome.runtime.sendMessage({
             type: SharedUtils.MESSAGE_TYPES.FETCH_TEXT_RESOURCES,
             attachments: attachments,
@@ -605,9 +676,14 @@
               timer = null;
             }
             if (runtimeError) {
-              Logger.debug('TXT附件后台消息失败', runtimeError.message);
+              attachments.forEach(function(attachment) { logTextDiagnostic(attachment, 'background_dispatch', 'failed', 'extension_message', deadline); });
               resolve(makeTextResourceFetchStatus(SharedUtils.emptyResources(), attachments.length, attachments.length, attachments.length));
               return;
+            }
+            if (resp && (resp.queueStatus === 'busy' || resp.queueStatus === 'expired')) {
+              attachments.forEach(function(attachment) { logTextDiagnostic(attachment, 'background_dispatch', 'skipped', 'queue_' + resp.queueStatus, deadline); });
+            } else if (!resp) {
+              attachments.forEach(function(attachment) { logTextDiagnostic(attachment, 'background_dispatch', 'failed', 'no_response', deadline); });
             }
             resolve(normalizeTextResourceFetchStatus(resp, attachments.length));
           });
@@ -615,7 +691,7 @@
           if (!done) {
             done = true;
             clearTimeout(timer);
-            Logger.debug('TXT附件后台消息异常', e.message);
+            attachments.forEach(function(attachment) { logTextDiagnostic(attachment, 'background_dispatch', 'failed', 'extension_message', deadline); });
             resolve(makeTextResourceFetchStatus(SharedUtils.emptyResources(), attachments.length, attachments.length, attachments.length));
           }
         }
@@ -624,6 +700,7 @@
 
     fetchTextAttachmentResource: async function(attachment, depth, hardFailSet, options) {
       options = options || {};
+      attachment = withTextDiagnosticId(attachment, options);
       var writeStartedAt = Date.now();
       var manualRetry = !!(options.manualRetry || options.force);
       depth = depth || 0;
@@ -651,7 +728,7 @@
 
         var fetchTimeout = getTextAttachmentFetchTimeout(options.deadline);
         if (fetchTimeout <= 0) {
-          Logger.debug('TXT附件deadline耗尽', attachment && attachment.url ? logUrl(attachment.url) : '');
+          logTextDiagnostic(attachment, 'direct', 'skipped', 'deadline', options.deadline);
           return SharedUtils.emptyResources();
         }
 
@@ -668,7 +745,10 @@
         }
 
         var ticket = sameOrigin ? await acquireForumTurn(getTextPaceOptions(options, 1)) : UNPACED_TICKET;
-        if (!ticket) return SharedUtils.emptyResources();
+        if (!ticket) {
+          logTextDiagnostic(attachment, 'direct', 'skipped', 'pace_deadline', options.deadline);
+          return SharedUtils.emptyResources();
+        }
         var report = { outcome: '', retryAfter: 0, ticket: ticket };
         try {
           return await ATPFetcher._readTextAttachmentDirect(attachment, depth, hardFailSet, options, fetchTimeout, writeStartedAt, report);
@@ -676,13 +756,18 @@
           ticket.done(report.outcome, report.retryAfter);
         }
       } catch (e) {
-        Logger.debug('TXT附件异常', (attachment && attachment.url ? logUrl(attachment.url) : '') + ' ' + e.message);
+        logTextDiagnostic(attachment, 'direct', 'failed', textFailureClass(e), options.deadline);
         return SharedUtils.emptyResources();
       }
     },
 
     _readTextAttachmentDirect: async function(attachment, depth, hardFailSet, options, fetchTimeout, writeStartedAt, report) {
       report = report || {};
+      var diagnosticStartedAt = Date.now();
+      var diagnosticOutcome = 'failed';
+      var diagnosticFailure = 'request_error';
+      var diagnosticStatus = 0;
+      var diagnosticResources = 0;
       try {
         var ctrl = new AbortController();
         var t = setTimeout(function() { ctrl.abort(); }, fetchTimeout);
@@ -698,23 +783,24 @@
             fetchOptions.referrerPolicy = 'strict-origin-when-cross-origin';
           }
           var resp = await fetch(attachment.url, fetchOptions);
+          diagnosticStatus = resp.status;
           var finalAttachmentUrl = resp.url || attachment.url;
           if (!isAllowedTextAttachmentFinalUrl(finalAttachmentUrl)) {
-            Logger.debug('TXT附件重定向已拒绝', logUrl(finalAttachmentUrl));
+            diagnosticFailure = 'redirect_not_allowed';
             return SharedUtils.emptyResources();
           }
 
           if (isSameOriginUrl(finalAttachmentUrl) && SharedUtils.isCloudflareChallengeResponse(resp)) {
             report.outcome = 'flood';
             if (hardFailSet) hardFailSet[attachment.url] = true;
-            Logger.debug('TXT附件返回 Cloudflare 验证', logUrl(attachment.url));
+            diagnosticFailure = 'forum_challenge';
             return SharedUtils.emptyResources();
           }
           if (!resp.ok) {
             var status = resp.status;
+            diagnosticFailure = textFailureClass('', status);
             var isHardFail = status === 401 || status === 403;
             if (isHardFail) {
-              Logger.debug('TXT附件站点拒绝', 'HTTP' + status + ' ' + logUrl(attachment.url));
               ATPCache.setTextFailCache(attachment.url, writeStartedAt);
               if (hardFailSet) hardFailSet[attachment.url] = true;
               return SharedUtils.emptyResources();
@@ -724,23 +810,21 @@
                 report.outcome = 'flood';
                 report.retryAfter = SharedUtils.parseRetryAfterHeader(resp.headers);
               }
-              Logger.debug('TXT附件限流或服务异常 HTTP' + status, logUrl(attachment.url));
               // Retrying the same request through the worker right away only
               // adds load; it stays retryable for the next attempt.
               if (hardFailSet) hardFailSet[attachment.url] = true;
               return SharedUtils.emptyResources();
             }
-            Logger.debug('TXT附件跳过 HTTP' + status, logUrl(attachment.url));
             return SharedUtils.emptyResources();
           }
           if (resp.redirected && /\/login|\/signin|\/member|\/register/.test(resp.url)) {
-            Logger.debug('TXT附件重定向登录页', logUrl(resp.url));
+            diagnosticFailure = 'login_redirect';
             return SharedUtils.emptyResources();
           }
 
           var len = parseInt(resp.headers.get('content-length') || '0', 10);
           if (len > TEXT_ATTACHMENT_MAX_BYTES) {
-            Logger.debug('TXT附件过大', attachment.name + ' ' + len + '字节');
+            diagnosticFailure = 'response_too_large';
             return SharedUtils.emptyResources();
           }
 
@@ -750,7 +834,7 @@
             buffer = await SharedUtils.readResponseArrayBufferLimited(resp, TEXT_ATTACHMENT_MAX_BYTES);
           } catch (readError) {
             if (readError && readError.name === 'ResponseTooLargeError') {
-              Logger.debug('TXT附件过大', attachment.name + ' 超过' + TEXT_ATTACHMENT_MAX_BYTES + '字节');
+              diagnosticFailure = 'response_too_large';
               return SharedUtils.emptyResources();
             }
             throw readError;
@@ -762,7 +846,7 @@
             // The worker would be handed the same challenge page.
             report.outcome = 'flood';
             if (hardFailSet) hardFailSet[attachment.url] = true;
-            Logger.debug('TXT附件返回论坛验证页', attachment.name || logUrl(attachment.url));
+            diagnosticFailure = 'forum_challenge';
             return SharedUtils.emptyResources();
           }
           if (isSameOriginUrl(resp.url || attachment.url)) report.outcome = 'ok';
@@ -779,7 +863,10 @@
                 url: downloadUrls[d],
                 name: attachment.name,
                 source: 'txt-download-url',
-                pageUrl: attachment.pageUrl || resp.url || attachment.url
+                pageUrl: attachment.pageUrl || resp.url || attachment.url,
+                diagnosticId: attachment.diagnosticId,
+                diagnosticThreadId: attachment.diagnosticThreadId,
+                diagnosticRunId: attachment.diagnosticRunId
               };
               var redirectedResources;
               try {
@@ -792,16 +879,19 @@
                 redirectedResources = await ATPFetcher.fetchTextAttachmentResourcesByBackground([nextAttachment], options);
               }
               if (hasResourcePayload(redirectedResources)) {
+                diagnosticOutcome = 'success';
+                diagnosticFailure = '';
+                diagnosticResources = SharedUtils.countResources(redirectedResources);
                 ATPCache.setCachedTextResources(attachment.url, redirectedResources, writeStartedAt);
                 ATPCache.clearTextFailCache(attachment.url);
                 return redirectedResources;
               }
             }
-            Logger.debug('TXT附件HTML中转无结果', attachment.name || logUrl(attachment.url));
+            diagnosticFailure = 'intermediary_unresolved';
           }
 
           if (!text || SharedUtils.isUnavailableTextDocument(text) || htmlLike) {
-            Logger.debug('TXT附件不可解析', attachment.name || logUrl(attachment.url));
+            if (diagnosticFailure !== 'intermediary_unresolved') diagnosticFailure = 'unavailable_document';
             return SharedUtils.emptyResources();
           }
 
@@ -811,7 +901,9 @@
             ATPCache.setCachedTextResources(attachment.url, normalizedResources, writeStartedAt);
             ATPCache.clearTextFailCache(attachment.url);
           }
-          Logger.debug('TXT附件资源', (attachment.name || logUrl(attachment.url)) + ' 资源' + SharedUtils.countResources(resources));
+          diagnosticResources = SharedUtils.countResources(normalizedResources);
+          diagnosticOutcome = hasResourcePayload(normalizedResources) ? 'success' : 'empty';
+          diagnosticFailure = hasResourcePayload(normalizedResources) ? '' : 'no_resource_links';
           return normalizedResources;
         } finally {
           clearTimeout(t);
@@ -820,13 +912,11 @@
           if (resp && !resp.bodyUsed) ctrl.abort();
         }
       } catch (e) {
-        var isTransient = e.name === 'AbortError' || e.name === 'TypeError' || !navigator.onLine;
-        if (isTransient) {
-          Logger.debug('TXT附件临时异常，不写失败缓存', (attachment && attachment.url ? logUrl(attachment.url) : '') + ' ' + e.message);
-        } else {
-          Logger.debug('TXT附件异常', (attachment && attachment.url ? logUrl(attachment.url) : '') + ' ' + e.message);
-        }
+        diagnosticFailure = !navigator.onLine ? 'offline' : textFailureClass(e);
         return SharedUtils.emptyResources();
+      } finally {
+        logTextDiagnostic(attachment, 'direct', diagnosticOutcome, diagnosticFailure, options.deadline,
+          { status: diagnosticStatus, resources: diagnosticResources, elapsedMs: Date.now() - diagnosticStartedAt, depth: depth });
       }
     },
 
@@ -1247,11 +1337,11 @@
           // 不过滤临时 TXT 附件 URL，全部保留给按需解析
           var attachments = SharedUtils.extractTextAttachments(html, finalUrl, TEXT_ATTACHMENT_MAX_COUNT);
           if (!attachments.length) {
-            // A challenge page has no attachments either; reporting [] would
-            // tell the thread it has none.
+            // A challenge or maintenance notice has no attachments either;
+            // [] is only safe after a successful read of the actual thread.
             var emptyPage = SharedUtils.classifyEmptyArticlePage(html);
-            if (emptyPage && SharedUtils.isForumFloodReason(emptyPage.reason)) {
-              report.outcome = 'flood';
+            if (emptyPage && emptyPage.retryable) {
+              if (SharedUtils.isForumFloodReason(emptyPage.reason)) report.outcome = 'flood';
               Logger.warn('按需TXT提取返回非帖子页', emptyPage.reason + ' title="' + SharedUtils.getHtmlPageTitle(html) + '" ' + html.length + '字符 ' + logUrl(url));
               return null;
             }

@@ -1985,10 +1985,19 @@
     stale: '标记刚刚有变化，请确认列表后再清空',
     not_allowed: '操作被拒绝',
     storage_write_failed: '存储写入失败',
-    storage_read_failed: '存储读取失败'
+    storage_read_failed: '存储读取失败',
+    invalid_snapshot: '导出或复制的资源快照无效'
   };
   var marksIndex = null;
   var marksRefreshTimer = null;
+  var marksClearConfirmRev = null;
+
+  function cancelChangedMarksConfirmation(index) {
+    if (!els.clearAllMarks || !els.clearAllMarks.__atpConfirmArmed || index.rev === marksClearConfirmRev) return;
+    clearDestructiveConfirm(els.clearAllMarks, true);
+    marksClearConfirmRev = null;
+    setPopupStatus('标记刚刚有变化，已取消清空确认，请确认列表后重试', 'warn', true);
+  }
 
   function marksErrorText(code) {
     return MARKS_ERROR_TEXT[code] || '操作失败';
@@ -2090,6 +2099,7 @@
     if (!MARKS || !els.marksSection) return null;
     var items = await storageGet([MARKS.KEYS.INDEX, MARKS.KEYS.DAYS], '读取标记');
     marksIndex = MARKS.readIndex(items && items[MARKS.KEYS.INDEX]);
+    cancelChangedMarksConfirmation(marksIndex);
     var days = MARKS.readDays(items && items[MARKS.KEYS.DAYS]);
     if (els.marksCount) els.marksCount.textContent = marksIndex.items.length;
     if (els.marksSummary) els.marksSummary.textContent = describeMarksSummary(marksIndex);
@@ -2134,7 +2144,23 @@
   }
 
   function handedOut(records) {
-    return records.map(function(record) { return { id: record.id, updatedAt: record.updatedAt }; });
+    return records.map(function(record) { return { id: record.id, updatedAt: record.updatedAt, snapshot: MARKS.recordToSnapshot(record) }; });
+  }
+
+  async function completeMarksHandOut(records, op) {
+    var result = { count: records.length, warning: '' };
+    try {
+      var response = await sendMarksMutation({ op: op, marks: handedOut(records) });
+      if (response.backedUp !== records.length) result.warning = '仅确认备份 ' + (Number(response.backedUp) || 0) + '/' + records.length + ' 帖';
+    } catch (e) {
+      result.warning = '未能确认备份：' + errorMessage(e);
+    }
+    try {
+      await refreshMarks();
+    } catch (e) {
+      result.warning = result.warning || '未能刷新标记列表：' + errorMessage(e);
+    }
+    return result;
   }
 
   async function exportMarks() {
@@ -2145,9 +2171,7 @@
     var now = new Date();
     var text = MARKS.formatExport(records, { version: chrome.runtime.getManifest().version, now: now.getTime() });
     downloadTextFile(text, 'thumbnail-preview-marked-' + formatLocalFilenameTimestamp(now) + '.txt');
-    await sendMarksMutation({ op: 'exported', marks: handedOut(records) });
-    await refreshMarks();
-    return { count: records.length };
+    return completeMarksHandOut(records, 'exported');
   }
 
   async function copyMarks() {
@@ -2157,9 +2181,7 @@
     if (!records.length) return { count: 0 };
     var text = MARKS.formatExport(records, { version: chrome.runtime.getManifest().version, now: Date.now() }).replace(/^\ufeff/, '').replace(/\r\n/g, '\n');
     await navigator.clipboard.writeText(text);
-    await sendMarksMutation({ op: 'copiedMarks', marks: handedOut(records) });
-    await refreshMarks();
-    return { count: records.length };
+    return completeMarksHandOut(records, 'copiedMarks');
   }
 
   async function readBackupDays(dates) {
@@ -2184,6 +2206,7 @@
   function countSuccess(verb) {
     return function(result) {
       var count = result && result.count;
+      if (count && result.warning) return { text: '已' + verb + ' ' + count + ' 帖，但' + result.warning, type: 'warn', persist: true };
       return count ? { text: '已' + verb + ' ' + count + ' 帖', type: 'ok' } : { text: '没有标记', type: 'info' };
     };
   }
@@ -2212,13 +2235,15 @@
     }
     if (els.clearAllMarks) {
       els.clearAllMarks.addEventListener('click', function() {
+        if (els.clearAllMarks.__atpBusy || !marksIndex) return;
+        if (!els.clearAllMarks.__atpConfirmArmed) marksClearConfirmRev = marksIndex.rev;
+        var confirmedRev = marksClearConfirmRev;
         var unexported = marksIndex ? MARKS.countUnexported(marksIndex) : 0;
         runDestructiveButtonAction(els.clearAllMarks, '再次点击清空', '再次点击确认清空全部标记' + (unexported ? '（其中 ' + unexported + ' 帖未导出）' : '') + '；每日备份保留', '清空中...', function(result) {
           return { text: '已移除 ' + ((result && result.removed) || 0) + ' 帖', type: 'ok' };
         }, '清空全部标记', async function() {
-          var index = marksIndex || await refreshMarks();
           try {
-            return await sendMarksMutation({ op: 'clearAll', rev: index ? index.rev : -1 });
+            return await sendMarksMutation({ op: 'clearAll', rev: confirmedRev });
           } finally {
             await refreshMarks();
           }
@@ -2267,7 +2292,9 @@
     }
     if (chrome.storage && chrome.storage.onChanged && chrome.storage.onChanged.addListener) {
       chrome.storage.onChanged.addListener(function(changes, areaName) {
-        if (areaName === 'local' && changes && (changes[MARKS.KEYS.INDEX] || changes[MARKS.KEYS.DAYS])) scheduleMarksRefresh();
+        if (areaName !== 'local' || !changes) return;
+        if (changes[MARKS.KEYS.INDEX]) cancelChangedMarksConfirmation(MARKS.readIndex(changes[MARKS.KEYS.INDEX].newValue));
+        if (changes[MARKS.KEYS.INDEX] || changes[MARKS.KEYS.DAYS]) scheduleMarksRefresh();
       });
     }
     refreshMarks().catch(function(e) {

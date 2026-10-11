@@ -127,14 +127,16 @@
   function normalizeCachedImage(image) {
     var item = typeof image === 'string' ? { src: image } : Object.assign({}, image || {});
     if (!item.src) return null;
-    item.src = SharedUtils.decodeHtmlEntities(String(item.src)).trim().replace(/\\\//g, '/');
+    // Extraction already decoded HTML attributes. Internal URLs may contain
+    // literal entity-shaped query data, so cache round-trips must preserve it.
+    item.src = String(item.src).trim().replace(/\\\//g, '/');
     if (!SharedUtils.isMeaningfulImage(item.src)) return null;
     if (item.previewSrc) {
-      item.previewSrc = SharedUtils.decodeHtmlEntities(String(item.previewSrc)).trim().replace(/\\\//g, '/');
+      item.previewSrc = String(item.previewSrc).trim().replace(/\\\//g, '/');
       if (!SharedUtils.isMeaningfulImage(item.previewSrc)) delete item.previewSrc;
     }
     if (item.displaySrc) {
-      item.displaySrc = SharedUtils.decodeHtmlEntities(String(item.displaySrc)).trim().replace(/\\\//g, '/');
+      item.displaySrc = String(item.displaySrc).trim().replace(/\\\//g, '/');
       if (!SharedUtils.isMeaningfulImage(item.displaySrc)) delete item.displaySrc;
     }
     return item;
@@ -160,7 +162,7 @@
     var seen = {};
     urls = Array.isArray(urls) ? urls : [];
     for (var i = 0; i < urls.length; i++) {
-      var url = SharedUtils.decodeHtmlEntities(String(urls[i] || '')).trim().replace(/\\\//g, '/');
+      var url = String(urls[i] || '').trim().replace(/\\\//g, '/');
       if (!url || seen[url]) continue;
       seen[url] = true;
       out.push(url);
@@ -180,7 +182,7 @@
     attachments = Array.isArray(attachments) ? attachments : [];
     for (var i = 0; i < attachments.length && out.length < maxCount; i++) {
       var raw = typeof attachments[i] === 'string' ? { url: attachments[i] } : Object.assign({}, attachments[i] || {});
-      var url = SharedUtils.decodeHtmlEntities(String(raw.url || '')).trim().replace(/\\\//g, '/');
+      var url = String(raw.url || '').trim().replace(/\\\//g, '/');
       if (!SharedUtils.isPersistableTextAttachmentUrl(url, raw.pageUrl || '')) continue;
       var key = SharedUtils.normalizeTextAttachmentUrl(url);
       if (!key || seen[key]) continue;
@@ -202,7 +204,7 @@
     attachments = Array.isArray(attachments) ? attachments : [];
     for (var i = 0; i < attachments.length; i++) {
       var raw = typeof attachments[i] === 'string' ? { url: attachments[i] } : (attachments[i] || {});
-      var url = SharedUtils.decodeHtmlEntities(String(raw.url || '')).trim().replace(/\\\//g, '/');
+      var url = String(raw.url || '').trim().replace(/\\\//g, '/');
       if (SharedUtils.isAllowedTextAttachmentUrl(url, raw.pageUrl || '') && SharedUtils.isTransientTextAttachmentUrl(url, raw.pageUrl || '')) count++;
     }
     return count;

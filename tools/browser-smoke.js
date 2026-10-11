@@ -13,6 +13,7 @@ const EXTENSION_DIR = path.resolve(process.env.ATP_EXTENSION_DIR || path.join(PR
 const EXPECTED_VERSION = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, 'manifest.json'), 'utf8')).version;
 const SMOKE_HOST = 'smoke.sehuatang.org';
 const CROSS_HOST = 'other.sehuatang.org';
+const PACER_HOST = 'pacer.sehuatang.org';
 const HEAVY_HOST = 'image.imx.to';
 const HOT_IMAGE_HOST = 'hot.sehuatang.org';
 const MIRROR_ROOT = 'smoke-mirror.test';
@@ -94,6 +95,7 @@ function createCertificate(pfxPath) {
     '$san = [System.Security.Cryptography.X509Certificates.SubjectAlternativeNameBuilder]::new()',
     "$san.AddDnsName('smoke.sehuatang.org')",
     "$san.AddDnsName('other.sehuatang.org')",
+    "$san.AddDnsName('pacer.sehuatang.org')",
     "$san.AddDnsName('hot.sehuatang.org')",
     "$san.AddDnsName('image.imx.to')",
     '$request.CertificateExtensions.Add($san.Build())',
@@ -624,6 +626,8 @@ async function findExtensionWorkerTarget(devtoolsPort, manifest) {
 }
 
 async function stopSmokeBrowser(browser) {
+  if (!browser || !browser.child) return;
+  if (browser.child.exitCode !== null || browser.child.signalCode !== null || !browser.child.pid) return;
   if (browser.child.exitCode === null) browser.child.kill();
   await Promise.race([
     new Promise(function(resolve) { browser.child.once('exit', resolve); }),
@@ -770,6 +774,109 @@ async function runMirrorScenario(browserPath, runRoot, fixture, fixturePort) {
   }
 }
 
+async function checkCrossTabProbe(devtoolsPort, extensionId, fixturePort, sessions) {
+  var pages = [];
+  for (var i = 0; i < 2; i++) {
+    var page = await createPageSession(devtoolsPort);
+    sessions.push(page);
+    await navigate(page, 'https://' + PACER_HOST + ':' + fixturePort + '/other.html');
+    var context = await waitForExtensionContext(page, extensionId);
+    await waitFor('native Web Locks in forum content script', function() {
+      return evaluate(page, '!!(window.ATPForumPacer && navigator.locks && navigator.locks.request)', context.id);
+    });
+    pages.push({ page: page, contextId: context.id });
+  }
+  // Simulate an expired pause, on a separate fixture origin with no article
+  // jobs. Only these two real extension contexts can claim the probe lease.
+  await evaluate(pages[0].page, `(() => {
+    const now = Date.now();
+    localStorage.setItem(ATPForumPacer.STORE_KEY, JSON.stringify({
+      at: now, tokens: 5, tokensAt: now, burst: 5, refillMs: 3000,
+      level: 1, pauseUntil: now - 1, lastFloodAt: now - 20000,
+      clearedAt: 0, calm: 0, relax: 0, resetId: ''
+    }));
+    return true;
+  })()`, pages[0].contextId);
+  // Prove that the actual native lock coordinates these isolated worlds:
+  // a localStorage-only fallback could pass the lease test below as well.
+  await evaluate(pages[0].page, `(() => {
+    window.__atpSmokeNativeLockHeld = false;
+    navigator.locks.request('atp.forumPacer.probe.v1', () => new Promise(resolve => {
+      window.__atpSmokeReleaseNativeLock = resolve;
+      window.__atpSmokeNativeLockHeld = true;
+    }));
+    return true;
+  })()`, pages[0].contextId);
+  await waitFor('explicit native recovery lock in first tab', function() {
+    return evaluate(pages[0].page, 'window.__atpSmokeNativeLockHeld === true', pages[0].contextId);
+  });
+  await evaluate(pages[1].page, `(() => {
+    window.__atpSmokeLockProbe = null;
+    window.__atpSmokeCancelProbe = false;
+    window.__atpSmokeCancelledResult = 'pending';
+    ATPForumPacer.acquire({
+      priority: 0, deadline: Date.now() + 10000,
+      isCancelled: () => window.__atpSmokeCancelProbe
+    }).then(ticket => { window.__atpSmokeCancelledResult = ticket; });
+    ATPForumPacer.acquire({ priority: 0, deadline: Date.now() + 10000 })
+      .then(ticket => { window.__atpSmokeLockProbe = ticket; });
+    return true;
+  })()`, pages[1].contextId);
+  await sleep(700);
+  assert(await evaluate(pages[1].page, `window.__atpSmokeCancelledResult === 'pending' &&
+    !window.__atpSmokeLockProbe && !localStorage.getItem('atp.forumPacer.probe.v1')`, pages[1].contextId),
+  'The second tab must neither grant a ticket nor write a lease while the first tab holds the native lock');
+  await evaluate(pages[1].page, 'window.__atpSmokeCancelProbe = true', pages[1].contextId);
+  await waitFor('cancelled probe while native lock is held', function() {
+    return evaluate(pages[1].page, "window.__atpSmokeCancelledResult === null && !window.__atpSmokeLockProbe && !localStorage.getItem('atp.forumPacer.probe.v1')", pages[1].contextId);
+  });
+  await evaluate(pages[0].page, 'window.__atpSmokeReleaseNativeLock()', pages[0].contextId);
+  await waitFor('probe after native lock release', function() {
+    return evaluate(pages[1].page, '!!window.__atpSmokeLockProbe', pages[1].contextId);
+  });
+  await evaluate(pages[1].page, "window.__atpSmokeLockProbe.done('')", pages[1].contextId);
+  await waitFor('native-lock probe lease released', function() {
+    return evaluate(pages[0].page, "!localStorage.getItem('atp.forumPacer.probe.v1')", pages[0].contextId);
+  });
+  await Promise.all(pages.map(function(item) {
+    return evaluate(item.page, `(() => {
+      window.__atpSmokeProbe = null;
+      ATPForumPacer.acquire({ priority: 0, deadline: Date.now() + 10000 }).then(ticket => {
+        window.__atpSmokeProbe = ticket;
+      });
+      return true;
+    })()`, item.contextId);
+  }));
+  async function readGrants() {
+    return Promise.all(pages.map(function(item) {
+      return evaluate(item.page, '!!window.__atpSmokeProbe', item.contextId);
+    }));
+  }
+  var first = await waitFor('one cross-tab recovery probe', async function() {
+    var grants = await readGrants();
+    assert(grants.filter(Boolean).length <= 1, 'Recovery must never grant a probe in both tabs at once');
+    return grants.some(Boolean) ? grants : null;
+  });
+  await sleep(700);
+  assert.deepStrictEqual(await readGrants(), first, 'The second tab must wait until the first probe settles');
+  var owner = first[0] ? 0 : 1;
+  await evaluate(pages[owner].page, "window.__atpSmokeProbe.done('')", pages[owner].contextId);
+  await waitFor('second tab probe after release', async function() {
+    return (await readGrants())[1 - owner];
+  });
+  await evaluate(pages[1 - owner].page, "window.__atpSmokeProbe.done('')", pages[1 - owner].contextId);
+  await waitFor('probe lease removed after settlement', function() {
+    return evaluate(pages[0].page, "!localStorage.getItem('atp.forumPacer.probe.v1')", pages[0].contextId);
+  });
+  for (var item of pages) {
+    assert.strictEqual(item.page.errors.length, 0, 'Probe pages must have no runtime exceptions');
+    item.page.cdp.close();
+    await closeTarget(devtoolsPort, item.page.target.id);
+    sessions.splice(sessions.indexOf(item.page), 1);
+  }
+  return true;
+}
+
 async function main() {
   assert(fs.existsSync(path.join(EXTENSION_DIR, 'manifest.json')), 'Packaged extension is missing: ' + EXTENSION_DIR);
   var packagedManifest = JSON.parse(fs.readFileSync(path.join(EXTENSION_DIR, 'manifest.json'), 'utf8'));
@@ -779,21 +886,21 @@ async function main() {
   var runRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atp-browser-smoke-'));
   var profileDir = path.join(runRoot, 'profile');
   var pfxPath = path.join(runRoot, 'fixture.pfx');
-  fs.mkdirSync(profileDir, { recursive: true });
-  createCertificate(pfxPath);
-
-  var fixture = createFixtureServer(pfxPath);
-  await new Promise(function(resolve, reject) {
-    fixture.server.once('error', reject);
-    fixture.server.listen(0, '127.0.0.1', resolve);
-  });
-  var fixturePort = fixture.server.address().port;
-  var browser = spawnSmokeBrowser(browserPath, profileDir, EXTENSION_DIR, [SMOKE_HOST, CROSS_HOST, HOT_IMAGE_HOST, HEAVY_HOST]);
-
+  var fixture = null;
+  var browser = null;
   var sessions = [];
   var browserConnection = null;
   var smokeFailure = null;
   try {
+    fs.mkdirSync(profileDir, { recursive: true });
+    createCertificate(pfxPath);
+    fixture = createFixtureServer(pfxPath);
+    await new Promise(function(resolve, reject) {
+      fixture.server.once('error', reject);
+      fixture.server.listen(0, '127.0.0.1', resolve);
+    });
+    var fixturePort = fixture.server.address().port;
+    browser = spawnSmokeBrowser(browserPath, profileDir, EXTENSION_DIR, [SMOKE_HOST, CROSS_HOST, PACER_HOST, HOT_IMAGE_HOST, HEAVY_HOST]);
     var devtoolsPort = await waitForDevtoolsPort(profileDir, browser);
 
     var versionInfo = await fetchJson('http://127.0.0.1:' + devtoolsPort + '/json/version');
@@ -1161,6 +1268,49 @@ async function main() {
     await waitFor('popup settings UI', async function() {
       return evaluate(popup, 'document.querySelector("#settingsContainer").children.length > 0 && document.querySelector("#versionFooter").textContent.includes("' + EXPECTED_VERSION + '")');
     });
+    var markedFromPanel = await evaluate(pageOne, `(() => {
+      const thread = Object.values(window.ATPState.threads).find((item) => item.link.includes('/thread-100-1-1.html'));
+      const button = thread && thread.panel && thread.panel.querySelector('[data-mark-toggle]');
+      if (!button) return false;
+      button.click();
+      return true;
+    })()`, pageOneContext.id);
+    assert(markedFromPanel, 'Ordinary thread must expose its mark button');
+    await waitFor('marked thread in popup', async function() {
+      return evaluate(popup, `document.querySelector('#marksCount').textContent === '1' &&
+        document.querySelector('#marksList').textContent.includes('Ordinary gallery')`);
+    });
+    var downloadDir = path.join(runRoot, 'downloads');
+    fs.mkdirSync(downloadDir);
+    await popup.cdp.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: downloadDir });
+    await evaluate(popup, `document.querySelector('#exportMarks').click()`);
+    await waitFor('mark export and daily backup', async function() {
+      return evaluate(popup, `document.querySelector('#marksSummary').textContent.includes('均已导出') &&
+        document.querySelector('#backupCount').textContent === '1'`);
+    });
+    var markedDownload = await waitFor('marked resources download', function() {
+      return fs.readdirSync(downloadDir).find(function(name) {
+        return /^thumbnail-preview-marked-.*\.txt$/.test(name);
+      });
+    });
+    var markedText = fs.readFileSync(path.join(downloadDir, markedDownload), 'utf8');
+    assert(markedText.includes('Ordinary gallery') && markedText.includes('1AtpSmokeMain') && markedText.includes('abcd'),
+      'Exported TXT must contain the marked thread and its paired share code');
+    await evaluate(popup, `document.querySelector('#clearExportedMarks').click();
+      document.querySelector('#clearExportedMarks').click()`);
+    await waitFor('exported mark cleared but backup retained', async function() {
+      return evaluate(popup, `document.querySelector('#marksCount').textContent === '0' &&
+        document.querySelector('#backupCount').textContent === '1'`);
+    });
+    await evaluate(popup, `document.querySelector('#downloadAllBackups').click()`);
+    var backupDownload = await waitFor('daily backup download', function() {
+      return fs.readdirSync(downloadDir).find(function(name) {
+        return /^thumbnail-preview-backup-all-.*\.txt$/.test(name);
+      });
+    });
+    var backupText = fs.readFileSync(path.join(downloadDir, backupDownload), 'utf8');
+    assert(backupText.includes('Ordinary gallery') && backupText.includes('1AtpSmokeMain'),
+      'Daily backup must retain the exported thread after its mark is cleared');
     // A full tab cannot reproduce browser-action auto-size feedback loops.
     await evaluate(popup, 'chrome.action.openPopup()');
     var actionTarget = await waitFor('native action popup', async function() {
@@ -1225,6 +1375,7 @@ async function main() {
     assert.strictEqual(allExceptions.length, 0, 'Browser runtime exceptions: ' + JSON.stringify(allExceptions));
     assert.strictEqual(extensionConsoleErrors.length, 0, 'Extension console errors: ' + JSON.stringify(extensionConsoleErrors));
 
+    var crossTabProbe = await checkCrossTabProbe(devtoolsPort, extensionId, fixturePort, sessions);
     var mirrorReport = await runMirrorScenario(browserPath, runRoot, fixture, fixturePort);
 
     var report = {
@@ -1270,12 +1421,14 @@ async function main() {
         combinedObservedMax: fixture.metrics.maxCombinedImages
       },
       popupBackgroundMessage: true,
+      markExportAndBackup: true,
       pageBridgeRedirectBoundary: true,
       signedImageUrlParity: true,
       nativePopupStableWidth: 320,
       admittedOffscreenRequest: true,
       syntheticPageFixtureCount: pageCases.length + 1,
       multiTab: true,
+      crossTabRecoveryProbe: crossTabProbe,
       bfcache: {
         persisted: bfcachePersisted,
         navigationType: bfcacheState.navigationType,
@@ -1314,20 +1467,28 @@ async function main() {
       try { await browserConnection.send('Browser.close'); } catch (error) {}
       browserConnection.close();
     }
-    await new Promise(function(resolve) {
-      fixture.server.close(resolve);
-      if (typeof fixture.server.closeAllConnections === 'function') fixture.server.closeAllConnections();
-    });
-    await stopSmokeBrowser(browser);
-    if (process.env.ATP_BROWSER_SMOKE_KEEP !== '1') {
-      try {
-        await removeSmokeRunRoot(runRoot);
-      } catch (cleanupError) {
-        if (!smokeFailure) throw cleanupError;
-        console.error('Cleanup also failed: ' + cleanupError.message);
+    try {
+      if (fixture) {
+        await new Promise(function(resolve) {
+          fixture.server.close(resolve);
+          if (typeof fixture.server.closeAllConnections === 'function') fixture.server.closeAllConnections();
+        });
       }
-    } else {
-      console.log('browser smoke artifacts: ' + runRoot);
+    } finally {
+      try {
+        await stopSmokeBrowser(browser);
+      } finally {
+        if (process.env.ATP_BROWSER_SMOKE_KEEP !== '1') {
+          try {
+            await removeSmokeRunRoot(runRoot);
+          } catch (cleanupError) {
+            if (!smokeFailure) throw cleanupError;
+            console.error('Cleanup also failed: ' + cleanupError.message);
+          }
+        } else {
+          console.log('browser smoke artifacts: ' + runRoot);
+        }
+      }
     }
   }
 }

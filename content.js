@@ -1227,6 +1227,10 @@
           if (finished) return;
           finished = true;
           if (timer) clearTimeout(timer);
+          // Timed rechecks resume the worker too: keep only live idle workers
+          // here, since shouldHandBack uses this list to decide who can help.
+          var index = gateWaiters.indexOf(finish);
+          if (index !== -1) gateWaiters.splice(index, 1);
           resolve();
         }
         timer = setTimeout(finish, 1000);
