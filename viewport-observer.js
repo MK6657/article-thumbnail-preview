@@ -3,6 +3,7 @@
 
   var viewportObserver = null;
   var viewportRootStates = new Map();
+  var rootProximityObserver = null;
   var loadingAnimationObserver = null;
   var loadingAnimationWrappers = new Set();
   var lightweightHeavyPreloadObserver = null;
@@ -32,6 +33,11 @@
   var pendingSlotRetryCount = 0;
   var LAZY_VIEWPORT_MARGIN_PX = 200;
   var LAZY_VIEWPORT_FAST_MARGIN_PX = 1000;
+  // Parked thumbnails start loading when their post is this close to the page
+  // viewport (about one screen, the lower bound of native lazy loading). In a
+  // scroll benchmark 200px left most posts blank on entry; 1000px matched the
+  // old blank rate without loading posts beyond the next screen.
+  var PAGE_PROXIMITY_MIN_MARGIN_PX = 1000;
   var LAZY_SCROLL_FAST_THRESHOLD_PX_MS = 0.65;
   var LAZY_SCROLL_MIN_DELTA_PX = 40;
   var lazyViewportTopMarginPx = LAZY_VIEWPORT_MARGIN_PX;
@@ -100,6 +106,15 @@
   function getAvailableSlotCount() {
     if (!window.ATPLoader || !ATPLoader.getAvailableSlots) return 1;
     return Math.max(0, Number(ATPLoader.getAvailableSlots()) || 0);
+  }
+
+  // A GIF waiting for its host's GIF lane says nothing about the slots other
+  // pending images could use: it is still tried (and parked as before) but
+  // does not use up the visible pass's attempt budget ahead of static
+  // thumbnails. Checked after loadWrapper, which refreshes its visibility.
+  function isLargeLaneBlockedWrapper(data) {
+    return !!(data && data.task && window.ATPLoader && ATPLoader.isLargeLaneBlocked &&
+      ATPLoader.isLargeLaneBlocked(data.task));
   }
 
   function hasPendingSlotRetry() {
@@ -423,7 +438,69 @@
     state.pendingCount = Math.max(0, state.pendingCount - 1);
     if (state.pendingCount > 0) return;
     if (state.observer) state.observer.disconnect();
+    unobserveRootProximity(state);
     viewportRootStates.delete(root);
+  }
+
+  // Parked thumbnails are observed inside their post's scroll box, which never
+  // reports page scrolling. This page-level observer watches the post panels
+  // themselves (with the page lazy margins) and re-checks a post's parked
+  // thumbnails when it comes near, so nothing loads before the user gets close.
+  function createRootProximityObserver() {
+    if (typeof IntersectionObserver !== 'function') return null;
+    var margins = getPageProximityMargins();
+    return new IntersectionObserver(handleRootProximity, {
+      root: null,
+      rootMargin: margins.top + 'px 0px ' + margins.bottom + 'px 0px',
+      threshold: 0
+    });
+  }
+
+  function observeRootProximity(state) {
+    if (!state || state.proximityTarget) return;
+    if (!rootProximityObserver) rootProximityObserver = createRootProximityObserver();
+    if (!rootProximityObserver) return;
+    var root = state.root;
+    state.proximityTarget = (root.closest && root.closest('.atp-thread-panel')) || root;
+    rootProximityObserver.observe(state.proximityTarget);
+  }
+
+  function unobserveRootProximity(state) {
+    if (!state || !state.proximityTarget) return;
+    if (rootProximityObserver) rootProximityObserver.unobserve(state.proximityTarget);
+    state.proximityTarget = null;
+  }
+
+  function rebuildRootProximityObserver() {
+    if (!rootProximityObserver) return;
+    rootProximityObserver.disconnect();
+    rootProximityObserver = createRootProximityObserver();
+    if (!rootProximityObserver) return;
+    viewportRootStates.forEach(function(state) {
+      if (state && state.proximityTarget) rootProximityObserver.observe(state.proximityTarget);
+    });
+  }
+
+  function handleRootProximity(entries) {
+    var nearTargets = null;
+    for (var i = 0; i < entries.length; i++) {
+      if (!entries[i].isIntersecting) continue;
+      if (!nearTargets) nearTargets = new Set();
+      nearTargets.add(entries[i].target);
+    }
+    if (!nearTargets || isLoaderPaused() || shouldPausePendingRetryWhenHidden()) return;
+    var candidates = [];
+    pendingWrappers.forEach(function(data, wrapper) {
+      if (!data || data.loaded || !data.observerRoot) return;
+      var state = viewportRootStates.get(data.observerRoot);
+      if (state && nearTargets.has(state.proximityTarget)) candidates.push([wrapper, data]);
+    });
+    for (var c = 0; c < candidates.length; c++) {
+      var wrapper = candidates[c][0];
+      var data = candidates[c][1];
+      if (pendingWrappers.get(wrapper) !== data || data.loaded) continue;
+      if (refreshPendingViewportVisibility(wrapper, data)) ATPViewport.loadWrapper(wrapper, data, false);
+    }
   }
 
   function unobservePendingWrapper(wrapper, data) {
@@ -634,12 +711,20 @@
     var visible = basicVisible && (
       !window.ATPLoader || !ATPLoader.isWrapperVisible || ATPLoader.isWrapperVisible(wrapper)
     );
-    var restoreMargin = scrollRoot ? 0 : HEAVY_RENDER_MARGIN_PX;
+    // Restore range = inside the inner box's own clip (not clipped to the
+    // page) and within HEAVY_RENDER_MARGIN_PX of the page viewport, so posts
+    // just below the fold are restored before they scroll in.
+    var inRootClip = !rootRect || (
+      rect.bottom >= rootRect.top && rect.top <= rootRect.bottom &&
+      (typeof rootRect.left !== 'number' || rect.right === undefined || rect.right >= rootRect.left) &&
+      (typeof rootRect.right !== 'number' || rect.left === undefined || rect.left <= rootRect.right)
+    );
+    var nearPageForRestore = viewportHeight > 0 &&
+      rect.bottom >= -HEAVY_RENDER_MARGIN_PX && rect.top <= viewportHeight + HEAVY_RENDER_MARGIN_PX &&
+      (rect.right === undefined || rect.left === undefined || (rect.right >= 0 && rect.left <= viewportWidth));
     return {
       visible: visible,
-      inHeavyRestoreRange: effectiveBottom > effectiveTop && intersectsHorizontal &&
-        rect.bottom >= effectiveTop - restoreMargin &&
-        rect.top <= effectiveBottom + restoreMargin,
+      inHeavyRestoreRange: inRootClip && nearPageForRestore,
       centerDistance: Math.abs(center - effectiveCenter)
     };
   }
@@ -694,6 +779,23 @@
     return { top: 0, bottom: window.innerHeight };
   }
 
+  // An inner scroll box clips its thumbnails but says nothing about where the
+  // post sits on the page. A parked thumbnail only counts as near when it is
+  // also within the page lazy margins (widened while scrolling fast).
+  function getPageProximityMargins() {
+    return {
+      top: Math.max(PAGE_PROXIMITY_MIN_MARGIN_PX, lazyViewportTopMarginPx),
+      bottom: Math.max(PAGE_PROXIMITY_MIN_MARGIN_PX, lazyViewportBottomMarginPx)
+    };
+  }
+
+  function isRectNearPageViewport(rect) {
+    if (!rect) return false;
+    var margins = getPageProximityMargins();
+    return rect.bottom >= -margins.top &&
+      rect.top <= (window.innerHeight || 0) + margins.bottom;
+  }
+
   function refreshPendingViewportVisibility(wrapper, data) {
     if (!data) return false;
     if (!wrapper || !wrapper.getBoundingClientRect) return false;
@@ -702,6 +804,7 @@
     var margins = getLazyMargins(root);
     var bounds = getLazyViewportBounds(root);
     var visible = rect.bottom >= bounds.top - margins.top && rect.top <= bounds.bottom + margins.bottom;
+    if (visible && root) visible = isRectNearPageViewport(rect);
     if (data.inViewport !== visible) {
       data.inViewport = visible;
       data.inViewportAt = visible ? Date.now() : 0;
@@ -2438,10 +2541,14 @@
       var wrapper = entry.target;
       var wrapperData = pendingWrappers.get(wrapper);
       if (!wrapperData) continue;
-      wrapperData.inViewport = !!entry.isIntersecting;
+      // Inner-box observers report "intersecting" wherever the post is on the
+      // page; the page proximity observer re-checks these when it comes near.
+      var intersecting = !!entry.isIntersecting &&
+        (!wrapperData.observerRoot || isRectNearPageViewport(entry.boundingClientRect));
+      wrapperData.inViewport = intersecting;
       wrapperData.lastIntersectionAt = Date.now();
 
-      if (entry.isIntersecting) {
+      if (intersecting) {
         if (!wrapperData.inViewportAt) wrapperData.inViewportAt = wrapperData.lastIntersectionAt;
         ATPViewport.loadWrapper(wrapper, wrapperData, false);
       } else if (wrapperData.slotRetryPending && !wrapperData.forceLoadWhenHidden && !wrapperData.lightweightPreloadInRange) {
@@ -2528,6 +2635,7 @@
       lazyViewportTopMarginPx = mode === 'fast_up' ? LAZY_VIEWPORT_FAST_MARGIN_PX : LAZY_VIEWPORT_MARGIN_PX;
       lazyViewportBottomMarginPx = mode === 'fast_down' ? LAZY_VIEWPORT_FAST_MARGIN_PX : LAZY_VIEWPORT_MARGIN_PX;
       lazyScrollLastModeChangeAt = now || Date.now();
+      rebuildRootProximityObserver();
     }
     rebuildViewportObserver(root);
     return true;
@@ -2546,6 +2654,7 @@
     if (root && (!state || state.pendingCount <= 0)) {
       if (state) {
         if (state.observer) state.observer.disconnect();
+        unobserveRootProximity(state);
         viewportRootStates.delete(root);
       }
       return 'idle';
@@ -2657,6 +2766,7 @@
       var requestObserver = ensureViewportObserver(observerRoot);
       observeLoadingAnimation(wrapper);
       requestObserver.observe(wrapper);
+      if (observerRoot) observeRootProximity(getLazyRootState(observerRoot, false));
       if (lightweightPreloadEligible) {
         lightweightPreloadObservedTotal++;
         initLightweightHeavyPreloadObserver();
@@ -2762,6 +2872,7 @@
         }
         return false;
       }
+      if (ATPLoader.isBackgroundImageLocked && ATPLoader.isBackgroundImageLocked(task)) return false;
       if (!forceLoad) wrapperData.forceLoadReason = wrapperData.inViewport ? 'viewport' : '';
       if (!forceLoad && !wrapperData.inViewport) return false;
       if (forceLoad && !wrapperData.forceLoadReason) {
@@ -2839,6 +2950,8 @@
         wrapperData.activeSlotToken = null;
         wrapperData.loadStartedAt = 0;
         wrapperData.pendingCountAtLoad = 0;
+        // 与加载器的暂停重排一致：恢复后重新计时，否则隐藏期间过期的截止会让恢复的加载立即失败
+        if (task) task.taskDeadlineAt = 0;
         wrapperData.inViewport = refreshPendingViewportVisibility(wrapper, wrapperData);
         clearPendingSlotRetry(wrapperData);
         pendingWrappers.set(wrapper, wrapperData);
@@ -2946,11 +3059,18 @@
             abandonStaleActiveLoad();
             return;
           }
+          if (ATPLoader.tryContinueTimedImageLoad &&
+              ATPLoader.tryContinueTimedImageLoad(task, img, startTimer)) return;
           var currentSrc = ATPLoader.getTaskImageSrc(task);
-          if (ATPLoader.tryNoReferrerFallback(task, img, currentSrc, startTimer, isActiveLoadCurrent)) return;
           if (ATPLoader.recordTaskImageFailure) {
             ATPLoader.recordTaskImageFailure(task, currentSrc, 'candidate_timeout', false);
           }
+          if (ATPLoader.isImageTaskDeadlineSpent && ATPLoader.isImageTaskDeadlineSpent(task)) {
+            failFinal('deadline_exhausted');
+            return;
+          }
+          var slowLargeImage = !!(ATPLoader.isLargeImageTask && ATPLoader.isLargeImageTask(task));
+          if (!slowLargeImage && ATPLoader.tryNoReferrerFallback(task, img, currentSrc, startTimer, isActiveLoadCurrent)) return;
           if (ATPLoader.tryHeavyCandidateFallback(task, img, startTimer, isActiveLoadCurrent)) return;
           failFinal();
         }, imgTimeout);
@@ -2975,8 +3095,11 @@
         } else {
           ATPLoader.recordDomainFailure(currentSrc, failReason);
         }
-        if (ATPLoader.logImageDone && (!ATPLoader.isDiagnosticLoggingEnabled || ATPLoader.isDiagnosticLoggingEnabled('DEBUG'))) {
-          ATPLoader.logImageDone(task, false, failReason, getViewportPendingLogFields(wrapper, wrapperData, forceLoad));
+        if (ATPLoader.logImageDone) {
+          var failureFields = ATPLoader.isDiagnosticLoggingEnabled && ATPLoader.isDiagnosticLoggingEnabled('DEBUG')
+            ? getViewportPendingLogFields(wrapper, wrapperData, forceLoad)
+            : null;
+          ATPLoader.logImageDone(task, false, failReason, failureFields);
         }
         releaseViewportSlot(task, slotToken);
         if (wrapperData.activeSlotToken === slotToken) wrapperData.activeSlotToken = null;
@@ -3019,7 +3142,7 @@
           ATPLoader.globalSchedule();
           return;
         }
-        ATPLoader.recordDomainSuccess(ATPLoader.getTaskImageSrc(task));
+        ATPLoader.recordDomainSuccess(ATPLoader.getTaskImageSrc(task), task);
         var heavyTask = !!(ATPLoader.isHeavyChannelTask && ATPLoader.isHeavyChannelTask(task));
         if (heavyTask && ATPViewport.monitorLoadedHeavyImage) {
           ATPViewport.monitorLoadedHeavyImage(wrapper, img, task);
@@ -3027,6 +3150,7 @@
           wrapper.classList.remove('atp-heavy-preview-active');
           wrapper.classList.remove('atp-heavy-preview-pending');
           wrapper.classList.remove('atp-heavy-unloaded');
+          if (ATPLoader.freezeAnimatedThumbnail) ATPLoader.freezeAnimatedThumbnail(wrapper, img, task);
         }
         if (loadingEl && loadingEl.parentNode) loadingEl.remove();
         if (!wrapper.classList.contains('atp-heavy-unloaded')) img.style.display = 'block';
@@ -3036,6 +3160,7 @@
           var ts = threads && threads[task.threadId];
           if (ts && ts.candidates && window.ATPPreviewer) {
             var previewCandidates = ts.heavyMode && ts.sourceCandidates ? ts.sourceCandidates : ts.candidates;
+            if (ATPLoader.getPreviewCandidates) previewCandidates = ATPLoader.getPreviewCandidates(ts);
             var allUrls = ATPLoader.buildPreviewUrls ? ATPLoader.buildPreviewUrls(previewCandidates) : [];
             if (!ATPLoader.buildPreviewUrls) {
               for (var pui = 0; pui < previewCandidates.length; pui++) {
@@ -3074,6 +3199,7 @@
         }
         var currentSrc = ATPLoader.getTaskImageSrc(task);
         if (ATPLoader.tryNoReferrerFallback(task, img, currentSrc, startTimer, isActiveLoadCurrent)) return;
+        if (ATPLoader.trySiblingHostFallback && ATPLoader.trySiblingHostFallback(task, img, startTimer, isActiveLoadCurrent)) return;
         if (ATPLoader.recordTaskImageFailure) {
           ATPLoader.recordTaskImageFailure(task, currentSrc, 'candidate_error', false);
         }
@@ -3234,8 +3360,9 @@
         nextCursor = index >= pendingWrappers.size ? 0 : index;
         scanned++;
         if (!data || data.loaded || !refreshPendingViewportVisibility(wrapper, data)) continue;
-        attempted++;
-        if (ATPViewport.loadWrapper(wrapper, data, false)) started++;
+        var didStart = ATPViewport.loadWrapper(wrapper, data, false);
+        if (didStart) started++;
+        if (didStart || !isLargeLaneBlockedWrapper(data)) attempted++;
       }
       if (started < available && attempted < attemptLimit && scanned < scanLimit && startIndex > 0) {
         pendingEntries = pendingWrappers.entries();
@@ -3253,13 +3380,17 @@
           nextCursor = index >= pendingWrappers.size ? 0 : index;
           scanned++;
           if (!wrappedData || wrappedData.loaded || !refreshPendingViewportVisibility(wrappedWrapper, wrappedData)) continue;
-          attempted++;
-          if (ATPViewport.loadWrapper(wrappedWrapper, wrappedData, false)) started++;
+          var wrappedDidStart = ATPViewport.loadWrapper(wrappedWrapper, wrappedData, false);
+          if (wrappedDidStart) started++;
+          if (wrappedDidStart || !isLargeLaneBlockedWrapper(wrappedData)) attempted++;
         }
       }
       pendingVisibleRetryCursor = normalizePendingRetryCursor(nextCursor);
       var completedEmptyScan = false;
-      if (started > 0 || attempted > 0 || scanned <= 0) {
+      // Only a pass that actually started a load resets the idle detector:
+      // refused attempts are woken by slot release and their own backoff, so
+      // counting them here re-armed this 80ms scan for as long as loads ran.
+      if (started > 0 || scanned <= 0) {
         pendingVisibleRetryEmptyScanCount = 0;
         pendingVisibleRetryEmptyScanSize = pendingWrappers.size;
       } else {
@@ -3430,6 +3561,10 @@
         rootState = rootStates.next();
       }
       viewportRootStates.clear();
+      if (rootProximityObserver) {
+        rootProximityObserver.disconnect();
+        rootProximityObserver = null;
+      }
       if (loadingAnimationObserver) {
         loadingAnimationObserver.disconnect();
         loadingAnimationObserver = null;

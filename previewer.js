@@ -192,7 +192,8 @@
       if (!imgList || !imgList.length) return;
       var wasOpen = isOpen;
       images = imgList;
-      currentIndex = startIndex || 0;
+      // An index past the list would show an empty, scroll-locked overlay.
+      currentIndex = Math.max(0, Math.min(imgList.length - 1, Math.floor(Number(startIndex) || 0)));
       if (!wasOpen) {
         previousBodyOverflow = document.body.style.overflow;
         previousBodyPaddingRight = document.body.style.paddingRight;

@@ -9,7 +9,9 @@
   var CACHE_GENERATION_KEY = SharedUtils.CACHE_GENERATION_KEY || 'atp_cache_generation_v1';
   var CACHE_FLUSH_TIMER = null;
   var CACHE_FLUSH_PENDING = {};
-  var QUOTA_BYTES = 10485760;
+  // storage.local is 10 MB from Chrome 114 but 5 MB on 111-113; a hard-coded
+  // 10 MB meant eviction never started there and every write failed.
+  var QUOTA_BYTES = (chrome.storage && chrome.storage.local && chrome.storage.local.QUOTA_BYTES) || 10485760;
   var HIGH_WATERMARK = Math.floor(QUOTA_BYTES * 0.85);
   var TARGET_WATERMARK = Math.floor(QUOTA_BYTES * 0.75);
   var ARTICLE_WRITE_QUEUES = {};
@@ -64,7 +66,10 @@
   function readCachedArticle(result, articleKey, now) {
     var article = result && result[articleKey];
     if (article && now - article.ts < getArticleCacheTTLMS() && article.complete && article.data) {
-      return ATPCache.normalizeArticleData(article.data);
+      var data = ATPCache.normalizeArticleData(article.data);
+      // When the thread itself was read: a cache hit is not a fresh read.
+      if (!data.readAt && Number(article.ts) > 0) data.readAt = Number(article.ts);
+      return data;
     }
     return null;
   }
@@ -122,14 +127,16 @@
   function normalizeCachedImage(image) {
     var item = typeof image === 'string' ? { src: image } : Object.assign({}, image || {});
     if (!item.src) return null;
-    item.src = SharedUtils.decodeHtmlEntities(String(item.src)).trim().replace(/\\\//g, '/');
+    // Extraction already decoded HTML attributes. Internal URLs may contain
+    // literal entity-shaped query data, so cache round-trips must preserve it.
+    item.src = String(item.src).trim().replace(/\\\//g, '/');
     if (!SharedUtils.isMeaningfulImage(item.src)) return null;
     if (item.previewSrc) {
-      item.previewSrc = SharedUtils.decodeHtmlEntities(String(item.previewSrc)).trim().replace(/\\\//g, '/');
+      item.previewSrc = String(item.previewSrc).trim().replace(/\\\//g, '/');
       if (!SharedUtils.isMeaningfulImage(item.previewSrc)) delete item.previewSrc;
     }
     if (item.displaySrc) {
-      item.displaySrc = SharedUtils.decodeHtmlEntities(String(item.displaySrc)).trim().replace(/\\\//g, '/');
+      item.displaySrc = String(item.displaySrc).trim().replace(/\\\//g, '/');
       if (!SharedUtils.isMeaningfulImage(item.displaySrc)) delete item.displaySrc;
     }
     return item;
@@ -155,7 +162,7 @@
     var seen = {};
     urls = Array.isArray(urls) ? urls : [];
     for (var i = 0; i < urls.length; i++) {
-      var url = SharedUtils.decodeHtmlEntities(String(urls[i] || '')).trim().replace(/\\\//g, '/');
+      var url = String(urls[i] || '').trim().replace(/\\\//g, '/');
       if (!url || seen[url]) continue;
       seen[url] = true;
       out.push(url);
@@ -175,7 +182,7 @@
     attachments = Array.isArray(attachments) ? attachments : [];
     for (var i = 0; i < attachments.length && out.length < maxCount; i++) {
       var raw = typeof attachments[i] === 'string' ? { url: attachments[i] } : Object.assign({}, attachments[i] || {});
-      var url = SharedUtils.decodeHtmlEntities(String(raw.url || '')).trim().replace(/\\\//g, '/');
+      var url = String(raw.url || '').trim().replace(/\\\//g, '/');
       if (!SharedUtils.isPersistableTextAttachmentUrl(url, raw.pageUrl || '')) continue;
       var key = SharedUtils.normalizeTextAttachmentUrl(url);
       if (!key || seen[key]) continue;
@@ -197,7 +204,7 @@
     attachments = Array.isArray(attachments) ? attachments : [];
     for (var i = 0; i < attachments.length; i++) {
       var raw = typeof attachments[i] === 'string' ? { url: attachments[i] } : (attachments[i] || {});
-      var url = SharedUtils.decodeHtmlEntities(String(raw.url || '')).trim().replace(/\\\//g, '/');
+      var url = String(raw.url || '').trim().replace(/\\\//g, '/');
       if (SharedUtils.isAllowedTextAttachmentUrl(url, raw.pageUrl || '') && SharedUtils.isTransientTextAttachmentUrl(url, raw.pageUrl || '')) count++;
     }
     return count;
@@ -251,7 +258,7 @@
     cacheWriteCheckInProgress = true;
     cacheWritesSinceCheck = 0;
     lastCacheWriteCheckAt = Date.now();
-    chrome.storage.local.getBytesInUse(null, function(bytesUsed) {
+    SharedUtils.getCacheBytesInUse(function(bytesUsed) {
       cacheWriteCheckInProgress = false;
       if (consumeStorageError('storage用量读取失败')) return;
       if (bytesUsed >= HIGH_WATERMARK) {
@@ -556,7 +563,7 @@
           finish(false);
           return;
         }
-        chrome.storage.local.getBytesInUse(null, function(bytesUsed) {
+        SharedUtils.getCacheBytesInUse(function(bytesUsed) {
           if (consumeStorageError('storage用量读取失败')) {
             finish(false);
             return;
@@ -722,6 +729,8 @@
           );
           existingData.loadedUrls = nextData.loadedUrls;
           existingData.resources = SharedUtils.mergeResources(existingData.resources, nextData.resources);
+          if (nextData.textResourcesImported) existingData.textResourcesImported = true;
+          if (nextData.textAttachmentsLimited) existingData.textAttachmentsLimited = true;
           existingData.textAttachments = mergeCachedTextAttachments(existingData.textAttachments, nextData.textAttachments);
           existingData.hasTextAttachments = existingData.hasTextAttachments || nextData.hasTextAttachments || existingData.textAttachments.length > 0;
           existingData.textResourcesComplete = (discoveredAdditionalTextWork || explicitUnresolvedTextWork)
@@ -809,7 +818,10 @@
       });
     },
 
+    // Discuz attachment URLs carry a per-render aid token, so an entry keyed
+    // by one is never read again; the article cache keeps those TXT results.
     setCachedTextResources: function(url, resources, writeStartedAt) {
+      if (SharedUtils.isDiscuzAttachmentUrl(url, url)) return;
       var keys = getTextCacheKeys(TEXT_RESOURCE_CACHE_PREFIX, url);
       if (!keys.length) return;
       var primaryKey = keys[0];
@@ -885,7 +897,13 @@
         return;
       }
 
+      // Entries past the cache TTL go first (oldest first): they can never be
+      // read again, yet type priority alone evicted live articles before them.
+      var expiredBefore = Date.now() - getArticleCacheTTLMS();
       cacheEntries.sort(function(a, b) {
+        var aExpired = a.ts < expiredBefore;
+        var bExpired = b.ts < expiredBefore;
+        if (aExpired !== bExpired) return aExpired ? -1 : 1;
         if (a.priority !== b.priority) return b.priority - a.priority;
         return a.ts - b.ts;
       });
@@ -989,6 +1007,7 @@
     },
 
     setTextFailCache: function(url, writeStartedAt) {
+      if (SharedUtils.isDiscuzAttachmentUrl(url, url)) return;
       var keys = getTextCacheKeys(TEXT_FAIL_CACHE_PREFIX, url);
       if (!keys.length) return;
       var primaryKey = keys[0];
@@ -1057,7 +1076,7 @@
       var markerCount = Math.max(transientAttachmentCount, parseInt(data.textAttachmentCount || 0, 10) || 0);
       var hasTextAttachments = textAttachments.length > 0 || !!data.hasTextAttachments || transientAttachmentCount > 0;
       var textAttachmentCount = deriveTextAttachmentCount(textAttachments, hasTextAttachments, markerCount);
-      return {
+      var normalized = {
         images: normalizeCachedImages(data.images),
         resources: SharedUtils.normalizeResources(data.resources),
         textAttachments: textAttachments,
@@ -1073,6 +1092,11 @@
         emptyReason: data.emptyReason || '',
         retryAfter: Math.max(0, Number(data.retryAfter || 0) || 0)
       };
+      var readAt = Number(data.readAt) || 0;
+      if (readAt > 0) normalized.readAt = readAt;
+      if (data.textResourcesImported === true) normalized.textResourcesImported = true;
+      if (data.textAttachmentsLimited === true) normalized.textAttachmentsLimited = true;
+      return normalized;
     },
 
     clearFlushTimer: function() {
