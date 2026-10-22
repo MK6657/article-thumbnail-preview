@@ -34,10 +34,12 @@ function makeReadable(bytes) {
   };
 }
 
-async function runFetcherBridgeIntegration(text) {
+async function runFetcherBridgeIntegration(text, scenario) {
+  scenario = scenario || {};
   const listeners = [];
   let contextWindow = null;
   let fetchCalls = 0;
+  let directCalls = 0;
   let cachedResources = null;
   let backgroundCalls = 0;
   const bytes = Array.from(Buffer.from(text, 'utf8'));
@@ -79,9 +81,15 @@ async function runFetcherBridgeIntegration(text) {
       }, 0);
     },
     fetch: async function(url, options) {
+      if (options.mode !== 'same-origin') {
+        // The isolated world's own attempt; it hits the same redirect.
+        directCalls++;
+        throw new TypeError('Failed to fetch');
+      }
       fetchCalls++;
       assert.strictEqual(options.credentials, 'include');
-      assert.strictEqual(options.mode, 'same-origin', 'page bridge must reject cross-origin redirects at the network boundary');
+      // The forum answering with a redirect to a download host.
+      if (scenario.redirectsCrossOrigin) throw new TypeError('Failed to fetch');
       return {
         ok: true,
         status: 200,
@@ -123,12 +131,26 @@ async function runFetcherBridgeIntegration(text) {
   vm.runInContext(fs.readFileSync(path.join(root, 'fetcher.js'), 'utf8'), sandbox, { filename: 'fetcher.js' });
   contextWindow = vm.runInContext('window', sandbox);
 
+  if (scenario.redirectsCrossOrigin) {
+    const status = await sandbox.ATPFetcher.fetchTextAttachmentResourcesWithStatus([{
+      url: 'https://www.sehuatang.org/forum.php?mod=attachment&aid=relay',
+      pageUrl: 'https://www.sehuatang.org/thread-3632512-1-2.html',
+      name: 'relay.txt'
+    }], { deadline: Date.now() + 5000 });
+    assert.strictEqual(fetchCalls, 1, 'the page session must be tried once');
+    assert.strictEqual(directCalls, 0, 'after the page request failed in transport, the isolated world must not send it again');
+    assert.strictEqual(backgroundCalls, 1, 'the attachment must go straight to the background worker, which can follow the redirect');
+    assert.strictEqual(status.attemptedCount, 1, 'the redirected attachment must still count as attempted');
+    return;
+  }
+
   const resources = await sandbox.ATPFetcher.fetchTextAttachmentResource({
     url: 'https://www.sehuatang.org/forum.php?mod=attachment&aid=signed',
     pageUrl: 'https://www.sehuatang.org/thread-3632512-1-2.html',
     name: 'www.98T.la@评分的兄弟吊二次增大.txt'
   }, 0, {}, { manualRetry: true, deadline: Date.now() + 5000 });
   assert.strictEqual(fetchCalls, 1, 'fetcher integration must satisfy same-origin TXT through the page bridge');
+  assert.strictEqual(directCalls, 0, 'a successful page bridge fetch must not be repeated from the isolated world');
   assert.strictEqual(backgroundCalls, 0, 'successful page bridge fetch must not reach background fallback');
   assert.strictEqual(resources.groups.ed2k.length, 1, 'fetcher integration must parse the bridged ED2K resource');
   assert(cachedResources && cachedResources.groups.ed2k.length === 1, 'fetcher integration must seed the positive TXT cache');
@@ -214,6 +236,19 @@ async function run() {
   assert.strictEqual(fetchCalls, 1, 'cross-origin page bridge requests must be rejected before fetch');
   assert.strictEqual(posted[0].message.error, 'url_not_allowed', 'cross-origin rejection must be explicit');
 
+  posted.length = 0;
+  await listener({
+    source: contextWindow,
+    origin: sandbox.location.origin,
+    data: {
+      type: 'ATP_PAGE_TEXT_FETCH_REQUEST_V1',
+      id: 'request_87654322',
+      url: 'https://www.sehuatang.org/misc.php?aid=7'
+    }
+  });
+  assert.strictEqual(fetchCalls, 1, 'unrelated misc.php requests must be rejected before fetch');
+  assert.strictEqual(posted[0].message.error, 'url_not_allowed', 'unrelated misc.php rejection must be explicit');
+
   let limitedSignal = null;
   let bodyRead = false;
   sandbox.fetch = async function(url, options) {
@@ -234,8 +269,9 @@ async function run() {
   assert.strictEqual(limitedSignal.aborted, true, 'rejected response must cancel the unread network body');
 
   await runFetcherBridgeIntegration(text);
+  await runFetcherBridgeIntegration(text, { redirectsCrossOrigin: true });
 
-  console.log('page fetch bridge tests ok: standalone + fetcher integration');
+  console.log('page fetch bridge tests ok: standalone + fetcher integration + redirect fallback');
 }
 
 run().catch(function(error) {

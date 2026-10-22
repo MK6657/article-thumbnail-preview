@@ -90,6 +90,18 @@ const SETTINGS_SCHEMA = [
     immediate: false,
   },
   {
+    // New key leaves the earlier default-on value in storage inert after upgrade.
+    key: 'autoLoadOffscreenFirstRowsEnabled',
+    label: '屏外首批自动加载',
+    type: 'boolean',
+    group: '加载',
+    default: false,
+    description: '不滚动页面也会以后台优先级加载每帖首批图片，张数由每行列数 × 可见行数决定。',
+    recommend: '开启后当前列表页的帖子会逐步加载首批图片。',
+    highImpact: '列表页帖子很多时会增加正文、图片及 TXT 附件请求。',
+    immediate: false,
+  },
+  {
     key: 'firstScreenConcurrency',
     label: '弱图可见并发',
     type: 'number',
@@ -178,6 +190,21 @@ const SETTINGS_SCHEMA = [
     default: true,
     description: '扫描列表页时跳过置顶、公告、版规、服务大厅、教程等非资源主题。',
     recommend: '建议开启，可减少无效抓取并改善长列表页滚动体验。',
+    immediate: false,
+  },
+  {
+    key: 'animatedThumbnailMode',
+    label: '动图缩略图',
+    type: 'select',
+    group: '显示',
+    default: 'still',
+    options: [
+      { value: 'still', label: '静帧（悬停播放）' },
+      { value: 'play', label: '始终播放' }
+    ],
+    description: '普通图床上的 GIF 动图在列表里显示第一帧，鼠标悬停时播放；点击仍打开原图。',
+    recommend: '建议静帧：列表同屏常有几十张动图，全部播放时每一帧都要重新解码、重绘，滚动容易卡顿。',
+    highImpact: '始终播放会明显增加滚动时的 CPU 占用，动图多的页面更容易卡顿。',
     immediate: false,
   },
   {
