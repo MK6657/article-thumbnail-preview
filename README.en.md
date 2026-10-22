@@ -4,7 +4,9 @@ English | [简体中文](README.md)
 
 A Chrome / Edge Manifest V3 extension that adds image previews and copyable resource links to supported Discuz! forum listing pages.
 
-Current version: **1.18.7**. No server, npm installation, or build is required to use the extension.
+Current version: **1.18.8**. No server, npm installation, or build is required to use the extension.
+
+Version 1.18.8 lets automatic TXT work waiting offscreen give its slot to queued onscreen work, retaining resources already read before resuming. First-screen diagnostics separate queue time, hidden-page pauses and request processing time.
 
 Version 1.18.7 distinguishes complete, partial and failed TXT results in diagnostics, removes expired article queue waiters, and derives adaptive GIF concurrency from the effective host limit so mixed galleries retain capacity for static images.
 
@@ -87,7 +89,7 @@ Node.js is required for verification; the current validation environment uses No
 node tools/verify.js
 ```
 
-This checks JavaScript syntax, Manifest references and permissions, documentation versions, sandbox behavior regressions, and eleven external test suites. Internal test hooks are injected into sandboxes only, not shipped in the extension.
+This checks JavaScript syntax, Manifest references and permissions, documentation versions, sandbox behavior regressions, and fourteen external test suites. Internal test hooks are injected into sandboxes only, not shipped in the extension.
 
 Package on Windows using PowerShell and Node.js:
 

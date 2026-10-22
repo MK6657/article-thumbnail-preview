@@ -171,19 +171,21 @@
     return SharedUtils.hasResourcePayload(resources);
   }
 
-  function makeTextResourceFetchStatus(resources, attemptedCount, unresolvedCount, retryableCount) {
+  function makeTextResourceFetchStatus(resources, attemptedCount, unresolvedCount, retryableCount, yielded) {
     var normalized = SharedUtils.normalizeResources(resources);
     var attempted = Math.max(0, Number(attemptedCount) || 0);
     var unresolved = Math.max(0, Number(unresolvedCount) || 0);
     if (unresolved > attempted) unresolved = attempted;
     var retryable = Math.max(0, Number(retryableCount) || 0);
     if (retryable > unresolved) retryable = unresolved;
-    return {
+    var status = {
       resources: normalized,
       attemptedCount: attempted,
       unresolvedCount: unresolved,
       retryableCount: retryable
     };
+    if (yielded) status.yielded = true;
+    return status;
   }
 
   function normalizeTextResourceFetchStatus(result, fallbackAttemptedCount) {
@@ -196,7 +198,7 @@
       }
       var retryable = Number(result.retryableCount);
       if (!isFinite(retryable) || retryable < 0) retryable = unresolved;
-      return makeTextResourceFetchStatus(result.resources, attempted, unresolved, retryable);
+      return makeTextResourceFetchStatus(result.resources, attempted, unresolved, retryable, result.yielded === true);
     }
     var resources = SharedUtils.normalizeResources(result);
     var fallbackAttempted = Math.max(0, Number(fallbackAttemptedCount) || 0);
@@ -220,6 +222,40 @@
     }
     next.deadline = deadline;
     return next;
+  }
+
+  function withTextRequestControl(options) {
+    options = options || {};
+    if (options._textRequestControl) return options;
+    var next = Object.assign({}, options);
+    // One run shares this latch through bridge/direct/worker fallbacks. A
+    // transient cancellation seen by the pacer must still reach the caller.
+    next._textRequestControl = { yielded: false };
+    return next;
+  }
+
+  function shouldYieldTextRequest(options) {
+    if (!options || options.manualRetry || options.force) return false;
+    var control = options._textRequestControl;
+    if (control && control.yielded) return true;
+    var cancelled = false;
+    try { cancelled = typeof options.isCancelled === 'function' && !!options.isCancelled(); } catch (e) {}
+    if (cancelled && control) control.yielded = true;
+    return cancelled;
+  }
+
+  function yieldedTextResources() {
+    var resources = SharedUtils.emptyResources();
+    resources.yielded = true;
+    return resources;
+  }
+
+  function yieldedTextStatus(attachments, deadline) {
+    attachments.forEach(function(attachment) {
+      logTextDiagnostic(attachment, 'background_dispatch', 'yielded', '', deadline);
+    });
+    return makeTextResourceFetchStatus(SharedUtils.emptyResources(), attachments.length,
+      attachments.length, attachments.length, true);
   }
 
   function isTextResourceDeadlineExhausted(deadline) {
@@ -264,6 +300,8 @@
     return {
       manual: !!(options.manualRetry || options.force),
       priority: getForumPriority('PRIORITY_ARTICLE'),
+      getPriority: typeof options.getPriority === 'function' ? options.getPriority : null,
+      isCancelled: function() { return shouldYieldTextRequest(options); },
       deadline: options.deadline || 0,
       cost: cost || 1
     };
@@ -381,9 +419,20 @@
   }
 
   async function fetchTextAttachmentResourceViaPage(attachment, timeoutMs, writeStartedAt, options) {
+    if (shouldYieldTextRequest(options)) {
+      logTextDiagnostic(attachment, 'page_bridge', 'yielded', '', options.deadline);
+      return { handled: true, resources: yieldedTextResources(), yielded: true };
+    }
     var ticket = await acquireForumTurn(getTextPaceOptions(options, 1));
+    if (shouldYieldTextRequest(options)) {
+      if (ticket) ticket.done('unused');
+      logTextDiagnostic(attachment, 'page_bridge', 'yielded', '', options.deadline);
+      return { handled: true, resources: yieldedTextResources(), yielded: true };
+    }
     // Out of time while queued: unresolved this round, nothing was sent.
-    if (!ticket) {
+    timeoutMs = getTextAttachmentFetchTimeout(options.deadline);
+    if (!ticket || timeoutMs <= 0) {
+      if (ticket) ticket.done('unused');
       logTextDiagnostic(attachment, 'page_bridge', 'skipped', 'pace_deadline', options.deadline);
       return { handled: true, resources: SharedUtils.emptyResources() };
     }
@@ -477,11 +526,12 @@
 
     fetchTextAttachmentResources: async function(attachments, options) {
       var status = await ATPFetcher.fetchTextAttachmentResourcesWithStatus(attachments, options);
+      if (status.yielded) status.resources.yielded = true;
       return status.resources;
     },
 
     fetchTextAttachmentResourcesWithStatus: async function(attachments, options) {
-      options = options || {};
+      options = withTextRequestControl(options);
       var manualRetry = !!(options.manualRetry || options.force);
       var sourceAttachments = attachments || [];
       attachments = [];
@@ -516,11 +566,12 @@
         var directResults = [];
         for (var dp = 0; dp < same.length; dp++) {
           directResults.push(await ATPFetcher.fetchTextAttachmentResource(same[dp], 0, hardFailSet, options));
+          if (options._textRequestControl.yielded) break;
         }
         var sameMerged = SharedUtils.emptyResources();
         var hardFailsInSame = 0;
         var sameFallback = [];
-        for (var s = 0; s < directResults.length; s++) {
+        for (var s = 0; s < same.length; s++) {
           if (hasResourcePayload(directResults[s])) {
             sameMerged = SharedUtils.mergeResources(sameMerged, directResults[s]);
           } else if (hardFailSet[same[s].url]) {
@@ -609,19 +660,22 @@
         unresolvedCount = attachments.length;
         retryableCount = attachments.length;
       }
-      return makeTextResourceFetchStatus(merged, attachments.length, unresolvedCount, retryableCount);
+      return makeTextResourceFetchStatus(merged, attachments.length, unresolvedCount, retryableCount,
+        options._textRequestControl.yielded);
     },
 
     fetchTextAttachmentResourcesByBackground: function(attachments, options) {
       return ATPFetcher.fetchTextAttachmentResourcesByBackgroundWithStatus(attachments, options).then(function(status) {
+        if (status.yielded) status.resources.yielded = true;
         return status.resources;
       });
     },
 
     fetchTextAttachmentResourcesByBackgroundWithStatus: async function(attachments, options) {
-      options = options || {};
+      options = withTextRequestControl(options);
       attachments = (attachments || []).map(function(attachment) { return withTextDiagnosticId(attachment, options); });
       var deadline = getTextResourceDeadline(options, attachments.length);
+      if (shouldYieldTextRequest(options)) return yieldedTextStatus(attachments, deadline);
       if (isTextResourceDeadlineExhausted(deadline)) {
         attachments.forEach(function(attachment) { logTextDiagnostic(attachment, 'background_dispatch', 'skipped', 'deadline', deadline); });
         return makeTextResourceFetchStatus(SharedUtils.emptyResources(), attachments.length, attachments.length, attachments.length);
@@ -635,13 +689,19 @@
       var ticket = forumCount
         ? await acquireForumTurn(getTextPaceOptions(withTextResourceDeadline(options, deadline), forumCount))
         : UNPACED_TICKET;
+      if (shouldYieldTextRequest(options)) {
+        if (ticket) ticket.done('unused');
+        return yieldedTextStatus(attachments, deadline);
+      }
       if (!ticket || isTextResourceDeadlineExhausted(deadline)) {
         if (ticket) ticket.done('unused');
         attachments.forEach(function(attachment) { logTextDiagnostic(attachment, 'background_dispatch', 'skipped', 'pace_deadline', deadline); });
         return makeTextResourceFetchStatus(SharedUtils.emptyResources(), attachments.length, attachments.length, attachments.length);
       }
       try {
-        return await ATPFetcher._requestTextResourcesFromBackground(attachments, options, deadline);
+        var status = await ATPFetcher._requestTextResourcesFromBackground(attachments, options, deadline);
+        if (status.yielded) ticket.done('unused');
+        return status;
       } finally {
         ticket.done('');
       }
@@ -650,6 +710,10 @@
     _requestTextResourcesFromBackground: function(attachments, options, deadline) {
       var manualRetry = !!(options.manualRetry || options.force);
       return new Promise(function(resolve) {
+        if (shouldYieldTextRequest(options)) {
+          resolve(yieldedTextStatus(attachments, deadline));
+          return;
+        }
         var done = false;
         var timeoutMs = Math.max(1, deadline - Date.now());
         var timer = setTimeout(function() {
@@ -699,7 +763,7 @@
     },
 
     fetchTextAttachmentResource: async function(attachment, depth, hardFailSet, options) {
-      options = options || {};
+      options = withTextRequestControl(options);
       attachment = withTextDiagnosticId(attachment, options);
       var writeStartedAt = Date.now();
       var manualRetry = !!(options.manualRetry || options.force);
@@ -726,6 +790,10 @@
           }
         }
 
+        if (shouldYieldTextRequest(options)) {
+          logTextDiagnostic(attachment, 'direct', 'yielded', '', options.deadline);
+          return yieldedTextResources();
+        }
         var fetchTimeout = getTextAttachmentFetchTimeout(options.deadline);
         if (fetchTimeout <= 0) {
           logTextDiagnostic(attachment, 'direct', 'skipped', 'deadline', options.deadline);
@@ -745,7 +813,14 @@
         }
 
         var ticket = sameOrigin ? await acquireForumTurn(getTextPaceOptions(options, 1)) : UNPACED_TICKET;
-        if (!ticket) {
+        if (shouldYieldTextRequest(options)) {
+          if (ticket) ticket.done('unused');
+          logTextDiagnostic(attachment, 'direct', 'yielded', '', options.deadline);
+          return yieldedTextResources();
+        }
+        fetchTimeout = getTextAttachmentFetchTimeout(options.deadline);
+        if (!ticket || fetchTimeout <= 0) {
+          if (ticket) ticket.done('unused');
           logTextDiagnostic(attachment, 'direct', 'skipped', 'pace_deadline', options.deadline);
           return SharedUtils.emptyResources();
         }
@@ -877,6 +952,11 @@
                 }
               } catch (e) {
                 redirectedResources = await ATPFetcher.fetchTextAttachmentResourcesByBackground([nextAttachment], options);
+              }
+              if (redirectedResources && redirectedResources.yielded) {
+                diagnosticOutcome = 'yielded';
+                diagnosticFailure = '';
+                return redirectedResources;
               }
               if (hasResourcePayload(redirectedResources)) {
                 diagnosticOutcome = 'success';
@@ -1200,18 +1280,30 @@
     },
 
     fetchTextAttachmentsFreshByBackground: async function(url, options) {
-      var ticket = await acquireForumTurn(getTextPaceOptions(withFreshTextDeadline(options), 1));
+      options = withFreshTextDeadline(withTextRequestControl(options));
+      if (shouldYieldTextRequest(options)) return { yielded: true, textAttachments: null };
+      var ticket = await acquireForumTurn(getTextPaceOptions(options, 1));
+      if (shouldYieldTextRequest(options)) {
+        if (ticket) ticket.done('unused');
+        return { yielded: true, textAttachments: null };
+      }
       if (!ticket) return null;
       var report = { outcome: '' };
       try {
-        return await ATPFetcher._requestFreshTextAttachmentsFromBackground(url, report);
+        var attachments = await ATPFetcher._requestFreshTextAttachmentsFromBackground(url, report, options);
+        if (attachments && attachments.yielded) ticket.done('unused');
+        return attachments;
       } finally {
         ticket.done(report.outcome);
       }
     },
 
-    _requestFreshTextAttachmentsFromBackground: function(url, report) {
+    _requestFreshTextAttachmentsFromBackground: function(url, report, options) {
       return new Promise(function(resolve) {
+        if (shouldYieldTextRequest(options)) {
+          resolve({ yielded: true, textAttachments: null });
+          return;
+        }
         var settings = ATPFetcher.getSettings();
         var articleTimeout = ATPLoadPolicy.getArticleTimeout(settings);
         var done = false;
@@ -1262,11 +1354,18 @@
 
     // Re-reads the thread for current attachment links. null means the links
     // could not be read this time (retryable); [] means the thread has none.
+    // { yielded: true } means an automatic run gave way before its request.
     fetchTextAttachmentsFresh: async function(url, options) {
+      options = withFreshTextDeadline(withTextRequestControl(options));
       if (!isSameOriginUrl(url)) {
         return await ATPFetcher.fetchTextAttachmentsFreshByBackground(url, options);
       }
-      var ticket = await acquireForumTurn(getTextPaceOptions(withFreshTextDeadline(options), 1));
+      if (shouldYieldTextRequest(options)) return { yielded: true, textAttachments: null };
+      var ticket = await acquireForumTurn(getTextPaceOptions(options, 1));
+      if (shouldYieldTextRequest(options)) {
+        if (ticket) ticket.done('unused');
+        return { yielded: true, textAttachments: null };
+      }
       if (!ticket) return null;
       var report = { outcome: '', retryAfter: 0 };
       try {

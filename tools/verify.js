@@ -98,7 +98,7 @@ function checkJsSyntax() {
 }
 
 function checkExternalTestSuites() {
-  const suites = ['tests/resource-extraction.test.js', 'tests/loading-policy.test.js', 'tests/page-fetch-bridge.test.js', 'tests/release-regressions.test.js', 'tests/text-queue.test.js', 'tests/page-fixtures.test.js', 'tests/mirror-sites.test.js', 'tests/resource-marks.test.js', 'tests/txt-diagnostics.test.js', 'tests/article-queue.test.js', 'tests/image-lane.test.js'];
+  const suites = ['tests/resource-extraction.test.js', 'tests/loading-policy.test.js', 'tests/page-fetch-bridge.test.js', 'tests/release-regressions.test.js', 'tests/text-queue.test.js', 'tests/page-fixtures.test.js', 'tests/mirror-sites.test.js', 'tests/resource-marks.test.js', 'tests/txt-diagnostics.test.js', 'tests/article-queue.test.js', 'tests/image-lane.test.js', 'tests/txt-yield.test.js', 'tests/txt-visible-queue.test.js', 'tests/first-screen-timing.test.js'];
   suites.forEach(function(file) {
     const result = spawnSync(process.execPath, [path.join(root, file)], {
       cwd: root,
@@ -16274,7 +16274,7 @@ function checkCriticalStaticRules() {
   assert(renderer.indexOf('var failTextResourceLoad = function(message, e)') !== -1, 'renderer TXT scheduling must centralize local fetch startup failures');
   assert(renderer.indexOf("if (!fetchPromise || typeof fetchPromise.then !== 'function')") !== -1, 'renderer TXT scheduling must reject non-promise TXT fetcher results without getting stuck loading');
   assert(renderer.indexOf("if (!freshPromise || typeof freshPromise.then !== 'function')") !== -1, 'renderer TXT scheduling must reject non-promise fresh attachment results without getting stuck loading');
-  assert(/var fetchOptions = \{ manualRetry: !!manualRetry,[^\n]+\};/.test(renderer) && renderer.indexOf('ATPFetcher.fetchTextAttachmentResourcesWithStatus(attachments, fetchOptions)') !== -1, 'renderer TXT scheduling must pass manual retry state to the status-aware fetcher');
+  assert(/var makeTextRunOptions = function\(\) \{\s+return \{\s+manualRetry: !!manualRetry,/.test(renderer) && renderer.indexOf('ATPFetcher.fetchTextAttachmentResourcesWithStatus(attachments, fetchOptions)') !== -1, 'renderer TXT scheduling must pass manual retry state to the status-aware fetcher');
   assert(resourcePanel.indexOf('|| threadState.textResourcesRetryable') !== -1, 'resource panel must keep TXT parse actions visible for retryable failures');
   assert(resourcePanel.indexOf('if (threadState.textResourcesDone && !threadState.textResourcesRetryable) return false;') !== -1, 'resource panel must keep TXT parse actions visible for done-but-retryable states');
   assert(resourcePanel.indexOf('function requestTextResourceManualLoad(threadState)') !== -1, 'resource panel TXT parse actions must route through one guarded manual scheduling helper');
@@ -17624,7 +17624,7 @@ function checkCriticalStaticRules() {
   assert(loader.indexOf('function applyHeavyBackgroundDeferred(ts, threadId, deferInfo)') !== -1, 'loader must defer open-host background queues without consuming candidates');
   assert(loader.indexOf("reason: 'heavy_bg_deferred'") !== -1, 'loader diagnostics must expose resumable heavy background deferrals');
   assert(loader.indexOf('DEFERRED_HEAVY_THREADS[threadId] = true') !== -1, 'loader must keep deferred heavy threads resumable after cooldown');
-  assert(popup.indexOf('/^(content_start|image_|render_|diagnostic_summary|schedule_state|thread_registered|scan_complete|fallback_|log_retention)/') !== -1, 'popup image log filter must include startup, render diagnostics, summaries, fallback diagnostics, and retention status');
+  assert(popup.indexOf('/^(content_start|image_|render_|first_screen_timing|diagnostic_summary|schedule_state|thread_registered|scan_complete|fallback_|log_retention)/') !== -1, 'popup image log filter must include startup, first-screen timing, render diagnostics, summaries, fallback diagnostics, and retention status');
   assert(popupHtml.indexOf('id="toggleHelp"') !== -1 && popupHtml.indexOf('aria-label="展开使用说明"') !== -1, 'popup help disclosure must start with a contextual aria-label');
   assert(popupHtml.indexOf('id="toggleLogs"') !== -1 && popupHtml.indexOf('aria-label="展开诊断日志"') !== -1, 'popup log disclosure must start with a contextual aria-label');
   assert(popup.indexOf('function setDisclosureState(button, panel, expanded)') !== -1, 'popup disclosure state must be centralized');

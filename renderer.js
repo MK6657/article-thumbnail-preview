@@ -84,9 +84,9 @@
 
   function releaseAutomaticTextResourceSlot(threadState, run) {
     if (!threadState) return;
-    threadState.textResourcesAutoQueued = false;
+    if (run && run.released) return;
+    if (!run || threadState.textResourcesRun === run) threadState.textResourcesAutoQueued = false;
     if (run) {
-      if (run.released) return;
       run.released = true;
       if (run.automatic) AUTO_TEXT_RESOURCE_ACTIVE = Math.max(0, AUTO_TEXT_RESOURCE_ACTIVE - 1);
       if (threadState.textResourcesRun === run) {
@@ -107,6 +107,17 @@
     var rect = el.getBoundingClientRect();
     var vh = window.innerHeight || (document.documentElement && document.documentElement.clientHeight) || 800;
     return rect.bottom > 0 && rect.top < vh;
+  }
+
+  function hasQueuedVisibleTextResourceThread(exceptThread) {
+    for (var i = 0; i < AUTO_TEXT_RESOURCE_QUEUE.length; i++) {
+      var candidate = AUTO_TEXT_RESOURCE_QUEUE[i];
+      if (!candidate || candidate === exceptThread || !candidate.textResourcesAutoQueued ||
+          candidate.textResourcesLoading || candidate.textResourcesImporting ||
+          (candidate.textResourcesDone && !candidate.textResourcesRetryable) || !isThreadCurrent(candidate)) continue;
+      if (isThreadOnScreen(candidate)) return true;
+    }
+    return false;
   }
 
   // Automatic TXT work costs forum requests. Threads on screen always go
@@ -682,6 +693,8 @@
         threadState.nextIdx++;
       }
 
+      if (window.ATPLoader && ATPLoader.registerFirstScreenTiming) ATPLoader.registerFirstScreenTiming(threadState);
+
       if (!threadState.firstScreenTotal) {
         container.classList.add(CONTAINER_CLASS);
         ATPCache.setCachedArticleData(linkUrl, {
@@ -736,6 +749,28 @@
         return threadState.textResourcesRun === run && isThreadCurrent(threadState);
       };
 
+      var shouldYieldBeforeRequest = function() {
+        if (!run.automatic || manualRetry) return false;
+        if (!isRunCurrent()) return true;
+        return hasQueuedVisibleTextResourceThread(threadState) && !isThreadOnScreen(threadState);
+      };
+
+      var getTextRunPriority = function() {
+        var pacer = window.ATPForumPacer;
+        var articlePriority = pacer && typeof pacer.PRIORITY_ARTICLE === 'number' ? pacer.PRIORITY_ARTICLE : 1;
+        return articlePriority + (run.automatic && !isThreadOnScreen(threadState) ? 1 : 0);
+      };
+
+      var makeTextRunOptions = function() {
+        return {
+          manualRetry: !!manualRetry,
+          diagnosticThreadId: threadState.id || '',
+          diagnosticRunId: run.id,
+          isCancelled: shouldYieldBeforeRequest,
+          getPriority: getTextRunPriority
+        };
+      };
+
       var logTextResourceResult = function(outcome, fields) {
         if (typeof Logger.event !== 'function') return;
         Logger.event('txt_result', Object.assign({
@@ -747,7 +782,34 @@
           outcome: outcome,
           reason: outcome,
           ms: Math.max(0, Date.now() - run.startedAt)
-        }, fields), outcome === 'complete' ? 'INFO' : 'WARN');
+        }, fields), outcome === 'complete' || outcome === 'yielded' ? 'INFO' : 'WARN');
+      };
+
+      var requeueYieldedTextResourceRun = function(result) {
+        if (!isRunCurrent()) {
+          releaseAutomaticTextResourceSlot(threadState, run);
+          return;
+        }
+        var retainedResources = SharedUtils.normalizeResources(result && result.resources);
+        var before = SharedUtils.countResources(threadState.resources);
+        threadState.resources = SharedUtils.mergeResources(threadState.resources, retainedResources);
+        threadState.textResourcesLoading = false;
+        threadState.textResourcesDone = false;
+        threadState.textResourcesRetryable = false;
+        threadState.textResourcesAutoAttempted = false;
+        // Only a settled fetcher promise may release this slot. Issued
+        // requests have finished; the unissued remainder can queue again.
+        releaseAutomaticTextResourceSlot(threadState, run);
+        queueAutomaticTextResourceLoad(threadState);
+        if (!threadState.candidates.length && threadState.statusEl) {
+          threadState.statusEl.textContent = SharedUtils.hasResourcePayload(threadState.resources) ? '资源链接' : '资源解析排队中';
+        }
+        if (window.ATPResourcePanel) ATPResourcePanel.updateThread(threadState);
+        logTextResourceResult('yielded', {
+          fetchedResources: SharedUtils.countResources(retainedResources),
+          addedResources: Math.max(0, SharedUtils.countResources(threadState.resources) - before),
+          totalResources: SharedUtils.countResources(threadState.resources)
+        });
       };
 
       var failTextResourceLoad = function(message, e) {
@@ -778,7 +840,7 @@
         }
         var fetchPromise;
         try {
-          var fetchOptions = { manualRetry: !!manualRetry, diagnosticThreadId: threadState.id || '', diagnosticRunId: run.id };
+          var fetchOptions = makeTextRunOptions();
           fetchPromise = ATPFetcher.fetchTextAttachmentResourcesWithStatus
             ? ATPFetcher.fetchTextAttachmentResourcesWithStatus(attachments, fetchOptions)
             : ATPFetcher.fetchTextAttachmentResources(attachments, fetchOptions);
@@ -793,6 +855,10 @@
         Promise.resolve(fetchPromise).then(function(result) {
           if (!isRunCurrent()) {
             releaseAutomaticTextResourceSlot(threadState, run);
+            return;
+          }
+          if (result && result.yielded === true && run.automatic && !manualRetry) {
+            requeueYieldedTextResourceRun(result);
             return;
           }
           threadState.textResourcesLoading = false;
@@ -915,7 +981,7 @@
         try {
           freshPromise = reusableLinks
             ? Promise.resolve(reusableLinks)
-            : ATPFetcher.fetchTextAttachmentsFresh(threadState.link, { manualRetry: !!manualRetry });
+            : ATPFetcher.fetchTextAttachmentsFresh(threadState.link, makeTextRunOptions());
         } catch (e) {
           fallbackToCachedAttachmentsAfterFreshFailure('TXT 附件链接提取失败', e);
           return;
@@ -927,6 +993,10 @@
         Promise.resolve(freshPromise).then(function(freshAttachments) {
           if (!isRunCurrent()) {
             releaseAutomaticTextResourceSlot(threadState, run);
+            return;
+          }
+          if (freshAttachments && freshAttachments.yielded === true && run.automatic && !manualRetry) {
+            requeueYieldedTextResourceRun(freshAttachments);
             return;
           }
           // null: the thread could not be re-read this time (network, forum

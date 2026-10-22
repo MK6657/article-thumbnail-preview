@@ -1005,6 +1005,30 @@ async function main() {
       })()`, pageOneContext.id);
       return progress && progress.firstScreenOk === progress.firstScreenTotal ? progress : null;
     });
+    var firstScreenTiming = await evaluate(pageOne, `new Promise(resolve => {
+      const thread = Object.values(window.ATPState.threads).find(item => item.link.includes('/thread-100-1-1.html'));
+      Logger.flush(() => chrome.storage.local.get(null, stored => {
+        const entries = Object.values(stored).filter(Array.isArray).flat();
+        const logged = entries.find(entry => entry && entry.type === 'first_screen_timing' &&
+          entry.fields && entry.fields.threadId === thread.id);
+        resolve({ timing: thread.firstScreenTiming && thread.firstScreenTiming.result,
+          logged: logged && logged.fields });
+      }));
+    })`, pageOneContext.id);
+    assert(firstScreenTiming && firstScreenTiming.timing && firstScreenTiming.logged,
+      'Completed first screen must retain and export its timing breakdown');
+    var timing = firstScreenTiming.timing;
+    assert.strictEqual(timing.settledTasks, ordinaryFirstScreen.firstScreenTotal);
+    assert.strictEqual(timing.taskElapsedTotalMs,
+      timing.queueWaitTotalMs + timing.hiddenPauseTotalMs + timing.requestTotalMs,
+      'Queue, hidden pause and request time must partition the task totals');
+    var explainedWallTime = timing.lastTaskStartOffsetMs + timing.lastTaskQueueWaitMs +
+      timing.lastTaskHiddenPauseMs + timing.lastTaskRequestMs;
+    assert(timing.wallClockMs >= explainedWallTime && timing.wallClockMs - explainedWallTime < 50,
+      'Last completed task must explain wall time within the synchronous completion overhead');
+    assert(timing.requestTotalMs > 0, 'Browser image requests must contribute measured processing time');
+    assert.strictEqual(firstScreenTiming.logged.requestMeasurement, timing.requestMeasurement,
+      'Exported timing log must preserve the request-time measurement description');
     var scrolledOrdinaryViewport = await evaluate(pageOne, `(() => {
       const thread = Object.values(window.ATPState.threads).find((item) => item.link.includes('/thread-100-1-1.html'));
       const viewport = thread && thread.panel && thread.panel.querySelector('.atp-scroll-viewport');
@@ -1429,6 +1453,13 @@ async function main() {
       syntheticPageFixtureCount: pageCases.length + 1,
       multiTab: true,
       crossTabRecoveryProbe: crossTabProbe,
+      firstScreenTiming: {
+        wallClockMs: timing.wallClockMs,
+        queueWaitTotalMs: timing.queueWaitTotalMs,
+        hiddenPauseTotalMs: timing.hiddenPauseTotalMs,
+        requestTotalMs: timing.requestTotalMs,
+        totalsBasis: timing.totalsBasis
+      },
       bfcache: {
         persisted: bfcachePersisted,
         navigationType: bfcacheState.navigationType,

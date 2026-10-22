@@ -1575,7 +1575,7 @@
 
   function isImageLog(e) {
     var type = getLogType(e);
-    if (/^(content_start|image_|render_|diagnostic_summary|schedule_state|thread_registered|scan_complete|fallback_|log_retention)/.test(type)) return true;
+    if (/^(content_start|image_|render_|first_screen_timing|diagnostic_summary|schedule_state|thread_registered|scan_complete|fallback_|log_retention)/.test(type)) return true;
     return /High fanout|Image candidate fallback|图片无Referer|首屏完成|重图/.test(String((e && e.msg) || '') + ' ' + getLogDataText(e));
   }
 

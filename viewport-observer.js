@@ -2944,6 +2944,7 @@
       function requeueHiddenPausedWrapper() {
         if (!document.contains(wrapper)) return false;
         if (ATPLoader.isTaskCurrent && !ATPLoader.isTaskCurrent(task)) return false;
+        if (ATPLoader.noteFirstScreenViewportWait) ATPLoader.noteFirstScreenViewportWait(task);
         wrapperData.loaded = false;
         wrapperData.forceLoadWhenHidden = false;
         wrapperData.forceLoadReason = '';

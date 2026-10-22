@@ -1491,6 +1491,171 @@
     return task && task.loadStartAt ? Math.max(0, Date.now() - task.loadStartAt) : undefined;
   }
 
+  // The three buckets partition each image task's lifetime. Request time is
+  // src assignment through load/error/cancel, including the browser's own
+  // network queue and decode. Parallel image totals overlap in wall time;
+  // only the last task's buckets plus its start offset explain wallClockMs.
+  function isFirstScreenHiddenPause() {
+    var settings = getCurrentSettings();
+    return document.visibilityState !== 'visible' && (!settings || settings.pauseWhenHidden !== false);
+  }
+
+  function advanceFirstScreenTaskTiming(timing, now) {
+    if (!timing || timing.settledAt !== null) return;
+    now = Math.max(timing.lastAt, now);
+    var elapsed = now - timing.lastAt;
+    if (timing.paused) timing.hiddenPauseMs += elapsed;
+    else if (timing.phase === 'request') timing.requestMs += elapsed;
+    else {
+      timing.queueWaitMs += elapsed;
+      if (timing.viewportWaiting) timing.viewportWaitMs += elapsed;
+    }
+    timing.lastAt = now;
+  }
+
+  function ensureFirstScreenTaskTiming(task, ts) {
+    if (!task || !task.isFirstScreen || task.firstScreenSettled) return null;
+    if (task.firstScreenTiming) return task.firstScreenTiming;
+    ts = ts || getThreadState(task.threadId);
+    if (!ts || ts.firstScreenDone) return null;
+    var now = Date.now();
+    var createdAt = typeof task.createdAt === 'number' && isFinite(task.createdAt)
+      ? Math.min(now, task.createdAt) : now;
+    var timing = task.firstScreenTiming = {
+      startedAt: createdAt, lastAt: createdAt, settledAt: null,
+      phase: 'queue', paused: isFirstScreenHiddenPause(), viewportWaiting: false,
+      queueWaitMs: 0, hiddenPauseMs: 0, requestMs: 0, viewportWaitMs: 0,
+      requestCount: 0, hiddenInterruptions: 0, usedViewport: false
+    };
+    var summary = ts.firstScreenTiming;
+    if (!summary) {
+      summary = ts.firstScreenTiming = {
+        startedAt: createdAt, tasks: [], settledTasks: 0,
+        queueWaitTotalMs: 0, hiddenPauseTotalMs: 0, requestTotalMs: 0,
+        viewportWaitTotalMs: 0, taskElapsedTotalMs: 0,
+        maxQueueWaitMs: 0, maxHiddenPauseMs: 0, maxRequestMs: 0,
+        requestCount: 0, hiddenInterruptions: 0, viewportParkedTasks: 0,
+        logged: false
+      };
+    }
+    summary.startedAt = Math.min(summary.startedAt, createdAt);
+    summary.tasks.push(task);
+    return timing;
+  }
+
+  function registerFirstScreenTiming(ts) {
+    if (!ts || ts.firstScreenDone) return;
+    for (var i = 0; i < (ts.firstTasks || []).length; i++) {
+      ensureFirstScreenTaskTiming(ts.firstTasks[i], ts);
+    }
+  }
+
+  function setFirstScreenTimingHiddenPause(paused) {
+    var threads = window.ATPState && window.ATPState.threads || {};
+    var now = Date.now();
+    for (var tid in threads) {
+      if (!Object.prototype.hasOwnProperty.call(threads, tid)) continue;
+      var ts = threads[tid];
+      if (!ts || ts.firstScreenDone) continue;
+      registerFirstScreenTiming(ts);
+      var tasks = ts.firstScreenTiming && ts.firstScreenTiming.tasks || [];
+      for (var i = 0; i < tasks.length; i++) {
+        var timing = tasks[i].firstScreenTiming;
+        if (!timing || timing.settledAt !== null || timing.paused === paused) continue;
+        advanceFirstScreenTaskTiming(timing, now);
+        if (paused && timing.phase === 'request') timing.hiddenInterruptions++;
+        timing.paused = paused;
+      }
+    }
+  }
+
+  function noteFirstScreenViewportWait(task) {
+    var timing = ensureFirstScreenTaskTiming(task);
+    if (!timing) return;
+    advanceFirstScreenTaskTiming(timing, Date.now());
+    timing.viewportWaiting = true;
+    timing.usedViewport = true;
+  }
+
+  function noteFirstScreenRequestStart(task) {
+    var timing = ensureFirstScreenTaskTiming(task);
+    if (!timing) return;
+    advanceFirstScreenTaskTiming(timing, Date.now());
+    timing.phase = 'request';
+    timing.viewportWaiting = false;
+    timing.requestCount++;
+  }
+
+  function noteFirstScreenRequestEnd(task) {
+    var timing = task && task.firstScreenTiming;
+    if (!timing || timing.settledAt !== null) return;
+    advanceFirstScreenTaskTiming(timing, Date.now());
+    timing.phase = 'queue';
+  }
+
+  function settleFirstScreenTaskTiming(task, ts) {
+    var timing = ensureFirstScreenTaskTiming(task, ts);
+    if (!timing || timing.settledAt !== null) return;
+    advanceFirstScreenTaskTiming(timing, Date.now());
+    timing.settledAt = timing.lastAt;
+    var summary = ts.firstScreenTiming;
+    summary.settledTasks++;
+    summary.taskElapsedTotalMs += timing.settledAt - timing.startedAt;
+    summary.queueWaitTotalMs += timing.queueWaitMs;
+    summary.hiddenPauseTotalMs += timing.hiddenPauseMs;
+    summary.requestTotalMs += timing.requestMs;
+    summary.viewportWaitTotalMs += timing.viewportWaitMs;
+    summary.maxQueueWaitMs = Math.max(summary.maxQueueWaitMs, timing.queueWaitMs);
+    summary.maxHiddenPauseMs = Math.max(summary.maxHiddenPauseMs, timing.hiddenPauseMs);
+    summary.maxRequestMs = Math.max(summary.maxRequestMs, timing.requestMs);
+    summary.requestCount += timing.requestCount;
+    summary.hiddenInterruptions += timing.hiddenInterruptions;
+    if (timing.usedViewport) summary.viewportParkedTasks++;
+    summary.lastTaskIdx = task.idx;
+    summary.lastTaskElapsedMs = timing.settledAt - timing.startedAt;
+    summary.lastTaskStartAt = timing.startedAt;
+    summary.lastTaskQueueWaitMs = timing.queueWaitMs;
+    summary.lastTaskHiddenPauseMs = timing.hiddenPauseMs;
+    summary.lastTaskRequestMs = timing.requestMs;
+  }
+
+  function logFirstScreenTiming(ts, threadId) {
+    var summary = ts && ts.firstScreenTiming;
+    if (!summary || summary.logged) return null;
+    summary.logged = true;
+    var fields = {
+      threadId: threadId, firstScreenTotal: ts.firstScreenTotal,
+      settledTasks: summary.settledTasks, ok: ts.firstScreenOk, failed: ts.firstScreenFailed,
+      wallClockMs: Math.max(0, Date.now() - summary.startedAt),
+      taskElapsedTotalMs: summary.taskElapsedTotalMs,
+      queueWaitTotalMs: summary.queueWaitTotalMs,
+      hiddenPauseTotalMs: summary.hiddenPauseTotalMs,
+      requestTotalMs: summary.requestTotalMs,
+      viewportWaitTotalMs: summary.viewportWaitTotalMs,
+      maxQueueWaitMs: summary.maxQueueWaitMs,
+      maxHiddenPauseMs: summary.maxHiddenPauseMs,
+      maxRequestMs: summary.maxRequestMs,
+      requestCount: summary.requestCount,
+      hiddenInterruptions: summary.hiddenInterruptions,
+      viewportParkedTasks: summary.viewportParkedTasks,
+      lastTaskIdx: summary.lastTaskIdx,
+      lastTaskStartOffsetMs: summary.lastTaskStartAt - summary.startedAt,
+      lastTaskElapsedMs: summary.lastTaskElapsedMs,
+      lastTaskQueueWaitMs: summary.lastTaskQueueWaitMs,
+      lastTaskHiddenPauseMs: summary.lastTaskHiddenPauseMs,
+      lastTaskRequestMs: summary.lastTaskRequestMs,
+      totalsBasis: 'parallel_task_sum',
+      queueIncludes: 'scheduler_slot_host_offscreen_and_request_dispatch_wait',
+      requestMeasurement: 'src_to_load_error_cancel_including_browser_queue_decode'
+    };
+    summary.tasks = null;
+    summary.result = fields;
+    if (isDiagnosticLoggingEnabled('INFO') && Logger.event) {
+      Logger.event('first_screen_timing', fields, 'INFO');
+    }
+    return fields;
+  }
+
   function getTaskBaseTime(task) {
     if (!task) return 0;
     return task.createdAt || task.queuedAt || task.viewportObservedAt || task.loadStartAt || 0;
@@ -1982,6 +2147,7 @@
 
   function clearTaskActiveSlotState(task) {
     if (!task) return;
+    noteFirstScreenRequestEnd(task);
     task.highFanoutSlot = false;
     task.slotActive = false;
     task.slotCounted = false;
@@ -3406,6 +3572,7 @@
 
   function syncVisibilityPauseState(settings, shouldSchedule) {
     settings = settings || (window.ATPState && window.ATPState.settings);
+    setFirstScreenTimingHiddenPause(document.visibilityState !== 'visible' && (!settings || settings.pauseWhenHidden !== false));
     if (window.ATPViewport && ATPViewport.syncLoadingAnimationVisibility) {
       ATPViewport.syncLoadingAnimationVisibility();
     }
@@ -3653,6 +3820,7 @@
   }
 
   function prepareThumbnailImage(img, task, w, h) {
+    img.__atpTimingTask = task;
     img.className = 'atp-thumbnail-img';
     img.decoding = 'async';
     img.loading = shouldLoadImageEagerly(task) ? 'eager' : 'lazy';
@@ -3695,15 +3863,22 @@
     noReferrer = !!noReferrer || shouldUseNoReferrerByDefault(src);
     if (noReferrer) {
       img.referrerPolicy = 'no-referrer';
+      noteFirstScreenRequestEnd(img.__atpTimingTask);
       img.removeAttribute('src');
       setTimeout(function() {
-        if (canApply()) img.src = src;
+        if (canApply()) {
+          noteFirstScreenRequestStart(img.__atpTimingTask);
+          img.src = src;
+        }
       }, 0);
       return;
     } else {
       img.removeAttribute('referrerpolicy');
     }
-    if (canApply()) img.src = src;
+    if (canApply()) {
+      noteFirstScreenRequestStart(img.__atpTimingTask);
+      img.src = src;
+    }
   }
 
   // The forum serves one attachment store under several rotating hosts
@@ -4217,6 +4392,8 @@
 
   var ATPLoader = {
     isPaused: function() { return GLOBAL_PAUSED; },
+    registerFirstScreenTiming: function(ts) { registerFirstScreenTiming(ts); },
+    noteFirstScreenViewportWait: function(task) { noteFirstScreenViewportWait(task); },
 
     recordDomainSuccess: function(url, task) { recordDomainSuccess(url, task); },
     recordDomainFailure: function(url, reason) { recordDomainFailure(url, reason); },
@@ -4529,6 +4706,7 @@
       }
       var useViewportLazyLoad = shouldUseViewportLazyLoad(task, settings, wrapper);
       if (useViewportLazyLoad) {
+        noteFirstScreenViewportWait(task);
         // 注册路径：此时还没有 img，可见性交给 IO 首帧回调判定，不做同步测量
         updateTaskViewportPriority(task, wrapper, task.viewportPriority === true);
         ATPViewport.observe(wrapper, task, imgData);
@@ -5133,18 +5311,22 @@
       }
 
       if (task.isFirstScreen && !task.firstScreenSettled) {
+        settleFirstScreenTaskTiming(task, ts);
         task.firstScreenSettled = true;
         if (ok) ts.firstScreenOk++;
         else ts.firstScreenFailed++;
 
         if (ts.firstScreenOk + ts.firstScreenFailed >= ts.firstScreenTotal) {
           ts.firstScreenDone = true;
+          var firstScreenTiming = logFirstScreenTiming(ts, task.threadId);
           ts.container.classList.add('atp-processed');
           if (ts.loaded > 0 || SharedUtils.hasResourcePayload(ts.resources)) {
             ATPCache.flushCacheNow(task.threadId, ts.nextIdx >= ts.candidates.length);
             Logger.info('首屏完成', '已加载' + ts.loaded + ' 失败' + ts.failedCount + '/' + ts.total +
-              ' 用时' + Math.max(0, Date.now() - (task.createdAt || Date.now())) + 'ms' +
-              (ts.firstScreenViewportParked ? ' 视口等待' : ' 直载'));
+              ' 用时' + (firstScreenTiming ? firstScreenTiming.wallClockMs : Math.max(0, Date.now() - getTaskBaseTime(task))) + 'ms' +
+              (firstScreenTiming ? ' 末张任务:排队' + firstScreenTiming.lastTaskQueueWaitMs +
+                'ms 后台暂停' + firstScreenTiming.lastTaskHiddenPauseMs +
+                'ms 请求' + firstScreenTiming.lastTaskRequestMs + 'ms' : ''));
           }
           ATPLoader.enqueueBgForThread(task.threadId);
         }
