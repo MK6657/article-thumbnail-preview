@@ -32,7 +32,7 @@ assert.strictEqual(heavyPreset.heavyFailureThreshold, sandbox.ATP_DEFAULTS.heavy
 assert(!Object.prototype.hasOwnProperty.call(heavyPreset, 'backgroundConcurrency'), 'heavy preset must not reset unrelated ordinary background settings');
 assert.strictEqual(gentleOrdinaryPreset.firstScreenConcurrency, 6, '100M ordinary preset must keep useful visible concurrency');
 assert.strictEqual(balancedOrdinaryPreset.firstScreenConcurrency, 8, '200M ordinary preset must speed up visible weak images');
-assert.strictEqual(fastOrdinaryPreset.firstScreenConcurrency, 12, 'fast ordinary preset must expose a higher visible weak-image ceiling');
+assert.strictEqual(fastOrdinaryPreset.firstScreenConcurrency, 16, 'fast ordinary preset must expose a higher visible weak-image ceiling');
 assert.strictEqual(balancedOrdinaryPreset.viewportPriorityReservedSlots, 5, '200M ordinary preset must reserve capacity for visible images');
 assert.strictEqual(fastOrdinaryPreset.ordinaryHostConcurrency, 10, 'fast ordinary preset must coordinate host concurrency with visible concurrency');
 assert.strictEqual(fastOrdinaryPreset.backgroundConcurrency, 2, 'fast ordinary preset must keep offscreen work subordinate to visible images');

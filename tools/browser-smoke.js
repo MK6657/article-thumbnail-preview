@@ -13,6 +13,7 @@ const EXTENSION_DIR = path.resolve(process.env.ATP_EXTENSION_DIR || path.join(PR
 const EXPECTED_VERSION = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, 'manifest.json'), 'utf8')).version;
 const SMOKE_HOST = 'smoke.sehuatang.org';
 const CROSS_HOST = 'other.sehuatang.org';
+const SIGNED_RELAY_HOST = 'xia.djhdhs.us';
 const PACER_HOST = 'pacer.sehuatang.org';
 const HEAVY_HOST = 'image.imx.to';
 const HOT_IMAGE_HOST = 'hot.sehuatang.org';
@@ -139,6 +140,10 @@ function forumPage(port, mode) {
       'ATP offscreen forum');
   } else if (mode === 'host-limit') {
     rows = '<tbody id="normalthread_402"><tr><th><a class="xst" href="https://' + SMOKE_HOST + ':' + port + '/thread-402-1-1.html">Host limit gallery</a></th></tr></tbody>';
+  } else if (mode === 'ready-queue') {
+    rows = '<tbody id="normalthread_404"><tr><th><a class="xst" href="/thread-404-1-1.html">Ready queue gallery</a></th></tr></tbody>';
+  } else if (mode === 'txt-retry') {
+    rows = '<tbody id="normalthread_403"><tr><th><a class="xst" href="/thread-403-1-1.html">TXT retry fixture</a></th></tr></tbody>';
   } else if (mode === 'mirror') {
     // One thread on the mirror itself and one on the built-in forum; a mirror
     // page must never have the built-in thread fetched with that session.
@@ -242,6 +247,60 @@ function createFixtureServer(pfxPath) {
       return;
     }
 
+    if (pathname === '/signed-relay-entry.txt') {
+      res.writeHead(302, { 'cache-control': 'no-store', location: 'https://' + SIGNED_RELAY_HOST + ':' +
+        server.address().port + '/download?sig=c%2Bd&part=2' });
+      res.end();
+      return;
+    }
+    if (host === SIGNED_RELAY_HOST && pathname === '/download') {
+      if (requestUrl.searchParams.get('sig') !== 'c+d' || requestUrl.searchParams.get('part') !== '2') {
+        res.writeHead(400);
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('https://pan.baidu.com/s/1AtpSignedRelay\n提取碼：jk34');
+      return;
+    }
+
+    if (pathname === '/one-use-attachment.txt') {
+      if (metrics.requestsByPath[pathname] > 1) {
+        res.writeHead(403);
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(htmlPage('<a href="https://' + CROSS_HOST + ':' + server.address().port +
+        '/one-use-download.txt?sig=a%2Bb&amp;part=1">Download</a>', 'One-use intermediary'));
+      return;
+    }
+    if (pathname === '/one-use-download.txt') {
+      if (requestUrl.searchParams.get('sig') !== 'a+b' || requestUrl.searchParams.get('part') !== '1') {
+        res.writeHead(400);
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('https://pan.baidu.com/s/1AtpOneUse\n提取码：rt12');
+      return;
+    }
+    if (pathname === '/retry-txt-fixture.txt') {
+      if (metrics.requestsByPath[pathname] === 1) {
+        res.writeHead(403);
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('https://pan.baidu.com/s/1AtpManualRetry\n提取码：mr12');
+      return;
+    }
+    if (pathname === '/thread-403-1-1.html') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(htmlPage('<p><a href="/retry-txt-fixture.txt">retry-txt-fixture.txt</a></p>', 'TXT retry fixture'));
+      return;
+    }
+
     if (pathname === '/forum.php' && requestUrl.searchParams.get('mod') === 'attachment') {
       res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
       res.end('ed2k://|file|www.98T.la@妃妃宝贝.zip|2945409455|43B5B13B95A9187A3BF041CC0A94FFC2|/');
@@ -289,6 +348,12 @@ function createFixtureServer(pfxPath) {
       res.end(htmlPage('<h1>Host limit gallery</h1>' + imageMarkup(HOT_IMAGE_HOST, server.address().port, 'host-limit', 14), 'Host limit thread'));
       return;
     }
+    if (pathname === '/thread-404-1-1.html') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(htmlPage('<div id="postmessage_1"><img src="/img/ready-hang.gif">' +
+        imageMarkup(SMOKE_HOST, server.address().port, 'ready-queue', 5) + '</div>', 'Ready queue thread'));
+      return;
+    }
     if (pathname === '/other.html') {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       res.end(htmlPage('<h1>BFCache destination</h1>', 'BFCache destination'));
@@ -326,6 +391,10 @@ function createFixtureServer(pfxPath) {
         metrics.activeImages = Math.max(0, metrics.activeImages - 1);
       }
       res.on('close', settleImage);
+      if (pathname === '/img/ready-hang.gif') {
+        res.once('close', function() { metrics.readyHangClosed = (metrics.readyHangClosed || 0) + 1; });
+        return;
+      }
       setTimeout(function() {
         if (!res.destroyed) {
           res.writeHead(200, { 'content-type': 'image/png', 'content-length': pixel.length });
@@ -900,7 +969,8 @@ async function main() {
       fixture.server.listen(0, '127.0.0.1', resolve);
     });
     var fixturePort = fixture.server.address().port;
-    browser = spawnSmokeBrowser(browserPath, profileDir, EXTENSION_DIR, [SMOKE_HOST, CROSS_HOST, PACER_HOST, HOT_IMAGE_HOST, HEAVY_HOST]);
+    browser = spawnSmokeBrowser(browserPath, profileDir, EXTENSION_DIR,
+      [SMOKE_HOST, CROSS_HOST, PACER_HOST, HOT_IMAGE_HOST, HEAVY_HOST, SIGNED_RELAY_HOST]);
     var devtoolsPort = await waitForDevtoolsPort(profileDir, browser);
 
     var versionInfo = await fetchJson('http://127.0.0.1:' + devtoolsPort + '/json/version');
@@ -1038,13 +1108,14 @@ async function main() {
       return true;
     })()`, pageOneContext.id);
     assert(scrolledOrdinaryViewport, 'Ordinary thumbnail viewport was not available for background progression');
-    var ordinaryBackgroundProgress = await waitFor('ordinary background loading beyond the first screen', async function() {
+    var ordinaryBackgroundProgress = await waitFor('one additional row after scrolling inside the gallery', async function() {
       var progress = await evaluate(pageOne, `(() => {
         const thread = Object.values(window.ATPState.threads).find((item) => item.link.includes('/thread-100-1-1.html'));
-        return thread ? { firstScreenTotal: thread.firstScreenTotal, sourceCandidates: thread.sourceCandidates.length, loaded: thread.loaded } : null;
+        return thread ? { firstScreenTotal: thread.firstScreenTotal, nextIdx: thread.nextIdx, loaded: thread.loaded } : null;
       })()`, pageOneContext.id);
-      return progress && progress.loaded >= Math.min(progress.sourceCandidates, progress.firstScreenTotal + 10) ? progress : null;
+      return progress && progress.loaded >= 15 ? progress : null;
     });
+    assert.strictEqual(ordinaryBackgroundProgress.nextIdx, 15, 'a single inner scroll must request just one extra row');
 
     var initialThreads = await evaluate(pageOne, `(() => Object.values(window.ATPState.threads).map((thread) => ({
       link: thread.link,
@@ -1155,6 +1226,56 @@ async function main() {
     assert.strictEqual(crossRedirect.ok, false, 'Page bridge must reject a cross-origin redirect');
     assert.strictEqual(fixture.metrics.requestsByPath['/bridge-target.txt'] || 0, targetsBeforeCrossRedirect,
       'Cross-origin redirect destination must not receive a network request');
+
+    var oneUseAttachment = await evaluate(pageOne, `ATPFetcher.fetchTextAttachmentResourcesWithStatus([
+      { url: location.origin + '/one-use-attachment.txt', name: 'one-use.txt' }
+    ], { manualRetry: true })`, pageOneContext.id);
+    assert.strictEqual(oneUseAttachment.unresolvedCount, 0, 'TXT relay must use the target from the first response');
+    assert.strictEqual(oneUseAttachment.resources.groups.baidu[0].code, 'rt12');
+    assert.strictEqual(fixture.metrics.requestsByPath['/one-use-attachment.txt'], 1, 'one-use entry must only be read once');
+    assert.strictEqual(fixture.metrics.requestsByPath['/one-use-download.txt'], 1, 'worker must fetch the signed target once');
+
+    var signedRelay = await evaluate(pageOne, `ATPFetcher.fetchTextAttachmentResourcesWithStatus([
+      { url: location.origin + '/signed-relay-entry.txt', name: 'signed-relay.txt' }
+    ], { manualRetry: true })`, pageOneContext.id);
+    assert.strictEqual(signedRelay.unresolvedCount, 0, 'The worker must follow the forum redirect to its signed TXT relay');
+    assert.strictEqual(signedRelay.resources.groups.baidu[0].code, 'jk34');
+    assert.strictEqual(fixture.metrics.requestsByPath['/signed-relay-entry.txt'], 2, 'The page bridge must hand off directly to the worker');
+    assert.strictEqual(fixture.metrics.requestsByHost[SIGNED_RELAY_HOST], 1, 'Only the worker should fetch the relay once');
+
+    var retryPage = await createPageSession(devtoolsPort);
+    sessions.push(retryPage);
+    await navigate(retryPage, 'https://' + SMOKE_HOST + ':' + fixturePort + '/forum.php?mod=forumdisplay&fid=95&mode=txt-retry');
+    var retryContext = await waitForExtensionContext(retryPage, extensionId);
+    var retryThreadExpression = "Object.values(window.ATPState.threads).find(item => item.link.includes('/thread-403-1-1.html'))";
+    var retryStatus = await waitFor('TXT failure becomes actionable', function() {
+      return evaluate(retryPage, `(() => {
+        const thread = ${retryThreadExpression};
+        return thread && thread.textResourcesRetryable && thread.statusEl.textContent;
+      })()`, retryContext.id);
+    });
+    assert.strictEqual(retryStatus, 'TXT 待重试');
+    assert(await evaluate(retryPage, `(() => {
+      const thread = ${retryThreadExpression};
+      thread.panel.querySelector('[data-resource-trigger]').click();
+      const action = Array.from(document.querySelectorAll('[data-parse-txt]')).find(button =>
+        button.getAttribute('aria-label') === '重试本帖 TXT');
+      if (!action) return false;
+      action.click();
+      return true;
+    })()`, retryContext.id), 'the per-thread retry action must be available after the automatic request fails');
+    await waitFor('manual TXT retry succeeds', function() {
+      return evaluate(retryPage, `(() => {
+        const thread = ${retryThreadExpression};
+        return thread && thread.textResourcesDone && !thread.textResourcesRetryable &&
+          thread.resources.groups.baidu[0]?.code === 'mr12';
+      })()`, retryContext.id);
+    });
+    assert.strictEqual(fixture.metrics.requestsByPath['/retry-txt-fixture.txt'], 2, 'manual retry should make one new attachment request');
+    retryPage.cdp.close();
+    await closeTarget(devtoolsPort, retryPage.target.id);
+    sessions.splice(sessions.indexOf(retryPage), 1);
+    await pageOne.cdp.send('Page.bringToFront');
 
     var openedResourcePanel = await evaluate(pageOne, `(() => {
       const thread = Object.values(window.ATPState.threads).find((item) => item.link.includes('/thread-200-1-1.html'));
@@ -1392,7 +1513,93 @@ async function main() {
     })`);
     var bfcachePersisted = bfcacheState.pageShows.indexOf(true) !== -1;
 
-    var pageErrors = [summarizeErrors(pageOne), summarizeErrors(pageTwo), summarizeErrors(offscreenPage), summarizeErrors(hostLimitPage), summarizeErrors(popup)];
+    var readyWorkerTarget = await findExtensionWorkerTarget(devtoolsPort, packagedManifest);
+    var readyWorker = await new CdpConnection(readyWorkerTarget.webSocketDebuggerUrl).connect();
+    try {
+      await readyWorker.send('Runtime.evaluate', {
+        expression: 'chrome.storage.local.set({settings:{autoLoadOffscreenFirstRowsEnabled:false,' +
+          'gridCols:2,visibleRows:1,firstScreenConcurrency:2,ordinaryHostConcurrency:2,globalImageConcurrency:3,' +
+          'imageTimeout:1400,animatedThumbnailMode:"play",maxRetryPerImage:0}})',
+        awaitPromise: true
+      });
+    } finally {
+      readyWorker.close();
+    }
+    var readyPage = await createPageSession(devtoolsPort);
+    sessions.push(readyPage);
+    await navigate(readyPage, 'https://' + SMOKE_HOST + ':' + fixturePort + '/forum.php?mode=ready-queue');
+    var readyContext = await waitForExtensionContext(readyPage, extensionId);
+    var readyDefault = await waitFor('first healthy image in the collapsed gallery', async function() {
+      return evaluate(readyPage, `(() => {
+        const thread = Object.values(ATPState.threads).find(item => item.link.includes('/thread-404-1-1.html'));
+        if (!thread || thread.loaded < 1) return null;
+        return { nextIdx: thread.nextIdx,
+          expanded: thread.panel.querySelector('.atp-thumbnail-expand').getAttribute('aria-expanded') };
+      })()`, readyContext.id);
+    }, 6000, 25);
+    assert.deepStrictEqual(readyDefault, { nextIdx: 2, expanded: 'false' },
+      'the collapsed gallery must load only the configured rows until the reader acts');
+    assert(!fixture.metrics.requestsByPath['/img/ready-queue-1.jpg'], 'the next row must make no request before scrolling');
+    assert(await evaluate(readyPage, `(() => {
+      const viewport = document.querySelector('.atp-scroll-viewport');
+      viewport.scrollTop = viewport.scrollHeight;
+      viewport.dispatchEvent(new Event('scroll'));
+      return viewport.scrollTop > 0;
+    })()`, readyContext.id), 'the reserved row must make the gallery scrollable');
+    var readyBeforeDeadline = await waitFor('later image rendered before the stuck first image settles', async function() {
+      return evaluate(readyPage, `(() => {
+        const thread = Object.values(ATPState.threads).find(item => item.link.includes('/thread-404-1-1.html'));
+        if (!thread || thread.firstScreenDone || thread.failedCount) return null;
+        const image = thread.grid.querySelector('img[src*="/img/ready-queue-1.jpg"]');
+        if (!image || !image.complete || !image.naturalWidth) return null;
+        const viewport = thread.panel.querySelector('.atp-scroll-viewport');
+        if (viewport.style.maxHeight === 'none') return null;
+        return { firstBatch: thread.firstScreenTotal, readyImageLoaded: thread.loaded,
+          row: image.parentElement.style.gridRowStart, column: image.parentElement.style.gridColumnStart };
+      })()`, readyContext.id);
+    }, 6000, 25);
+    assert(readyBeforeDeadline.firstBatch === 2 && readyBeforeDeadline.row === '2' && readyBeforeDeadline.column === '1',
+      'ready queue should show the second row in post order before first-row settlement');
+    var readyAfterDeadline = await waitFor('stuck request cancelled and gallery settled', async function() {
+      if (!fixture.metrics.readyHangClosed) return null;
+      return evaluate(readyPage, `(() => {
+        const thread = Object.values(ATPState.threads).find(item => item.link.includes('/thread-404-1-1.html'));
+        if (!thread || thread.loaded !== 3 || thread.failedCount !== 1) return null;
+        return { loaded: thread.loaded, failed: thread.failedCount,
+          placeholders: thread.grid.querySelectorAll('.atp-thumbnail-failed').length };
+      })()`, readyContext.id);
+    }, 7000, 25);
+    assert.strictEqual(readyAfterDeadline.placeholders, 1, 'terminal failure must leave one manually retryable cell');
+    assert.strictEqual(fixture.metrics.requestsByPath['/img/ready-hang.gif'], 1, 'timeout must release the request without retrying in place');
+    assert(!fixture.metrics.requestsByPath['/img/ready-queue-3.jpg'], 'a single inner scroll must leave further rows out of the queue');
+    await evaluate(readyPage, `(() => {
+      const failed = document.querySelector('.atp-thumbnail-failed');
+      failed.click();
+      failed.click();
+      document.querySelector('.atp-thumbnail-expand').click();
+    })()`, readyContext.id);
+    await waitFor('remaining rows after explicit expansion', async function() {
+      return evaluate(readyPage, `(() => {
+        const thread = Object.values(ATPState.threads).find(item => item.link.includes('/thread-404-1-1.html'));
+        return thread && thread.loaded === 5 && thread.failedCount === 1 &&
+          thread.panel.querySelector('.atp-thumbnail-expand').getAttribute('aria-expanded') === 'true';
+      })()`, readyContext.id);
+    });
+    await waitFor('manual retry deadline cancels the request', async function() {
+      return fixture.metrics.readyHangClosed === 2 && evaluate(readyPage, `(() => {
+        const thread = Object.values(ATPState.threads).find(item => item.link.includes('/thread-404-1-1.html'));
+        return !!thread.grid.querySelector('.atp-thumbnail-failed') && !thread.grid.querySelector('.atp-thumbnail-loading');
+      })()`, readyContext.id);
+    }, 6000, 25);
+    assert.strictEqual(fixture.metrics.requestsByPath['/img/ready-hang.gif'], 2,
+      'repeated manual activation must send one retry and leave the terminal failure retryable');
+    assert.strictEqual(await evaluate(readyPage, `(() => {
+      const button = document.querySelector('.atp-thumbnail-expand');
+      button.click();
+      return button.getAttribute('aria-expanded');
+    })()`), 'false', 'manual expansion must allow the reader to collapse the gallery');
+
+    var pageErrors = [pageOne, pageTwo, offscreenPage, hostLimitPage, readyPage, popup].map(summarizeErrors);
     var allExceptions = [].concat.apply([], pageErrors.map(function(item) { return item.exceptions; }));
     var extensionConsoleErrors = [].concat.apply([], pageErrors.map(function(item) { return item.consoleErrors; }))
       .filter(function(text) { return /chrome-extension|ATP|bfp|Uncaught|TypeError|ReferenceError/i.test(text); });
@@ -1447,6 +1654,11 @@ async function main() {
       popupBackgroundMessage: true,
       markExportAndBackup: true,
       pageBridgeRedirectBoundary: true,
+      oneUseTxtRelay: true,
+      signedRelayRedirect: true,
+      readyImageQueue: { initial: readyDefault, beforeDeadline: readyBeforeDeadline, afterDeadline: readyAfterDeadline,
+        cancelledRequests: fixture.metrics.readyHangClosed },
+      manualTxtRetry: true,
       signedImageUrlParity: true,
       nativePopupStableWidth: 320,
       admittedOffscreenRequest: true,

@@ -145,7 +145,7 @@ function createRun(options = {}) {
     return state;
   }
   function resources(number) { return sandbox.SharedUtils.extractResources(magnet(number), origin, 'txt'); }
-  function respond(request, body) {
+  function respond(request, body, bridgeError) {
     assert(!request.settled, 'each fake response must settle only once');
     request.settled = true;
     const fresh = /\/thread-/.test(request.url);
@@ -155,8 +155,8 @@ function createRun(options = {}) {
     if (request.kind === 'bridge') {
       for (const listener of Array.from(listeners)) listener({
         source: contextWindow, origin,
-        data: { type: 'ATP_PAGE_TEXT_FETCH_RESPONSE_V1', id: request.message.id, ok: true,
-          status: 200, finalUrl: request.url, contentType: 'text/plain; charset=utf-8',
+        data: { type: 'ATP_PAGE_TEXT_FETCH_RESPONSE_V1', id: request.message.id, ok: !bridgeError,
+          error: bridgeError, status: bridgeError ? 0 : 200, finalUrl: request.url, contentType: 'text/plain; charset=utf-8',
           base64: Buffer.from(body).toString('base64') }
       });
     } else if (request.kind === 'fetch') {
@@ -221,6 +221,51 @@ async function checkWaitingPriorityAndResume() {
   await run.drain();
   assert([a, b, visible].every(state => state.textResourcesDone), 'yielded runs must resume and finish automatically');
   assert.strictEqual(run.requests.length, 3, 'yielding must not duplicate a request');
+  assertNoFailure(run);
+}
+
+async function checkVisibleWorkerFallback() {
+  const run = createRun();
+  const pacer = run.sandbox.ATPForumPacer;
+  const thread = run.thread('fallback', { visible: true });
+  run.queue(thread); await run.flush();
+  assert.strictEqual(run.waiters[0].options.getPriority(), pacer.PRIORITY_ARTICLE,
+    'a fresh TXT read must keep the article reserve intact');
+  await run.grantNext();
+  assert.strictEqual(run.requests[0].kind, 'bridge');
+
+  const prefetch = pacer.acquire({ priority: pacer.PRIORITY_ARTICLE });
+  const visibleArticle = pacer.acquire({ priority: pacer.PRIORITY_VISIBLE });
+  run.respond(run.requests[0], null, 'TypeError'); await run.flush();
+  assert.strictEqual(run.requests.length, 1, 'the worker must wait for its own allowance');
+  assert.strictEqual(run.waiters.length, 3);
+  const fallback = run.waiters[2];
+  assert.strictEqual(fallback.options.cost, 1);
+  assert.strictEqual(fallback.options.getPriority(), pacer.PRIORITY_VISIBLE,
+    'a visible transport fallback must be eligible for the next visible token');
+  thread.visible = false;
+  assert(fallback.options.getPriority() > pacer.PRIORITY_ARTICLE, 'a scrolled-away fallback must give up visible priority');
+  thread.visible = true;
+  run.sandbox.document.visibilityState = 'hidden';
+  assert(fallback.options.getPriority() > pacer.PRIORITY_ARTICLE, 'a hidden tab must give up visible priority');
+  run.sandbox.document.visibilityState = 'visible';
+  assert(run.events.some(event => event.name === 'txt_request' &&
+    event.fields.stage === 'background_pace' && event.fields.outcome === 'queued'),
+    'log exports during the wait must identify the worker pace queue');
+
+  await run.grantNext();
+  assert.strictEqual(run.requests.length, 1, 'an earlier visible article must keep its place');
+  (await visibleArticle).done('');
+  await run.grantNext();
+  assert.strictEqual(run.requests[1].kind, 'background', 'visible fallback must precede offscreen prefetch');
+  assert.strictEqual(run.requests[1].url, run.requests[0].url);
+  run.respond(run.requests[1]); await run.flush();
+  await run.grantNext();
+  (await prefetch).done('');
+  await run.drain();
+  assert.strictEqual(run.count(thread), 1);
+  assert.strictEqual(thread.textResourcesDone, true);
+  assert.strictEqual(run.requests.length, 2, 'the failed bridge must hand off once without a redundant direct request');
   assertNoFailure(run);
 }
 
@@ -346,6 +391,7 @@ async function checkLateCallbackKeepsRequeuedWork() {
 
 async function main() {
   await checkWaitingPriorityAndResume();
+  await checkVisibleWorkerFallback();
   await checkInflightSlots();
   await checkPartialResourceRetention();
   await checkFreshExtractionYield();

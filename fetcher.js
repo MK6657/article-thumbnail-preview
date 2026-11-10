@@ -43,7 +43,7 @@
       fields.runId = attachment.diagnosticRunId;
     }
     details = details || {};
-    ['status', 'resources', 'elapsedMs', 'depth'].forEach(function(key) {
+    ['status', 'resources', 'elapsedMs', 'depth', 'paceWaitMs'].forEach(function(key) {
       if (Number.isFinite(details[key])) fields[key] = Math.max(0, Math.min(100000000, Math.round(details[key])));
     });
     try {
@@ -295,12 +295,12 @@
 
   // Automatic TXT work never waits past its deadline (it then shows the
   // manual retry); a user's click goes out at once.
-  function getTextPaceOptions(options, cost) {
+  function getTextPaceOptions(options, cost, stage) {
     options = options || {};
     return {
       manual: !!(options.manualRetry || options.force),
       priority: getForumPriority('PRIORITY_ARTICLE'),
-      getPriority: typeof options.getPriority === 'function' ? options.getPriority : null,
+      getPriority: typeof options.getPriority === 'function' ? function() { return options.getPriority(stage); } : null,
       isCancelled: function() { return shouldYieldTextRequest(options); },
       deadline: options.deadline || 0,
       cost: cost || 1
@@ -454,7 +454,8 @@
       // cross-origin redirects (which the worker can follow) fall back.
       var httpStatus = response ? Number(response.status) || 0 : 0;
       if (httpStatus === 429 || httpStatus === 503) report.outcome = 'flood';
-      if (httpStatus >= 400 || (response && response.error === 'response_too_large')) {
+      var error = response && response.error;
+      if (httpStatus >= 400 || error === 'response_too_large' || error === 'timeout') {
         logTextDiagnostic(attachment, 'page_bridge', 'failed', textFailureClass(response && response.error, httpStatus), deadline,
           { status: httpStatus, elapsedMs: Date.now() - startedAt });
         return { handled: true, resources: SharedUtils.emptyResources(), finalFailure: true };
@@ -487,15 +488,22 @@
       return { handled: true, resources: SharedUtils.emptyResources(), finalFailure: true };
     }
     report.outcome = 'ok';
-    if (htmlLike || SharedUtils.looksLikeDownloadIntermediary(text)) {
+    var downloadUrls = htmlLike || SharedUtils.looksLikeDownloadIntermediary(text)
+      ? SharedUtils.extractTextDownloadUrls(text, finalUrl, TEXT_ATTACHMENT_MAX_COUNT)
+      : [];
+    if (htmlLike) {
       logTextDiagnostic(attachment, 'page_bridge', 'fallback', 'download_intermediary', deadline);
-      return { handled: false, resources: SharedUtils.emptyResources() };
+      return { handled: false, resources: SharedUtils.emptyResources(), downloadUrls: downloadUrls, finalUrl: finalUrl, skipDirect: true };
     }
     if (!text || SharedUtils.isUnavailableTextDocument(text)) {
       logTextDiagnostic(attachment, 'page_bridge', 'empty', 'unavailable_document', deadline);
-      return { handled: true, resources: SharedUtils.emptyResources() };
+      return { handled: true, resources: SharedUtils.emptyResources(), finalFailure: true };
     }
     var resources = SharedUtils.normalizeResources(SharedUtils.extractResources(text, finalUrl, 'txt'));
+    if (downloadUrls.length) {
+      logTextDiagnostic(attachment, 'page_bridge', 'fallback', 'download_intermediary', deadline);
+      return { handled: false, resources: resources, downloadUrls: downloadUrls, finalUrl: finalUrl };
+    }
     if (hasResourcePayload(resources)) {
       ATPCache.setCachedTextResources(attachment.url, resources, writeStartedAt);
       ATPCache.clearTextFailCache(attachment.url);
@@ -503,7 +511,36 @@
     logTextDiagnostic(attachment, 'page_bridge', hasResourcePayload(resources) ? 'success' : 'empty',
       hasResourcePayload(resources) ? '' : 'no_resource_links', deadline,
       { resources: SharedUtils.countResources(resources), elapsedMs: Date.now() - startedAt });
-    return { handled: true, resources: resources };
+    return { handled: true, resources: resources, finalFailure: !hasResourcePayload(resources) };
+  }
+
+  async function followTextDownloadUrls(attachment, finalUrl, downloadUrls, depth, hardFailSet, options) {
+    var ancestors = (options._textDownloadAncestors || []).concat(attachment.url, finalUrl);
+    var nextOptions = Object.assign({}, options, { _textDownloadAncestors: ancestors });
+    for (var d = 0; d < downloadUrls.length; d++) {
+      if (shouldYieldTextRequest(options)) return yieldedTextResources();
+      if (isTextResourceDeadlineExhausted(options.deadline)) break;
+      var url = downloadUrls[d];
+      if (ancestors.indexOf(url) !== -1 || !isAllowedTextAttachmentFinalUrl(url)) continue;
+      var nextAttachment = {
+        url: url,
+        name: attachment.name,
+        source: 'txt-download-url',
+        pageUrl: attachment.pageUrl || finalUrl,
+        diagnosticId: attachment.diagnosticId,
+        diagnosticThreadId: attachment.diagnosticThreadId,
+        diagnosticRunId: attachment.diagnosticRunId
+      };
+      var resources = null;
+      if (isSameOriginUrl(url)) {
+        resources = await ATPFetcher.fetchTextAttachmentResource(nextAttachment, depth + 1, hardFailSet, nextOptions);
+        if ((resources && resources.yielded) || hasResourcePayload(resources)) return resources;
+        if (hardFailSet[url]) continue;
+      }
+      resources = await ATPFetcher.fetchTextAttachmentResourcesByBackground([nextAttachment], nextOptions, 'background_fallback');
+      if ((resources && resources.yielded) || hasResourcePayload(resources)) return resources;
+    }
+    return SharedUtils.emptyResources();
   }
 
   function logUrl(url) {
@@ -560,39 +597,25 @@
       }
 
       var results = [];
-      var backgroundFallbackAttempted = false;
-
-      if (same.length) {
-        var directResults = [];
-        for (var dp = 0; dp < same.length; dp++) {
-          directResults.push(await ATPFetcher.fetchTextAttachmentResource(same[dp], 0, hardFailSet, options));
-          if (options._textRequestControl.yielded) break;
-        }
-        var sameMerged = SharedUtils.emptyResources();
-        var hardFailsInSame = 0;
-        var sameFallback = [];
-        for (var s = 0; s < same.length; s++) {
-          if (hasResourcePayload(directResults[s])) {
-            sameMerged = SharedUtils.mergeResources(sameMerged, directResults[s]);
-          } else if (hardFailSet[same[s].url]) {
-            hardFailsInSame++;
-            unresolvedCount++;
-            retryableCount++;
-          } else {
-            sameFallback.push(same[s]);
-          }
-        }
-        if (hasResourcePayload(sameMerged)) {
-          results.push(sameMerged);
-        }
-        if (sameFallback.length) {
-          backgroundFallbackAttempted = true;
-          var bgFallback = await ATPFetcher.fetchTextAttachmentResourcesByBackgroundWithStatus(sameFallback, options);
+      // Finish each attachment's handoff while it still has time on the shared deadline.
+      for (var s = 0; s < same.length; s++) {
+        var current = same[s];
+        var direct = await ATPFetcher.fetchTextAttachmentResource(current, 0, hardFailSet, options);
+        if (hasResourcePayload(direct)) {
+          results.push(direct);
+        } else if (hardFailSet[current.url] || options._textRequestControl.yielded) {
+          unresolvedCount++;
+          retryableCount++;
+        } else {
+          var bgFallback = await ATPFetcher.fetchTextAttachmentResourcesByBackgroundWithStatus([current], options, 'background_fallback');
           unresolvedCount += bgFallback.unresolvedCount;
           retryableCount += bgFallback.retryableCount;
           if (hasResourcePayload(bgFallback.resources)) results.push(bgFallback.resources);
-        } else if (!hasResourcePayload(sameMerged) && hardFailsInSame) {
-          Logger.debug('TXT附件同源全部硬失败，跳过后台回退', same.length + '个');
+        }
+        if (options._textRequestControl.yielded) {
+          unresolvedCount += same.length - s - 1;
+          retryableCount += same.length - s - 1;
+          break;
         }
       }
 
@@ -629,24 +652,10 @@
           }
         }
         if (crossFiltered.length) {
-          backgroundFallbackAttempted = true;
           var bgCross = await ATPFetcher.fetchTextAttachmentResourcesByBackgroundWithStatus(crossFiltered, options);
           unresolvedCount += bgCross.unresolvedCount;
           retryableCount += bgCross.retryableCount;
           if (hasResourcePayload(bgCross.resources)) results.push(bgCross.resources);
-        }
-      }
-
-      if (!results.length && !backgroundFallbackAttempted) {
-        var remainingAll = [];
-        for (var ra = 0; ra < attachments.length; ra++) {
-          if (!hardFailSet[attachments[ra].url]) remainingAll.push(attachments[ra]);
-        }
-        if (remainingAll.length) {
-          var bgAll = await ATPFetcher.fetchTextAttachmentResourcesByBackgroundWithStatus(remainingAll, options);
-          unresolvedCount += bgAll.unresolvedCount;
-          retryableCount += bgAll.retryableCount;
-          if (hasResourcePayload(bgAll.resources)) results.push(bgAll.resources);
         }
       }
 
@@ -664,14 +673,14 @@
         options._textRequestControl.yielded);
     },
 
-    fetchTextAttachmentResourcesByBackground: function(attachments, options) {
-      return ATPFetcher.fetchTextAttachmentResourcesByBackgroundWithStatus(attachments, options).then(function(status) {
+    fetchTextAttachmentResourcesByBackground: function(attachments, options, stage) {
+      return ATPFetcher.fetchTextAttachmentResourcesByBackgroundWithStatus(attachments, options, stage).then(function(status) {
         if (status.yielded) status.resources.yielded = true;
         return status.resources;
       });
     },
 
-    fetchTextAttachmentResourcesByBackgroundWithStatus: async function(attachments, options) {
+    fetchTextAttachmentResourcesByBackgroundWithStatus: async function(attachments, options, stage) {
       options = withTextRequestControl(options);
       attachments = (attachments || []).map(function(attachment) { return withTextDiagnosticId(attachment, options); });
       var deadline = getTextResourceDeadline(options, attachments.length);
@@ -686,8 +695,11 @@
       for (var fi = 0; fi < attachments.length; fi++) {
         if (attachments[fi] && SharedUtils.getForumUrlZone(attachments[fi].url)) forumCount++;
       }
+      if (forumCount && !options.manualRetry && !options.force) {
+        attachments.forEach(function(attachment) { logTextDiagnostic(attachment, 'background_pace', 'queued', '', deadline); });
+      }
       var ticket = forumCount
-        ? await acquireForumTurn(getTextPaceOptions(withTextResourceDeadline(options, deadline), forumCount))
+        ? await acquireForumTurn(getTextPaceOptions(withTextResourceDeadline(options, deadline), forumCount, stage))
         : UNPACED_TICKET;
       if (shouldYieldTextRequest(options)) {
         if (ticket) ticket.done('unused');
@@ -699,7 +711,7 @@
         return makeTextResourceFetchStatus(SharedUtils.emptyResources(), attachments.length, attachments.length, attachments.length);
       }
       try {
-        var status = await ATPFetcher._requestTextResourcesFromBackground(attachments, options, deadline);
+        var status = await ATPFetcher._requestTextResourcesFromBackground(attachments, options, deadline, forumCount ? ticket.waitMs : undefined);
         if (status.yielded) ticket.done('unused');
         return status;
       } finally {
@@ -707,7 +719,7 @@
       }
     },
 
-    _requestTextResourcesFromBackground: function(attachments, options, deadline) {
+    _requestTextResourcesFromBackground: function(attachments, options, deadline, paceWaitMs) {
       var manualRetry = !!(options.manualRetry || options.force);
       return new Promise(function(resolve) {
         if (shouldYieldTextRequest(options)) {
@@ -725,7 +737,9 @@
           }
         }, timeoutMs);
         try {
-          attachments.forEach(function(attachment) { logTextDiagnostic(attachment, 'background_dispatch', 'sent', '', deadline); });
+          attachments.forEach(function(attachment) {
+            logTextDiagnostic(attachment, 'background_dispatch', 'sent', '', deadline, { paceWaitMs: paceWaitMs });
+          });
           chrome.runtime.sendMessage({
             type: SharedUtils.MESSAGE_TYPES.FETCH_TEXT_RESOURCES,
             attachments: attachments,
@@ -764,6 +778,7 @@
 
     fetchTextAttachmentResource: async function(attachment, depth, hardFailSet, options) {
       options = withTextRequestControl(options);
+      hardFailSet = hardFailSet || {};
       attachment = withTextDiagnosticId(attachment, options);
       var writeStartedAt = Date.now();
       var manualRetry = !!(options.manualRetry || options.force);
@@ -806,6 +821,20 @@
           if (pageResult.handled) {
             if (pageResult.finalFailure && hardFailSet) hardFailSet[attachment.url] = true;
             return pageResult.resources;
+          }
+          if (pageResult.downloadUrls && pageResult.downloadUrls.length) {
+            var followed = depth < 2
+              ? await followTextDownloadUrls(attachment, pageResult.finalUrl, pageResult.downloadUrls, depth, hardFailSet, options)
+              : SharedUtils.emptyResources();
+            if (followed.yielded) return hasResourcePayload(pageResult.resources) ? pageResult.resources : followed;
+            var pageResources = hasResourcePayload(followed) ? followed : pageResult.resources;
+            if (hasResourcePayload(pageResources)) {
+              ATPCache.setCachedTextResources(attachment.url, pageResources, writeStartedAt);
+              ATPCache.clearTextFailCache(attachment.url);
+            } else {
+              hardFailSet[attachment.url] = true;
+            }
+            return pageResources;
           }
           if (pageResult.skipDirect) return SharedUtils.emptyResources();
           fetchTimeout = getTextAttachmentFetchTimeout(options.deadline);
@@ -852,6 +881,7 @@
             credentials: 'include',
             headers: { 'Accept': 'text/plain, application/octet-stream;q=0.9, */*;q=0.5' }
           };
+          if (isSameOriginUrl(attachment.url)) fetchOptions.mode = 'same-origin';
           var referrer = getSafeAttachmentReferrer(attachment);
           if (referrer) {
             fetchOptions.referrer = referrer;
@@ -931,42 +961,22 @@
           if (report.ticket) report.ticket.done(report.outcome, report.retryAfter);
           var downloadLike = SharedUtils.looksLikeDownloadIntermediary(text);
           if ((htmlLike || downloadLike) && depth < 2) {
-            var downloadUrls = SharedUtils.extractTextDownloadUrls(text, resp.url || attachment.url, TEXT_ATTACHMENT_MAX_COUNT);
-            for (var d = 0; d < downloadUrls.length; d++) {
-              if (downloadUrls[d] === attachment.url) continue;
-              var nextAttachment = {
-                url: downloadUrls[d],
-                name: attachment.name,
-                source: 'txt-download-url',
-                pageUrl: attachment.pageUrl || resp.url || attachment.url,
-                diagnosticId: attachment.diagnosticId,
-                diagnosticThreadId: attachment.diagnosticThreadId,
-                diagnosticRunId: attachment.diagnosticRunId
-              };
-              var redirectedResources;
-              try {
-                if (isSameOriginUrl(downloadUrls[d])) {
-                  redirectedResources = await ATPFetcher.fetchTextAttachmentResource(nextAttachment, depth + 1, hardFailSet, options);
-                } else {
-                  redirectedResources = await ATPFetcher.fetchTextAttachmentResourcesByBackground([nextAttachment], options);
-                }
-              } catch (e) {
-                redirectedResources = await ATPFetcher.fetchTextAttachmentResourcesByBackground([nextAttachment], options);
-              }
-              if (redirectedResources && redirectedResources.yielded) {
-                diagnosticOutcome = 'yielded';
-                diagnosticFailure = '';
-                return redirectedResources;
-              }
-              if (hasResourcePayload(redirectedResources)) {
-                diagnosticOutcome = 'success';
-                diagnosticFailure = '';
-                diagnosticResources = SharedUtils.countResources(redirectedResources);
-                ATPCache.setCachedTextResources(attachment.url, redirectedResources, writeStartedAt);
-                ATPCache.clearTextFailCache(attachment.url);
-                return redirectedResources;
-              }
+            var downloadUrls = SharedUtils.extractTextDownloadUrls(text, finalAttachmentUrl, TEXT_ATTACHMENT_MAX_COUNT);
+            var redirectedResources = await followTextDownloadUrls(attachment, finalAttachmentUrl, downloadUrls, depth, hardFailSet, options);
+            if (redirectedResources.yielded) {
+              diagnosticOutcome = 'yielded';
+              diagnosticFailure = '';
+              return redirectedResources;
             }
+            if (hasResourcePayload(redirectedResources)) {
+              diagnosticOutcome = 'success';
+              diagnosticFailure = '';
+              diagnosticResources = SharedUtils.countResources(redirectedResources);
+              ATPCache.setCachedTextResources(attachment.url, redirectedResources, writeStartedAt);
+              ATPCache.clearTextFailCache(attachment.url);
+              return redirectedResources;
+            }
+            if (downloadUrls.length && hardFailSet) hardFailSet[attachment.url] = true;
             diagnosticFailure = 'intermediary_unresolved';
           }
 
@@ -980,6 +990,8 @@
           if (hasResourcePayload(normalizedResources)) {
             ATPCache.setCachedTextResources(attachment.url, normalizedResources, writeStartedAt);
             ATPCache.clearTextFailCache(attachment.url);
+          } else if (hardFailSet) {
+            hardFailSet[attachment.url] = true;
           }
           diagnosticResources = SharedUtils.countResources(normalizedResources);
           diagnosticOutcome = hasResourcePayload(normalizedResources) ? 'success' : 'empty';

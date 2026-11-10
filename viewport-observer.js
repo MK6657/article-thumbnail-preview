@@ -490,16 +490,19 @@
     }
     if (!nearTargets || isLoaderPaused() || shouldPausePendingRetryWhenHidden()) return;
     var candidates = [];
+    var rootRects = new Map();
     pendingWrappers.forEach(function(data, wrapper) {
       if (!data || data.loaded || !data.observerRoot) return;
       var state = viewportRootStates.get(data.observerRoot);
-      if (state && nearTargets.has(state.proximityTarget)) candidates.push([wrapper, data]);
+      if (state && nearTargets.has(state.proximityTarget) && refreshPendingViewportVisibility(wrapper, data, rootRects)) {
+        candidates.push([wrapper, data]);
+      }
     });
     for (var c = 0; c < candidates.length; c++) {
       var wrapper = candidates[c][0];
       var data = candidates[c][1];
       if (pendingWrappers.get(wrapper) !== data || data.loaded) continue;
-      if (refreshPendingViewportVisibility(wrapper, data)) ATPViewport.loadWrapper(wrapper, data, false);
+      ATPViewport.loadWrapper(wrapper, data, false);
     }
   }
 
@@ -668,7 +671,15 @@
     );
   }
 
-  function getViewportRectState(wrapper) {
+  // A geometry pass shares each scroll root's rect before any thumbnail starts.
+  function readScrollRootRect(root, rootRects) {
+    if (!root || !root.getBoundingClientRect) return null;
+    if (!rootRects) return root.getBoundingClientRect();
+    if (!rootRects.has(root)) rootRects.set(root, root.getBoundingClientRect());
+    return rootRects.get(root);
+  }
+
+  function getViewportRectState(wrapper, rootRects) {
     if (!wrapper || !wrapper.getBoundingClientRect) {
       return {
         visible: false,
@@ -692,9 +703,8 @@
     var effectiveBottom = viewportHeight;
     var effectiveLeft = 0;
     var effectiveRight = viewportWidth;
-    var scrollRoot = getWrapperScrollRoot(wrapper);
-    if (scrollRoot && scrollRoot.getBoundingClientRect) {
-      var rootRect = scrollRoot.getBoundingClientRect();
+    var rootRect = readScrollRootRect(getWrapperScrollRoot(wrapper), rootRects);
+    if (rootRect) {
       effectiveTop = Math.max(effectiveTop, rootRect.top);
       effectiveBottom = Math.min(effectiveBottom, rootRect.bottom);
       if (typeof rootRect.left === 'number') effectiveLeft = Math.max(effectiveLeft, rootRect.left);
@@ -771,12 +781,8 @@
     };
   }
 
-  function getLazyViewportBounds(root) {
-    if (root && root.getBoundingClientRect) {
-      var rootRect = root.getBoundingClientRect();
-      return { top: rootRect.top, bottom: rootRect.bottom };
-    }
-    return { top: 0, bottom: window.innerHeight };
+  function getLazyViewportBounds(root, rootRects) {
+    return readScrollRootRect(root, rootRects) || { top: 0, bottom: window.innerHeight };
   }
 
   // An inner scroll box clips its thumbnails but says nothing about where the
@@ -796,13 +802,13 @@
       rect.top <= (window.innerHeight || 0) + margins.bottom;
   }
 
-  function refreshPendingViewportVisibility(wrapper, data) {
+  function refreshPendingViewportVisibility(wrapper, data, rootRects) {
     if (!data) return false;
     if (!wrapper || !wrapper.getBoundingClientRect) return false;
     var rect = wrapper.getBoundingClientRect();
     var root = data.observerRoot || getWrapperScrollRoot(wrapper);
     var margins = getLazyMargins(root);
-    var bounds = getLazyViewportBounds(root);
+    var bounds = getLazyViewportBounds(root, rootRects);
     var visible = rect.bottom >= bounds.top - margins.top && rect.top <= bounds.bottom + margins.bottom;
     if (visible && root) visible = isRectNearPageViewport(rect);
     if (data.inViewport !== visible) {
@@ -814,9 +820,6 @@
   }
 
   function markVisiblePendingSlotRetries(maxAttempts) {
-    // 唯一调用方 retryVisiblePending 在紧邻的上一行已做过强制 prune，
-    // 其间只有纯读的 getAvailableSlotCount()，此处再强制扫一遍恒返回 0
-    prunePendingWrappers(true);
     var marked = 0;
     var actualWrappers = actualVisiblePendingWrappers.values();
     var actualWrapper = actualWrappers.next();
@@ -831,6 +834,7 @@
       actualWrapper = actualWrappers.next();
     }
     if (marked) return marked;
+    var rootRects = new Map();
     var attemptLimit = Math.max(1, Math.min(
       Number(maxAttempts) || PENDING_SLOT_RETRY_SCAN_LIMIT,
       pendingWrappers.size,
@@ -854,7 +858,7 @@
       }
       scanned++;
       nextCursor = index >= pendingWrappers.size ? 0 : index;
-      if (!data || data.loaded || !refreshPendingViewportVisibility(wrapper, data)) continue;
+      if (!data || data.loaded || !refreshPendingViewportVisibility(wrapper, data, rootRects)) continue;
       markPendingSlotRetry(data);
       marked++;
     }
@@ -873,7 +877,7 @@
         }
         scanned++;
         nextCursor = index >= pendingWrappers.size ? 0 : index;
-        if (!wrappedData || wrappedData.loaded || !refreshPendingViewportVisibility(wrappedWrapper, wrappedData)) continue;
+        if (!wrappedData || wrappedData.loaded || !refreshPendingViewportVisibility(wrappedWrapper, wrappedData, rootRects)) continue;
         markPendingSlotRetry(wrappedData);
         marked++;
       }
@@ -1065,6 +1069,7 @@
   function getHeavyRenderSnapshot() {
     var now = Date.now();
     var items = [];
+    var rootRects = new Map();
     var stats = {
       heavyTracked: 0,
       heavyUnloaded: 0,
@@ -1121,7 +1126,7 @@
         cleanupHeavyRenderItem(wrapper);
         continue;
       }
-      var viewportState = getViewportRectState(wrapper);
+      var viewportState = getViewportRectState(wrapper, rootRects);
       var inRange = viewportState.inHeavyRestoreRange;
       var visible = viewportState.visible;
       var restoring = !!data.restoreLoading;

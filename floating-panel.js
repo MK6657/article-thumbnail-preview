@@ -417,7 +417,7 @@ class FloatingPanel {
     return '<div class="bfp-preset-row"><span class="bfp-preset-label">弱图加载预设</span><span class="bfp-preset-actions">' +
       '<button class="bfp-ordinary-preset" type="button" data-preset="ordinaryGentle" title="100M：可见 6 / 后台 1 / 同域 6">100M</button>' +
       '<button class="bfp-ordinary-preset" type="button" data-preset="ordinaryBalanced" title="200M：可见 8 / 后台 2 / 同域 8">200M</button>' +
-      '<button class="bfp-ordinary-preset" type="button" data-preset="ordinaryFast" title="推荐：可见 12 / 后台 2 / 同域 10">高速（推荐）</button>' +
+      '<button class="bfp-ordinary-preset" type="button" data-preset="ordinaryFast" title="推荐：可见 16 / 后台 2 / 同域 10">高速（推荐）</button>' +
       '</span></div>';
   }
 

@@ -360,31 +360,6 @@
       return out;
     },
 
-    // 首屏（前 limit 个）里静态图排在动图前面，其余顺序不变；无需调整时原样返回，
-    // 不改动入参（它可能与缓存数据共用同一数组）。动图仍留在首屏，只是后开始加载。
-    prioritizeStaticFirstScreenCandidates: function(candidates, limit) {
-      if (!Array.isArray(candidates) || typeof SharedUtils.isAnimatedGifUrl !== 'function' || typeof SharedUtils.getImageDisplaySrc !== 'function') {
-        return candidates;
-      }
-      limit = Math.min(candidates.length, Math.max(0, Math.floor(Number(limit) || 0)));
-      if (limit <= 1) return candidates;
-      var gifFlags = new Array(limit);
-      var seenGif = false;
-      var needsMove = false;
-      for (var i = 0; i < limit; i++) {
-        gifFlags[i] = SharedUtils.isAnimatedGifUrl(SharedUtils.getImageDisplaySrc(candidates[i]));
-        if (gifFlags[i]) seenGif = true;
-        else if (seenGif) needsMove = true;
-      }
-      if (!needsMove) return candidates;
-      var out = new Array(candidates.length);
-      var write = 0;
-      for (var s = 0; s < limit; s++) if (!gifFlags[s]) out[write++] = candidates[s];
-      for (var g = 0; g < limit; g++) if (gifFlags[g]) out[write++] = candidates[g];
-      for (var r = limit; r < candidates.length; r++) out[write++] = candidates[r];
-      return out;
-    },
-
     injectThumbnails: function(container, articleData, link, cacheWriteStartedAt) {
       if (container.tagName === 'TH' || container.tagName === 'TD') {
         container = container.parentElement;
@@ -408,16 +383,12 @@
       var displayLimit = SharedUtils.effectiveDisplayLimit(settings);
       var candidatePool = copyCandidatePrefix(images, fetchLimit);
       var heavyPlan = ATPRenderer.getHeavyImagePlan(candidatePool, settings, cols, displayLimit);
-      // 缓存按帖子原顺序保存：静态优先只是本次渲染的加载顺序，每次渲染按当时的显示设置重新计算
       // A copy: a rendered slot can move to a sibling attachment host while
       // the thread registers, and the cache keeps the forum's own URLs.
       var cacheImages = candidatePool.slice();
       if (heavyPlan.enabled) {
         candidatePool = ATPRenderer.prioritizeLoadedCandidates(candidatePool, data.loadedUrls);
         cacheImages = candidatePool.slice();
-      } else {
-        // 只在实际显示的前缀里调整，免得把显示上限之外的静态图换进来、把动图挤出显示范围
-        candidatePool = ATPRenderer.prioritizeStaticFirstScreenCandidates(candidatePool, Math.min(cols * visRows, displayLimit));
       }
       var sourceCandidates = candidatePool;
       var renderLimit = heavyPlan.enabled ? heavyPlan.limit : displayLimit;
@@ -433,6 +404,18 @@
       var panel = document.createElement('div');
       panel.className = 'atp-thread-panel';
       var threadState = null;
+      function reserveReadyScrollRows(limit) {
+        // One extra row of height allows scrolling to the next row without
+        // creating image elements or admitting requests for it yet.
+        var rows = Math.min(Math.ceil(allCandidates.length / cols), Math.ceil(limit / cols) + 1);
+        grid.style.minHeight = (rows * h + Math.max(0, rows - 1) * gap) + 'px';
+      }
+      function setReadyImageLimit(limit) {
+        if (threadState.readyImageLimit === limit) return;
+        threadState.readyImageLimit = limit;
+        if (viewport.style.maxHeight !== 'none') reserveReadyScrollRows(Math.max(limit, threadState.nextIdx));
+        if (window.ATPLoader && ATPLoader.enqueueBgForThread) ATPLoader.enqueueBgForThread(threadState.id);
+      }
       function unlockBackgroundImages() {
         if (!threadState || threadState.backgroundUnlocked) return;
         threadState.backgroundUnlocked = true;
@@ -471,20 +454,24 @@
         expandBtn.setAttribute('aria-expanded', 'false');
         expandBtn.setAttribute('aria-label', '展开缩略图列表');
         expandBtn.setAttribute('aria-controls', viewportId);
+        var setExpanded = function(expanded) {
+          viewport.style.maxHeight = expanded ? 'none' : viewportH + 'px';
+          expandBtn.textContent = expanded ? '收起' : '展开';
+          expandBtn.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+          expandBtn.setAttribute('aria-label', expanded ? '收起缩略图列表' : '展开缩略图列表');
+        };
         expandBtn.onclick = function() {
-          var vp = document.getElementById(viewportId) || panel.querySelector('.atp-scroll-viewport');
-          if (!vp) return;
-          var expanded = vp.style.maxHeight !== 'none';
-          vp.style.maxHeight = expanded ? 'none' : viewportH + 'px';
-          if (expanded) {
+          if (!viewport) return;
+          var expanded = viewport.style.maxHeight !== 'none';
+          setExpanded(expanded);
+          if (threadState && threadState.readyImageQueue) {
+            setReadyImageLimit(expanded ? allCandidates.length : threadState.firstScreenTotal);
+          } else if (expanded) {
             unlockBackgroundImages();
             if (threadState && window.ATPLoader && ATPLoader.enqueueBgForThread) {
               ATPLoader.enqueueBgForThread(threadState.id);
             }
           }
-          expandBtn.textContent = expanded ? '收起' : '展开';
-          expandBtn.setAttribute('aria-expanded', expanded ? 'true' : 'false');
-          expandBtn.setAttribute('aria-label', expanded ? '收起缩略图列表' : '展开缩略图列表');
         };
         toolbar.appendChild(expandBtn);
       }
@@ -518,7 +505,9 @@
         grid = document.createElement('div');
         grid.className = THUMB_CLASS;
         grid.style.cssText = 'display:grid;grid-template-columns:repeat(' + cols + ',' + w + 'px);grid-auto-rows:' + h + 'px;gap:' + gap + 'px;width:' + gridWidth + 'px;max-width:none;box-sizing:border-box;';
-        if (settings.autoLoadOffscreenFirstRowsEnabled === true && allCandidates.length > firstAutoCount) {
+        if (!heavyPlan.enabled && allCandidates.length > firstAutoCount) {
+          reserveReadyScrollRows(firstAutoCount);
+        } else if (settings.autoLoadOffscreenFirstRowsEnabled === true && allCandidates.length > firstAutoCount) {
           grid.style.minHeight = ((visibleRowsForRender + 1) * h + visibleRowsForRender * gap) + 'px';
         }
         viewport.appendChild(grid);
@@ -559,6 +548,13 @@
       }
       if (viewport && allCandidates.length > threadState.firstScreenTotal) {
         viewport.addEventListener('scroll', function() {
+          if (threadState.readyImageQueue) {
+            if (viewport.style.maxHeight === 'none' || viewport.scrollTop <= 0) return;
+            var rows = visibleRowsForRender + Math.ceil(viewport.scrollTop / (h + gap));
+            var limit = Math.min(allCandidates.length, rows * cols);
+            if (limit > threadState.readyImageLimit) setReadyImageLimit(limit);
+            return;
+          }
           if (viewport.scrollTop > 0) unlockBackgroundImages();
           if (window.ATPLoader && ATPLoader.enqueueBgForThread) {
             ATPLoader.enqueueBgForThread(threadState.id);
@@ -601,6 +597,7 @@
         candidates: allCandidates,
         sourceCandidates: sourceCandidates || allCandidates,
         heavyMode: !!(heavyPlan && heavyPlan.enabled),
+        readyImageQueue: !(heavyPlan && heavyPlan.enabled),
         lightweightHeavyMode: lightweightHeavyMode,
         heavyOriginalTotal: sourceCandidates ? sourceCandidates.length : allCandidates.length,
         nextIdx: 0,
@@ -609,6 +606,7 @@
         loadedUrls: [],
         loadedUrlMap: {},
         firstScreenTotal: firstScreenTotal,
+        readyImageLimit: firstScreenTotal,
         firstScreenOk: 0,
         firstScreenFailed: 0,
         firstScreenDone: false,
@@ -755,10 +753,14 @@
         return hasQueuedVisibleTextResourceThread(threadState) && !isThreadOnScreen(threadState);
       };
 
-      var getTextRunPriority = function() {
+      var getTextRunPriority = function(stage) {
         var pacer = window.ATPForumPacer;
         var articlePriority = pacer && typeof pacer.PRIORITY_ARTICLE === 'number' ? pacer.PRIORITY_ARTICLE : 1;
-        return articlePriority + (run.automatic && !isThreadOnScreen(threadState) ? 1 : 0);
+        var onScreen = document.visibilityState !== 'hidden' && isThreadOnScreen(threadState);
+        if (onScreen && stage === 'background_fallback') {
+          return pacer && typeof pacer.PRIORITY_VISIBLE === 'number' ? pacer.PRIORITY_VISIBLE : 0;
+        }
+        return articlePriority + (run.automatic && !onScreen ? 1 : 0);
       };
 
       var makeTextRunOptions = function() {
@@ -876,6 +878,8 @@
           threadState.resources = SharedUtils.mergeResources(threadState.resources, resources);
           if (unresolvedCount > 0 && hasFetchedResources) {
             threadState.textResourceMessage = '已解析部分 TXT 资源，仍有 ' + unresolvedCount + ' 个附件待重试';
+          } else if (unresolvedCount > 0) {
+            threadState.textResourceMessage = '有 ' + unresolvedCount + ' 个 TXT 附件待重试，可重试本帖或导入已下载 TXT';
           } else {
             threadState.textResourceMessage = hasFetchedResources
               ? ''
@@ -884,7 +888,8 @@
           releaseAutomaticTextResourceSlot(threadState, run);
 
           if (!threadState.candidates.length && threadState.statusEl) {
-            threadState.statusEl.textContent = SharedUtils.hasResourcePayload(threadState.resources) ? '资源链接' : '无资源';
+            threadState.statusEl.textContent = SharedUtils.hasResourcePayload(threadState.resources) ? '资源链接' :
+              (threadState.textResourcesRetryable ? 'TXT 待重试' : '无资源');
           }
 
           if (window.ATPResourcePanel) {

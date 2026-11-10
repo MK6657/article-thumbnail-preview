@@ -69,23 +69,20 @@ function createRun(extraSettings) {
   };
 }
 
-// The user's measured configuration: configured host width 10, effective
-// automatic width 6. Even a previously learned GIF width 5 must now use 3.
+// Visible images keep the configured host width when prefetch is enabled.
 const automatic = createRun();
-automatic.setLearnedWidth(5);
-assert.strictEqual(automatic.snapshot().ordinaryHostLimit, 6);
-assert.strictEqual(automatic.snapshot().ordinaryHostLargeLimit, 3);
-for (let i = 0; i < 3; i++) assert(automatic.loader.acquireSlot(automatic.task('gif')));
-const fourthGif = automatic.task('gif');
-assert.strictEqual(automatic.loader.acquireSlot(fourthGif), false, 'a fourth visible GIF must wait for its lane');
-assert.strictEqual(automatic.loader.isLargeLaneBlocked(fourthGif), true);
-for (let i = 0; i < 3; i++) assert(automatic.loader.acquireSlot(automatic.task('jpg')), 'static thumbnails must retain the other three host slots');
-assert.strictEqual(automatic.loader.acquireSlot(automatic.task('jpg')), false, 'the total host safety cap must remain six');
+assert.strictEqual(automatic.snapshot().ordinaryHostLimit, 10);
+for (let i = 0; i < 5; i++) assert(automatic.loader.acquireSlot(automatic.task('gif', { readyImageQueue: true })));
+const sixthGif = automatic.task('gif', { readyImageQueue: true });
+assert.strictEqual(automatic.loader.acquireSlot(sixthGif), false, 'a sixth GIF must wait for its lane');
+assert.strictEqual(automatic.loader.isLargeLaneBlocked(sixthGif), true);
+for (let i = 0; i < 5; i++) assert(automatic.loader.acquireSlot(automatic.task('jpg')), 'static thumbnails must retain the other five host slots');
+assert.strictEqual(automatic.loader.acquireSlot(automatic.task('jpg')), false, 'the total host cap must remain ten');
 
 // Fast successful downloads still widen the starting lane from two to three,
 // then stop widening. This exercises feedback through the same live slots
 // that the production scheduler counts, rather than just checking a formula.
-const feedback = createRun();
+const feedback = createRun({ ordinaryHostConcurrency: 6 });
 const first = feedback.task('gif');
 const second = feedback.task('gif');
 assert(feedback.loader.acquireSlot(first) && feedback.loader.acquireSlot(second));
@@ -99,7 +96,7 @@ assert.strictEqual(feedback.hooks.stats(host, false).largeLaneLimit, 3, 'fast co
 
 // A scroll can move the three running GIFs offscreen. Keep the existing
 // single visible compensation slot, while respecting the overall host cap.
-const scrolled = createRun();
+const scrolled = createRun({ ordinaryHostConcurrency: 6 });
 scrolled.setLearnedWidth(5);
 const oldVisible = [scrolled.task('gif'), scrolled.task('gif'), scrolled.task('gif')];
 oldVisible.forEach(function(task) { assert(scrolled.loader.acquireSlot(task)); });
@@ -108,6 +105,41 @@ assert(scrolled.loader.acquireSlot(scrolled.task('gif')), 'one currently visible
 assert.strictEqual(scrolled.loader.acquireSlot(scrolled.task('gif')), false, 'visible compensation must remain bounded');
 assert(scrolled.loader.acquireSlot(scrolled.task('jpg')) && scrolled.loader.acquireSlot(scrolled.task('jpg')));
 assert.strictEqual(scrolled.loader.acquireSlot(scrolled.task('jpg')), false);
+
+// The regular host cap includes requests that were visible when admitted.
+const manualList = {
+  firstScreenConcurrency: 10,
+  backgroundConcurrency: 4,
+  globalImageConcurrency: 12,
+  ordinaryHostConcurrency: 6,
+  autoLoadOffscreenFirstRowsEnabled: false,
+  viewportPriorityReservedSlots: 2
+};
+const scrollBatch = createRun(manualList);
+const inFlight = Array.from({ length: 6 }, () => scrollBatch.task('jpg'));
+inFlight.forEach(task => assert(scrollBatch.loader.acquireSlot(task)));
+inFlight.forEach(task => { task.currentlyVisible = false; task.viewportPriority = false; });
+const newlyVisible = scrollBatch.task('jpg');
+assert.strictEqual(scrollBatch.loader.acquireSlot(newlyVisible), false,
+  'ordinary host cap must include visible tasks that have scrolled away');
+scrollBatch.loader.releaseSlot(inFlight[0]);
+assert(scrollBatch.loader.acquireSlot(newlyVisible), 'a newly visible task must use the next free host slot');
+assert.strictEqual(scrollBatch.snapshot().ordinaryHostActive, 6);
+
+const prefetchBatch = createRun(manualList);
+for (let i = 0; i < 4; i++) {
+  assert(prefetchBatch.loader.acquireSlot(prefetchBatch.task('jpg', { viewportPriority: false })));
+}
+assert.strictEqual(prefetchBatch.loader.acquireSlot(prefetchBatch.task('jpg', { viewportPriority: false })), false,
+  'offscreen first-row requests must leave two real host slots available');
+assert(prefetchBatch.loader.acquireSlot(prefetchBatch.task('jpg')));
+assert(prefetchBatch.loader.acquireSlot(prefetchBatch.task('jpg')));
+assert.strictEqual(prefetchBatch.snapshot().ordinaryHostActive, 6);
+
+const noReserve = createRun(Object.assign({}, manualList, { viewportPriorityReservedSlots: 0 }));
+for (let i = 0; i < 6; i++) assert(noReserve.loader.acquireSlot(noReserve.task('jpg', { viewportPriority: false })));
+assert.strictEqual(noReserve.loader.acquireSlot(noReserve.task('jpg')), false,
+  'disabling the reserve still must keep the total host cap');
 
 // Non-automatic mode and explicit manual retries retain their prior behavior.
 const nonAutomatic = createRun({ autoLoadOffscreenFirstRowsEnabled: false });
@@ -118,8 +150,14 @@ for (let i = 0; i < 5; i++) assert(nonAutomatic.loader.acquireSlot(nonAutomatic.
 assert.strictEqual(nonAutomatic.loader.acquireSlot(nonAutomatic.task('gif')), false);
 const manual = createRun();
 manual.setLearnedWidth(5);
-for (let i = 0; i < 3; i++) assert(manual.loader.acquireSlot(manual.task('gif')));
-assert(manual.loader.acquireSlot(manual.task('gif', { manualRetry: true })), 'explicit retries must keep their existing lane bypass');
+const runningGifs = Array.from({ length: 5 }, () => manual.task('gif', { readyImageQueue: true }));
+runningGifs.forEach(task => assert(manual.loader.acquireSlot(task)));
+const manualGif = manual.task('gif', { manualRetry: true, readyImageQueue: true });
+assert.strictEqual(manual.loader.acquireSlot(manualGif), false, 'manual retry must wait for the GIF lane');
+manual.loader.releaseSlot(runningGifs[0]);
+assert(manual.loader.acquireSlot(manualGif), 'manual retry can use a released GIF slot');
+assert.strictEqual(manual.loader.acquireSlot(manual.task('jpg', { manualRetry: true })), false,
+  'each host must run at most one manual retry');
 const fixed = createRun({ ordinaryHostAdaptive: false });
 fixed.setLearnedWidth(5);
 assert.strictEqual(fixed.snapshot().ordinaryHostLargeLimit, 2, 'fixed mode must retain its starting width');

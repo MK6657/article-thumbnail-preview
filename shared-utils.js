@@ -772,7 +772,7 @@ const SharedUtils = {
   // Every forum-host decision goes through the functions below.
   BUILTIN_FORUM_ROOTS: Object.freeze(['sehuatang.org', 'sehuatang.net']),
   TEXT_DIRECT_DOWNLOAD_HOSTS: Object.freeze(['dl.ldkms.la']),
-  SIGNED_TEXT_DOWNLOAD_HOSTS: Object.freeze(['xia.ewrewej.la']),
+  SIGNED_TEXT_DOWNLOAD_HOSTS: Object.freeze(['xia.ewrewej.la', 'xia.djhdhs.us']),
   MIRROR_SITES_STORAGE_KEY: 'atp_mirror_sites_v1',
   MIRROR_SITE_MAX_COUNT: 20,
   _mirrorSites: [],
@@ -1267,7 +1267,10 @@ const SharedUtils = {
         return result;
       }
       var urlCode = SharedUtils.extractAccessCodeFromUrlQuery(parsedUrl);
-      if (urlCode) result.code = urlCode;
+      if (urlCode) {
+        result.code = urlCode;
+        result.codeFromUrl = true;
+      }
       parsedUrl.hostname = SharedUtils.canonicalPanHost(parsedUrl.hostname);
       parsedUrl.pathname = (parsedUrl.pathname || '/').replace(/\/+$/, '') || '/';
       parsedUrl.hash = '';
@@ -1309,7 +1312,14 @@ const SharedUtils = {
         item.url = this.cleanResourceUrl(item.url || '');
         var normalizedPan = this.normalizePanResourceUrlCode(type, item.url, item.code);
         item.url = normalizedPan.url;
-        if (normalizedPan.code) item.code = normalizedPan.code;
+        if (normalizedPan.code) {
+          item.code = normalizedPan.code;
+          if (normalizedPan.codeFromUrl) item.codeOrigin = 'url';
+          else if (item.codeOrigin !== 'url' && item.codeOrigin !== 'txt' && item.codeOrigin !== 'html') delete item.codeOrigin;
+        } else {
+          delete item.code;
+          delete item.codeOrigin;
+        }
         if (!item.source) item.source = 'html';
         if (!item.url || !this.isCopyableResourceUrl(type, item.url)) continue;
         var altCodes = Array.isArray(item.altCodes) ? item.altCodes : [];
@@ -1318,10 +1328,7 @@ const SharedUtils = {
         if (seen[dedupKey]) {
           var existing = seen[dedupKey];
           existing.source = this.mergeResourceSource(existing.source, item.source);
-          // Another sighting with a different code: keep both, the first one
-          // stays the link's code.
-          if (!existing.code && item.code) existing.code = item.code;
-          else if (item.code) this.addAltAccessCode(existing, item.code);
+          this.mergeAccessCode(existing, item);
           for (var ea = 0; ea < altCodes.length; ea++) this.addAltAccessCode(existing, altCodes[ea]);
           continue;
         }
@@ -1731,7 +1738,7 @@ const SharedUtils = {
     return {
       rawHtml: rawHtml,
       decoded: decoded,
-      text: this.decodeHtmlEntities(this.htmlToText(rawHtml))
+      text: this.decodeHtmlEntities(this.htmlToText(rawHtml, true))
     };
   },
 
@@ -1739,21 +1746,18 @@ const SharedUtils = {
     source = source || 'html';
     var resources = this.emptyResources();
     var seen = {};
-    var rawHtml, decoded, text;
+    var rawHtml, text;
     if (source === 'txt') {
       // TXT is literal text: angle brackets and entity-looking strings can be
       // part of a resource URL or password and must never be parsed as HTML.
       rawHtml = this.limitArticleHtml(html);
-      decoded = rawHtml;
       text = rawHtml;
-    } else if (context && typeof context.rawHtml === 'string' && typeof context.decoded === 'string' && typeof context.text === 'string') {
+    } else if (context && typeof context.rawHtml === 'string' && typeof context.text === 'string') {
       rawHtml = context.rawHtml;
-      decoded = context.decoded;
       text = context.text;
     } else {
       rawHtml = this.stripNonRenderedHtmlRegions(this.restoreProtectedEmails(this.limitArticleHtml(html)));
-      decoded = this.decodeHtmlEntities(rawHtml);
-      text = this.decodeHtmlEntities(this.htmlToText(rawHtml));
+      text = this.decodeHtmlEntities(this.htmlToText(rawHtml, true));
     }
 
     // Codes come from the link's own query here (?pwd=...); codes written
@@ -1762,20 +1766,20 @@ const SharedUtils = {
       if (!url) return;
       url = SharedUtils.cleanResourceUrl(url);
       if (!url) return;
-      meta = meta ? Object.assign({}, meta) : {};
-      var normalizedPan = SharedUtils.normalizePanResourceUrlCode(type, url, meta.code);
+      var normalizedPan = SharedUtils.normalizePanResourceUrlCode(type, url, meta && meta.code);
       url = normalizedPan.url;
-      if (normalizedPan.code) meta.code = normalizedPan.code;
+      var item = { type: type, url: url, source: source };
+      if (normalizedPan.code) {
+        item.code = normalizedPan.code;
+        item.codeOrigin = 'url';
+      }
       var key = SharedUtils.getResourceDedupKey(type, url);
       if (seen[key]) {
         var existing = seen[key];
         existing.source = SharedUtils.mergeResourceSource(existing.source, source);
-        if (!existing.code && meta && meta.code) existing.code = meta.code;
-        else if (meta && meta.code) SharedUtils.addAltAccessCode(existing, meta.code);
+        SharedUtils.mergeAccessCode(existing, item);
         return;
       }
-      var item = { type: type, url: url, source: source };
-      if (meta && meta.code) item.code = meta.code;
       seen[key] = item;
       resources.groups[type].push(item);
     }
@@ -1839,25 +1843,17 @@ const SharedUtils = {
     // Displayed HTML examples (e.g. &lt;a href="..."&gt;) do not
     // contribute attribute URLs. Password extraction below keeps their
     // displayed characters, while TXT always remains literal text.
-    scanResourceText(source === 'txt' ? text : this.htmlToText(decoded));
-    var hrefTagRegex = /<(?:a|area)\b([^>]*)>/gi;
-    var hrefTagMatch;
-    while (source !== 'txt' && (hrefTagMatch = hrefTagRegex.exec(rawHtml)) !== null) {
-      var tagHref = SharedUtils.extractHtmlAttr(hrefTagMatch[1] || '', 'href');
-      if (tagHref) {
-        var decodedHref = SharedUtils.decodeHtmlEntities(tagHref);
-        scanResourceText(decodedHref);
-      }
-    }
-
+    scanResourceText(source === 'txt' ? text : this.htmlToText(text, true));
     var resourceAnchors = [];
-    if (source !== 'txt') SharedUtils.forEachAnchorTag(rawHtml, function(attrs, body, openIndex, endIndex) {
+    if (source !== 'txt') SharedUtils.forEachHtmlTag(rawHtml, function(tag, attrs) {
+      if (tag !== 'a' && tag !== 'area') return;
       var href = SharedUtils.decodeHtmlEntities(SharedUtils.extractHtmlAttr(attrs, 'href'));
-      if (!href || !SharedUtils.classifyResourceUrl(href)) return;
-      resourceAnchors.push({ href: href, openIndex: openIndex, endIndex: endIndex });
+      if (!href) return;
+      scanResourceText(href);
+      if (tag === 'a') resourceAnchors.push(href);
     });
     for (var ai = 0; ai < resourceAnchors.length; ai++) {
-      addResourceCandidate(resourceAnchors[ai].href);
+      addResourceCandidate(resourceAnchors[ai]);
     }
 
     resources.passwords = source === 'txt' ? this.extractArchivePasswords(text) : this.mergeUniqueLimited(
@@ -1876,8 +1872,7 @@ const SharedUtils = {
       for (var pi = 0; pi < panItems.length; pi++) {
         var itemCodes = pairedCodes[this.getResourceDedupKey(panItems[pi].type, panItems[pi].url)] || [];
         for (var ci = 0; ci < itemCodes.length; ci++) {
-          if (!panItems[pi].code) panItems[pi].code = itemCodes[ci];
-          else this.addAltAccessCode(panItems[pi], itemCodes[ci]);
+          this.mergeAccessCode(panItems[pi], { code: itemCodes[ci], codeOrigin: source === 'txt' ? 'txt' : 'html' });
         }
       }
     }
@@ -1899,16 +1894,30 @@ const SharedUtils = {
     return -1;
   },
 
-  forEachHtmlTag: function(html, callback) {
-    var opening = /<([a-z][a-z0-9:-]*)(?=[\t\n\f\r />])/gi;
+  forEachHtmlTag: function(html, callback, includeClosing) {
+    var opening = /<(\/?)([a-z][a-z0-9:-]*)(?=[\t\n\f\r />])/gi;
     var match;
     while ((match = opening.exec(html)) !== null) {
       var attrsStart = opening.lastIndex;
       var end = SharedUtils.findHtmlTagEnd(html, attrsStart);
       if (end === -1) return;
       opening.lastIndex = end + 1;
-      if (callback(match[1].toLowerCase(), html.slice(attrsStart, end)) === false) return;
+      var closing = match[1] === '/';
+      if ((!closing || includeClosing) &&
+        callback(match[2].toLowerCase(), html.slice(attrsStart, end), match.index, end + 1, closing) === false) return;
     }
+  },
+
+  replaceHtmlTags: function(html, replacement) {
+    var parts = [];
+    var offset = 0;
+    this.forEachHtmlTag(html, function(name, attrs, start, end, closing) {
+      parts.push(html.slice(offset, start), replacement(name, attrs, closing));
+      offset = end;
+    }, true);
+    if (!offset) return html;
+    parts.push(html.slice(offset));
+    return parts.join('');
   },
 
   // 扫描锚点时每段只走一次；属性引号中的 > 不是标签结束，未闭合标签不重复扫尾。
@@ -1943,10 +1952,17 @@ const SharedUtils = {
       });
   },
 
-  htmlToText: function(html) {
+  htmlToText: function(html, tagAware) {
+    var text = String(html || '');
+    if (tagAware === true) {
+      text = this.replaceHtmlTags(text, function(name, attrs, closing) {
+        var lineBreak = closing ? /^(?:p|div|li|tr|td|th|table|section)$/.test(name) : name === 'br';
+        return lineBreak ? '\n' : ' ';
+      });
+    }
     // [^<>] (not [^>]) keeps a run of '<' without '>' linear instead of
     // rescanning to the end from every '<'.
-    return String(html || '')
+    return text
       .replace(/<\s*br\s*\/?\s*>/gi, '\n')
       .replace(/<\/(?:p|div|li|tr|td|th|table|section)>/gi, '\n')
       .replace(/<[^<>]+>/g, ' ')
@@ -2017,11 +2033,14 @@ const SharedUtils = {
 
   classifyResourceUrl: function(url) {
     var raw = String(url || '');
-    try {
-      var panUrl = new URL(SharedUtils.preparePanResourceUrlForParse(raw));
-      var panType = SharedUtils.getPanResourceTypeFromParsedUrl(panUrl);
-      if (panType) return panType;
-    } catch (e) {}
+    var prepared = SharedUtils.preparePanResourceUrlForParse(raw);
+    // Relative forum links have no scheme after preparation.
+    if (prepared.indexOf(':') !== -1) {
+      try {
+        var panType = SharedUtils.getPanResourceTypeFromParsedUrl(new URL(prepared));
+        if (panType) return panType;
+      } catch (e) {}
+    }
     var L = raw.toLowerCase();
     if (/\.(?:zip|rar|7z|torrent)(?:[?#].*)?$/i.test(L)) return 'other';
     return null;
@@ -2042,18 +2061,18 @@ const SharedUtils = {
       return cleaned.replace(trailingPunctuation, '');
     }
     if (/^magnet:\?/i.test(cleaned)) {
-      cleaned = cleaned.replace(/(btih:[A-Fa-f0-9]{32,40})(?:[。；;，,、\s]*)?(?:提取码|提取密码|访问码|取件码|解压密码|压缩密码|解压码|解压口令|解壓密碼|解壓碼|密码)\s*[:：=]?.*$/i, '$1');
-      cleaned = cleaned.replace(/(?<![。；;，,、\s])[。；;，,、\s]+(?:(?:提取码|提取密码|访问码|取件码|解压密码|压缩密码|解压码|解压口令|解壓密碼|解壓碼)\s*[:：=]?|密码\s*[:：=]).*$/i, '');
+      cleaned = cleaned.replace(/(btih:[A-Fa-f0-9]{32,40})(?:[。；;，,、\s]*)?(?:提取[码碼]|提取密码|访问码|取件码|解压密码|压缩密码|解压码|解压口令|解壓密碼|解壓碼|密码)\s*[:：=]?.*$/i, '$1');
+      cleaned = cleaned.replace(/(?<![。；;，,、\s])[。；;，,、\s]+(?:(?:提取[码碼]|提取密码|访问码|取件码|解压密码|压缩密码|解压码|解压口令|解壓密碼|解壓碼)\s*[:：=]?|密码\s*[:：=]).*$/i, '');
       return cleaned.replace(trailingPunctuation, '');
     }
     // ASCII punctuation is legal inside query/fragment values, including at
     // their end. Keep signed URLs byte-for-byte unless explicit prose follows.
     var queryStart = cleaned.search(/[?#]/);
-    if (queryStart !== -1 && !/(?:提取码|提取密码|访问码|取件码|解压密码|压缩密码|密码)\s*[:：=]/i.test(cleaned.slice(queryStart))) {
+    if (queryStart !== -1 && !/(?:提取[码碼]|提取密码|访问码|取件码|解压密码|压缩密码|密码)\s*[:：=]/i.test(cleaned.slice(queryStart))) {
       return cleaned.replace(/[」』“”】）》〉。；，、？！…][\s\S]*$/g, '');
     }
     if (/(?:pan\.baidu\.com|yun\.baidu\.com|pan\.quark\.cn|115\.com\/s\/|(?:aliyundrive|alipan)\.com\/s\/|drive\.uc\.cn\/s\/|pan\.xunlei\.com\/s\/)/i.test(cleaned)) {
-      cleaned = cleaned.replace(/(?<![。；;，,、\s])[。；;，,、\s]*(?:提取码|提取密码|访问码|取件码|解压密码|压缩密码|密码)\s*[:：=]?.*$/i, '');
+      cleaned = cleaned.replace(/(?<![。；;，,、\s])[。；;，,、\s]*(?:提取[码碼]|提取密码|访问码|取件码|解压密码|压缩密码|密码)\s*[:：=]?.*$/i, '');
       return cleaned.replace(/[」』“”"'\])】）》〉>。；;，,、？！…][\s\S]*$/g, '');
     }
     if (/^(?:https?:)?\/\/xia\.ewrewej\.la\//i.test(cleaned) || /(?:forum\.php\?|attachment\.php\?|misc\.php\?)/i.test(cleaned)) {
@@ -2172,6 +2191,12 @@ const SharedUtils = {
     if (source === 'txt') {
       rawHtml = rawHtml.replace(/\r\n?/g, '\n');
     } else {
+      // Keep only the real anchor destination before identifying visual line breaks.
+      rawHtml = SharedUtils.replaceHtmlTags(rawHtml, function(name, attrs, closing) {
+        var href = name === 'a' && !closing && SharedUtils.extractHtmlAttr(attrs, 'href');
+        if (href) return '<a href="' + SharedUtils.escapeHtml(SharedUtils.decodeHtmlEntities(href)) + '">';
+        return '<' + (closing ? '/' : '') + name + '>';
+      });
       // Lines are what the page shows: only tags break them. A picture (and a
       // Discuz image attachment with its file name and download tip) is a
       // line of content. A run of line breaks and block tags is one line
@@ -2314,7 +2339,7 @@ const SharedUtils = {
         var valueStart = end - cm[1].length;
         if (linkMask[start]) continue;
         // 无需提取码 / 免提取码 / 无密码: a label saying there is none.
-        if (/(?:无|免|无需|无须|不需要?|不用|没有)[ \t]*$/.test(text.slice(Math.max(0, start - 3), start))) continue;
+        if (/(?:[无無](?:需|[须須])?|免|不需要?|不用|没有)[ \t]*$/.test(text.slice(Math.max(0, start - 3), start))) continue;
         var lineBefore = text.slice(Math.max(0, start - 40), start);
         if (passwordLabel && SharedUtils.isNonShareCodePasswordLabel(lineBefore)) continue;
         // A value from inside a link, or the first word of a later line
@@ -2338,13 +2363,13 @@ const SharedUtils = {
         codes.push({ kind: 'C', start: start, end: end, code: cm[1], drive: SharedUtils.getAccessCodeLabelDrive(text.slice(labelFrom, start)) });
       }
     }
-    collect(/(?:提取码|提取密码|访问码|取件码)\s*[:：=]?\s*([A-Za-z0-9]{3,12})(?![A-Za-z0-9])/gi, false);
+    collect(/(?:提取[码碼]|提取密码|访问码|取件码)\s*[:：=]?\s*([A-Za-z0-9]{3,12})(?![A-Za-z0-9])/gi, false);
     collect(/提取[ \t]*[:：=][ \t]*([A-Za-z0-9]{3,12})(?![A-Za-z0-9])/gi, false);
     collect(/密码\s*[:：=]?\s*([A-Za-z0-9]{3,12})(?![A-Za-z0-9])/gi, true);
     if (!codes.length) return {};
     // 无需提取码 / 免提取码 / 提取码：无: the link on that line has no code,
     // so it cannot take a neighbour's.
-    var noneRe = /(?:无需|无须|免|不需要?|不用|没有|无)[ \t]*(?:提取码|提取密码|访问码|取件码|密码)|(?:提取码|提取密码|访问码|取件码|密码)[ \t]*[:：]?[ \t]*(?:无|没有|不需要|不用)(?![一-龥A-Za-z0-9])/g;
+    var noneRe = /(?:[无無](?:需|[须須])?|免|不需要?|不用|没有)[ \t]*(?:提取[码碼]|提取密码|访问码|取件码|密码)|(?:提取[码碼]|提取密码|访问码|取件码|密码)[ \t]*[:：]?[ \t]*(?:[无無]|没有|不需要|不用)(?![一-龥A-Za-z0-9])/g;
     while ((m = noneRe.exec(text)) !== null) {
       var noneStart = m.index;
       var noneEnd = noneStart + m[0].length;
@@ -2575,6 +2600,25 @@ const SharedUtils = {
     return byKey;
   },
 
+  mergeAccessCode: function(item, incoming) {
+    if (!incoming.code) return;
+    var promote = !item.code ||
+      (incoming.codeOrigin === 'url' && item.codeOrigin !== 'url') ||
+      (incoming.codeOrigin === 'txt' && item.codeOrigin === 'html');
+    if (!promote) {
+      this.addAltAccessCode(item, incoming.code);
+      return;
+    }
+    var previousCode = item.code;
+    var alternatives = item.altCodes || [];
+    item.code = incoming.code;
+    if (incoming.codeOrigin) item.codeOrigin = incoming.codeOrigin;
+    else delete item.codeOrigin;
+    delete item.altCodes;
+    this.addAltAccessCode(item, previousCode);
+    for (var i = 0; i < alternatives.length; i++) this.addAltAccessCode(item, alternatives[i]);
+  },
+
   addAltAccessCode: function(item, code) {
     code = SharedUtils.cleanPasswordValue(code || '');
     if (!item || !code || code === item.code) return;
@@ -2596,13 +2640,16 @@ const SharedUtils = {
   extractArchivePasswords: function(text) {
     var result = [];
     var seen = Object.create(null);
-    var regex = /[【\[\(（「『]?\s*(?:解压密码|压缩密码|压缩包密码|解压包密码|(?:rar|zip|7z)\s*密码|解压码|解压口令|解壓密碼|解壓碼)\s*[】\]\)）」』]?\s*[:：=]?\s*/gi;
+    // Starting at the label keeps long blank runs linear.
+    var regex = /(?:解压密码|压缩密码|压缩包密码|解压包密码|(?:rar|zip|7z)\s*密码|解压码|解压口令|解壓密碼|解壓碼)\s*[】\]\)）」』]?\s*[:：=]?\s*/gi;
     var m;
     while ((m = regex.exec(text)) !== null) {
       // A password sits right after its label; rescanning the whole remaining
       // text for every label was quadratic on label-heavy TXT files.
       var rest = text.slice(regex.lastIndex, regex.lastIndex + 500).replace(/^[\s\u00a0]+/, '');
-      var stop = rest.search(/\n|(?:链接|下载链接|提取码|提取密码|访问码|ed2k:\/\/|magnet:\?|https?:\/\/)\s*/i);
+      // A new note field ends an empty password field.
+      if (/[\r\n]/.test(m[0]) && /^(?:说明|說明|备注|備註)[ \t]*[:：]/.test(rest)) continue;
+      var stop = rest.search(/\n|(?:链接|下载链接|提取[码碼]|提取密码|访问码|ed2k:\/\/|magnet:\?|https?:\/\/)\s*/i);
       var raw = stop === -1 ? rest : rest.slice(0, stop);
       var val = this.cleanPasswordValue(raw);
       if (!val || seen[val]) continue;
@@ -2616,19 +2663,33 @@ const SharedUtils = {
   extractArchivePasswordsFromHtml: function(html) {
     var result = [];
     var seen = Object.create(null);
-    var fieldRegex = /[【\[\(（「『]?\s*(?:解压密码|压缩密码|压缩包密码|解压包密码|(?:rar|zip|7z)\s*密码|解压码|解压口令|解壓密碼|解壓碼)\s*[】\]\)）」』]?\s*[:：=]?\s*/gi;
-    var m;
-    while ((m = fieldRegex.exec(html)) !== null) {
-      var rest = html.slice(fieldRegex.lastIndex, fieldRegex.lastIndex + 500);
-      var boundary = rest.search(/(?:<\s*br\s*\/?\s*>|<\/(?:p|div|li|tr|td|th)>|\n|(?:链接|下载链接|提取码|提取密码|访问码|ed2k:\/\/|magnet:\?|https?:\/\/))/i);
-      var raw = boundary === -1 ? rest : rest.slice(0, boundary);
-      var restored = this.restoreMailtoPassword(raw);
-      var val = this.cleanPasswordValue(restored || this.decodeHtmlEntities(this.htmlToText(raw)));
-      if (!val || seen[val]) continue;
-      seen[val] = true;
-      result.push(val);
-      if (result.length >= 5) break;
+    var fieldRegex = /(?:解压密码|压缩密码|压缩包密码|解压包密码|(?:rar|zip|7z)\s*密码|解压码|解压口令|解壓密碼|解壓碼)\s*[】\]\)）」』]?\s*[:：=]?\s*/gi;
+    var match = fieldRegex.exec(html);
+    if (!match) return result;
+    function readVisibleFields(limit) {
+      while (match && match.index < limit && result.length < 5) {
+        var label = match[0];
+        var rest = html.slice(fieldRegex.lastIndex, fieldRegex.lastIndex + 500);
+        match = fieldRegex.exec(html);
+        if (/[\r\n]/.test(label) && /^(?:说明|說明|备注|備註)[ \t]*[:：]/.test(rest)) continue;
+        var boundary = rest.search(/(?:<\s*br\s*\/?\s*>|<\/(?:p|div|li|tr|td|th)>|\n|(?:链接|下载链接|提取[码碼]|提取密码|访问码|ed2k:\/\/|magnet:\?|https?:\/\/))/i);
+        var raw = boundary === -1 ? rest : rest.slice(0, boundary);
+        var restored = SharedUtils.restoreMailtoPassword(raw);
+        var val = SharedUtils.cleanPasswordValue(restored || SharedUtils.decodeHtmlEntities(SharedUtils.htmlToText(raw, true)));
+        if (!val || seen[val]) continue;
+        seen[val] = true;
+        result.push(val);
+      }
     }
+    this.forEachHtmlTag(html, function(name, attrs, start, end) {
+      readVisibleFields(start);
+      if (!match || result.length >= 5) return false;
+      if (match.index < end) {
+        fieldRegex.lastIndex = end;
+        match = fieldRegex.exec(html);
+      }
+    }, true);
+    readVisibleFields(html.length);
     return result;
   },
 
@@ -2678,9 +2739,14 @@ const SharedUtils = {
   },
 
   extractHtmlAttr: function(attrs, name) {
-    var re = new RegExp("(?:^|\\s)" + name + "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))", 'i');
-    var m = re.exec(String(attrs || ''));
-    return m ? (m[1] || m[2] || m[3] || '') : '';
+    var attribute = /([^\s=/<>"']+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g;
+    var input = String(attrs || '');
+    name = String(name || '').toLowerCase();
+    var match;
+    while ((match = attribute.exec(input)) !== null) {
+      if (match[1].toLowerCase() === name) return match[2] || match[3] || match[4] || '';
+    }
+    return '';
   },
 
   extractDataAttrValues: function(attrs) {

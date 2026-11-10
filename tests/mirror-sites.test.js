@@ -104,6 +104,7 @@ function textResponse(text, url) {
     'dl.ldkms.la': 'reserved',
     'ldkms.la': 'reserved',
     'a.xia.ewrewej.la': 'reserved',
+    'a.xia.djhdhs.us': 'reserved',
     'https://*.mirror.example/': 'invalid'
   };
   Object.keys(rejected).forEach(function(input) {
@@ -166,6 +167,11 @@ function textResponse(text, url) {
   assert.strictEqual(shared.isAllowedTextAttachmentUrl('https://www.unknown.example/a.txt'), false);
   assert.strictEqual(shared.isAllowedTextAttachmentUrl('https://dl.ldkms.la/a.txt'), true);
   assert.strictEqual(shared.isAllowedTextAttachmentUrl('https://xia.ewrewej.la/download?id=1&sign=x'), true);
+  const signedRelay = 'https://xia.djhdhs.us/download?id=1&sign=x';
+  assert.strictEqual(shared.isAllowedTextAttachmentUrl(signedRelay), true);
+  assert.strictEqual(shared.isTransientTextAttachmentUrl(signedRelay), true);
+  assert.strictEqual(shared.isAllowedTextAttachmentUrl('https://xia.djhdhs.us/logout'), false);
+  assert.strictEqual(shared.isAllowedTextAttachmentUrl('https://tu.djhdhs.us/download?id=1&sign=x'), false);
   assert.strictEqual(shared.isDiscuzAttachmentUrl('https://mirror.example/forum.php?mod=attachment&aid=1', MIRROR_PAGE), true);
   assert.strictEqual(shared.isDiscuzAttachmentUrl('https://www.sehuatang.org/forum.php?mod=attachment&aid=1', MIRROR_PAGE), false);
   const mirrorZone = shared.getForumUrlZone(MIRROR_PAGE);

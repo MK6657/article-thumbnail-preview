@@ -82,6 +82,35 @@ assert.strictEqual(bracketedTxt.groups.magnet.length, 1, 'TXT autolink brackets 
 assert.deepStrictEqual(plain(bracketedTxt.passwords), ['abc<123>def&amp;end'], 'TXT passwords must preserve literal markup and entities');
 const htmlLiteralPassword = SharedUtils.extractResources('<p>解压密码：abc&lt;123&gt;def&amp;amp;end</p>', baseUrl, 'html');
 assert.deepStrictEqual(plain(htmlLiteralPassword.passwords), ['abc<123>def&amp;end'], 'HTML must strip actual tags before decoding displayed password text');
+const traditionalHtml = '<p><a href="https://pan.baidu.com/s/1traditional">下载</a> 提取碼：aB12</p>' +
+  '<p><a href="https://pan.baidu.com/s/1open">下载</a> 無需提取碼</p><p>解壓密碼：unzip@123</p>';
+const traditionalTxt = '链接：https://pan.baidu.com/s/1traditional\n提取碼：aB12\n' +
+  '链接：https://pan.baidu.com/s/1open\n提取碼：無\n解壓密碼：unzip@123';
+for (const [source, input] of [['html', traditionalHtml], ['txt', traditionalTxt]]) {
+  const resources = SharedUtils.extractResources(input, baseUrl, source);
+  assert.deepStrictEqual(plain(resources.groups.baidu.map(item => [item.url, item.code || ''])), [
+    ['https://pan.baidu.com/s/1traditional', 'aB12'],
+    ['https://pan.baidu.com/s/1open', '']
+  ], source + ' must pair traditional share-code labels without assigning an archive password to a link');
+  assert.deepStrictEqual(plain(resources.passwords), ['unzip@123']);
+}
+for (const [source, input] of [
+  ['html', '<p>解压密码：<br>说明：这是补充说明</p><p>解压密码：<br>Keep@123</p>'],
+  ['txt', '解压密码：\r\n说明：这是补充说明\r\n解压密码：\r\nKeep@123']
+]) {
+  assert.deepStrictEqual(plain(SharedUtils.extractResources(input, baseUrl, source).passwords),
+    ['Keep@123'], source + ' must keep a real next-line password and skip a separate note field');
+}
+const longBlankGap = '\n'.repeat(60000) + '无关说明\n';
+for (const [source, input] of [
+  ['html', '<div>' + longBlankGap + '</div><p>解压密码：Keep@123</p>'],
+  ['txt', longBlankGap + '解压密码：Keep@123']
+]) {
+  const startedAt = Date.now();
+  assert.deepStrictEqual(plain(SharedUtils.extractResources(input, baseUrl, source).passwords), ['Keep@123']);
+  const durationMs = Date.now() - startedAt;
+  assert(durationMs < 1500, source + ' archive password scan exceeded its long-whitespace safety budget: ' + durationMs + 'ms');
+}
 const displayedAnchorExample = '&lt;a href="https://pan.baidu.com/s/1fake?pwd=zzzz"&gt;百度网盘&lt;/a&gt;';
 for (const context of [undefined, SharedUtils.prepareArticleExtractionContext(displayedAnchorExample)]) {
   assert.strictEqual(SharedUtils.extractResources(displayedAnchorExample, baseUrl, 'html', context).groups.baidu.length, 0,
@@ -91,6 +120,35 @@ const realLinkAfterExample = SharedUtils.extractResources(displayedAnchorExample
   '<a href="https://pan.baidu.com/s/1real">真实下载</a> 提取码：ab12', baseUrl, 'html');
 assert.strictEqual(realLinkAfterExample.groups.baidu.length, 1, 'an escaped HTML example must not add a phantom resource');
 assert.strictEqual(realLinkAfterExample.groups.baidu[0].code, 'ab12', 'escaped markup must not steal a real link\'s access code');
+const fakeMarkupInsideAttribute =
+  '<img title=\'Preview > 解压密码：Shadow@123 <a href="https://pan.baidu.com/s/1ghost">\' src="/preview.png">' +
+  '<p><a title=\'Example href="https://pan.baidu.com/s/1alsoGhost" > label\' href="https://pan.baidu.com/s/1realAttr">下载</a>' +
+  ' 提取码：rt12</p><p>解压密码：Real@123</p>';
+for (const context of [undefined, SharedUtils.prepareArticleExtractionContext(fakeMarkupInsideAttribute)]) {
+  const parsed = SharedUtils.extractResources(fakeMarkupInsideAttribute, baseUrl, 'html', context);
+  assert.deepStrictEqual(plain(parsed.groups.baidu.map(item => [item.url, item.code])),
+    [['https://pan.baidu.com/s/1realAttr', 'rt12']], 'quoted attribute values must not create fake anchors or steal an access code');
+  assert.deepStrictEqual(plain(parsed.passwords), ['Real@123'], 'password labels must come from rendered text');
+}
+const joinedTraditional = SharedUtils.extractResources('https://pan.baidu.com/s/1joined提取碼：rt12', baseUrl, 'txt');
+assert.deepStrictEqual(plain(joinedTraditional.groups.baidu.map(item => [item.url, item.code])),
+  [['https://pan.baidu.com/s/1joined', 'rt12']], 'a traditional label immediately after the URL must not become part of the URL');
+
+const sourceUrl = 'https://pan.baidu.com/s/1codeOrigin';
+const bodyCode = SharedUtils.extractResources('<p>' + sourceUrl + ' 提取码：old1</p>', baseUrl, 'html');
+const txtCode = SharedUtils.extractResources(sourceUrl + '\n提取码：txt2', baseUrl, 'txt');
+const urlCode = SharedUtils.extractResources('<a href="' + sourceUrl + '?pwd=URL3">下载</a>', baseUrl, 'html');
+for (const ordered of [[bodyCode, txtCode], [txtCode, bodyCode]]) {
+  const combined = SharedUtils.mergeResources(...ordered).groups.baidu[0];
+  assert.strictEqual(combined.code, 'txt2', 'TXT labels must win over a conflicting HTML label for the same link');
+  assert.deepStrictEqual(plain(combined.altCodes), ['old1']);
+}
+const preferred = SharedUtils.mergeResources(bodyCode, txtCode, urlCode).groups.baidu[0];
+assert.strictEqual(preferred.code, 'URL3', 'the link query is the highest-confidence access code');
+assert.deepStrictEqual(plain(preferred.altCodes), ['txt2', 'old1']);
+const legacy = { groups: { baidu: [{ url: sourceUrl, code: 'old0', source: 'html+txt' }] }, passwords: [] };
+assert.strictEqual(SharedUtils.mergeResources(legacy, txtCode).groups.baidu[0].code, 'old0',
+  'entries without code provenance must preserve their existing primary code');
 const manyPasswords = Array.from({ length: 12 }, function(_, index) { return '解压密码：secret' + index; });
 for (const source of ['html', 'txt']) {
   const passwordInput = source === 'html' ? manyPasswords.map(function(line) { return '<p>' + line + '</p>'; }).join('') : manyPasswords.join('\n');

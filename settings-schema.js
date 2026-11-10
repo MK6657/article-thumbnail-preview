@@ -109,7 +109,7 @@ const SETTINGS_SCHEMA = [
     default: 3,
     min: 1, max: 128, step: 1,
     recommendedMax: 30,
-    description: '普通/弱图在首屏或进入真实可视范围后，最多同时加载多少张；重图使用独立并发。',
+    description: '已入普通队列的图片最多同时加载多少张。实际并发也受同域和全局上限约束。',
     recommend: '3 适合保守环境；也可使用弱图加载预设快速调整。',
     lowImpact: '并发太低会让当前视线内的图片逐张等待。',
     highImpact: '并发太高可能触发浏览器限制。',
@@ -123,7 +123,7 @@ const SETTINGS_SCHEMA = [
     default: 2,
     min: 0, max: 128, step: 1,
     recommendedMax: 16,
-    description: '为真实可见图片和手动重试保留多少全局槽位；离屏任务至少保留 1 路持续推进。0 表示不额外保留。',
+    description: '为真实可见图片和手动重试保留全局槽位。每个普通图床也按此值预留，最多预留该图床上限的一半。离屏任务至少保留 1 路，0 表示取消预留。',
     recommend: '默认 2；弱图并发提高时可同步提高，预设会自动协调。',
     lowImpact: '过低时离屏慢图可能先占满槽位，让可见图等待。',
     highImpact: '过高时离屏预加载吞吐会下降，但不会完全停止。',
@@ -137,7 +137,7 @@ const SETTINGS_SCHEMA = [
     default: 1,
     min: 1, max: 128, step: 1,
     recommendedMax: 24,
-    description: '后台补齐时普通图床同时加载多少张图片；重图图床使用独立并发。',
+    description: '控制按视口登记的后台普通图并发，并参与待加载预算计算。普通帖队列使用普通图并发上限。',
     applyMode: 'live',
   },
   {
@@ -406,7 +406,7 @@ const SETTINGS_SCHEMA = [
     default: 6,
     min: 1, max: 128, step: 1,
     recommendedMax: 30,
-    description: '单一普通图床最多同时加载多少张，不再被运行时固定为 6。',
+    description: '单一普通图床的总并发上限。静态图和动图共用额度，屏外首批使用较小的并发。',
     applyMode: 'live',
   },
   {
@@ -415,7 +415,7 @@ const SETTINGS_SCHEMA = [
     type: 'boolean',
     group: '专家调优',
     default: true,
-    description: '开启后按最近失败数量与失败比例降低单域并发，少量失效 URL 不会误伤整台图床；关闭后始终执行“普通图同域并发”。',
+    description: '开启后按近期失败和超时降载。普通队列的动图单独降速，静态图仍能使用图床的剩余额度。',
     applyMode: 'live',
   },
   {
@@ -883,7 +883,7 @@ var ATP_ORDINARY_LOAD_PRESET_VALUES = {
     articleCommitBatchSize: 2
   },
   ordinaryFast: {
-    firstScreenConcurrency: 12,
+    firstScreenConcurrency: 16,
     viewportPriorityReservedSlots: 7,
     backgroundConcurrency: 2,
     ordinaryHostConcurrency: 10,

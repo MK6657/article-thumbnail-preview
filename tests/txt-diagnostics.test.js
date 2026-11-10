@@ -12,7 +12,7 @@ const attachment = {
   pageUrl: 'https://www.sehuatang.org/thread-123-1-1.html?secret=private_referrer'
 };
 
-function loadContent(fetchResponse) {
+function loadContent(fetchResponse, backgroundResponse) {
   const events = [];
   const messages = [];
   const listeners = [];
@@ -35,7 +35,8 @@ function loadContent(fetchResponse) {
     fetch: async (url, options) => { requests++; return fetchResponse(url, options); },
     chrome: { runtime: { lastError: null, sendMessage(message, callback) {
       messages.push(message);
-      callback({ resources: sandbox.SharedUtils.emptyResources(), attemptedCount: message.attachments.length,
+      callback(backgroundResponse ? backgroundResponse(message, sandbox.SharedUtils) : {
+        resources: sandbox.SharedUtils.emptyResources(), attemptedCount: message.attachments.length,
         unresolvedCount: message.attachments.length, retryableCount: message.attachments.length });
     } } }
   };
@@ -105,6 +106,76 @@ async function run() {
   assert.strictEqual(dispatch.fields.threadId, pageEvent.fields.threadId);
   assert.strictEqual(dispatch.fields.runId, pageEvent.fields.runId);
   assert.strictEqual(attachment.diagnosticId, undefined, 'diagnostic metadata must not mutate caller data');
+
+  const relayUrl = 'https://xia.ewrewej.la/download?sign=private_signature';
+  const relayHtml = '<!doctype html><a href="' + relayUrl + '">下载附件</a>';
+  const txt = 'https://pan.baidu.com/s/1relay\n提取码：aB12';
+  const respond = (url, body, contentType = 'text/plain') => ({
+    ok: true, status: 200, url, headers: { get: (name) => name === 'content-type' ? contentType : null },
+    arrayBuffer: async () => new TextEncoder().encode(body).buffer
+  });
+  const workerSuccess = (shared) => ({
+    resources: shared.extractResources(txt, relayUrl, 'txt'),
+    attemptedCount: 1, unresolvedCount: 0, retryableCount: 0
+  });
+  let rootReads = 0;
+  const oneShot = loadContent(async (url) => {
+    assert.strictEqual(url, attachment.url);
+    if (++rootReads === 1) return respond(url, relayHtml, 'text/html');
+    return { ok: false, status: 403, url, headers: { get: () => null } };
+  }, (message, shared) => {
+    assert.strictEqual(message.attachments[0].url, relayUrl, 'worker must receive the original signed relay URL');
+    return workerSuccess(shared);
+  });
+  const oneShotResult = await oneShot.sandbox.ATPFetcher.fetchTextAttachmentResourcesWithStatus([attachment]);
+  assert.strictEqual(rootReads, 1, 'a successful intermediary response must be used without replaying a one-use request');
+  assert.strictEqual(oneShot.messages.length, 1);
+  assert.strictEqual(oneShotResult.unresolvedCount, 0);
+  assert.strictEqual(oneShotResult.resources.groups.baidu[0].code, 'aB12');
+  assertPrivate(oneShot.events);
+
+  const second = { ...attachment, url: attachment.url.replace('private_aid', 'second_aid') };
+  const order = [];
+  const handoff = loadContent(async (url) => {
+    order.push(url === attachment.url ? 'first page request' : 'second page request');
+    if (url === attachment.url) throw new TypeError('Failed to fetch');
+    return respond(url, txt);
+  }, (message, shared) => {
+    order.push('worker handoff');
+    assert.strictEqual(message.attachments[0].url, attachment.url);
+    return workerSuccess(shared);
+  });
+  const handoffResult = await handoff.sandbox.ATPFetcher.fetchTextAttachmentResourcesWithStatus([attachment, second]);
+  assert.deepStrictEqual(order, ['first page request', 'worker handoff', 'second page request'],
+    'a redirect fallback must reach the worker before a later attachment spends the remaining deadline');
+  assert.strictEqual(handoffResult.unresolvedCount, 0);
+  assertPrivate(handoff.events);
+
+  const noLinks = loadContent(async (url) => respond(url, 'An ordinary text document.'));
+  const noLinksResult = await noLinks.sandbox.ATPFetcher.fetchTextAttachmentResourcesWithStatus([attachment]);
+  assert.strictEqual(noLinks.requests(), 1);
+  assert.strictEqual(noLinks.messages.length, 0, 'a complete TXT document with no resources should not be read again');
+  assert.strictEqual(noLinksResult.unresolvedCount, 1);
+  assert.strictEqual(noLinksResult.retryableCount, 1);
+
+  const timeout = loadContent(async () => { throw new DOMException('Fixture deadline', 'AbortError'); });
+  const timeoutResult = await timeout.sandbox.ATPFetcher.fetchTextAttachmentResourcesWithStatus([attachment]);
+  assert.strictEqual(timeout.requests(), 1);
+  assert.strictEqual(timeout.messages.length, 0, 'a confirmed timeout keeps manual retry available without an immediate second request');
+  assert.strictEqual(timeoutResult.retryableCount, 1);
+  assert.strictEqual(timeout.events[0].fields.failureClass, 'timeout');
+
+  const sameOriginRelay = 'https://www.sehuatang.org/loop.txt';
+  const requested = [];
+  const cycle = loadContent(async (url) => {
+    requested.push(url);
+    const next = url === attachment.url ? sameOriginRelay : attachment.url;
+    return respond(url, '<!doctype html><a href="' + next.replace(/&/g, '&amp;') + '">下载附件</a>', 'text/html');
+  });
+  const cycleResult = await cycle.sandbox.ATPFetcher.fetchTextAttachmentResourcesWithStatus([attachment]);
+  assert.deepStrictEqual(requested, [attachment.url, sameOriginRelay], 'intermediary chains must not revisit an ancestor');
+  assert.strictEqual(cycle.messages.length, 0);
+  assert.strictEqual(cycleResult.unresolvedCount, 1);
 
   const background = loadBackground(failure.sandbox.SharedUtils, async () => { throw new TypeError('Failed to fetch ' + attachment.url); });
   await background.sandbox.fetchTextAttachmentResource(failure.messages[0].attachments[0], 0, Date.now() + 5000, { zone: 'builtin' });

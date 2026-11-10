@@ -264,6 +264,39 @@ async function checkBackgroundWaitAndInflight() {
   assert.strictEqual(relay.messages.length, 0, 'unpaced cross-origin dispatch still needs the cancellation guard');
 }
 
+async function checkVisibleFallbackAllowance() {
+  const run = load({
+    fetch: () => { throw new TypeError('fixture transport failure'); },
+    message(request, callback) {
+      const resources = run.sandbox.SharedUtils.extractResources(
+        'https://pan.baidu.com/s/1fallback?pwd=xy12', articleUrl, 'txt');
+      callback({ resources, attemptedCount: 1, unresolvedCount: 0, retryableCount: 0 });
+    }
+  });
+  await useAllowance(run, 5);
+  let onScreen = false;
+  const promise = run.fetcher.fetchTextAttachmentResourcesWithStatus([attachment('fallback')], {
+    deadline: run.now() + 60000,
+    getPriority: stage => onScreen && stage === 'background_fallback' ? run.pacer.PRIORITY_VISIBLE : run.pacer.PRIORITY_ARTICLE
+  });
+  await run.advance(500);
+  assert.strictEqual(run.requests.length, 1);
+  assert.strictEqual(run.messages.length, 0);
+  assert.strictEqual(run.pacer.getState().waiting, 1);
+  assert(run.pacer.getState().tokens >= 4, 'offscreen handoff must preserve visible tokens');
+
+  onScreen = true;
+  await run.advance(500);
+  assert.strictEqual(run.messages.length, 1, 'visible handoff must use an existing reserved token before another refill');
+  assert(run.pacer.getState().tokens < 4, 'the worker request must consume a token');
+  const sent = run.events.find(event => event.fields.stage === 'background_dispatch' && event.fields.outcome === 'sent');
+  assert(sent.fields.paceWaitMs > 0 && sent.fields.paceWaitMs <= 1000, 'the dispatch must report the actual pace wait');
+  const result = await promise;
+  assert.strictEqual(result.resources.groups.baidu[0].code, 'xy12');
+  assert.strictEqual(run.pacer.getState().active, 0);
+  assertNoFailure(run);
+}
+
 async function checkDirectAndIntermediaryBoundaries() {
   const direct = load({ bridge: false });
   await useAllowance(direct, 5);
@@ -385,6 +418,7 @@ async function run() {
   await checkDynamicPriorityAndInflight();
   await checkPartialResultsAndResume();
   await checkBackgroundWaitAndInflight();
+  await checkVisibleFallbackAllowance();
   await checkDirectAndIntermediaryBoundaries();
   await checkFreshAndManual();
   await checkGrantedTicketRefundAndLatch();

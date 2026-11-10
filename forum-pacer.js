@@ -43,8 +43,8 @@
   var LIMIT_KEY = 'atp.forumPacer.limits.v1';
   var LIMIT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
-  // Requests for threads on screen go first; everything else (offscreen
-  // threads, TXT work) is served in the order it asked.
+  // Visible articles and visible TXT handoffs can use the reserved tokens.
+  // Waiters of the same priority keep their original order.
   var PRIORITY_VISIBLE = 0;
   var PRIORITY_ARTICLE = 1;
 

@@ -953,9 +953,10 @@
   function getTextParseButtonHtml(threadState, compact) {
     var attachmentCount = getTextAttachmentCount(threadState);
     var loading = !!(threadState && threadState.textResourcesLoading);
-    var label = loading ? 'TXT 资源解析中' : '解析TXT';
-    var text = loading ? '解析中' : '解析TXT';
-    if (attachmentCount) {
+    var retryable = !!(threadState && threadState.textResourcesRetryable);
+    var label = loading ? 'TXT 资源解析中' : (retryable ? '重试本帖 TXT' : '解析本帖 TXT');
+    var text = loading ? '解析中' : (retryable ? '重试 TXT' : '解析 TXT');
+    if (attachmentCount && !retryable) {
       label += '（' + attachmentCount + '个附件）';
       if (!compact) text += ' (' + attachmentCount + '个附件)';
     }

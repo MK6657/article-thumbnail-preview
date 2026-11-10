@@ -287,9 +287,6 @@
       offscreenAdmissionLimit: Math.max(1, globalLimit - visibleReserve),
       offscreenOrdinaryLimit: Math.min(ATPLoadPolicy.getOffscreenFirstRowOrdinaryLimit(settings), Math.max(1, globalLimit - visibleReserve)),
       ordinaryHostConcurrency: settings.ordinaryHostConcurrency,
-      autoHostSafetyLimit: settings.autoLoadOffscreenFirstRowsEnabled === true
-        ? Math.min(Math.max(1, Number(settings.ordinaryHostConcurrency) || 6), 6)
-        : undefined,
       articleFetchConcurrency: ATPLoadPolicy.getArticleFetchConcurrency(settings),
       forumRequestBurst: paceState ? paceState.burst : undefined,
       forumRequestIntervalMs: paceState ? paceState.refillMs : undefined,

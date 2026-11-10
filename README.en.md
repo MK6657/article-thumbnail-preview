@@ -4,7 +4,9 @@ English | [简体中文](README.md)
 
 A Chrome / Edge Manifest V3 extension that adds image previews and copyable resource links to supported Discuz! forum listing pages.
 
-Current version: **1.18.8**. No server, npm installation, or build is required to use the extension.
+Current version: **1.18.9**. Install the unpacked extension directly in the browser.
+
+Version 1.18.9 reuses TXT intermediary download links, reads resource labels from visible content, and prioritizes access codes by source. Scroll passes share container bounds, and each thread updates thumbnail progress once per frame.
 
 Version 1.18.8 lets automatic TXT work waiting offscreen give its slot to queued onscreen work, retaining resources already read before resuming. First-screen diagnostics separate queue time, hidden-page pauses and request processing time.
 
