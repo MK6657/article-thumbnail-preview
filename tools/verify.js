@@ -15959,13 +15959,13 @@ function checkCriticalStaticRules() {
   assert(renderer.indexOf('var normalizedTextAttachments = []') !== -1, 'renderer must build normalized TXT attachment arrays explicitly');
   assert(renderer.indexOf('for (var tai = 0; tai < (textAttachments || []).length; tai++)') !== -1, 'renderer TXT attachment normalization must use one loop');
   assert(renderer.indexOf('(textAttachments || []).map(function') === -1, 'renderer TXT attachment normalization must not allocate via map');
-  assert(renderer.indexOf('function mergeTextAttachments(existingAttachments, freshAttachments, pageUrl)') !== -1, 'renderer must merge cached and freshly extracted TXT attachments for mixed marker states');
-  assert(renderer.indexOf('var needsFreshExtraction = !!(') !== -1, 'renderer TXT scheduling must detect mixed cached TXT markers before fetching resources');
-  assert(renderer.indexOf('Number(threadState.textAttachmentCount || 0) > (hasCachedAttachments ? threadState.textAttachments.length : 0)') !== -1, 'renderer mixed TXT marker detection must compare raw marker count against cached attachment count');
-  assert(renderer.indexOf('if (hasCachedAttachments && !needsFreshExtraction)') !== -1, 'renderer must not bypass fresh extraction when cached TXT attachments are only a subset');
+  assert(renderer.indexOf('function mergeTextAttachments(freshAttachments, stableAttachments, pageUrl)') !== -1, 'renderer must merge current TXT links with stable cached links');
+  assert(renderer.indexOf('var needsFreshExtraction = (hasTransientLinks && !canReuseFreshLinks)') !== -1, 'renderer TXT scheduling must refresh stale transient links');
+  assert(renderer.indexOf('threadState.hasTextAttachments && expectedAttachmentCount > existingAttachments.length') !== -1, 'renderer mixed TXT marker detection must compare raw marker count against cached attachment count');
+  assert(renderer.indexOf('if (existingAttachments.length && !needsFreshExtraction)') !== -1, 'renderer must check for missing or stale links before reading existing attachments');
   assert(renderer.indexOf('var fallbackToCachedAttachmentsAfterFreshFailure = function(message, e)') !== -1, 'renderer must fall back to cached TXT attachments when mixed-state fresh extraction fails');
   assert(renderer.indexOf("threadState.textResourceMessage = 'TXT 附件重新提取失败，解析已缓存附件'") !== -1, 'renderer mixed TXT fresh-failure fallback must expose a transient fallback status');
-  assert(renderer.indexOf('doFetch(threadState.textAttachments);') !== -1, 'renderer mixed TXT fresh-failure fallback must parse cached TXT attachments');
+  assert(renderer.indexOf('doFetch(stableAttachments, expectedAttachmentCount - stableAttachments.length);') !== -1, 'renderer fresh-failure fallback must read stable TXT attachments and retain the missing count');
   assert(renderer.indexOf('doFetch(attachments, missingAttachmentCount);') !== -1, 'renderer must fetch the merged TXT attachment set and retain missing attachment counts after fresh extraction');
   assert(renderer.indexOf("heavyThumbnailClarity === 'lightweight'") !== -1, 'renderer must detect lightweight heavy thumbnail mode');
   assert(renderer.indexOf('var visibleRowsForRender = heavyPlan.enabled && !heavyPlan.lightweight ? 1 : visRows') !== -1, 'lightweight heavy thumbnails must use the ordinary visible row count');
@@ -16004,7 +16004,7 @@ function checkCriticalStaticRules() {
   assert(loader.indexOf('SharedUtils.hasResources(ts.resources)') === -1, 'loader must not use link-only resource checks for thread completion cache writes');
   assert(resourcePanel.indexOf('function hasResourcePayload(resources)') !== -1, 'resource panel must share password-aware payload checks');
   assert(resourcePanel.indexOf('data-copy-passwords="1"') !== -1, 'resource panel must expose a dedicated copy action for password-only resources');
-  assert(/if \(!groups\.length\) \{[\s\S]*?if \(resources\.passwords\.length\) \{[\s\S]*?data-copy-passwords="1"[\s\S]*?if \(statusMessage\)[\s\S]*?atp-resource-status[\s\S]*?if \(showTextFallbackActions\)[\s\S]*?getTextParseButtonHtml\(threadState, false\)[\s\S]*?return;/.test(resourcePanel), 'resource sidebar password-only branch must keep TXT status and automatic-failure fallback actions visible');
+  assert(/if \(!groups\.length\) \{[\s\S]*?if \(resources\.passwords\.length\) \{[\s\S]*?data-copy-passwords="1"[\s\S]*?if \(statusMessage\)[\s\S]*?atp-resource-status[\s\S]*?if \(showTextFallbackActions\)[\s\S]*?getTextFallbackActionsHtml\(threadState, false\)[\s\S]*?return;/.test(resourcePanel), 'resource sidebar password-only branch must keep TXT status and automatic-failure fallback actions visible');
   assert(resourcePanel.indexOf('function copyPasswordsOnly(sourceEl)') !== -1, 'resource panel password-only copy must not reuse link-copy settings');
   assert(resourcePanel.indexOf('formatPasswords(resources, true)') !== -1, 'resource panel explicit password copy must ignore copyPasswordsWithLinks=false');
   assert(resourcePanel.indexOf('function writeTextWithFallback(text)') !== -1, 'resource panel copy must centralize clipboard API and fallback copy handling');
@@ -16055,7 +16055,7 @@ function checkCriticalStaticRules() {
   assert(background.indexOf('var fetchTimeout = getDeadlineFetchTimeout(deadline, TEXT_ATTACHMENT_TIMEOUT);') !== -1, 'background TXT fetch must compute per-request timeout from remaining deadline');
   assert(background.indexOf('setTimeout(function() { ctrl.abort(); }, fetchTimeout)') !== -1, 'background TXT fetch must abort using the deadline-clamped timeout');
   assert(background.indexOf('}, depth + 1, deadline, options);') !== -1, 'background TXT intermediary recursion must preserve the original deadline');
-  assert(background.indexOf('var results = []') !== -1 && background.indexOf('results.push(await fetchTextAttachmentResource(attachments[pi], 0, deadline, options));') !== -1, 'background TXT resource fetch must keep each automatic thread to one attachment request at a time');
+  assert(/async function fetchTextAttachmentResourcesWithStatus[\s\S]*?for \(var i = 0; i < attachments\.length; i\+\+\) \{[\s\S]*?await fetchTextAttachmentResource\(attachments\[i\], 0, deadline,/.test(background), 'background TXT resource fetch must keep each automatic thread to one attachment request at a time');
   assert(background.indexOf('await Promise.all(promises)') === -1, 'background TXT attachment reads must not multiply automatic queue concurrency with Promise.all');
   assert(background.indexOf('attachments.map(function(attachment)') === -1, 'background TXT resource fetch must not allocate promises with map');
   assert(background.indexOf('var ARTICLE_FETCH_IN_FLIGHT = {}') !== -1, 'background article fetches must track in-flight requests for reuse');
@@ -16197,8 +16197,8 @@ function checkCriticalStaticRules() {
   assert(sharedUtils.indexOf('collectAccessCodePairs: function(rawHtml, baseUrl, source)') !== -1 && sharedUtils.split('this.collectAccessCodePairs(rawHtml, baseUrl, source)').length === 2,
     'share codes must be paired once per page, over one text that holds every link');
   assert(sharedUtils.indexOf('function scanResourceText(scanText)') !== -1, 'resource extraction must scan text and href values without building one large scan string');
-  assert(sharedUtils.indexOf('forEachHrefValue: function(html, callback)') !== -1, 'shared utils must expose streaming href iteration for hot extraction paths');
-  assert(sharedUtils.indexOf('this.forEachHrefValue(decoded, function(href)') !== -1, 'resource and TXT extraction must iterate href values without building arrays first');
+  assert(sharedUtils.indexOf('var rawText = this.replaceHtmlTags(rawHtml, function(name, attrs, closing)') !== -1,
+    'TXT download extraction must read real link attributes and scan raw URLs outside tags');
   assert(sharedUtils.indexOf('mergeUniqueLimited: function(primary, secondary, limit)') !== -1, 'resource password extraction must support bounded password merging');
   assert(/resources\.passwords = source === 'txt' \? this\.extractArchivePasswords\(text\) : this\.mergeUniqueLimited\(\s*this\.extractArchivePasswordsFromHtml\(rawHtml\),\s*this\.extractArchivePasswords\(text\),\s*5\s*\);/.test(sharedUtils),
     'resource password extraction must keep literal TXT extraction separate and cap HTML password merging at five without slicing a full merged list');
@@ -16611,12 +16611,12 @@ function checkCriticalStaticRules() {
   assert(resourcePanel.indexOf('!threadState.textResourcesAutoQueued') !== -1 && resourcePanel.indexOf('!threadState.textResourcesAutoActive') !== -1 && resourcePanel.indexOf('threadState.textResourcesRetryable') !== -1, 'resource panel must hide manual TXT actions until automatic parsing has failed');
   assert(resourcePanel.indexOf('window.ATPRenderer.scheduleTextResourceLoad(threadState, true)') !== -1, 'resource panel manual TXT parse must bypass fail-cache retries through the renderer scheduler');
   assert(resourcePanel.indexOf('markTextResourceManualScheduleFailed') !== -1, 'resource panel manual TXT parse must keep local scheduling failures retryable');
-  assert((resourcePanel.match(/getTextParseButtonHtml\(threadState, false\)/g) || []).length >= 3 && resourcePanel.indexOf('getTextParseButtonHtml(threadState, true)') !== -1, 'resource panel manual TXT fallback buttons must stay available in sidebar and inline views after automatic failure');
+  assert((resourcePanel.match(/getTextFallbackActionsHtml\(threadState, false\)/g) || []).length >= 3 && resourcePanel.indexOf('getTextFallbackActionsHtml(threadState, true)') !== -1, 'resource panel manual TXT fallback actions must stay available in sidebar and inline views after automatic failure');
   assert(resourcePanel.indexOf('return (threadState.hasTextAttachments || threadState.textResourcesRetryable) ? 1 : 0;') !== -1, 'resource panel must not show zero-count TXT parse actions for marker-only states');
   assert(resourcePanel.indexOf('function getTextResourceStatusMessage(threadState, emptyFallback)') !== -1, 'resource panel must centralize TXT parse status messages');
   assert(resourcePanel.indexOf('atp-resource-status') !== -1, 'resource sidebar must render persistent TXT parse status beside existing resources');
   assert(resourcePanel.indexOf('atp-resource-inline-status') !== -1, 'inline resource panel must render persistent TXT parse status');
-  assert(/html \+= '<div class="atp-resource-empty"[\s\S]*?if \(showTextFallbackActions\)[\s\S]*?getTextParseButtonHtml\(threadState, false\)[\s\S]*?html \+= getLiveRegionHtml\('atp-resource-msg'\);[\s\S]*?setSidebarHtml\(el, renderSignature, html\);/.test(resourcePanel), 'resource sidebar automatic-failure state must keep a message live region for manual fallback feedback');
+  assert(/html \+= '<div class="atp-resource-empty"[\s\S]*?if \(showTextFallbackActions\)[\s\S]*?getTextFallbackActionsHtml\(threadState, false\)[\s\S]*?html \+= getLiveRegionHtml\('atp-resource-msg'\);[\s\S]*?setSidebarHtml\(el, renderSignature, html\);/.test(resourcePanel), 'resource sidebar automatic-failure state must keep a message live region for manual fallback feedback');
   assert(resourcePanel.indexOf('!hasResourcePayload(threadState.resources) && !hasPendingAttachments && !statusMessage') !== -1, 'inline resource panel must stay visible for TXT loading or failure status without existing resources');
   assert(loader.indexOf('function isTaskCurrent(task)') !== -1, 'loader must ignore stale image tasks after reload');
   assert(loader.indexOf('var IMAGE_SLOT_EPOCH = 0') !== -1, 'loader active slot accounting must have an epoch for reload/disable resets');
@@ -17933,7 +17933,7 @@ function checkCriticalStaticRules() {
   assert(background.indexOf("BGLOG.info('提取'") === -1, 'background article fetches must not log successful extraction totals per article');
   assert(/function\(r\) \{ sendResponse\(Object\.assign\(deniedImageResponses, r \|\| \{\}\)\); BGLOG\.flushSoon\(\); \}/.test(background), 'background FETCH_IMAGES success path must merge denied URL responses and respond before scheduling log flush');
   assert(background.indexOf('BGLOG.flush(); sendResponse(r);') === -1, 'background FETCH_IMAGES success path must not force a log storage write before responding');
-  assert(/sendResponse\(\{\s+resources: SharedUtils\.normalizeResources\(status\.resources\),\s+attemptedCount: status\.attemptedCount,\s+unresolvedCount: status\.unresolvedCount,\s+retryableCount: status\.retryableCount,\s+queueStatus: status\.queueStatus \|\| 'completed'\s+\}\);\n      BGLOG\.flushSoon\(\);/.test(background), 'background FETCH_TEXT_RESOURCES success path must respond with TXT and queue status before scheduling log flush');
+  assert(/sendResponse\(\{\s+resources: SharedUtils\.normalizeResources\(status\.resources\),\s+attemptedCount: status\.attemptedCount,\s+unresolvedCount: status\.unresolvedCount,\s+retryableCount: status\.retryableCount,\s+accessDeniedCount: status\.accessDeniedCount \|\| 0,\s+queueStatus: status\.queueStatus \|\| 'completed'\s+\}\);\n      BGLOG\.flushSoon\(\);/.test(background), 'background FETCH_TEXT_RESOURCES must respond with TXT and queue status before scheduling log flush');
   assert(loader.indexOf('HEAVY_BG_STOP_LOSS_MIN_HOST_FAILURES') === -1, 'loader must not retain a hidden cooled background stop-loss threshold');
   assert(loader.indexOf('function isHeavyCoolingBackgroundStopLossThread') === -1, 'loader must defer open-host background work instead of discarding it through stop-loss');
   assert(loader.indexOf('LIGHTWEIGHT_HEAVY_ORDINARY_PRESSURE_LIMIT = 3') === -1, 'lightweight heavy mode must not retain the old hidden mixed-page limit of 3');

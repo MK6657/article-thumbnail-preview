@@ -281,12 +281,20 @@ function createFixtureServer(pfxPath) {
         res.end();
         return;
       }
-      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-      res.end('https://pan.baidu.com/s/1AtpOneUse\n提取码：rt12');
+      res.writeHead(200, { 'content-type': 'application/octet-stream' });
+      res.end(Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('https://pan.baidu.com/s/1AtpOneUse\n提取码：rt12', 'utf16le')]));
+      return;
+    }
+    if (pathname === '/forbidden-txt-fixture.txt') {
+      res.writeHead(403);
+      res.end();
       return;
     }
     if (pathname === '/retry-txt-fixture.txt') {
-      if (metrics.requestsByPath[pathname] === 1) {
+      var token = requestUrl.searchParams.get('sig');
+      if (!metrics.retryTokens) metrics.retryTokens = [];
+      metrics.retryTokens.push(token);
+      if (token !== 'current') {
         res.writeHead(403);
         res.end();
         return;
@@ -296,8 +304,9 @@ function createFixtureServer(pfxPath) {
       return;
     }
     if (pathname === '/thread-403-1-1.html') {
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-      res.end(htmlPage('<p><a href="/retry-txt-fixture.txt">retry-txt-fixture.txt</a></p>', 'TXT retry fixture'));
+      var signature = metrics.requestsByPath[pathname] === 1 ? 'expired' : 'current';
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'public, max-age=600' });
+      res.end(htmlPage('<p><a href="/retry-txt-fixture.txt?sig=' + signature + '">retry-txt-fixture.txt</a></p>', 'TXT retry fixture'));
       return;
     }
 
@@ -1243,6 +1252,12 @@ async function main() {
     assert.strictEqual(fixture.metrics.requestsByPath['/signed-relay-entry.txt'], 2, 'The page bridge must hand off directly to the worker');
     assert.strictEqual(fixture.metrics.requestsByHost[SIGNED_RELAY_HOST], 1, 'Only the worker should fetch the relay once');
 
+    var forbiddenAttachment = { url: 'https://' + CROSS_HOST + ':' + fixturePort + '/forbidden-txt-fixture.txt', name: 'forbidden.txt' };
+    var deniedByWorker = await evaluate(pageOne, 'ATPFetcher.fetchTextAttachmentResourcesWithStatus([' +
+      JSON.stringify(forbiddenAttachment) + '], { manualRetry: true })', pageOneContext.id);
+    assert.strictEqual(deniedByWorker.accessDeniedCount, 1, 'worker HTTP denial must reach the content script');
+    assert.strictEqual(fixture.metrics.requestsByPath['/forbidden-txt-fixture.txt'], 1);
+
     var retryPage = await createPageSession(devtoolsPort);
     sessions.push(retryPage);
     await navigate(retryPage, 'https://' + SMOKE_HOST + ':' + fixturePort + '/forum.php?mod=forumdisplay&fid=95&mode=txt-retry');
@@ -1258,6 +1273,11 @@ async function main() {
     assert(await evaluate(retryPage, `(() => {
       const thread = ${retryThreadExpression};
       thread.panel.querySelector('[data-resource-trigger]').click();
+      return thread.textResourceMessage.includes('站点拒绝读取 1 个 TXT 附件') &&
+        !!document.querySelector('a[data-open-thread][href*="/thread-403-1-1.html"]') &&
+        !!document.querySelector('[data-import-txt]');
+    })()`, retryContext.id), 'the failure must offer the original thread and TXT import');
+    assert(await evaluate(retryPage, `(() => {
       const action = Array.from(document.querySelectorAll('[data-parse-txt]')).find(button =>
         button.getAttribute('aria-label') === '重试本帖 TXT');
       if (!action) return false;
@@ -1272,6 +1292,8 @@ async function main() {
       })()`, retryContext.id);
     });
     assert.strictEqual(fixture.metrics.requestsByPath['/retry-txt-fixture.txt'], 2, 'manual retry should make one new attachment request');
+    assert.strictEqual(fixture.metrics.requestsByPath['/thread-403-1-1.html'], 2, 'manual retry must re-read the cached thread');
+    assert.deepStrictEqual(fixture.metrics.retryTokens, ['expired', 'current'], 'the new request must use the current attachment URL');
     retryPage.cdp.close();
     await closeTarget(devtoolsPort, retryPage.target.id);
     sessions.splice(sessions.indexOf(retryPage), 1);

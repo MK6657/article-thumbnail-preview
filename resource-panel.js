@@ -143,7 +143,8 @@
       'data-copy-all',
       'data-copy-passwords',
       'data-parse-txt',
-      'data-import-txt'
+      'data-import-txt',
+      'data-open-thread'
     ];
     for (var i = 0; i < attrs.length; i++) {
       if (btn.hasAttribute(attrs[i])) {
@@ -156,14 +157,14 @@
   function getFocusedResourceAction(root) {
     var active = document.activeElement;
     if (!root || !active || !root.contains || !root.contains(active)) return null;
-    var btn = active.closest ? active.closest('button') : null;
+    var btn = active.closest ? active.closest('button') || active.closest('[data-open-thread]') : null;
     if (!btn || !root.contains(btn)) return null;
     return getResourceActionKey(btn);
   }
 
   function restoreResourceActionFocus(root, actionKey) {
     if (!root || !actionKey || !root.querySelectorAll) return false;
-    var buttons = root.querySelectorAll('button');
+    var buttons = root.querySelectorAll(actionKey.attr === 'data-open-thread' ? '[data-open-thread]' : 'button');
     for (var i = 0; i < buttons.length; i++) {
       var btn = buttons[i];
       if (!btn.hasAttribute || !btn.hasAttribute(actionKey.attr)) continue;
@@ -972,6 +973,15 @@
     return '<button type="button" class="atp-resource-import-btn" data-import-txt="1" aria-label="' + esc(label) + '"' + (importing ? ' aria-disabled="true"' : '') + '>' + esc(text) + '</button>';
   }
 
+  function getTextFallbackActionsHtml(threadState, compact) {
+    var html = getTextParseButtonHtml(threadState, compact) + getTextImportButtonHtml(threadState, compact);
+    if (SharedUtils.getForumUrlZone(threadState.link)) {
+      html += '<a class="atp-resource-import-btn atp-resource-original-link" data-open-thread="1" href="' + esc(threadState.link) +
+        '" target="_blank" rel="noopener noreferrer">打开原帖</a>';
+    }
+    return html;
+  }
+
   function getSidebarRenderSignature(threadState, resources, groups, emptyMessage, statusMessage, hasPendingAttachments, showTextFallbackActions) {
     if (!threadState) return 'empty';
     var parts = [
@@ -1141,8 +1151,7 @@
           html += getStatusRegionHtml('div', 'atp-resource-status', statusMessage);
         }
         if (showTextFallbackActions) {
-          html += getTextParseButtonHtml(threadState, false);
-          html += getTextImportButtonHtml(threadState, false);
+          html += getTextFallbackActionsHtml(threadState, false);
         }
         html += getLiveRegionHtml('atp-resource-msg');
         setSidebarHtml(el, renderSignature, html);
@@ -1150,8 +1159,7 @@
       }
       html += '<div class="atp-resource-empty" role="status" aria-live="polite" aria-atomic="true">' + esc(emptyMessage) + '</div>';
       if (showTextFallbackActions) {
-        html += getTextParseButtonHtml(threadState, false);
-        html += getTextImportButtonHtml(threadState, false);
+        html += getTextFallbackActionsHtml(threadState, false);
       }
       html += getLiveRegionHtml('atp-resource-msg');
       setSidebarHtml(el, renderSignature, html);
@@ -1172,8 +1180,7 @@
       html += getStatusRegionHtml('div', 'atp-resource-status', statusMessage);
     }
     if (showTextFallbackActions) {
-      html += getTextParseButtonHtml(threadState, false);
-      html += getTextImportButtonHtml(threadState, false);
+      html += getTextFallbackActionsHtml(threadState, false);
     }
     html += '<button type="button" class="atp-resource-copy-all" data-copy-all="1">复制所有链接</button>';
     html += getLiveRegionHtml('atp-resource-msg');
@@ -1224,8 +1231,7 @@
       html += '<button type="button" data-copy-passwords="1">复制密码</button>';
     }
     if (showTextFallbackActions) {
-      html += getTextParseButtonHtml(threadState, true);
-      html += getTextImportButtonHtml(threadState, true);
+      html += getTextFallbackActionsHtml(threadState, true);
     }
     html += statusMessage
       ? getStatusRegionHtml('span', 'atp-resource-inline-status', statusMessage)

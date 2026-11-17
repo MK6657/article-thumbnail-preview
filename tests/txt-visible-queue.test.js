@@ -389,6 +389,32 @@ async function checkLateCallbackKeepsRequeuedWork() {
   assertNoFailure(run);
 }
 
+async function checkManualRetryRefreshesTransientLinks() {
+  const run = createRun();
+  const prefix = 'https://xia.djhdhs.us/download';
+  const old = Array.from({ length: 3 }, (_, index) => ({ url: prefix + '?sig=old-' + index, name: index + '.txt' }));
+  const state = run.thread('stale-txt', { visible: true, attachments: old });
+  state.textResourcesRetryable = true;
+  assert.strictEqual(run.sandbox.ATPRenderer.scheduleTextResourceLoad(state, true), true);
+  await run.flush();
+  const refresh = run.requests[0];
+  assert.strictEqual(refresh.url, state.link, 'a manual retry must request the thread even when the existing list is full');
+  assert.strictEqual(refresh.fetchOptions.cache, 'no-store', 'the refresh must request current attachment addresses');
+  const refreshed = Array.from({ length: 3 }, (_, index) => prefix + '?sig=new-' + index);
+  run.respond(refresh, '<html>' + refreshed.map((url, index) =>
+    '<a href="' + url + '">' + index + '.txt</a>').join('') + '</html>');
+  await run.flush();
+  const worker = run.requests[1];
+  assert.strictEqual(worker.kind, 'background');
+  assert.deepStrictEqual(Array.from(worker.message.attachments, item => item.url), refreshed,
+    'the previous signed URLs must not occupy slots in the refreshed request');
+  worker.callback({ resources: run.resources(501), attemptedCount: 3, unresolvedCount: 1, retryableCount: 1, accessDeniedCount: 1 });
+  await run.flush();
+  assert.strictEqual(run.count(state), 1);
+  assert.strictEqual(state.textResourcesRetryable, true);
+  assert(state.textResourceMessage.includes('站点拒绝读取 1 个 TXT 附件'));
+}
+
 async function main() {
   await checkWaitingPriorityAndResume();
   await checkVisibleWorkerFallback();
@@ -397,6 +423,7 @@ async function main() {
   await checkFreshExtractionYield();
   await checkImportAndGeneration();
   await checkLateCallbackKeepsRequeuedWork();
+  await checkManualRetryRefreshesTransientLinks();
   console.log('TXT visible queue integration tests ok');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

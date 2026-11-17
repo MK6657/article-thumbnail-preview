@@ -174,6 +174,41 @@ const literalAttachmentHtml = '<a href="' + literalAttachmentUrl.replace(/&/g, '
 assert.strictEqual(SharedUtils.extractTextAttachments(literalAttachmentHtml, baseUrl, 3)[0].url, literalAttachmentUrl, 'TXT attachment URLs must be entity-decoded once');
 assert.strictEqual(SharedUtils.extractTextDownloadUrls(literalAttachmentHtml, baseUrl, 3)[0], literalAttachmentUrl, 'TXT intermediary download URLs must be entity-decoded once');
 
+const splitShare = '<p>https://pan.baidu.com/s/1split<wbr><span>Link</span> 提取码：sp12</p>';
+const splitResources = SharedUtils.extractResources(splitShare, baseUrl, 'html');
+assert.deepStrictEqual(plain(splitResources.groups.baidu.map(item => [item.url, item.code])),
+  [['https://pan.baidu.com/s/1splitLink', 'sp12']], 'inline formatting must preserve the full displayed link and its code');
+
+const quotedFile = 'https://files.example/bundle.zip?token=a%22b&part=1';
+const quotedLinkHtml = '<a href="https://files.example/bundle.zip?token=a&quot;b&amp;part=1">下载</a>';
+assert.deepStrictEqual(plain(SharedUtils.extractResources(quotedLinkHtml, baseUrl, 'html').groups.other.map(item => item.url)),
+  [quotedFile], 'an escaped quote in a real link must not produce a truncated duplicate');
+
+const relayLink = 'https://xia.djhdhs.us/download?token=a%22b&part=1';
+const quotedRelay = '<a href="https://xia.djhdhs.us/download?token=a&quot;b&amp;part=1">资源.txt</a>';
+assert.deepStrictEqual(plain(SharedUtils.extractTextAttachments(quotedRelay, baseUrl, 3).map(item => item.url)),
+  [relayLink], 'attachment attributes must be parsed before decoding entities');
+assert.deepStrictEqual(plain(SharedUtils.extractTextDownloadUrls(quotedRelay, baseUrl, 3)),
+  [relayLink], 'the intermediary must follow the complete quoted URL exactly once');
+const plainRelay = '下载 ' + relayLink;
+assert(SharedUtils.looksLikeDownloadIntermediary(plainRelay), 'a plain link on the configured relay must be recognised');
+assert.deepStrictEqual(plain(SharedUtils.extractTextDownloadUrls(plainRelay, baseUrl, 3)), [relayLink]);
+const archiveThenText = '<a href="/forum.php?mod=attachment&amp;aid=archive">bundle.txt.zip</a>' + quotedRelay;
+assert.deepStrictEqual(plain(SharedUtils.extractTextAttachments(archiveThenText, baseUrl, 3).map(item => item.url)),
+  [relayLink], 'a TXT-like archive filename must not take an attachment slot');
+
+const unicodeText = 'https://pan.baidu.com/s/1unicode\n提取码：ab12\n解压密码：汉字';
+const littleEndian = Buffer.from(unicodeText, 'utf16le');
+for (const [bom, body] of [
+  [Buffer.from([0xff, 0xfe]), littleEndian],
+  [Buffer.from([0xfe, 0xff]), Buffer.from(littleEndian).swap16()],
+  [Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(unicodeText)]
+]) {
+  const decoded = SharedUtils.decodeTextBuffer(Buffer.concat([bom, body]), 'text/plain; charset=windows-1252');
+  assert.strictEqual(decoded, unicodeText, 'the file BOM must take precedence over the declared charset');
+  assert.strictEqual(SharedUtils.extractResources(decoded, baseUrl, 'txt').groups.baidu[0].code, 'ab12');
+}
+
 // Nearby images cannot borrow a TXT filename and occupy all three fetch slots.
 const imagesBesideTxt = [1, 2, 3].map(function(id) {
   return '<div class="attach"><a href="forum.php?mod=attachment&amp;aid=' + id + '">preview' + id + '.jpg</a></div>';

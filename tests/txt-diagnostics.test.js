@@ -209,12 +209,20 @@ async function run() {
   assertPrivate(expired.events);
 
   const forbidden = loadContent(async url => ({ ok: false, status: 403, url, headers: { get: () => null } }));
-  await forbidden.sandbox.ATPFetcher.fetchTextAttachmentResourcesWithStatus([attachment], { deadline: Date.now() + 5000 });
+  const forbiddenStatus = await forbidden.sandbox.ATPFetcher.fetchTextAttachmentResourcesWithStatus([attachment], { deadline: Date.now() + 5000 });
+  assert.strictEqual(forbiddenStatus.accessDeniedCount, 1);
   assert.strictEqual(forbidden.requests(), 1);
   assert.strictEqual(forbidden.messages.length, 0, 'HTTP failures retain the existing no-fallback behavior');
   assert.strictEqual(forbidden.events[0].fields.status, 403);
   assert.strictEqual(forbidden.events[0].fields.failureClass, 'auth_or_forbidden');
   assertPrivate(forbidden.events);
+
+  const workerForbidden = loadContent(async () => { throw new TypeError('Failed to fetch'); }, (message, shared) => ({
+    resources: shared.emptyResources(), attemptedCount: 1, unresolvedCount: 1, retryableCount: 1, accessDeniedCount: 1
+  }));
+  const workerStatus = await workerForbidden.sandbox.ATPFetcher.fetchTextAttachmentResourcesWithStatus([attachment], { deadline: Date.now() + 5000 });
+  assert.strictEqual(workerStatus.accessDeniedCount, 1, 'an access denial from the worker must reach the resource panel');
+  assert.strictEqual(workerForbidden.messages.length, 1);
 
   const empty = loadContent(async url => ({ ok: true, status: 200, url, headers: { get: () => 'text/plain' },
     arrayBuffer: async () => new TextEncoder().encode('No download links here.').buffer }));

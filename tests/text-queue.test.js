@@ -21,7 +21,7 @@ function createQueue() {
   vm.runInContext(source.slice(source.indexOf('const TEXT_RESOURCE_MESSAGE_CONCURRENCY'),
     source.indexOf('function getRemainingDeadlineMs')), sandbox);
   return { sandbox, timers, requests, advance: ms => { now += ms; },
-    enqueue: (owner, deadline = 60000) => sandbox.enqueueTextResourceMessage([{ url: 'https://example.test/fixture.txt' }], deadline, { owner, manualRetry: true }) };
+    enqueue: (owner, deadline = 60000, manualRetry = true) => sandbox.enqueueTextResourceMessage([{ url: 'https://example.test/fixture.txt' }], deadline, { owner, manualRetry }) };
 }
 async function tick() { for (let i = 0; i < 12; i++) await Promise.resolve(); }
 async function run() {
@@ -65,6 +65,25 @@ async function run() {
   thrown.sandbox.fetchTextAttachmentResourcesWithStatus = () => { throw new Error('sync failure'); };
   await assert.rejects(thrown.enqueue(1), /sync failure/); await tick();
   assert.strictEqual(thrown.sandbox.textResourceMessageActive, 0);
+
+  const priority = createQueue();
+  const jobsWithPriority = [
+    priority.enqueue('active-a', 60000, false),
+    priority.enqueue('active-b', 60000, false),
+    priority.enqueue('auto-waiting', 60000, false),
+    priority.enqueue('manual-a'),
+    priority.enqueue('manual-b')
+  ];
+  await tick();
+  assert.deepStrictEqual(priority.requests.map(request => request.options.owner), ['active-a', 'active-b']);
+  for (let i = 0; i < 5; i++) {
+    priority.requests[i].resolve({ ok: true });
+    await tick();
+  }
+  await Promise.all(jobsWithPriority);
+  assert.deepStrictEqual(priority.requests.map(request => request.options.owner),
+    ['active-a', 'active-b', 'manual-a', 'manual-b', 'auto-waiting'],
+    'manual retries should take the next free slots in their own arrival order');
   console.log('TXT queue backpressure tests ok');
 }
 run().catch(error => { console.error(error); process.exitCode = 1; });

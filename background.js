@@ -565,19 +565,22 @@ function getFloatingPanelCss() {
   return floatingPanelCssPromise;
 }
 
-function makeTextResourceFetchStatus(resources, attemptedCount, unresolvedCount, retryableCount) {
+function makeTextResourceFetchStatus(resources, attemptedCount, unresolvedCount, retryableCount, accessDeniedCount) {
   var normalized = SharedUtils.normalizeResources(resources);
   var attempted = Math.max(0, Number(attemptedCount) || 0);
   var unresolved = Math.max(0, Number(unresolvedCount) || 0);
   if (unresolved > attempted) unresolved = attempted;
   var retryable = Math.max(0, Number(retryableCount) || 0);
   if (retryable > unresolved) retryable = unresolved;
-  return {
+  var status = {
     resources: normalized,
     attemptedCount: attempted,
     unresolvedCount: unresolved,
     retryableCount: retryable
   };
+  var denied = Math.min(unresolved, Math.max(0, Number(accessDeniedCount) || 0));
+  if (denied) status.accessDeniedCount = denied;
+  return status;
 }
 
 function getSafeAttachmentReferrer(attachment) {
@@ -716,7 +719,11 @@ function enqueueTextResourceMessage(attachments, deadline, options) {
     }
     var job = { attachments: attachments, deadline: deadline, options: options, owner: owner,
       expiresAt: expiresAt, resolve: resolve, reject: reject, timer: null };
-    textResourceMessageQueue.push(job);
+    var firstAutomatic = options.manualRetry
+      ? textResourceMessageQueue.findIndex(function(queued) { return !queued.options.manualRetry; })
+      : -1;
+    if (firstAutomatic === -1) textResourceMessageQueue.push(job);
+    else textResourceMessageQueue.splice(firstAutomatic, 0, job);
     job.timer = setTimeout(function() { expireQueuedTextResourceJob(job); }, expiresAt - now);
     drainTextResourceMessageQueue();
   });
@@ -1688,6 +1695,7 @@ async function fetchTextAttachmentResource(attachment, depth, deadline, options)
         var status = resp.status;
         diagnosticFailure = backgroundTextFailureClass(null, status);
         if (status === 401 || status === 403) {
+          if (options.attachmentOutcome) options.attachmentOutcome.accessDenied = true;
           setTextFailCache(attachment.url, writeStartedAt);
           return SharedUtils.emptyResources();
         }
@@ -1795,20 +1803,21 @@ async function fetchTextAttachmentResourcesWithStatus(attachments, deadline, opt
     attachments.push(attachment);
   }
   if (!attachments.length) return makeTextResourceFetchStatus(SharedUtils.emptyResources(), 0, 0, 0);
-  var results = [];
-  for (var pi = 0; pi < attachments.length; pi++) {
-    results.push(await fetchTextAttachmentResource(attachments[pi], 0, deadline, options));
-  }
   var merged = SharedUtils.emptyResources();
   var unresolvedCount = 0;
-  for (var i = 0; i < results.length; i++) {
-    if (SharedUtils.hasResourcePayload(results[i])) {
-      merged = SharedUtils.mergeResources(merged, results[i]);
+  var accessDeniedCount = 0;
+  for (var i = 0; i < attachments.length; i++) {
+    var attachmentOutcome = { accessDenied: false };
+    var result = await fetchTextAttachmentResource(attachments[i], 0, deadline,
+      Object.assign({}, options, { attachmentOutcome: attachmentOutcome }));
+    if (SharedUtils.hasResourcePayload(result)) {
+      merged = SharedUtils.mergeResources(merged, result);
     } else {
       unresolvedCount++;
+      if (attachmentOutcome.accessDenied) accessDeniedCount++;
     }
   }
-  return makeTextResourceFetchStatus(merged, attachments.length, unresolvedCount, unresolvedCount);
+  return makeTextResourceFetchStatus(merged, attachments.length, unresolvedCount, unresolvedCount, accessDeniedCount);
 }
 
 function normalizeImageExtractionSettings(input) {
@@ -1819,6 +1828,7 @@ function normalizeImageExtractionSettings(input) {
     maxImagesPerPost: fetchLimit,
     maxDisplayPerPost: displayLimit,
     heavyImageOptimization: input.heavyImageOptimization !== false,
+    freshTextLinks: input.freshTextLinks === true,
     articleTimeout: ATPLoadPolicy.getArticleTimeout(input),
     articleFetchConcurrency: ATPLoadPolicy.getArticleFetchConcurrency(input)
   };
@@ -1831,7 +1841,8 @@ function getArticleFetchKey(url, imageSettings) {
     normalizedUrl || url,
     imageSettings.maxImagesPerPost,
     imageSettings.maxDisplayPerPost,
-    imageSettings.heavyImageOptimization ? 1 : 0
+    imageSettings.heavyImageOptimization ? 1 : 0,
+    imageSettings.freshTextLinks ? 1 : 0
   ].join('|');
 }
 
@@ -1954,7 +1965,12 @@ async function fetchArticle(url, imageSettings, deadline, control) {
     control = control || createArticleFetchControl(deadline, imageSettings);
     if (control.controller.signal.aborted) return makeDeadlineArticleResult();
     try {
-      var resp = await fetch(url, { signal: control.controller.signal, credentials: 'include', headers: { 'Accept': 'text/html' } });
+      var resp = await fetch(url, {
+        signal: control.controller.signal,
+        credentials: 'include',
+        cache: imageSettings.freshTextLinks ? 'no-store' : 'default',
+        headers: { 'Accept': 'text/html' }
+      });
       var finalUrl = resp.url || url;
       if (!originAllowed(finalUrl) || !SharedUtils.isSameForumZoneUrl(finalUrl, url)) {
         BGLOG.warn('文章重定向已拒绝', shortUrl(finalUrl));
@@ -2227,6 +2243,7 @@ function handleRuntimeMessage(msg, sender, sendResponse) {
       maxImagesPerPost: msg.maxImages || 100,
       maxDisplayPerPost: msg.displayImages || msg.maxImages || 100,
       heavyImageOptimization: msg.heavyImageOptimization !== false,
+      freshTextLinks: true,
       articleTimeout: msg.articleTimeout
     }, freshDeadline).then(function(item) {
       if (!item || !item.ok) {
@@ -2272,6 +2289,7 @@ function handleRuntimeMessage(msg, sender, sendResponse) {
         attemptedCount: status.attemptedCount,
         unresolvedCount: status.unresolvedCount,
         retryableCount: status.retryableCount,
+        accessDeniedCount: status.accessDeniedCount || 0,
         queueStatus: status.queueStatus || 'completed'
       });
       BGLOG.flushSoon();

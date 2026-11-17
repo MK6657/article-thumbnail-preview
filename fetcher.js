@@ -171,7 +171,7 @@
     return SharedUtils.hasResourcePayload(resources);
   }
 
-  function makeTextResourceFetchStatus(resources, attemptedCount, unresolvedCount, retryableCount, yielded) {
+  function makeTextResourceFetchStatus(resources, attemptedCount, unresolvedCount, retryableCount, yielded, accessDeniedCount) {
     var normalized = SharedUtils.normalizeResources(resources);
     var attempted = Math.max(0, Number(attemptedCount) || 0);
     var unresolved = Math.max(0, Number(unresolvedCount) || 0);
@@ -185,6 +185,8 @@
       retryableCount: retryable
     };
     if (yielded) status.yielded = true;
+    var denied = Math.min(unresolved, Math.max(0, Number(accessDeniedCount) || 0));
+    if (denied) status.accessDeniedCount = denied;
     return status;
   }
 
@@ -198,7 +200,8 @@
       }
       var retryable = Number(result.retryableCount);
       if (!isFinite(retryable) || retryable < 0) retryable = unresolved;
-      return makeTextResourceFetchStatus(result.resources, attempted, unresolved, retryable, result.yielded === true);
+      return makeTextResourceFetchStatus(result.resources, attempted, unresolved, retryable,
+        result.yielded === true, result.accessDeniedCount);
     }
     var resources = SharedUtils.normalizeResources(result);
     var fallbackAttempted = Math.max(0, Number(fallbackAttemptedCount) || 0);
@@ -456,9 +459,10 @@
       if (httpStatus === 429 || httpStatus === 503) report.outcome = 'flood';
       var error = response && response.error;
       if (httpStatus >= 400 || error === 'response_too_large' || error === 'timeout') {
-        logTextDiagnostic(attachment, 'page_bridge', 'failed', textFailureClass(response && response.error, httpStatus), deadline,
+        var failureClass = textFailureClass(error, httpStatus);
+        logTextDiagnostic(attachment, 'page_bridge', 'failed', failureClass, deadline,
           { status: httpStatus, elapsedMs: Date.now() - startedAt });
-        return { handled: true, resources: SharedUtils.emptyResources(), finalFailure: true };
+        return { handled: true, resources: SharedUtils.emptyResources(), finalFailure: failureClass };
       }
       // Once the page's own request reached the forum and failed in transport
       // (typically the forum redirecting to a download host), the isolated
@@ -517,6 +521,7 @@
   async function followTextDownloadUrls(attachment, finalUrl, downloadUrls, depth, hardFailSet, options) {
     var ancestors = (options._textDownloadAncestors || []).concat(attachment.url, finalUrl);
     var nextOptions = Object.assign({}, options, { _textDownloadAncestors: ancestors });
+    var accessDenied = false;
     for (var d = 0; d < downloadUrls.length; d++) {
       if (shouldYieldTextRequest(options)) return yieldedTextResources();
       if (isTextResourceDeadlineExhausted(options.deadline)) break;
@@ -535,11 +540,17 @@
       if (isSameOriginUrl(url)) {
         resources = await ATPFetcher.fetchTextAttachmentResource(nextAttachment, depth + 1, hardFailSet, nextOptions);
         if ((resources && resources.yielded) || hasResourcePayload(resources)) return resources;
-        if (hardFailSet[url]) continue;
+        if (hardFailSet[url]) {
+          if (hardFailSet[url] === 'auth_or_forbidden') accessDenied = true;
+          continue;
+        }
       }
-      resources = await ATPFetcher.fetchTextAttachmentResourcesByBackground([nextAttachment], nextOptions, 'background_fallback');
-      if ((resources && resources.yielded) || hasResourcePayload(resources)) return resources;
+      var status = await ATPFetcher.fetchTextAttachmentResourcesByBackgroundWithStatus([nextAttachment], nextOptions, 'background_fallback');
+      if (status.yielded) return yieldedTextResources();
+      if (hasResourcePayload(status.resources)) return status.resources;
+      if (status.accessDeniedCount) accessDenied = true;
     }
+    if (accessDenied) hardFailSet[attachment.url] = 'auth_or_forbidden';
     return SharedUtils.emptyResources();
   }
 
@@ -588,6 +599,7 @@
       var hardFailSet = {};
       var unresolvedCount = 0;
       var retryableCount = 0;
+      var accessDeniedCount = 0;
 
       var same = [];
       var cross = [];
@@ -606,10 +618,12 @@
         } else if (hardFailSet[current.url] || options._textRequestControl.yielded) {
           unresolvedCount++;
           retryableCount++;
+          if (hardFailSet[current.url] === 'auth_or_forbidden') accessDeniedCount++;
         } else {
           var bgFallback = await ATPFetcher.fetchTextAttachmentResourcesByBackgroundWithStatus([current], options, 'background_fallback');
           unresolvedCount += bgFallback.unresolvedCount;
           retryableCount += bgFallback.retryableCount;
+          accessDeniedCount += bgFallback.accessDeniedCount || 0;
           if (hasResourcePayload(bgFallback.resources)) results.push(bgFallback.resources);
         }
         if (options._textRequestControl.yielded) {
@@ -655,6 +669,7 @@
           var bgCross = await ATPFetcher.fetchTextAttachmentResourcesByBackgroundWithStatus(crossFiltered, options);
           unresolvedCount += bgCross.unresolvedCount;
           retryableCount += bgCross.retryableCount;
+          accessDeniedCount += bgCross.accessDeniedCount || 0;
           if (hasResourcePayload(bgCross.resources)) results.push(bgCross.resources);
         }
       }
@@ -670,7 +685,7 @@
         retryableCount = attachments.length;
       }
       return makeTextResourceFetchStatus(merged, attachments.length, unresolvedCount, retryableCount,
-        options._textRequestControl.yielded);
+        options._textRequestControl.yielded, accessDeniedCount);
     },
 
     fetchTextAttachmentResourcesByBackground: function(attachments, options, stage) {
@@ -819,7 +834,7 @@
         if (sameOrigin) {
           var pageResult = await fetchTextAttachmentResourceViaPage(attachment, fetchTimeout, writeStartedAt, options);
           if (pageResult.handled) {
-            if (pageResult.finalFailure && hardFailSet) hardFailSet[attachment.url] = true;
+            if (pageResult.finalFailure && hardFailSet) hardFailSet[attachment.url] = pageResult.finalFailure;
             return pageResult.resources;
           }
           if (pageResult.downloadUrls && pageResult.downloadUrls.length) {
@@ -831,7 +846,7 @@
             if (hasResourcePayload(pageResources)) {
               ATPCache.setCachedTextResources(attachment.url, pageResources, writeStartedAt);
               ATPCache.clearTextFailCache(attachment.url);
-            } else {
+            } else if (!hardFailSet[attachment.url]) {
               hardFailSet[attachment.url] = true;
             }
             return pageResources;
@@ -907,7 +922,7 @@
             var isHardFail = status === 401 || status === 403;
             if (isHardFail) {
               ATPCache.setTextFailCache(attachment.url, writeStartedAt);
-              if (hardFailSet) hardFailSet[attachment.url] = true;
+              if (hardFailSet) hardFailSet[attachment.url] = diagnosticFailure;
               return SharedUtils.emptyResources();
             }
             if (status === 429 || status >= 500) {
@@ -976,7 +991,7 @@
               ATPCache.clearTextFailCache(attachment.url);
               return redirectedResources;
             }
-            if (downloadUrls.length && hardFailSet) hardFailSet[attachment.url] = true;
+            if (downloadUrls.length && hardFailSet && !hardFailSet[attachment.url]) hardFailSet[attachment.url] = true;
             diagnosticFailure = 'intermediary_unresolved';
           }
 
@@ -990,7 +1005,7 @@
           if (hasResourcePayload(normalizedResources)) {
             ATPCache.setCachedTextResources(attachment.url, normalizedResources, writeStartedAt);
             ATPCache.clearTextFailCache(attachment.url);
-          } else if (hardFailSet) {
+          } else if (hardFailSet && !hardFailSet[attachment.url]) {
             hardFailSet[attachment.url] = true;
           }
           diagnosticResources = SharedUtils.countResources(normalizedResources);
@@ -1396,6 +1411,7 @@
           var resp = await fetch(url, {
             signal: ctrl.signal,
             credentials: 'include',
+            cache: 'no-store',
             headers: { 'Accept': 'text/html' }
           });
           var finalUrl = resp.url || url;

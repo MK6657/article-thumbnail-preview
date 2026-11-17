@@ -47,14 +47,19 @@
       resources: resources,
       attemptedCount: attempted,
       unresolvedCount: unresolved,
-      retryableCount: retryable
+      retryableCount: retryable,
+      accessDeniedCount: hasWrappedResources ? Math.min(unresolved, Math.max(0, Number(result.accessDeniedCount) || 0)) : 0
     };
   }
 
-  function mergeTextAttachments(existingAttachments, freshAttachments, pageUrl) {
+  function mergeTextAttachments(freshAttachments, stableAttachments, pageUrl) {
     var out = [];
     var seen = {};
     var maxCount = SharedUtils.TEXT_ATTACHMENT_MAX_COUNT || 3;
+    var stableByKey = new Map();
+    stableAttachments.forEach(function(attachment) {
+      stableByKey.set(SharedUtils.normalizeTextAttachmentUrl(attachment.url), attachment);
+    });
 
     function append(attachments) {
       attachments = Array.isArray(attachments) ? attachments : [];
@@ -64,12 +69,13 @@
         var key = SharedUtils.normalizeTextAttachmentUrl(attachment.url);
         if (!key || seen[key]) continue;
         seen[key] = true;
+        attachment = stableByKey.get(key) || attachment;
         out.push(attachment.pageUrl ? attachment : Object.assign({}, attachment, { pageUrl: pageUrl }));
       }
     }
 
-    append(existingAttachments);
     append(freshAttachments);
+    append(stableAttachments);
     return out;
   }
 
@@ -824,14 +830,23 @@
         threadState.textResourcesRetryable = true;
         threadState.textResourceMessage = message;
         releaseAutomaticTextResourceSlot(threadState, run);
-        if (!threadState.candidates.length && threadState.statusEl) threadState.statusEl.textContent = '无资源';
+        if (!threadState.candidates.length && threadState.statusEl) {
+          threadState.statusEl.textContent = SharedUtils.hasResourcePayload(threadState.resources) ? '资源链接' : 'TXT 待重试';
+        }
         if (window.ATPResourcePanel) {
           ATPResourcePanel.updateThread(threadState);
         }
         logTextResourceResult('failed', { failureClass: 'processing_error', fetchedResources: 0 });
       };
 
-      var hasCachedAttachments = threadState.textAttachments && threadState.textAttachments.length;
+      var existingAttachments = threadState.textAttachments || [];
+      var stableAttachments = existingAttachments.filter(function(attachment) {
+        return attachment && attachment.url && !SharedUtils.isTransientTextAttachmentUrl(attachment.url, threadState.link);
+      });
+      var hasTransientLinks = stableAttachments.length < existingAttachments.length;
+      var freshLinksAt = Number(threadState.freshTextAttachmentsAt) || 0;
+      var canReuseFreshLinks = !manualRetry && freshLinksAt > 0 && Date.now() - freshLinksAt < FRESH_TEXT_LINK_REUSE_MS;
+      var expectedAttachmentCount = Math.max(existingAttachments.length, Number(threadState.textAttachmentCount) || 0);
       // pendingCount: attachments known to exist but not in this list (their
       // fresh links could not be read); they keep the thread retryable.
       var doFetch = function(attachments, pendingCount) {
@@ -876,7 +891,9 @@
           threadState.textResourcesRetryableCount = retryableCount;
           var previousResourceCount = SharedUtils.countResources(threadState.resources);
           threadState.resources = SharedUtils.mergeResources(threadState.resources, resources);
-          if (unresolvedCount > 0 && hasFetchedResources) {
+          if (textStatus.accessDeniedCount > 0) {
+            threadState.textResourceMessage = '站点拒绝读取 ' + textStatus.accessDeniedCount + ' 个 TXT 附件，可在原帖下载后导入';
+          } else if (unresolvedCount > 0 && hasFetchedResources) {
             threadState.textResourceMessage = '已解析部分 TXT 资源，仍有 ' + unresolvedCount + ' 个附件待重试';
           } else if (unresolvedCount > 0) {
             threadState.textResourceMessage = '有 ' + unresolvedCount + ' 个 TXT 附件待重试，可重试本帖或导入已下载 TXT';
@@ -928,6 +945,7 @@
             attemptedCount: textStatus.attemptedCount,
             unresolvedCount: unresolvedCount,
             retryableCount: retryableCount,
+            accessDeniedCount: textStatus.accessDeniedCount,
             fetchedResources: SharedUtils.countResources(resources),
             addedResources: Math.max(0, totalResourceCount - previousResourceCount),
             totalResources: totalResourceCount
@@ -940,23 +958,23 @@
       };
 
       var fallbackToCachedAttachmentsAfterFreshFailure = function(message, e) {
-        if (hasCachedAttachments && isRunCurrent()) {
+        if (stableAttachments.length && isRunCurrent()) {
+          threadState.textAttachments = stableAttachments;
+          threadState.hasTextAttachments = expectedAttachmentCount > stableAttachments.length;
           threadState.textResourceMessage = 'TXT 附件重新提取失败，解析已缓存附件';
           if (window.ATPResourcePanel) {
             ATPResourcePanel.updateThread(threadState);
           }
           Logger.debug(message + '，改用已缓存TXT附件', threadState.link + ' ' + (e && e.message ? e.message : e || 'unknown error'));
-          doFetch(threadState.textAttachments, Math.max(0, (Number(threadState.textAttachmentCount || 0) || 0) - threadState.textAttachments.length));
+          doFetch(stableAttachments, expectedAttachmentCount - stableAttachments.length);
           return;
         }
         failTextResourceLoad(message, e);
       };
 
-      var needsFreshExtraction = !!(
-        threadState.hasTextAttachments &&
-        Number(threadState.textAttachmentCount || 0) > (hasCachedAttachments ? threadState.textAttachments.length : 0)
-      );
-      if (hasCachedAttachments && !needsFreshExtraction) {
+      var needsFreshExtraction = (hasTransientLinks && !canReuseFreshLinks) ||
+        (threadState.hasTextAttachments && expectedAttachmentCount > existingAttachments.length);
+      if (existingAttachments.length && !needsFreshExtraction) {
         setTimeout(function() {
           if (isRunCurrent()) doFetch(threadState.textAttachments);
           else releaseAutomaticTextResourceSlot(threadState, run);
@@ -975,11 +993,9 @@
           return;
         }
         var freshPromise;
-        // An automatic run reuses the links the article fetch read minutes
-        // ago instead of reading the thread page again; a manual retry always
-        // re-reads.
-        var reusableLinks = !manualRetry && Array.isArray(threadState.freshTextAttachments) &&
-          Date.now() - (Number(threadState.freshTextAttachmentsAt) || 0) < FRESH_TEXT_LINK_REUSE_MS
+        // Automatic work can reuse recent links from the article fetch.
+        // A manual retry of transient links reads the thread again.
+        var reusableLinks = canReuseFreshLinks && Array.isArray(threadState.freshTextAttachments)
           ? threadState.freshTextAttachments
           : null;
         threadState.freshTextAttachments = null;
@@ -1010,20 +1026,14 @@
             fallbackToCachedAttachmentsAfterFreshFailure('TXT 附件链接提取失败', 'fresh attachment links unavailable');
             return;
           }
-          var attachments = mergeTextAttachments(threadState.textAttachments, freshAttachments, threadState.link);
+          var attachments = mergeTextAttachments(freshAttachments, stableAttachments, threadState.link);
           threadState.textAttachments = attachments;
-          threadState.textAttachmentCount = Math.max(Number(threadState.textAttachmentCount || 0) || 0, attachments.length);
+          threadState.freshTextAttachmentsAt = reusableLinks ? freshLinksAt : Date.now();
+          threadState.textAttachmentCount = Math.max(expectedAttachmentCount, attachments.length);
           var missingAttachmentCount = Math.max(0, threadState.textAttachmentCount - attachments.length);
           threadState.hasTextAttachments = missingAttachmentCount > 0;
           if (!attachments.length) {
-            threadState.textResourcesLoading = false;
-            threadState.textResourcesDone = false;
-            threadState.textResourcesRetryable = true;
-            threadState.textResourceMessage = '未能自动读取 TXT 附件，请手动重试或导入已下载 TXT';
-            releaseAutomaticTextResourceSlot(threadState, run);
-            if (window.ATPResourcePanel) {
-              ATPResourcePanel.updateThread(threadState);
-            }
+            failTextResourceLoad('未读取到 TXT 附件链接，可在原帖下载后导入');
             return;
           }
           doFetch(attachments, missingAttachmentCount);
