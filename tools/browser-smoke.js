@@ -17,6 +17,8 @@ const SIGNED_RELAY_HOST = 'xia.djhdhs.us';
 const PACER_HOST = 'pacer.sehuatang.org';
 const HEAVY_HOST = 'image.imx.to';
 const HOT_IMAGE_HOST = 'hot.sehuatang.org';
+const ATTACHMENT_LIVE_HOST = 'tu.live.example';
+const ATTACHMENT_DEAD_HOST = 'tu.dead.example';
 const MIRROR_ROOT = 'smoke-mirror.test';
 const MIRROR_HOST = 'www.' + MIRROR_ROOT;
 const MIRROR_PATTERN = 'https://*.' + MIRROR_ROOT + '/*';
@@ -142,6 +144,8 @@ function forumPage(port, mode) {
     rows = '<tbody id="normalthread_402"><tr><th><a class="xst" href="https://' + SMOKE_HOST + ':' + port + '/thread-402-1-1.html">Host limit gallery</a></th></tr></tbody>';
   } else if (mode === 'ready-queue') {
     rows = '<tbody id="normalthread_404"><tr><th><a class="xst" href="/thread-404-1-1.html">Ready queue gallery</a></th></tr></tbody>';
+  } else if (mode === 'attachment-recovery') {
+    rows = '<tbody id="normalthread_405"><tr><th><a class="xst" href="/thread-405-1-1.html">Attachment recovery gallery</a></th></tr></tbody>';
   } else if (mode === 'txt-retry') {
     rows = '<tbody id="normalthread_403"><tr><th><a class="xst" href="/thread-403-1-1.html">TXT retry fixture</a></th></tr></tbody>';
   } else if (mode === 'mirror') {
@@ -164,6 +168,10 @@ function imageMarkup(host, port, prefix, count) {
     images.push('<img src="https://' + host + ':' + port + '/img/' + prefix + '-' + i + '.jpg" alt="' + prefix + '-' + i + '">');
   }
   return images.join('\n');
+}
+
+function attachmentPath(index) {
+  return '/tupian/forum/202611/17/00000' + index + 'abcdefghijklmnop.jpg';
 }
 
 function ordinaryThread(port) {
@@ -209,6 +217,8 @@ function createFixtureServer(pfxPath) {
     activeFarImages: 0,
     activeHeavyImages: 0,
     activeImages: 0,
+    activeAttachmentImages: 0,
+    maxAttachmentImages: 0,
     maxOrdinaryImages: 0,
     maxHostLimitImages: 0,
     maxFarImages: 0,
@@ -223,6 +233,28 @@ function createFixtureServer(pfxPath) {
     metrics.requestPaths.push(pathname);
     metrics.requestsByHost[host] = (metrics.requestsByHost[host] || 0) + 1;
     metrics.requestsByPath[pathname] = (metrics.requestsByPath[pathname] || 0) + 1;
+
+    if (/^\/tupian\/forum\/202611\/17\/00000[0-3]abcdefghijklmnop\.jpg$/.test(pathname)) {
+      if (host !== ATTACHMENT_LIVE_HOST) {
+        res.writeHead(404, { 'cache-control': 'no-store' });
+        res.end();
+        return;
+      }
+      metrics.activeAttachmentImages++;
+      metrics.maxAttachmentImages = Math.max(metrics.maxAttachmentImages, metrics.activeAttachmentImages);
+      var attachmentSettled = false;
+      res.on('close', function() {
+        if (attachmentSettled) return;
+        attachmentSettled = true;
+        metrics.activeAttachmentImages--;
+      });
+      setTimeout(function() {
+        if (attachmentSettled || res.destroyed) return;
+        res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'no-store' });
+        res.end(pixel);
+      }, pathname === attachmentPath(2) ? 1200 : IMAGE_DELAY_MS);
+      return;
+    }
 
     if (pathname === '/admitted-image-probe.png') {
       res.writeHead(200, { 'content-type': 'image/png', 'content-length': pixel.length });
@@ -361,6 +393,13 @@ function createFixtureServer(pfxPath) {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       res.end(htmlPage('<div id="postmessage_1"><img src="/img/ready-hang.gif">' +
         imageMarkup(SMOKE_HOST, server.address().port, 'ready-queue', 5) + '</div>', 'Ready queue thread'));
+      return;
+    }
+    if (pathname === '/thread-405-1-1.html') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(htmlPage('<div id="postmessage_1">' + [0, 1].map(function(index) {
+        return '<img src="https://' + ATTACHMENT_LIVE_HOST + ':' + server.address().port + attachmentPath(index) + '">';
+      }).join('') + '</div>', 'Attachment recovery thread'));
       return;
     }
     if (pathname === '/other.html') {
@@ -979,7 +1018,8 @@ async function main() {
     });
     var fixturePort = fixture.server.address().port;
     browser = spawnSmokeBrowser(browserPath, profileDir, EXTENSION_DIR,
-      [SMOKE_HOST, CROSS_HOST, PACER_HOST, HOT_IMAGE_HOST, HEAVY_HOST, SIGNED_RELAY_HOST]);
+      [SMOKE_HOST, CROSS_HOST, PACER_HOST, HOT_IMAGE_HOST, HEAVY_HOST, SIGNED_RELAY_HOST,
+        ATTACHMENT_LIVE_HOST, ATTACHMENT_DEAD_HOST]);
     var devtoolsPort = await waitForDevtoolsPort(profileDir, browser);
 
     var versionInfo = await fetchJson('http://127.0.0.1:' + devtoolsPort + '/json/version');
@@ -1621,7 +1661,49 @@ async function main() {
       return button.getAttribute('aria-expanded');
     })()`), 'false', 'manual expansion must allow the reader to collapse the gallery');
 
-    var pageErrors = [pageOne, pageTwo, offscreenPage, hostLimitPage, readyPage, popup].map(summarizeErrors);
+    var recoveryPage = await createPageSession(devtoolsPort);
+    sessions.push(recoveryPage);
+    await navigate(recoveryPage, 'https://' + SMOKE_HOST + ':' + fixturePort + '/forum.php?mode=attachment-recovery');
+    var recoveryContext = await waitForExtensionContext(recoveryPage, extensionId);
+    var recoveryThreadExpression = "Object.values(ATPState.threads).find(item => item.link.includes('/thread-405-1-1.html'))";
+    await waitFor('two healthy attachment images establish the sibling', function() {
+      return evaluate(recoveryPage, `(() => {
+        const thread = ${recoveryThreadExpression};
+        return thread && thread.loaded === 2;
+      })()`, recoveryContext.id);
+    });
+    fixture.metrics.maxAttachmentImages = 0;
+    var liveBlocker = 'https://' + ATTACHMENT_LIVE_HOST + ':' + fixturePort + attachmentPath(2);
+    var failedAttachment = 'https://' + ATTACHMENT_DEAD_HOST + ':' + fixturePort + attachmentPath(3);
+    await evaluate(recoveryPage, `(() => {
+      Object.assign(ATPState.settings, { ordinaryHostConcurrency: 1,
+        firstScreenConcurrency: 2, globalImageConcurrency: 2, imageTimeout: 3000 });
+      const thread = ${recoveryThreadExpression};
+      thread.candidates.push({ src: ${JSON.stringify(liveBlocker)} }, { src: ${JSON.stringify(failedAttachment)} });
+      thread.cacheImages = thread.candidates;
+      thread.sourceCandidates = thread.candidates;
+      thread.total = 4;
+      thread.readyImageLimit = 4;
+      ATPLoader.enqueueBgForThread(Object.keys(ATPState.threads).find(id => ATPState.threads[id] === thread));
+      return true;
+    })()`, recoveryContext.id);
+    var attachmentRecovery = await waitFor('failed attachment resumes on its sibling after the host slot frees', function() {
+      return evaluate(recoveryPage, `(() => {
+        const thread = ${recoveryThreadExpression};
+        if (thread.loaded !== 4) return null;
+        return { loaded: thread.loaded, failed: thread.failedCount,
+          mirrorHost: new URL(thread.candidates[3].src).hostname,
+          originalHost: new URL(thread.cacheImages[3].src).hostname,
+          cells: thread.grid.children.length };
+      })()`, recoveryContext.id);
+    }, 8000, 25);
+    assert.deepStrictEqual(attachmentRecovery, { loaded: 4, failed: 0,
+      mirrorHost: ATTACHMENT_LIVE_HOST, originalHost: ATTACHMENT_DEAD_HOST, cells: 4 });
+    assert.strictEqual(fixture.metrics.maxAttachmentImages, 1, 'mirror recovery must respect the destination host concurrency');
+    assert.strictEqual(fixture.metrics.requestsByHost[ATTACHMENT_DEAD_HOST], 2,
+      'the failed attachment must get one original and one no-referrer attempt without a retry loop');
+
+    var pageErrors = [pageOne, pageTwo, offscreenPage, hostLimitPage, readyPage, recoveryPage, popup].map(summarizeErrors);
     var allExceptions = [].concat.apply([], pageErrors.map(function(item) { return item.exceptions; }));
     var extensionConsoleErrors = [].concat.apply([], pageErrors.map(function(item) { return item.consoleErrors; }))
       .filter(function(text) { return /chrome-extension|ATP|bfp|Uncaught|TypeError|ReferenceError/i.test(text); });
@@ -1644,6 +1726,7 @@ async function main() {
         loadingPolicy: sha256File(path.join(EXTENSION_DIR, 'loading-policy.js'))
       },
       isolatedWorld: true,
+      attachmentRecovery: attachmentRecovery,
       pageOne: {
         rootCount: pageOneRootCount,
         threadCount: initialThreads.length,

@@ -2344,6 +2344,10 @@
           var attemptTimeout = getImageLoadTimeout(deadlineSettings, task);
           taskDeadlineMs = taskDeadlineMs > 0 ? Math.min(taskDeadlineMs, attemptTimeout) : attemptTimeout;
         }
+        if (task.siblingTimeoutRemainingMs > 0) {
+          taskDeadlineMs = Math.min(taskDeadlineMs, task.siblingTimeoutRemainingMs);
+          task.siblingTimeoutRemainingMs = 0;
+        }
         task.taskDeadlineAt = taskDeadlineMs > 0 ? now + taskDeadlineMs : 0;
         task.taskDeadlineMs = taskDeadlineMs;
         // A fresh deadline is a fresh attempt; the slow-image grace used by an
@@ -4236,9 +4240,9 @@
   // A host that is down fails every image at once (in the user's logs one
   // host never loaded an image while another served the same paths), so an
   // attachment that failed with and without a Referer is tried once on a
-  // sibling host that has already served this page. Once a host has failed
-  // like that three times without a single success, new images for it start
-  // on the sibling directly.
+  // sibling host that has already served this page. Three different failed
+  // attachments mark a host temporarily unavailable; a successful request
+  // clears that observation, and expiry allows the original host to recover.
   var ATTACHMENT_PATH_RE = /^((?:\/[^\/?#]+)*\/)forum\/\d{6}\/\d{2}\/\d{6}[a-z0-9]{16}\.(?:jpe?g|png|gif|webp|bmp)(?:\.thumb\.jpg)?$/i;
   var ATTACHMENT_SIBLING_MAX_AGE_MS = 10 * 60 * 1000;
   var ATTACHMENT_HOSTS = {};
@@ -4251,7 +4255,7 @@
     } catch (e) {
       return null;
     }
-    if (parsed.protocol !== 'https:') return null;
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password) return null;
     var match = ATTACHMENT_PATH_RE.exec(parsed.pathname);
     if (!match) return null;
     var host = parsed.hostname.toLowerCase();
@@ -4264,7 +4268,7 @@
       if (!create) return null;
       hosts = ATTACHMENT_HOSTS[family.key] = {};
     }
-    if (!hosts[family.host] && create) hosts[family.host] = { ok: 0, fail: 0, lastOkAt: 0 };
+    if (!hosts[family.host] && create) hosts[family.host] = { ok: 0, fail: 0, lastOkAt: 0, lastFailAt: 0 };
     return hosts[family.host] || null;
   }
 
@@ -4272,8 +4276,13 @@
     var family = getAttachmentFamily(url);
     if (!family) return;
     var stats = getAttachmentHostStats(family, true);
-    stats.ok++;
-    stats.lastOkAt = Date.now();
+    var now = Date.now();
+    if (now - stats.lastOkAt > ATTACHMENT_SIBLING_MAX_AGE_MS || now < stats.lastOkAt) stats.ok = 0;
+    stats.ok = Math.min(2, stats.ok + 1);
+    stats.lastOkAt = now;
+    stats.fail = 0;
+    stats.lastFailAt = 0;
+    stats.readyFailureKeys = null;
   }
 
   function noteReadyAttachmentHostFailure(url) {
@@ -4281,18 +4290,26 @@
     var family = getAttachmentFamily(url);
     if (!family) return;
     var stats = getAttachmentHostStats(family, true);
-    if (stats.ok || stats.fail >= 3) return;
+    var now = Date.now();
+    if (!stats.fail || now - stats.firstFailAt > ORDINARY_TIMEOUT_WINDOW_MS || now < stats.firstFailAt) {
+      stats.fail = 0;
+      stats.readyFailureKeys = null;
+      stats.firstFailAt = now;
+    }
+    if (stats.fail >= 3) return;
     if (!stats.readyFailureKeys) stats.readyFailureKeys = new Set();
     var key = getImageUrlKey(url);
     if (stats.readyFailureKeys.has(key)) return;
     stats.readyFailureKeys.add(key);
     stats.fail++;
+    stats.lastFailAt = now;
   }
 
   function getReadyAttachmentFamily(task) {
     var src = getTaskImageSrc(task);
     if (!src || src.indexOf('/forum/') === -1) return null;
     var candidate = getTaskImageData(task);
+    if (!candidate) return null;
     var hasQuery = [candidate.src, candidate.displaySrc, candidate.previewSrc].some(function(url) {
       return url && url.indexOf('?') !== -1;
     });
@@ -4309,7 +4326,8 @@
     for (var host in hosts) {
       if (!Object.prototype.hasOwnProperty.call(hosts, host) || host === family.host) continue;
       var stats = hosts[host];
-      if (stats.ok < 2 || now - stats.lastOkAt > ATTACHMENT_SIBLING_MAX_AGE_MS || stats.lastOkAt <= bestAt) continue;
+      if (stats.ok < 2 || now < stats.lastOkAt || now - stats.lastOkAt > ATTACHMENT_SIBLING_MAX_AGE_MS ||
+          stats.lastOkAt <= bestAt || isDeadAttachmentHost({ key: family.key, host: host })) continue;
       var health = getOrdinaryHostStats(host, false);
       if (health && health.cooldownUntil && health.cooldownUntil > now) continue;
       best = host;
@@ -4320,7 +4338,9 @@
 
   function isDeadAttachmentHost(family) {
     var stats = getAttachmentHostStats(family, false);
-    return !!(stats && stats.ok === 0 && stats.fail >= 3);
+    var now = Date.now();
+    return !!(stats && stats.fail >= 3 && now >= stats.lastFailAt &&
+      now - stats.lastFailAt < ATTACHMENT_SIBLING_MAX_AGE_MS);
   }
 
   function withAttachmentHost(candidate, fromHost, toHost) {
@@ -4377,7 +4397,7 @@
     if (isHeavyChannelTask(task, getCurrentSettings()) || isImageTaskDeadlineSpent(task)) return false;
     var family = getAttachmentFamily(getTaskImageSrc(task));
     if (!family) return false;
-    getAttachmentHostStats(family, true).fail++;
+    noteReadyAttachmentHostFailure(getTaskImageSrc(task));
     var sibling = moveTaskToSiblingHost(task, family);
     if (!sibling) return false;
     var newSrc = getTaskImageSrc(task);
@@ -5168,8 +5188,43 @@
         var currentSrc = getTaskImageSrc(task);
         recordTaskImageFailure(task, currentSrc, reason || 'active_recover', false);
         if (tryNoReferrerFallback(task, img, currentSrc, startTimer, isActiveLoadCurrent)) return;
+        if (requeueOnSiblingHost()) return;
         if (!task.readyImageQueue && tryHeavyCandidateFallback(task, img, startTimer, isActiveLoadCurrent)) return;
         failFinal(reason || 'direct_recover');
+      }
+      function requeueOnSiblingHost() {
+        if (!task.readyImageQueue || task.manualRetry || task.siblingHostTried ||
+            !task.currentSrcNoReferrerTried || !isActiveLoadCurrent() || !isTaskCurrent(task)) return false;
+        var remainingMs = task.taskDeadlineAt ? task.taskDeadlineAt - Date.now() : 0;
+        if (remainingMs < 500) return false;
+        var family = getReadyAttachmentFamily(task);
+        if (!family || !pickSiblingAttachmentHost(family)) return false;
+        var failedSrc = getTaskImageSrc(task);
+        recordTaskImageFailure(task, failedSrc, 'candidate_error', true);
+        var sibling = moveTaskToSiblingHost(task, family);
+        if (!sibling) return false;
+        settled = true;
+        if (t) { clearTimeout(t); t = null; }
+        cancelImageLoadElement(img);
+        finishActiveLoad();
+        releaseImageSlot(task, slotToken);
+        // Re-enter admission on the new host instead of changing src inside
+        // the old slot. Queue wait is free, but both hosts share the original
+        // request budget; switching hosts never buys another full timeout.
+        task.siblingTimeoutRemainingMs = remainingMs;
+        task.taskDeadlineAt = 0;
+        task.queuedAt = Date.now();
+        task.loadStartAt = 0;
+        task.queueKind = 'ready_sibling_retry';
+        task.pausedWrapper = wrapper;
+        task.pausedLoadingEl = lel;
+        enqueueReadyImage(getThreadState(task.threadId), task, true);
+        logImageEvent('image_retry', task, {
+          reason: 'sibling_host_queue', fromHost: family.host, toHost: sibling,
+          remainingMs: remainingMs
+        }, 'INFO');
+        ATPLoader.globalSchedule();
+        return true;
       }
       unregisterActiveLoad = registerActiveImageLoad({ cancel: cancelActiveLoad, recover: recoverActiveLoad });
       function startTimer(timeoutOverride) {
@@ -5306,6 +5361,7 @@
         }
         var currentSrc = getTaskImageSrc(task);
         if (tryNoReferrerFallback(task, img, currentSrc, startTimer, isActiveLoadCurrent)) return;
+        if (requeueOnSiblingHost()) return;
         if (!task.readyImageQueue && trySiblingHostFallback(task, img, startTimer, isActiveLoadCurrent)) return;
         recordTaskImageFailure(task, currentSrc, 'candidate_error', false);
         if (!task.readyImageQueue && tryHeavyCandidateFallback(task, img, startTimer, isActiveLoadCurrent)) return;

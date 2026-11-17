@@ -8784,6 +8784,59 @@ function checkLoaderSiblingAttachmentHost() {
   const otherFamily = createRun(2);
   failTwice(otherFamily, 'https://img.dead.example' + attachmentPath(5), 'sibling-6');
   assert(retries(otherFamily, 'sibling_host').length === 0, 'only hosts of the same attachment family may be siblings');
+
+  function failReady(run, src) {
+    run.sandbox.ATPLoader.recordTaskImageFailure({ candidates: [{ src: src }], idx: 0, readyImageQueue: true },
+      src, 'direct_fail', true);
+  }
+  function nextHost(run, src, id) {
+    run.addThread(id, src, 0);
+    const task = createVerifyLaneTask(src, id, { readyImageQueue: true, viewportPriority: true });
+    assert(run.sandbox.ATPLoader.acquireSlot(task), 'the host observation test must admit its next request');
+    run.sandbox.ATPLoader.releaseSlot(task);
+    return task.candidates[0].src;
+  }
+  const formerlyLive = createRun(2);
+  formerlyLive.sandbox.ATPLoader.recordDomainSuccess(dead + attachmentPath(10));
+  for (let i = 0; i < 3; i++) failReady(formerlyLive, dead + attachmentPath(i));
+  assert(nextHost(formerlyLive, dead + attachmentPath(3), 'formerly-live') === live + attachmentPath(3),
+    'a previously successful host must still be avoided after three different recent failures');
+  formerlyLive.sandbox.ATPLoader.recordDomainSuccess(dead + attachmentPath(11));
+  assert(nextHost(formerlyLive, dead + attachmentPath(4), 'recovered-original') === dead + attachmentPath(4),
+    'a real success must clear the unavailable observation and allow the original host again');
+
+  const repeated = createRun(2);
+  for (let i = 0; i < 4; i++) failReady(repeated, dead + attachmentPath(0));
+  assert(nextHost(repeated, dead + attachmentPath(1), 'one-broken-url') === dead + attachmentPath(1),
+    'retries of one broken image must not classify the whole host as unavailable');
+
+  const scattered = createRun(2);
+  let scatteredNow = Date.now();
+  scattered.sandbox.Date = class extends Date { static now() { return scatteredNow; } };
+  for (let i = 0; i < 3; i++) {
+    failReady(scattered, dead + attachmentPath(i));
+    scatteredNow += 30000;
+  }
+  assert(nextHost(scattered, dead + attachmentPath(4), 'scattered-failures') === dead + attachmentPath(4),
+    'failures spread beyond one observation window must not accumulate into an unavailable host');
+
+  const expired = createRun(2);
+  let now = Date.now();
+  expired.sandbox.Date = class extends Date { static now() { return now; } };
+  for (let i = 0; i < 3; i++) failReady(expired, dead + attachmentPath(i));
+  now += 10 * 60 * 1000 + 1;
+  expired.sandbox.ATPLoader.recordDomainSuccess(live + attachmentPath(10));
+  expired.sandbox.ATPLoader.recordDomainSuccess(live + attachmentPath(11));
+  assert(nextHost(expired, dead + attachmentPath(4), 'expired-original') === dead + attachmentPath(4),
+    'unavailable observations must expire so a recovered original host is eventually probed');
+
+  const failedSibling = createRun(2);
+  for (let i = 0; i < 3; i++) {
+    failReady(failedSibling, dead + attachmentPath(i));
+    failReady(failedSibling, live + attachmentPath(i));
+  }
+  assert(nextHost(failedSibling, dead + attachmentPath(4), 'failed-sibling') === dead + attachmentPath(4),
+    'a sibling with historical successes but recent repeated failures must not be selected');
 }
 
 function checkLoaderCompletedImageRecoverBehavior() {
@@ -11458,6 +11511,71 @@ function checkReadyImageQueue() {
   failover.images[0].onload();
   assert(failover.images[2].src === live + attachment(4),
     'unsigned attachments from a failed host must use the previously healthy sibling after its slot frees');
+
+  const rescue = createRun({ ordinaryHostConcurrency: 1 });
+  rescue.loader.recordDomainSuccess(live + attachment(0));
+  rescue.loader.recordDomainSuccess(live + attachment(1));
+  rescue.addReadyThread('mirror-blocker', [live + attachment(2)], 1);
+  const rescuedThread = rescue.addReadyThread('mirror-rescue', [dead + attachment(3)], 1);
+  rescuedThread.cacheImages = rescuedThread.candidates;
+  const originalSrc = rescuedThread.candidates[0].src;
+  rescue.loader.globalSchedule();
+  const failedImage = rescue.images[1];
+  rescue.advance(100);
+  failedImage.onerror();
+  rescue.advance(100);
+  failedImage.onerror();
+  assert(rescue.images.length === 2 && failedImage.src === undefined && rescue.loader.getActive() === 1,
+    'an errored ready image must release its old slot and queue for a saturated sibling');
+  assert(rescuedThread.failedCount === 0 && rescuedThread.candidates[0].src === live + attachment(3),
+    'a ready image must try its healthy sibling before settling as failed');
+  assert(rescuedThread.cacheImages !== rescuedThread.candidates && rescuedThread.cacheImages[0].src === originalSrc,
+    'mirror recovery must retain the original attachment URL in the article cache');
+  rescue.advance(2000);
+  rescue.images[0].onload();
+  assert(rescue.images.length === 3 && rescue.images[2].src === live + attachment(3) && rescue.loader.getActive() === 1,
+    'mirror retries must obey the destination host cap and resume when its slot frees');
+  const mirrorTimer = rescue.timers.filter(timer => !timer.cleared && timer.delay === 800).pop();
+  assert(mirrorTimer, 'queue waiting must not buy the mirror another full request timeout');
+  rescue.advance(100);
+  rescue.images[2].onload();
+  assert(rescuedThread.loaded === 1 && rescuedThread.failedCount === 0 && rescuedThread.firstScreenOk === 1 &&
+    rescuedThread.grid.children.length === 1 && rescue.loader.getActive() === 0,
+    'a rescued first-screen image must settle exactly once in its original grid cell');
+
+  const exhausted = createRun();
+  exhausted.loader.recordDomainSuccess(live + attachment(0));
+  exhausted.loader.recordDomainSuccess(live + attachment(1));
+  const exhaustedThread = exhausted.addReadyThread('mirror-budget', [dead + attachment(4)], 1);
+  exhausted.loader.globalSchedule();
+  exhausted.advance(800);
+  exhausted.images[0].onerror();
+  exhausted.images[0].onerror();
+  assert(exhausted.images.length === 1 && exhaustedThread.failedCount === 1,
+    'an almost-spent request budget must not start a mirror or extend the deadline');
+
+  const signedRun = createRun();
+  signedRun.loader.recordDomainSuccess(live + attachment(0));
+  signedRun.loader.recordDomainSuccess(live + attachment(1));
+  const signedThread = signedRun.addReadyThread('mirror-signed', [signed], 1);
+  signedRun.loader.globalSchedule();
+  signedRun.images[0].onerror();
+  signedRun.images[0].onerror();
+  assert(signedRun.images.length === 1 && signedThread.candidates[0].src === signed,
+    'failed signed attachments must never be rewritten to another host');
+
+  const mirrorFailure = createRun();
+  mirrorFailure.loader.recordDomainSuccess(live + attachment(0));
+  mirrorFailure.loader.recordDomainSuccess(live + attachment(1));
+  const mirrorFailureThread = mirrorFailure.addReadyThread('mirror-once', [dead + attachment(4)], 1);
+  mirrorFailure.loader.globalSchedule();
+  mirrorFailure.images[0].onerror();
+  mirrorFailure.images[0].onerror();
+  assert(mirrorFailure.images.length === 2, 'an eligible ready image must try its sibling');
+  mirrorFailure.images[1].onerror();
+  mirrorFailure.images[1].onerror();
+  assert(mirrorFailure.images.length === 2 && mirrorFailureThread.failedCount === 1 && mirrorFailure.loader.getActive() === 0,
+    'a failed mirror must not ping-pong between hosts or settle the image more than once');
 }
 
 function checkLoaderViewportRegistrationBudget() {
