@@ -4,6 +4,7 @@ const SETTINGS_SCHEMA = [
     label: '每行列数',
     type: 'number',
     group: '显示',
+    quickAccess: true,
     default: 5,
     min: 1, max: 32, step: 1,
     recommendedMax: 12,
@@ -11,21 +12,71 @@ const SETTINGS_SCHEMA = [
     recommend: '5 列适合宽屏，3-4 列适合窄屏。',
     lowImpact: '列数过少会占用更多垂直空间。',
     highImpact: '列数过多会导致图片过小。',
-    immediate: false,
+    immediate: true,
+    applyMode: 'live',
   },
   {
     key: 'visibleRows',
     label: '可见行数',
     type: 'number',
     group: '显示',
+    quickAccess: true,
     default: 2,
     min: 1, max: 20, step: 1,
     recommendedMax: 6,
-    description: '不滚动时可见几行缩略图。首屏图片数 = 列数 × 行数。',
+    description: '不展开时默认可见几行缩略图。首屏图片数 = 列数 × 行数。',
     recommend: '2 行可在不展开时看到足够图片。',
     lowImpact: '行数过少看不到足够图片。',
     highImpact: '行数过多会占用页面空间。',
     immediate: false,
+    applyMode: 'hotReload',
+  },
+  {
+    key: 'showFloatingLauncher',
+    label: '显示页面悬浮按钮',
+    type: 'boolean',
+    group: '显示',
+    quickAccess: true,
+    default: true,
+    description: '在论坛列表页右下角显示可拖拽的快捷控制台悬浮球。',
+    recommend: '建议开启，可随时切换速度模式、暂停加载或调整列数。',
+    immediate: true,
+    applyMode: 'live',
+  },
+  {
+    key: 'showResourcePanel',
+    label: '显示资源栏',
+    type: 'boolean',
+    group: '显示',
+    quickAccess: true,
+    default: true,
+    description: '在列表页右侧空白区显示当前帖子提取到的网盘、ED2K、磁力等资源摘要。',
+    recommend: '开启后可直接复制帖子资源链接，无需进入帖子详情页。',
+    immediate: true,
+    applyMode: 'live',
+  },
+  {
+    key: 'copyPasswordsWithLinks',
+    label: '复制时附带密码',
+    type: 'boolean',
+    group: '高级',
+    quickAccess: true,
+    default: true,
+    description: '复制资源链接时自动附带帖子中识别到的解压密码。',
+    recommend: '建议开启，避免下载压缩包后还要回帖查找密码。',
+    immediate: true,
+    applyMode: 'live',
+  },
+  {
+    key: 'autoEnterAgeGate',
+    label: '自动点击年龄入口',
+    type: 'boolean',
+    group: '加载',
+    quickAccess: true,
+    default: true,
+    description: '遇到论坛的中英文年龄声明页时，自动点击「满18岁，请点此进入」。从版块或帖子进入时会返回原页。',
+    immediate: true,
+    applyMode: 'live',
   },
   {
     key: 'thumbWidth',
@@ -39,7 +90,8 @@ const SETTINGS_SCHEMA = [
     recommend: '110px 适合列表页紧凑显示。',
     lowImpact: '宽度太小看不清图片内容。',
     highImpact: '宽度太大会让网格变得很宽。',
-    immediate: false,
+    immediate: true,
+    applyMode: 'live',
   },
   {
     key: 'thumbHeight',
@@ -51,7 +103,8 @@ const SETTINGS_SCHEMA = [
     unit: 'px',
     description: '每张缩略图的高度。',
     recommend: '82px 与 110px 宽度搭配比例合适。',
-    immediate: false,
+    immediate: true,
+    applyMode: 'live',
   },
   {
     key: 'gridGap',
@@ -62,135 +115,8 @@ const SETTINGS_SCHEMA = [
     min: 0, max: 20, step: 1,
     unit: 'px',
     description: '相邻缩略图之间的间隙。',
-    immediate: false,
-  },
-  {
-    key: 'maxImagesPerPost',
-    label: '抓取上限',
-    type: 'number',
-    group: '加载',
-    default: 100,
-    min: 10, max: 5000, step: 10,
-    recommendedMax: 500,
-    description: '从帖子正文最多提取多少张候选图片。',
-    recommend: '100 张足够覆盖大部分帖子。',
-    lowImpact: '上限太低可能漏掉图片。',
-    highImpact: '上限太高会消耗更多流量和内存。',
-    immediate: false,
-  },
-  {
-    key: 'maxDisplayPerPost',
-    label: '显示上限',
-    type: 'number',
-    group: '加载',
-    default: 100,
-    min: 10, max: 5000, step: 10,
-    recommendedMax: 500,
-    description: '每篇帖子最多显示多少张缩略图。',
-    immediate: false,
-  },
-  {
-    // New key leaves the earlier default-on value in storage inert after upgrade.
-    key: 'autoLoadOffscreenFirstRowsEnabled',
-    label: '屏外首批自动加载',
-    type: 'boolean',
-    group: '加载',
-    default: false,
-    description: '不滚动页面也会以后台优先级加载每帖首批图片，张数由每行列数 × 可见行数决定。',
-    recommend: '开启后当前列表页的帖子会逐步加载首批图片。',
-    highImpact: '列表页帖子很多时会增加正文、图片及 TXT 附件请求。',
-    immediate: false,
-  },
-  {
-    key: 'firstScreenConcurrency',
-    label: '弱图可见并发',
-    type: 'number',
-    group: '加载',
-    default: 3,
-    min: 1, max: 128, step: 1,
-    recommendedMax: 30,
-    description: '已入普通队列的图片最多同时加载多少张。实际并发也受同域和全局上限约束。',
-    recommend: '3 适合保守环境；也可使用弱图加载预设快速调整。',
-    lowImpact: '并发太低会让当前视线内的图片逐张等待。',
-    highImpact: '并发太高可能触发浏览器限制。',
+    immediate: true,
     applyMode: 'live',
-  },
-  {
-    key: 'viewportPriorityReservedSlots',
-    label: '可视范围保留槽位',
-    type: 'number',
-    group: '加载',
-    default: 2,
-    min: 0, max: 128, step: 1,
-    recommendedMax: 16,
-    description: '为真实可见图片和手动重试保留全局槽位。每个普通图床也按此值预留，最多预留该图床上限的一半。离屏任务至少保留 1 路，0 表示取消预留。',
-    recommend: '默认 2；弱图并发提高时可同步提高，预设会自动协调。',
-    lowImpact: '过低时离屏慢图可能先占满槽位，让可见图等待。',
-    highImpact: '过高时离屏预加载吞吐会下降，但不会完全停止。',
-    applyMode: 'live',
-  },
-  {
-    key: 'backgroundConcurrency',
-    label: '普图后台并发',
-    type: 'number',
-    group: '加载',
-    default: 1,
-    min: 1, max: 128, step: 1,
-    recommendedMax: 24,
-    description: '控制按视口登记的后台普通图并发，并参与待加载预算计算。普通帖队列使用普通图并发上限。',
-    applyMode: 'live',
-  },
-  {
-    key: 'backgroundSpeed',
-    label: '后台加载速度',
-    type: 'select',
-    group: '加载',
-    default: 'normal',
-    options: [
-      { value: 'extreme', label: '极速 (20ms)' },
-      { value: 'veryfast', label: '很快 (50ms)' },
-      { value: 'fast', label: '快速 (100ms)' },
-      { value: 'normal', label: '平衡 (300ms)' },
-      { value: 'slow', label: '温和 (800ms)' },
-    ],
-    description: '后台逐张加载图片的间隔速度。',
-    recommend: '平衡模式兼顾速度和性能。',
-    highImpact: '快速模式可能增加浏览器负载。',
-    applyMode: 'live',
-  },
-  {
-    key: 'imageTimeout',
-    label: '图片超时',
-    type: 'number',
-    group: '加载',
-    default: 15000,
-    min: 1000, max: 180000, step: 1000,
-    recommendedMax: 60000,
-    unit: 'ms',
-    description: '单张图片加载超时时间，超时后视为加载失败。',
-    recommend: '15000ms 通常足够加载大部分图片。',
-    lowImpact: '超时太短正常图片也可能失败。',
-    highImpact: '超时太长会拖慢整体加载。',
-    applyMode: 'live',
-  },
-  {
-    key: 'pauseWhenHidden',
-    label: '标签页不可见时暂停',
-    type: 'boolean',
-    group: '加载',
-    default: true,
-    description: '开启时切到其他标签页会暂停后台图片加载；关闭后标签页隐藏时继续加载，但不影响并发和速度设置。',
-    immediate: false,
-  },
-  {
-    key: 'skipServiceThreads',
-    label: '跳过置顶/版务帖',
-    type: 'boolean',
-    group: '加载',
-    default: true,
-    description: '扫描列表页时跳过置顶、公告、版规、服务大厅、教程等非资源主题。',
-    recommend: '建议开启，可减少无效抓取并改善长列表页滚动体验。',
-    immediate: false,
   },
   {
     key: 'animatedThumbnailMode',
@@ -205,7 +131,132 @@ const SETTINGS_SCHEMA = [
     description: '普通图床上的 GIF 动图在列表里显示第一帧，鼠标悬停时播放；点击仍打开原图。',
     recommend: '建议静帧：列表同屏常有几十张动图，全部播放时每一帧都要重新解码、重绘，滚动容易卡顿。',
     highImpact: '始终播放会明显增加滚动时的 CPU 占用，动图多的页面更容易卡顿。',
+    immediate: true,
+    applyMode: 'live',
+  },
+  {
+    key: 'maxImagesPerPost',
+    label: '抓取上限',
+    type: 'number',
+    group: '加载',
+    default: 100,
+    min: 10, max: 5000, step: 10,
+    recommendedMax: 500,
+    description: '从帖子正文最多提取多少张候选图片。',
+    recommend: '100 张足够覆盖大部分帖子。',
+    lowImpact: '上限太低可能漏掉图片。',
+    highImpact: '上限太高会消耗更多流量和内存。',
     immediate: false,
+    applyMode: 'hotReload',
+  },
+  {
+    key: 'maxDisplayPerPost',
+    label: '显示上限',
+    type: 'number',
+    group: '加载',
+    default: 100,
+    min: 10, max: 5000, step: 10,
+    recommendedMax: 500,
+    description: '每篇帖子最多显示多少张缩略图。',
+    immediate: false,
+    applyMode: 'hotReload',
+  },
+  {
+    // New key leaves the earlier default-on value in storage inert after upgrade.
+    key: 'autoLoadOffscreenFirstRowsEnabled',
+    label: '屏外首批自动加载',
+    type: 'boolean',
+    group: '加载',
+    default: false,
+    description: '不滚动页面也会以后台优先级加载每帖首批图片，张数由每行列数 × 可见行数决定。',
+    recommend: '开启后当前列表页的帖子会逐步加载首批图片。',
+    highImpact: '列表页帖子很多时会增加正文、图片及 TXT 附件请求。',
+    immediate: false,
+    applyMode: 'hotReload',
+  },
+  {
+    key: 'firstScreenConcurrency',
+    label: '可见图片并发',
+    type: 'number',
+    group: '加载',
+    default: 8,
+    min: 1, max: 128, step: 1,
+    recommendedMax: 30,
+    description: '当前视线内的普通图片最多同时加载多少张。实际并发也受同域和全局上限约束。',
+    recommend: '默认 8 兼顾速度与流畅；也可在概览页一键切换加载模式预设。',
+    lowImpact: '并发太低会让当前视线内的图片逐张等待。',
+    highImpact: '并发太高可能触发图床或浏览器同域限制。',
+    immediate: true,
+    applyMode: 'live',
+  },
+  {
+    key: 'backgroundConcurrency',
+    label: '后台预载并发',
+    type: 'number',
+    group: '加载',
+    default: 2,
+    min: 1, max: 128, step: 1,
+    recommendedMax: 24,
+    description: '控制视口外待展示普通图的后台预载并发，并参与待加载预算计算。',
+    recommend: '默认 2 让向下滚动时图片提前就绪，又不抢占当前屏幕带宽。',
+    immediate: true,
+    applyMode: 'live',
+  },
+  {
+    key: 'backgroundSpeed',
+    label: '后台加载速度',
+    type: 'select',
+    group: '加载',
+    default: 'fast',
+    options: [
+      { value: 'extreme', label: '极速 (20ms)' },
+      { value: 'veryfast', label: '很快 (50ms)' },
+      { value: 'fast', label: '快速 (100ms)' },
+      { value: 'normal', label: '平衡 (300ms)' },
+      { value: 'slow', label: '温和 (800ms)' },
+    ],
+    description: '后台逐张调度预载图片的间隔速度。',
+    recommend: '默认快速 (100ms) 滚动衔接更丝滑；弱网可切回平衡或温和。',
+    highImpact: '极速模式可能增加低配设备或慢速网络负载。',
+    immediate: true,
+    applyMode: 'live',
+  },
+  {
+    key: 'imageTimeout',
+    label: '图片超时',
+    type: 'number',
+    group: '加载',
+    default: 12000,
+    min: 1000, max: 180000, step: 1000,
+    recommendedMax: 60000,
+    unit: 'ms',
+    description: '单张图片加载超时时间，超时后尽快切换备用候选或标记失败。',
+    recommend: '12000ms 兼顾慢图床容忍度与死链快速释放槽位。',
+    lowImpact: '超时太短正常大图也可能中途失败。',
+    highImpact: '超时太长会让失效图片长时间占住并发槽。',
+    immediate: true,
+    applyMode: 'live',
+  },
+  {
+    key: 'pauseWhenHidden',
+    label: '标签页不可见时暂停',
+    type: 'boolean',
+    group: '加载',
+    default: true,
+    description: '开启时切到其他标签页会暂停后台图片加载；关闭后标签页隐藏时继续加载。',
+    immediate: true,
+    applyMode: 'live',
+  },
+  {
+    key: 'skipServiceThreads',
+    label: '跳过置顶/版务帖',
+    type: 'boolean',
+    group: '加载',
+    default: true,
+    description: '扫描列表页时跳过置顶、公告、版规、服务大厅、教程等非资源主题。',
+    recommend: '建议开启，可减少无效抓取并改善长列表页滚动体验。',
+    immediate: false,
+    applyMode: 'hotReload',
   },
   {
     key: 'heavyImageOptimization',
@@ -216,19 +267,21 @@ const SETTINGS_SCHEMA = [
     description: '检测到高分辨率重图图床时，均衡模式每帖只加载一行代表图，并从抓取上限内的候选继续补位；轻量缩略模式按普通图显示数量展示；普通图帖不受影响。',
     recommend: '建议开启；轻图页面不受影响，关闭后所有页面按统一显示上限加载。',
     immediate: false,
+    applyMode: 'hotReload',
   },
   {
     key: 'heavyImageConcurrency',
     label: '重图并发',
     type: 'number',
     group: '加载',
-    default: 2,
+    default: 3,
     min: 1, max: 128, step: 1,
     recommendedMax: 12,
-    description: '重图优化开启时的用户并发 ceiling；固定模式直接执行，自适应模式只在公开调优参数内变化。',
-    recommend: '2 适合高速网络；如果滚动仍卡顿可调回 1。',
+    description: '重图优化开启时的重图并发上限；固定模式直接执行，自适应模式只在公开调优参数内变化。',
+    recommend: '默认 3 适合主流宽带；如果图床限流或滚动卡顿可调回 1-2。',
     highImpact: '设为较高值会更积极加载重图，可能增加解码和图床压力。',
     enabledWhen: { key: 'heavyImageOptimization', value: true },
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -246,64 +299,7 @@ const SETTINGS_SCHEMA = [
     highImpact: '轻量缩略会降低列表缩略图细节，并跳过毛玻璃恢复清晰队列。',
     enabledWhen: { key: 'heavyImageOptimization', value: true },
     immediate: false,
-  },
-  {
-    key: 'heavyPreviewStarvationWait',
-    label: '重图兜底等待',
-    type: 'number',
-    group: '加载',
-    default: 3,
-    min: 0, max: 120, step: 1,
-    recommendedMax: 24,
-    unit: '秒',
-    description: '可见毛玻璃长时间被 MP 预算挡住时，等待多少秒后允许重图走更高上限的饥饿兜底恢复。仅重图优化开启时有效。',
-    recommend: '3 秒为当前默认（毛玻璃恢复更快）；若满屏重图出现卡顿反弹，可调回 8-16 秒。',
-    highImpact: '数值太低会更早恢复超大图，可能增加滚动后的瞬时解码压力。',
-    enabledWhen: { key: 'heavyImageOptimization', value: true },
-    immediate: true,
-  },
-  {
-    key: 'heavyPreviewStarvationMP',
-    label: '重图兜底上限',
-    type: 'number',
-    group: '加载',
-    default: 820,
-    min: 0, max: 10000, step: 20,
-    recommendedMax: 2000,
-    unit: 'MP',
-    description: '饥饿兜底恢复时允许的当前可见区解码量上限。仅重图优化开启时有效。',
-    recommend: '820MP 是当前保守值；如果毛玻璃仍残留，可逐步试 1000、1400、1800。',
-    highImpact: '数值越高越容易把毛玻璃恢复成清晰图，但也会提高满屏重图时的解码峰值。',
-    enabledWhen: { key: 'heavyImageOptimization', value: true },
-    immediate: true,
-  },
-  {
-    key: 'heavyRestoreFastBatchSize',
-    label: '重图低压恢复批量',
-    type: 'number',
-    group: '加载',
-    default: 2,
-    min: 1, max: 128, step: 1,
-    recommendedMax: 6,
-    description: '滚动停止且 MP 压力低时，每批最多恢复多少张小/中重图。',
-    recommend: '默认 2 保持当前稳定行为；可逐步试 3-4。',
-    highImpact: '数值越高，低压时清晰图恢复越快，但同一批解码越集中。',
-    enabledWhen: { key: 'heavyImageOptimization', value: true },
-    immediate: true,
-  },
-  {
-    key: 'heavyRestorePressureBatchSize',
-    label: '重图高压恢复批量',
-    type: 'number',
-    group: '加载',
-    default: 1,
-    min: 1, max: 128, step: 1,
-    recommendedMax: 4,
-    description: '遇到 soft/hard/ultra 压力或饥饿兜底时，每批最多恢复多少张重图。',
-    recommend: '默认 1 最稳；有模糊图缓冲后可试 2。',
-    highImpact: '数值越高，毛玻璃更快变清晰，但满屏重图时更容易推高可见 MP 峰值。',
-    enabledWhen: { key: 'heavyImageOptimization', value: true },
-    immediate: true,
+    applyMode: 'hotReload',
   },
   {
     key: 'maxRetryPerImage',
@@ -313,9 +309,26 @@ const SETTINGS_SCHEMA = [
     default: 0,
     min: 0, max: 20, step: 1,
     recommendedMax: 3,
-    description: '单张图片加载失败后的重试次数。',
+    description: '单张图片加载失败后的自动重试次数。',
     highImpact: '重试次数太多可能拖慢整体进度。',
-    immediate: false,
+    immediate: true,
+    applyMode: 'live',
+  },
+  {
+    key: 'cacheTTL',
+    label: '缓存时间',
+    type: 'number',
+    group: '高级',
+    default: 30,
+    min: 1, max: 1440, step: 1,
+    recommendedMax: 120,
+    unit: '分钟',
+    description: '已抓取文章与图片 URL 的缓存有效时间。缓存期内不再重复请求。',
+    recommend: '30 分钟适合大部分使用场景。',
+    lowImpact: '缓存太短会导致翻页返回时重复抓取。',
+    highImpact: '缓存太长可能导致新编辑图片不及时刷新。',
+    immediate: true,
+    applyMode: 'live',
   },
   {
     key: 'debugLogging',
@@ -327,18 +340,97 @@ const SETTINGS_SCHEMA = [
     recommend: '仅在排查加载问题或导出诊断时临时开启。',
     highImpact: '开启后会增加日志清洗、序列化和本地存储开销。',
     immediate: true,
+    applyMode: 'live',
+  },
+  {
+    key: 'viewportPriorityReservedSlots',
+    label: '可视范围保留槽位',
+    type: 'number',
+    group: '专家调优',
+    default: 4,
+    min: 0, max: 128, step: 1,
+    recommendedMax: 16,
+    description: '为真实可见图片和手动重试保留全局槽位。每个普通图床也按此值预留，最多预留该图床上限的一半。离屏任务至少保留 1 路，0 表示取消预留。',
+    recommend: '默认 4；可见图片并发提高时可同步提高，加载模式预设会自动协调。',
+    lowImpact: '过低时离屏慢图可能先占满槽位，让可见图等待。',
+    highImpact: '过高时离屏预加载吞吐会下降，但不会完全停止。',
+    immediate: true,
+    applyMode: 'live',
+  },
+  {
+    key: 'heavyPreviewStarvationWait',
+    label: '重图兜底等待',
+    type: 'number',
+    group: '专家调优',
+    default: 3,
+    min: 0, max: 120, step: 1,
+    recommendedMax: 24,
+    unit: '秒',
+    description: '可见毛玻璃长时间被 MP 预算挡住时，等待多少秒后允许重图走更高上限的饥饿兜底恢复。仅重图优化开启时有效。',
+    recommend: '3 秒为当前默认（毛玻璃恢复更快）；若满屏重图出现卡顿反弹，可调回 8-16 秒。',
+    highImpact: '数值太低会更早恢复超大图，可能增加滚动后的瞬时解码压力。',
+    enabledWhen: { key: 'heavyImageOptimization', value: true },
+    immediate: true,
+    applyMode: 'live',
+  },
+  {
+    key: 'heavyPreviewStarvationMP',
+    label: '重图兜底上限',
+    type: 'number',
+    group: '专家调优',
+    default: 820,
+    min: 0, max: 10000, step: 20,
+    recommendedMax: 2000,
+    unit: 'MP',
+    description: '饥饿兜底恢复时允许的当前可见区解码量上限。仅重图优化开启时有效。',
+    recommend: '820MP 是当前保守值；如果毛玻璃仍残留，可逐步试 1000、1400、1800。',
+    highImpact: '数值越高越容易把毛玻璃恢复成清晰图，但也会提高满屏重图时的解码峰值。',
+    enabledWhen: { key: 'heavyImageOptimization', value: true },
+    immediate: true,
+    applyMode: 'live',
+  },
+  {
+    key: 'heavyRestoreFastBatchSize',
+    label: '重图低压恢复批量',
+    type: 'number',
+    group: '专家调优',
+    default: 2,
+    min: 1, max: 128, step: 1,
+    recommendedMax: 6,
+    description: '滚动停止且 MP 压力低时，每批最多恢复多少张小/中重图。',
+    recommend: '默认 2 保持当前稳定行为；可逐步试 3-4。',
+    highImpact: '数值越高，低压时清晰图恢复越快，但同一批解码越集中。',
+    enabledWhen: { key: 'heavyImageOptimization', value: true },
+    immediate: true,
+    applyMode: 'live',
+  },
+  {
+    key: 'heavyRestorePressureBatchSize',
+    label: '重图高压恢复批量',
+    type: 'number',
+    group: '专家调优',
+    default: 1,
+    min: 1, max: 128, step: 1,
+    recommendedMax: 4,
+    description: '遇到 soft/hard/ultra 压力或饥饿兜底时，每批最多恢复多少张重图。',
+    recommend: '默认 1 最稳；有模糊图缓冲后可试 2。',
+    highImpact: '数值越高，毛玻璃更快变清晰，但满屏重图时更容易推高可见 MP 峰值。',
+    enabledWhen: { key: 'heavyImageOptimization', value: true },
+    immediate: true,
+    applyMode: 'live',
   },
   {
     key: 'articleFetchConcurrency',
     label: '正文抓取并发',
     type: 'number',
     group: '专家调优',
-    default: 3,
+    default: 4,
     min: 1, max: 32, step: 1,
     recommendedMax: 8,
     description: '同时抓取多少篇帖子正文。正文完成后会立即提交，不再等待整批最慢请求。',
-    recommend: '3-6 适合大部分网络；高速网络和高性能电脑可继续提高。',
+    recommend: '4-6 适合大部分网络；高速网络和高性能电脑可继续提高。',
     highImpact: '过高可能触发论坛限速或增加解析峰值。',
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -346,10 +438,11 @@ const SETTINGS_SCHEMA = [
     label: '正文队列高水位',
     type: 'number',
     group: '专家调优',
-    default: 5,
+    default: 8,
     min: 1, max: 100, step: 1,
     recommendedMax: 20,
     description: '扫描器一次最多补充多少篇待抓取帖子，worker 空闲后立即补位。',
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -362,6 +455,7 @@ const SETTINGS_SCHEMA = [
     recommendedMax: 60000,
     unit: 'ms',
     description: '单篇帖子正文的网络超时。',
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -374,6 +468,7 @@ const SETTINGS_SCHEMA = [
     recommendedMax: 10000,
     unit: 'px',
     description: '视口上下多远范围内的帖子可以提前进入正文队列。',
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -385,6 +480,7 @@ const SETTINGS_SCHEMA = [
     min: 1, max: 32, step: 1,
     recommendedMax: 8,
     description: '同一帧最多向页面提交多少篇离屏正文结果。可见帖子仍优先立即提交。',
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -395,7 +491,8 @@ const SETTINGS_SCHEMA = [
     default: 0,
     min: 0, max: 256, step: 1,
     recommendedMax: 64,
-    description: '普通图与重图合计并发。0 表示自动取弱图可见并发与重图并发之和。',
+    description: '普通图与重图合计并发。0 表示自动取可见图片并发与重图并发之和。',
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -403,10 +500,11 @@ const SETTINGS_SCHEMA = [
     label: '普通图同域并发',
     type: 'number',
     group: '专家调优',
-    default: 6,
+    default: 8,
     min: 1, max: 128, step: 1,
     recommendedMax: 30,
     description: '单一普通图床的总并发上限。静态图和动图共用额度，屏外首批使用较小的并发。',
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -416,6 +514,7 @@ const SETTINGS_SCHEMA = [
     group: '专家调优',
     default: true,
     description: '开启后按近期失败和超时降载。普通队列的动图单独降速，静态图仍能使用图床的剩余额度。',
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -427,6 +526,7 @@ const SETTINGS_SCHEMA = [
     min: 1, max: 128, step: 1,
     recommendedMax: 16,
     enabledWhen: { key: 'ordinaryHostAdaptive', value: true },
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -438,6 +538,7 @@ const SETTINGS_SCHEMA = [
     min: 1, max: 128, step: 1,
     recommendedMax: 8,
     enabledWhen: { key: 'ordinaryHostAdaptive', value: true },
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -449,6 +550,7 @@ const SETTINGS_SCHEMA = [
     min: 1, max: 100, step: 1,
     recommendedMax: 30,
     enabledWhen: { key: 'ordinaryHostAdaptive', value: true },
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -460,6 +562,7 @@ const SETTINGS_SCHEMA = [
     min: 1, max: 100, step: 1,
     recommendedMax: 50,
     enabledWhen: { key: 'ordinaryHostAdaptive', value: true },
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -472,6 +575,7 @@ const SETTINGS_SCHEMA = [
     recommendedMax: 120000,
     unit: 'ms',
     enabledWhen: { key: 'ordinaryHostAdaptive', value: true },
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -484,6 +588,7 @@ const SETTINGS_SCHEMA = [
     recommendedMax: 30,
     description: '普通图同域冷却后需要连续成功多少次才提前恢复。',
     enabledWhen: { key: 'ordinaryHostAdaptive', value: true },
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -495,6 +600,7 @@ const SETTINGS_SCHEMA = [
     min: 0, max: 2000, step: 1,
     recommendedMax: 500,
     description: '视口懒加载队列上限。0 表示按布局和后台并发自动计算。',
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -507,6 +613,7 @@ const SETTINGS_SCHEMA = [
     recommendedMax: 1000,
     unit: 'ms',
     description: '-1 使用“后台加载速度”预设；0 表示无额外间隔，其余值为自定义间隔。',
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -521,6 +628,7 @@ const SETTINGS_SCHEMA = [
     ],
     description: '固定模式严格使用重图并发上限；自适应模式在用户配置范围内升降。',
     enabledWhen: { key: 'heavyImageOptimization', value: true },
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -531,6 +639,7 @@ const SETTINGS_SCHEMA = [
     default: true,
     description: '关闭后不因图床失败自动开路，仍遵守你设置的并发和超时。',
     enabledWhen: { key: 'heavyImageOptimization', value: true },
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -543,6 +652,7 @@ const SETTINGS_SCHEMA = [
     recommendedMax: 12,
     description: '自适应模式下健康未知或恢复初期的起始并发。',
     enabledWhen: { key: 'heavyImageOptimization', value: true },
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -555,6 +665,7 @@ const SETTINGS_SCHEMA = [
     recommendedMax: 8,
     description: '图床冷却到期后用于试探恢复的并发。',
     enabledWhen: { key: 'heavyImageOptimization', value: true },
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -566,6 +677,7 @@ const SETTINGS_SCHEMA = [
     min: 0, max: 128, step: 1,
     recommendedMax: 16,
     description: '混合页面为普通图保留多少总槽。0 表示不保留，不再暗中把重图压到 1 或 3。',
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -577,6 +689,7 @@ const SETTINGS_SCHEMA = [
     min: 0, max: 50, step: 1,
     recommendedMax: 10,
     description: '普通或混合帖子中，一个加载槽最多替换多少个候选。0 表示失败后不自动换候选。',
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -590,6 +703,7 @@ const SETTINGS_SCHEMA = [
     unit: 'ms',
     description: '0 继承“图片超时”；非零时重图使用该值，不再有隐藏 8 秒或 3.5 秒截断。',
     enabledWhen: { key: 'heavyImageOptimization', value: true },
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -602,6 +716,7 @@ const SETTINGS_SCHEMA = [
     recommendedMax: 30,
     enabledWhen: { key: 'heavyImageOptimization', value: true },
     description: '失败时间窗内达到多少个不同候选失败后进入冷却。',
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -615,6 +730,7 @@ const SETTINGS_SCHEMA = [
     unit: 'ms',
     enabledWhen: { key: 'heavyImageOptimization', value: true },
     description: '超过时间窗的旧失败不再污染当前图床健康状态。',
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -627,6 +743,7 @@ const SETTINGS_SCHEMA = [
     recommendedMax: 120000,
     unit: 'ms',
     enabledWhen: { key: 'heavyImageOptimization', value: true },
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -639,6 +756,7 @@ const SETTINGS_SCHEMA = [
     recommendedMax: 300000,
     unit: 'ms',
     enabledWhen: { key: 'heavyImageOptimization', value: true },
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -651,6 +769,7 @@ const SETTINGS_SCHEMA = [
     recommendedMax: 20,
     description: '自适应模式每增加一个并发槽需要多少次连续成功。',
     enabledWhen: { key: 'heavyImageOptimization', value: true },
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -663,6 +782,7 @@ const SETTINGS_SCHEMA = [
     recommendedMax: 20,
     description: '半开探针连续成功多少次后恢复到预热状态。',
     enabledWhen: { key: 'heavyImageOptimization', value: true },
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -675,6 +795,7 @@ const SETTINGS_SCHEMA = [
     recommendedMax: 10,
     description: '一个加载槽内最多替换多少个候选。图床开路时同域候选等待恢复，不连续冲击。',
     enabledWhen: { key: 'heavyImageOptimization', value: true },
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -682,11 +803,13 @@ const SETTINGS_SCHEMA = [
     label: '图片任务总期限',
     type: 'number',
     group: '专家调优',
-    default: 0,
+    default: 20000,
     min: 0, max: 900000, step: 1000,
     recommendedMax: 300000,
     unit: 'ms',
-    description: '0 表示不额外限制；非零时限制同一任务多候选串联的总耗时。',
+    description: '限制同一任务多候选串联的总耗时，防止死链长期悬挂槽位；0 表示不额外限制。',
+    recommend: '默认 20000ms 可避免坏候选占住并发槽过久。',
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -700,6 +823,7 @@ const SETTINGS_SCHEMA = [
     unit: 'MP',
     description: '重图恢复范围内允许保留的解码量。0 表示不使用 MP 上限。',
     enabledWhen: { key: 'heavyImageOptimization', value: true },
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -713,6 +837,7 @@ const SETTINGS_SCHEMA = [
     unit: 'MP',
     description: '当前可见区允许保留的重图解码量。0 表示不使用 MP 上限。',
     enabledWhen: { key: 'heavyImageOptimization', value: true },
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -725,6 +850,7 @@ const SETTINGS_SCHEMA = [
     recommendedMax: 32,
     description: '附近区域最多保留多少张清晰重图。0 表示不限制数量。',
     enabledWhen: { key: 'heavyImageOptimization', value: true },
+    immediate: true,
     applyMode: 'live',
   },
   {
@@ -738,42 +864,8 @@ const SETTINGS_SCHEMA = [
     unit: 'px',
     enabledWhen: { key: 'heavyImageOptimization', value: true },
     description: '轻量缩略画布的最长边。数值越大越清晰，也更占内存。',
-    applyMode: 'live',
-  },
-  {
-    key: 'cacheTTL',
-    label: '缓存时间',
-    type: 'number',
-    group: '高级',
-    default: 30,
-    min: 1, max: 1440, step: 1,
-    recommendedMax: 120,
-    unit: '分钟',
-    description: '已加载图片 URL 的缓存有效时间。缓存期内不再重新抓取。',
-    recommend: '30 分钟适合大部分使用场景。',
-    lowImpact: '缓存太短会导致重复抓取。',
-    highImpact: '缓存太长可能导致新图片不及时显示。',
-    immediate: false,
-  },
-  {
-    key: 'showResourcePanel',
-    label: '显示资源栏',
-    type: 'boolean',
-    group: '资源',
-    default: true,
-    description: '在列表页右侧空白区显示当前帖子提取到的网盘、ED2K、磁力等资源摘要。',
-    recommend: '开启后可直接复制帖子资源链接，无需进入帖子详情页。',
-    immediate: false,
-  },
-  {
-    key: 'copyPasswordsWithLinks',
-    label: '复制时附带密码',
-    type: 'boolean',
-    group: '资源',
-    default: true,
-    description: '复制资源链接时自动附带帖子中识别到的解压密码。',
-    recommend: '建议开启，避免下载压缩包后还要回帖查找密码。',
     immediate: true,
+    applyMode: 'live',
   },
 ];
 
@@ -784,11 +876,68 @@ const ATP_SETTINGS_APPLY_MODES = Object.freeze({
 });
 
 const ATP_SETTINGS_GROUP_META = Object.freeze({
+  '显示': Object.freeze({ collapsible: true, collapsed: true }),
+  '加载': Object.freeze({ collapsible: true, collapsed: true }),
+  '高级': Object.freeze({ collapsible: true, collapsed: true }),
   '\u4e13\u5bb6\u8c03\u4f18': Object.freeze({ collapsible: true, collapsed: true })
 });
 
+const ATP_QUICK_ACCESS_ORDER = Object.freeze([
+  'gridCols',
+  'visibleRows',
+  'showFloatingLauncher',
+  'showResourcePanel',
+  'copyPasswordsWithLinks',
+  'autoEnterAgeGate'
+]);
+
 function ATPGetSettingsGroupMeta(groupName) {
   return ATP_SETTINGS_GROUP_META[groupName] || {};
+}
+
+function ATPGetSettingsViewGroups(schema) {
+  var groups = Object.create(null);
+  (schema || SETTINGS_SCHEMA).forEach(function(item) {
+    if (!item || !item.key) return;
+    var name = item.quickAccess ? '常用' : item.group;
+    if (!name) return;
+    if (!groups[name]) groups[name] = [];
+    groups[name].push(item);
+  });
+  if (groups['常用'] && groups['常用'].length > 1) {
+    groups['常用'].sort(function(a, b) {
+      var ai = ATP_QUICK_ACCESS_ORDER.indexOf(a.key);
+      var bi = ATP_QUICK_ACCESS_ORDER.indexOf(b.key);
+      if (ai === -1 && bi === -1) return 0;
+      if (ai === -1) return 1;
+      if (bi === -1) return -1;
+      return ai - bi;
+    });
+  }
+  var order = ['常用', '显示', '加载', '高级', '专家调优'];
+  return order.concat(Object.keys(groups).filter(function(name) {
+    return order.indexOf(name) === -1;
+  })).filter(function(name) {
+    return groups[name] && groups[name].length > 0;
+  }).map(function(name) {
+    return [name, groups[name]];
+  });
+}
+
+function ATPReadNumberSetting(rawValue, item) {
+  var text = String(rawValue == null ? '' : rawValue).trim();
+  if (!/^-?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?$/i.test(text)) return null;
+  var value = Number(text);
+  if (!Number.isSafeInteger(value) ||
+      (item.min !== undefined && value < item.min) ||
+      (item.max !== undefined && value > item.max)) return null;
+  return value;
+}
+
+function ATPGetNumberSettingError(item) {
+  return item.min !== undefined && item.max !== undefined
+    ? '请输入 ' + item.min + ' 至 ' + item.max + ' 之间的整数。'
+    : '请输入有效的整数。';
 }
 
 for (var ATPSettingsSchemaIndex = 0; ATPSettingsSchemaIndex < SETTINGS_SCHEMA.length; ATPSettingsSchemaIndex++) {
@@ -838,48 +987,48 @@ function ATPGetSettingsApplyMode(keys, schema) {
 var ATP_ORDINARY_LOAD_PRESET_VALUES = {
   ordinaryGentle: {
     firstScreenConcurrency: 6,
-    viewportPriorityReservedSlots: 4,
+    viewportPriorityReservedSlots: 3,
     backgroundConcurrency: 1,
     ordinaryHostConcurrency: 6,
     ordinaryHostAdaptive: true,
-    ordinaryHostSoftLimit: 3,
-    ordinaryHostHardLimit: 2,
-    ordinaryHostSoftFailures: 4,
-    ordinaryHostHardFailures: 8,
-    ordinaryHostCooldownMs: 15000,
-    ordinaryHostRecoverySuccesses: 2,
+    ordinaryHostSoftLimit: 2,
+    ordinaryHostHardLimit: 1,
+    ordinaryHostSoftFailures: 3,
+    ordinaryHostHardFailures: 6,
+    ordinaryHostCooldownMs: 25000,
+    ordinaryHostRecoverySuccesses: 3,
     globalImageConcurrency: 0,
     viewportPendingLimit: 24,
     backgroundSpeed: 'normal',
     backgroundDelayMs: -1,
-    imageTimeout: 10000,
-    imageTaskDeadline: 20000,
-    articleFetchConcurrency: 4,
+    imageTimeout: 14000,
+    imageTaskDeadline: 24000,
+    articleFetchConcurrency: 3,
     articleQueueHighWatermark: 6,
-    articlePrefetchDistance: 2000,
+    articlePrefetchDistance: 1600,
     articleCommitBatchSize: 2
   },
   ordinaryBalanced: {
     firstScreenConcurrency: 8,
-    viewportPriorityReservedSlots: 5,
+    viewportPriorityReservedSlots: 4,
     backgroundConcurrency: 2,
     ordinaryHostConcurrency: 8,
     ordinaryHostAdaptive: true,
-    ordinaryHostSoftLimit: 4,
-    ordinaryHostHardLimit: 2,
-    ordinaryHostSoftFailures: 5,
-    ordinaryHostHardFailures: 10,
-    ordinaryHostCooldownMs: 12000,
-    ordinaryHostRecoverySuccesses: 2,
+    ordinaryHostSoftLimit: 2,
+    ordinaryHostHardLimit: 1,
+    ordinaryHostSoftFailures: 3,
+    ordinaryHostHardFailures: 6,
+    ordinaryHostCooldownMs: 30000,
+    ordinaryHostRecoverySuccesses: 3,
     globalImageConcurrency: 0,
-    viewportPendingLimit: 24,
-    backgroundSpeed: 'normal',
+    viewportPendingLimit: 0,
+    backgroundSpeed: 'fast',
     backgroundDelayMs: -1,
-    imageTimeout: 9000,
-    imageTaskDeadline: 18000,
-    articleFetchConcurrency: 5,
+    imageTimeout: 12000,
+    imageTaskDeadline: 20000,
+    articleFetchConcurrency: 4,
     articleQueueHighWatermark: 8,
-    articlePrefetchDistance: 2400,
+    articlePrefetchDistance: 2000,
     articleCommitBatchSize: 2
   },
   ordinaryFast: {
@@ -928,4 +1077,40 @@ function ATPGetSettingsPreset(name, schema) {
     if (isHeavySetting || isSharedHeavySetting) preset[item.key] = item.default;
   }
   return preset;
+}
+
+function ATPDetectActiveOrdinaryPreset(settings, schema) {
+  if (!settings || typeof settings !== 'object') return null;
+  var names = ['ordinaryGentle', 'ordinaryBalanced', 'ordinaryFast'];
+  var source = Array.isArray(schema) ? schema : SETTINGS_SCHEMA;
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    var preset = ATPGetSettingsPreset(name, source);
+    var matchesAny = false;
+    var matchedAll = true;
+    for (var key in preset) {
+      if (!Object.prototype.hasOwnProperty.call(preset, key)) continue;
+      matchesAny = true;
+      if (settings[key] !== preset[key]) {
+        matchedAll = false;
+        break;
+      }
+    }
+    if (matchesAny && matchedAll) return name;
+  }
+  return null;
+}
+
+if (typeof globalThis !== 'undefined') {
+  globalThis.SETTINGS_SCHEMA = SETTINGS_SCHEMA;
+  globalThis.ATP_SETTINGS_APPLY_MODES = ATP_SETTINGS_APPLY_MODES;
+  globalThis.ATPGetSettingsGroupMeta = ATPGetSettingsGroupMeta;
+  globalThis.ATPGetSettingsViewGroups = ATPGetSettingsViewGroups;
+  globalThis.ATPReadNumberSetting = ATPReadNumberSetting;
+  globalThis.ATPGetNumberSettingError = ATPGetNumberSettingError;
+  globalThis.ATPGetSettingApplyMode = ATPGetSettingApplyMode;
+  globalThis.ATPGetSettingsApplyMode = ATPGetSettingsApplyMode;
+  globalThis.ATP_ORDINARY_LOAD_PRESET_VALUES = ATP_ORDINARY_LOAD_PRESET_VALUES;
+  globalThis.ATPGetSettingsPreset = ATPGetSettingsPreset;
+  globalThis.ATPDetectActiveOrdinaryPreset = ATPDetectActiveOrdinaryPreset;
 }

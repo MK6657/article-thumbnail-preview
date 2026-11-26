@@ -42,7 +42,7 @@ function createRun(extraSettings) {
   };
   sandbox.window = sandbox;
   vm.createContext(sandbox);
-  for (const name of ['shared-utils.js', 'loading-policy.js']) {
+  for (const name of ['shared-utils.js', 'loading-policy.js', 'host-health.js', 'image-runner.js']) {
     vm.runInContext(fs.readFileSync(path.join(root, name), 'utf8'), sandbox, { filename: name });
   }
   // Use the production loader and its real admission path; expose only

@@ -1,10 +1,80 @@
 (function () {
   'use strict';
 
+  var FALLBACK_DEFAULTS = {
+    enabled: true,
+    siteConfigs: {},
+    gridCols: 5,
+    visibleRows: 2,
+    showFloatingLauncher: true,
+    showResourcePanel: true,
+    copyPasswordsWithLinks: true,
+    autoEnterAgeGate: true,
+    thumbWidth: 110,
+    thumbHeight: 82,
+    gridGap: 6,
+    animatedThumbnailMode: 'still',
+    maxImagesPerPost: 100,
+    maxDisplayPerPost: 100,
+    autoLoadOffscreenFirstRowsEnabled: false,
+    firstScreenConcurrency: 8,
+    viewportPriorityReservedSlots: 4,
+    backgroundConcurrency: 2,
+    backgroundSpeed: 'fast',
+    imageTimeout: 12000,
+    pauseWhenHidden: true,
+    skipServiceThreads: true,
+    heavyImageOptimization: true,
+    heavyImageConcurrency: 3,
+    heavyThumbnailClarity: 'balanced',
+    heavyPreviewStarvationWait: 3,
+    heavyPreviewStarvationMP: 820,
+    heavyRestoreFastBatchSize: 2,
+    heavyRestorePressureBatchSize: 1,
+    maxRetryPerImage: 0,
+    cacheTTL: 30,
+    debugLogging: false,
+    articleFetchConcurrency: 4,
+    articleQueueHighWatermark: 8,
+    articleTimeout: 15000,
+    articlePrefetchDistance: 2000,
+    articleCommitBatchSize: 2,
+    globalImageConcurrency: 0,
+    ordinaryHostConcurrency: 8,
+    ordinaryHostAdaptive: true,
+    ordinaryHostSoftLimit: 2,
+    ordinaryHostHardLimit: 1,
+    ordinaryHostSoftFailures: 3,
+    ordinaryHostHardFailures: 6,
+    ordinaryHostCooldownMs: 30000,
+    ordinaryHostRecoverySuccesses: 3,
+    viewportPendingLimit: 0,
+    backgroundDelayMs: -1,
+    heavySchedulingMode: 'adaptive',
+    heavyCircuitBreaker: true,
+    heavyWarmupConcurrency: 2,
+    heavyProbeConcurrency: 1,
+    ordinaryReservedSlots: 2,
+    ordinaryFallbackLimit: 2,
+    heavyImageTimeout: 0,
+    heavyFailureThreshold: 6,
+    heavyFailureWindowMs: 60000,
+    heavyCooldownBaseMs: 20000,
+    heavyCooldownMaxMs: 60000,
+    heavyRampSuccesses: 2,
+    heavyRecoverySuccesses: 2,
+    heavyFallbackLimit: 2,
+    imageTaskDeadline: 20000,
+    heavyDecodedBudgetMP: 160,
+    heavyVisibleBudgetMP: 180,
+    heavyDecodedImageLimit: 8,
+    heavyLightweightPreviewEdge: 160
+  };
+
   function getDefaultsFromSchema(schema) {
     const d = {};
     schema.forEach(function(item) {
-      d[item.key] = item.default;
+      if (item && item.key) d[item.key] = item.default;
     });
     return d;
   }
@@ -38,15 +108,16 @@
     return out;
   }
 
+  const hasSchema = typeof SETTINGS_SCHEMA !== 'undefined' && Array.isArray(SETTINGS_SCHEMA) && SETTINGS_SCHEMA.length > 0;
   const ATP_DEFAULTS = Object.assign(
-    { enabled: true, siteConfigs: {} },
-    typeof SETTINGS_SCHEMA !== 'undefined' ? getDefaultsFromSchema(SETTINGS_SCHEMA) : {}
+    hasSchema ? { enabled: true, siteConfigs: {} } : Object.assign({}, FALLBACK_DEFAULTS, { siteConfigs: {} }),
+    hasSchema ? getDefaultsFromSchema(SETTINGS_SCHEMA) : {}
   );
 
   function normalizeSettings(raw) {
     const source = raw && typeof raw === 'object' ? raw : {};
     const settings = Object.assign({}, ATP_DEFAULTS);
-    const schema = typeof SETTINGS_SCHEMA !== 'undefined' ? SETTINGS_SCHEMA : [];
+    const schema = typeof SETTINGS_SCHEMA !== 'undefined' && Array.isArray(SETTINGS_SCHEMA) ? SETTINGS_SCHEMA : [];
 
     settings.enabled = normalizeBoolean(source.enabled, ATP_DEFAULTS.enabled);
     settings.siteConfigs = normalizeSiteConfigs(source.siteConfigs);

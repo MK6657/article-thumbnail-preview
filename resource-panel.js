@@ -8,13 +8,27 @@
   var pinnedThread = null;
   var hoverThread = null;
   var hoverClearTimer = null;
+  var hoverIntentTimer = null;
+  var hoverIntentPanel = null;
+  var lastPointerClientX = null;
   var sidebarHovering = false;
   var sidebarFocused = false;
+  var sidebarReturnFocusTrigger = null;
   var sidebarRenderSignature = '';
   var HOVER_CLEAR_DELAY = 800;
+  var HOVER_INTENT_DELAY_MS = 140;
   var RESOURCE_SIDEBAR_ID = 'atp-resource-sidebar';
   var RESOURCE_NARROW_QUERY = '(max-width: 1024px)';
+  // Sidebar width (280px), right inset (18px), and 12px of separation.
+  var RESOURCE_SIDEBAR_GUTTER = 310;
+  var RESOURCE_INLINE_LAYOUT_CLASS = 'atp-resource-inline-layout';
   var resourceLayoutMedia = null;
+  var resourceLayoutRoots = new Set();
+  var attachedPanels = new Set();
+  var resourceLayoutObserver = null;
+  var resourceGutterObserver = null;
+  var resourceGutterMargin = '';
+  var resourceLayoutOverlap = false;
   var resourceLayoutListenerBound = false;
   // Marked threads (site|tid ids) as the worker last stored them.
   var markedIds = Object.create(null);
@@ -49,7 +63,7 @@
     var staleSidebar = document.getElementById(RESOURCE_SIDEBAR_ID);
     if (staleSidebar && staleSidebar.parentNode) staleSidebar.remove();
     sidebar = document.createElement('div');
-    sidebar.className = 'atp-resource-sidebar';
+    sidebar.className = 'atp-resource-sidebar atp-resource-sidebar-idle';
     sidebar.id = RESOURCE_SIDEBAR_ID;
     sidebar.tabIndex = -1;
     sidebar.setAttribute('role', 'region');
@@ -57,6 +71,7 @@
     sidebar.addEventListener('mouseenter', function() {
       sidebarHovering = true;
       clearHoverClearTimer();
+      clearHoverIntentTimer();
     });
     sidebar.addEventListener('mouseleave', function() {
       sidebarHovering = false;
@@ -65,6 +80,7 @@
     sidebar.addEventListener('focusin', function() {
       sidebarFocused = true;
       clearHoverClearTimer();
+      clearHoverIntentTimer();
     });
     sidebar.addEventListener('focusout', function(e) {
       if (e.relatedTarget && sidebar.contains(e.relatedTarget)) return;
@@ -88,20 +104,42 @@
     var state = currentThread;
     e.stopPropagation();
     if (btn.getAttribute && btn.getAttribute('aria-disabled') === 'true') return;
+    if (btn.hasAttribute('data-sidebar-close')) {
+      if (pinnedThread) {
+        var oldPinned = pinnedThread;
+        pinnedThread = null;
+        if (oldPinned.panel) updatePanelToggleState(oldPinned.panel, oldPinned);
+      }
+      closeTemporarySidebar(true);
+      return;
+    }
     if (btn.hasAttribute('data-sidebar-pin-toggle')) {
       togglePinnedThread(state);
       return;
     }
+    if (btn.hasAttribute('data-copy-single-pw')) {
+      var singlePw = btn.getAttribute('data-copy-single-pw') || '';
+      if (state && singlePw) copyAndRecord(state, singlePw, sidebar, 'passwords');
+      return;
+    }
+    if (btn.hasAttribute('data-copy-single-link')) {
+      var singleUrl = btn.getAttribute('data-copy-single-link') || '';
+      var singleCode = btn.getAttribute('data-copy-single-code') || '';
+      var singleType = btn.getAttribute('data-copy-single-type') || 'other';
+      var singleText = singleUrl + (singleCode ? '\n提取码: ' + singleCode : '');
+      if (state && singleUrl) copyAndRecord(state, singleText, sidebar, 'type:' + singleType);
+      return;
+    }
     if (btn.hasAttribute('data-copy-type')) {
-      copyType(btn.getAttribute('data-copy-type'), sidebar);
+      copyType(state, btn.getAttribute('data-copy-type'), sidebar);
       return;
     }
     if (btn.hasAttribute('data-copy-all')) {
-      copyAllLinks(sidebar);
+      copyAllLinks(state, sidebar);
       return;
     }
     if (btn.hasAttribute('data-copy-passwords')) {
-      copyPasswordsOnly(sidebar);
+      copyPasswordsOnly(state, sidebar);
       return;
     }
     if (btn.hasAttribute('data-parse-txt')) {
@@ -112,6 +150,20 @@
     }
     if (btn.hasAttribute('data-import-txt')) {
       requestTextResourceLocalImport(state, sidebar);
+    }
+  }
+
+  function clearHoverIntentTimer() {
+    if (hoverIntentTimer) {
+      clearTimeout(hoverIntentTimer);
+      hoverIntentTimer = null;
+    }
+    hoverIntentPanel = null;
+  }
+
+  function handleGlobalPointerMove(e) {
+    if (e && typeof e.clientX === 'number') {
+      lastPointerClientX = e.clientX;
     }
   }
 
@@ -144,6 +196,9 @@
       'data-copy-passwords',
       'data-parse-txt',
       'data-import-txt',
+      'data-sidebar-close',
+      'data-copy-single-pw',
+      'data-copy-single-link',
       'data-open-thread'
     ];
     for (var i = 0; i < attrs.length; i++) {
@@ -222,20 +277,68 @@
     return panel && panel.querySelector ? panel.querySelector('[data-resource-trigger]') : null;
   }
 
+  function buildResourceTriggerSummary(threadState) {
+    if (!threadState) return { visible: false, text: '资源' };
+    var resources = SharedUtils.normalizeResources(threadState.resources);
+    var groups = getGroupsFromNormalized(resources);
+    var pwCount = resources.passwords ? resources.passwords.length : 0;
+    var txtCount = getTextAttachmentCount(threadState);
+    var hasPendingTxt = canParseTextResources(threadState);
+    var statusMsg = getTextResourceStatusMessage(threadState, false);
+    if (!groups.length && !pwCount && !txtCount && !hasPendingTxt && !statusMsg) {
+      return { visible: false, text: '资源' };
+    }
+    var parts = [];
+    var magnetCount = resources.groups && resources.groups.magnet ? resources.groups.magnet.length : 0;
+    var ed2kCount = resources.groups && resources.groups.ed2k ? resources.groups.ed2k.length : 0;
+    var panCount = 0;
+    var otherCount = 0;
+    for (var i = 0; i < groups.length; i++) {
+      var g = groups[i];
+      if (g.type === 'magnet' || g.type === 'ed2k') continue;
+      if (SharedUtils.isPanResourceType && SharedUtils.isPanResourceType(g.type)) {
+        panCount += g.items.length;
+      } else {
+        otherCount += g.items.length;
+      }
+    }
+    if (magnetCount > 0) parts.push('磁力 ' + magnetCount);
+    if (ed2kCount > 0) parts.push('电驴 ' + ed2kCount);
+    if (panCount > 0) parts.push('网盘 ' + panCount);
+    if (otherCount > 0) parts.push('链接 ' + otherCount);
+    if (parts.length) {
+      return { visible: true, text: '资源 · ' + parts.join(' / ') };
+    }
+    if (txtCount > 0 || hasPendingTxt) {
+      return { visible: true, text: threadState.textResourcesLoading ? 'TXT 解析中' : 'TXT 附件' };
+    }
+    if (pwCount > 0) {
+      return { visible: true, text: '资源 · 密码 ' + pwCount };
+    }
+    return { visible: true, text: '资源' };
+  }
+
+  function hasThreadResourcesOrText(threadState) {
+    return buildResourceTriggerSummary(threadState).visible;
+  }
+
   function ensureResourceTrigger(panel, threadState) {
     if (!panel || !threadState || !panel.querySelector) return null;
     var toolbar = panel.querySelector('.atp-toolbar');
     if (!toolbar) return null;
+    var summary = buildResourceTriggerSummary(threadState);
     var trigger = getResourceTrigger(panel);
     if (!trigger) {
       trigger = document.createElement('button');
       trigger.type = 'button';
       trigger.className = 'atp-resource-trigger';
       trigger.setAttribute('data-resource-trigger', '1');
-      trigger.textContent = '资源';
       toolbar.appendChild(trigger);
     }
-    trigger.setAttribute('aria-label', '查看本帖资源');
+    trigger.textContent = summary.text;
+    trigger.hidden = !summary.visible;
+    if (trigger.style) trigger.style.display = summary.visible ? '' : 'none';
+    trigger.setAttribute('aria-label', summary.visible ? ('查看本帖资源（' + summary.text + '）') : '查看本帖资源');
     trigger.setAttribute('aria-controls', RESOURCE_SIDEBAR_ID);
     trigger.setAttribute('aria-expanded', currentThread === threadState && isSidebarVisible() ? 'true' : 'false');
     if (!trigger.__atpResourceTriggerBound) {
@@ -473,11 +576,8 @@
     }, MARK_UPDATE_DELAY_MS);
   }
 
-  // Everything copied goes into today's backup with the thread's title.
-  function recordCopy(threadState, scope) {
+  function recordCopy(snapshot, scope) {
     if (!isMarkingEnabled()) return Promise.resolve({ ok: true, skipped: true });
-    if (!threadState || !threadState.markIdentity) return Promise.resolve({ ok: false, error: 'invalid_thread' });
-    var snapshot = ATPMarks.buildSnapshot(threadState, threadState.markIdentity, scope);
     if (!snapshot) return Promise.resolve({ ok: false, error: 'invalid_thread' });
     return sendMarksMessage({ op: 'copied', scope: scope, snapshot: snapshot });
   }
@@ -490,6 +590,7 @@
   }
 
   function isSidebarVisible() {
+    if (resourceLayoutOverlap) return false;
     var el = sidebar;
     if (!el) {
       if (resourceLayoutMedia) return !resourceLayoutMedia.matches;
@@ -501,6 +602,7 @@
   }
 
   function isNarrowResourceLayout() {
+    if (resourceLayoutOverlap) return true;
     if (resourceLayoutMedia) return !!resourceLayoutMedia.matches;
     return !isSidebarVisible();
   }
@@ -555,7 +657,7 @@
 
   function focusDesktopResourceAction(panel, actionKey) {
     if (!panel) return false;
-    showThreadResources(panel);
+    showThreadResources(panel, true);
     var el = ensureSidebar();
     if (restoreDesktopResourceActionFocus(el, actionKey)) return true;
     var trigger = getResourceTrigger(panel);
@@ -568,7 +670,7 @@
 
   function openSidebarFromTrigger(panel) {
     if (isSidebarVisible()) {
-      showThreadResources(panel);
+      showThreadResources(panel, true);
       focusFirstSidebarAction();
       return;
     }
@@ -611,22 +713,94 @@
     };
   }
 
+  function observeResourceGutter(root, width) {
+    if (!width || !window.IntersectionObserver || !resourceLayoutRoots.size) return;
+    var height = Math.max(root.scrollHeight, root.clientHeight);
+    var margin = height + 'px 0px ' + height + 'px -' + Math.max(0, width - RESOURCE_SIDEBAR_GUTTER) + 'px';
+    if (margin === resourceGutterMargin) return;
+    if (resourceGutterObserver) resourceGutterObserver.disconnect();
+    resourceGutterMargin = margin;
+    resourceGutterObserver = new window.IntersectionObserver(syncResourceLayoutForViewport, { rootMargin: margin });
+    resourceLayoutRoots.forEach(function(list) { resourceGutterObserver.observe(list); });
+  }
+
+  function isInlineLayoutActive() {
+    var root = typeof document !== 'undefined' && document.documentElement;
+    if (root && root.classList && root.classList.contains(RESOURCE_INLINE_LAYOUT_CLASS)) return true;
+    return isNarrowResourceLayout();
+  }
+
+  function syncInlinePanelsForLayout(useInlineLayout) {
+    attachedPanels.forEach(function(panel) {
+      if (!panel || !document.contains || !document.contains(panel)) {
+        attachedPanels.delete(panel);
+        return;
+      }
+      var ts = panel.__atpResourceThread;
+      if (!ts) return;
+      if (useInlineLayout) {
+        renderInline(panel, ts);
+      } else {
+        var oldInline = panel.querySelector ? panel.querySelector('.atp-resource-inline') : null;
+        if (oldInline) {
+          clearMessageTimers(oldInline);
+          oldInline.remove();
+        }
+        panel.__atpResourceInlineSignature = '';
+        panel.__atpResourceInlineThread = null;
+      }
+    });
+  }
+
   function syncResourceLayoutForViewport() {
-    if (!isNarrowResourceLayout()) {
-      var inlineFocusThread = getInlineFocusedThread();
+    if (!resourceLayoutListenerBound) return;
+    var root = document.documentElement;
+    var width = root && root.clientWidth;
+    observeResourceGutter(root, width);
+    var overlaps = false;
+    resourceLayoutRoots.forEach(function(list) {
+      if (list.isConnected === false) {
+        resourceLayoutRoots.delete(list);
+        if (resourceLayoutObserver) resourceLayoutObserver.unobserve(list);
+        if (resourceGutterObserver) resourceGutterObserver.unobserve(list);
+      } else if (width && (!resourceLayoutMedia || !resourceLayoutMedia.matches) &&
+          list.getBoundingClientRect().right >= width - RESOURCE_SIDEBAR_GUTTER) {
+        overlaps = true;
+      }
+    });
+    // Capture the old controls while they are still visible and focusable.
+    var focusThread = getDesktopFocusedThread();
+    var inlineFocusThread = getInlineFocusedThread();
+    resourceLayoutOverlap = overlaps;
+    var useInlineLayout = overlaps || !!(resourceLayoutMedia && resourceLayoutMedia.matches);
+    if (root && root.classList) root.classList.toggle(RESOURCE_INLINE_LAYOUT_CLASS, useInlineLayout);
+    if (!useInlineLayout) {
       if (currentThread) updateThreadExpandedState(currentThread, isSidebarVisible());
       if (inlineFocusThread && inlineFocusThread.panel && !focusDesktopResourceAction(inlineFocusThread.panel, inlineFocusThread.actionKey)) {
         releaseHiddenInlineResourceFocus(inlineFocusThread);
       }
       return;
     }
-    var focusThread = getDesktopFocusedThread();
     updateDisplayedThreadExpandedState(false);
     sidebarHovering = false;
     sidebarFocused = false;
     if (focusThread && focusThread.panel && !focusInlineResourceAction(focusThread.panel, focusThread.actionKey)) {
       releaseHiddenDesktopResourceFocus(focusThread);
     }
+  }
+
+  function trackResourceLayout(panel) {
+    var list = panel.closest && panel.closest('#threadlisttable, #threadlist, table');
+    list = list || panel.parentElement || panel;
+    if (!list.getBoundingClientRect || resourceLayoutRoots.has(list)) return;
+    resourceLayoutRoots.add(list);
+    if (!resourceLayoutObserver && window.ResizeObserver) {
+      resourceLayoutObserver = new window.ResizeObserver(syncResourceLayoutForViewport);
+      resourceLayoutObserver.observe(document.documentElement);
+    }
+    if (resourceLayoutObserver) resourceLayoutObserver.observe(list);
+    if (resourceGutterObserver) resourceGutterObserver.observe(list);
+    syncResourceLayoutForViewport();
   }
 
   function bindResourceLayoutListener() {
@@ -640,7 +814,10 @@
         resourceLayoutMedia.addListener(syncResourceLayoutForViewport);
       }
     }
-    if (window.addEventListener) window.addEventListener('resize', syncResourceLayoutForViewport);
+    if (window.addEventListener) {
+      window.addEventListener('resize', syncResourceLayoutForViewport);
+      window.addEventListener('mousemove', handleGlobalPointerMove, { passive: true });
+    }
     syncResourceLayoutForViewport();
   }
 
@@ -653,7 +830,19 @@
         resourceLayoutMedia.removeListener(syncResourceLayoutForViewport);
       }
     }
-    if (window.removeEventListener) window.removeEventListener('resize', syncResourceLayoutForViewport);
+    if (window.removeEventListener) {
+      window.removeEventListener('resize', syncResourceLayoutForViewport);
+      window.removeEventListener('mousemove', handleGlobalPointerMove);
+    }
+    if (resourceLayoutObserver) resourceLayoutObserver.disconnect();
+    resourceLayoutObserver = null;
+    if (resourceGutterObserver) resourceGutterObserver.disconnect();
+    resourceGutterObserver = null;
+    resourceGutterMargin = '';
+    resourceLayoutRoots.clear();
+    resourceLayoutOverlap = false;
+    var root = document.documentElement;
+    if (root && root.classList) root.classList.remove(RESOURCE_INLINE_LAYOUT_CLASS);
     resourceLayoutMedia = null;
     resourceLayoutListenerBound = false;
   }
@@ -667,7 +856,12 @@
     renderThread(pinnedThread || null);
     var trigger = closingThread && closingThread.panel ? getResourceTrigger(closingThread.panel) : null;
     if (restoreFocus && trigger && typeof trigger.focus === 'function') {
-      trigger.focus();
+      sidebarReturnFocusTrigger = trigger;
+      try {
+        trigger.focus();
+      } finally {
+        sidebarReturnFocusTrigger = null;
+      }
     }
   }
 
@@ -816,34 +1010,27 @@
     });
   }
 
-  function finishLocalTextImport(threadState, imports, sourceEl) {
+  function finishLocalTextImport(threadState, imports) {
     if (!threadState || !isThreadAttached(threadState)) return;
     threadState.textResourcesImporting = false;
     var usable = [];
     for (var i = 0; i < imports.length; i++) {
       if (imports[i] && SharedUtils.hasResourcePayload(imports[i].resources)) usable.push(imports[i]);
     }
-    if (!usable.length) {
+    var imported = usable.length && window.ATPRenderer &&
+      typeof ATPRenderer.importTextResources === 'function' && ATPRenderer.importTextResources(threadState, usable) === true;
+    if (!imported) {
       threadState.textResourcesDone = false;
       threadState.textResourcesRetryable = true;
-      threadState.textResourceMessage = '本地 TXT 未识别到资源链接';
-      renderThread(threadState);
-      var emptyMessageRoot = threadState.panel && threadState.panel.querySelector('.atp-resource-inline');
-      showMessage(threadState.textResourceMessage, emptyMessageRoot || sidebar || sourceEl, true);
-      return;
+      threadState.textResourceMessage = usable.length ? '本地 TXT 导入失败' : '本地 TXT 未识别到资源链接';
+      ATPResourcePanel.updateThread(threadState);
     }
-    if (!window.ATPRenderer || typeof window.ATPRenderer.importTextResources !== 'function' || ATPRenderer.importTextResources(threadState, usable) !== true) {
-      threadState.textResourcesDone = false;
-      threadState.textResourcesRetryable = true;
-      threadState.textResourceMessage = '本地 TXT 导入失败';
-      renderThread(threadState);
-      var failureMessageRoot = threadState.panel && threadState.panel.querySelector('.atp-resource-inline');
-      showMessage(threadState.textResourceMessage, failureMessageRoot || sidebar || sourceEl, true);
-      return;
+    var messageRoot = currentThread === threadState && isSidebarVisible()
+      ? sidebar
+      : threadState.panel && threadState.panel.querySelector('.atp-resource-inline');
+    if (messageRoot) {
+      showMessage(threadState.textResourceMessage || '本地 TXT 已导入', messageRoot, !imported);
     }
-    renderThread(threadState);
-    var messageRoot = threadState.panel && threadState.panel.querySelector('.atp-resource-inline');
-    showMessage(threadState.textResourceMessage || '本地 TXT 已导入', messageRoot || sidebar, false);
   }
 
   function requestTextResourceLocalImport(threadState, sourceEl) {
@@ -881,10 +1068,10 @@
       }
       Promise.all(reads).then(function(imports) {
         cleanup();
-        finishLocalTextImport(threadState, imports, sourceEl);
+        finishLocalTextImport(threadState, imports);
       }, function() {
         cleanup();
-        finishLocalTextImport(threadState, [], sourceEl);
+        finishLocalTextImport(threadState, []);
       });
     });
     document.body.appendChild(input);
@@ -1020,24 +1207,92 @@
     return 'inline|' + getSidebarRenderSignature(threadState, resources, groups, '', statusMessage, hasPendingAttachments, showTextFallbackActions);
   }
 
+  function getPasswordPillsHtml(passwords) {
+    var valid = [];
+    for (var i = 0; i < (passwords || []).length; i++) {
+      var pw = passwords[i];
+      if (!pw || SharedUtils.isInvalidPasswordValue(pw) || SharedUtils.isProtectedEmailPlaceholder(pw)) continue;
+      valid.push(pw);
+    }
+    if (!valid.length) return '';
+    var html = '<div class="atp-resource-pw-list">';
+    for (var j = 0; j < valid.length; j++) {
+      html += '<button type="button" class="atp-resource-pw-pill" data-copy-single-pw="' + esc(valid[j]) +
+        '" aria-label="复制密码 ' + esc(valid[j]) + '" title="点击复制此密码">' +
+        '<span class="atp-resource-pw-label">密码: ' + esc(valid[j]) + '</span>' +
+        '<span class="atp-resource-pw-action">复制</span></button>';
+    }
+    html += '</div>';
+    return html;
+  }
+
+  function getGroupDetailsHtml(group) {
+    var items = group && group.items ? group.items : [];
+    if (!items.length) return '';
+    var html = '<details class="atp-resource-details" data-details-type="' + esc(group.type) + '">';
+    html += '<summary class="atp-resource-details-toggle">查看明细 (' + esc(items.length) + ')</summary>';
+    html += '<div class="atp-resource-details-list">';
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i] || {};
+      var url = item.url || '';
+      var isHttps = /^https:\/\//i.test(url);
+      html += '<div class="atp-resource-item">';
+      html += '<div class="atp-resource-item-url" title="' + esc(url) + '">' + esc(url) + '</div>';
+      html += '<div class="atp-resource-item-meta">';
+      if (item.code) {
+        html += '<span class="atp-resource-item-code">提取码: ' + esc(item.code) + '</span>';
+      }
+      html += '<span class="atp-resource-item-actions">';
+      html += '<button type="button" class="atp-resource-item-btn" data-copy-single-link="' + esc(url) +
+        '" data-copy-single-code="' + esc(item.code || '') + '" data-copy-single-type="' + esc(group.type) +
+        '" aria-label="复制单条' + esc(group.label) + '链接">复制</button>';
+      if (isHttps) {
+        html += '<a class="atp-resource-item-btn atp-resource-item-open" href="' + esc(url) +
+          '" target="_blank" rel="noopener noreferrer">打开 ↗</a>';
+      }
+      html += '</span></div></div>';
+    }
+    html += '</div></details>';
+    return html;
+  }
+
   function setSidebarHtml(el, signature, html) {
     if (sidebarRenderSignature === signature) return false;
+    var openTypes = {};
+    if (el && el.querySelectorAll) {
+      var openDetails = el.querySelectorAll('details.atp-resource-details[open]');
+      for (var d = 0; d < openDetails.length; d++) {
+        var dtype = openDetails[d].getAttribute('data-details-type');
+        if (dtype) openTypes[dtype] = true;
+      }
+    }
     var actionKey = getFocusedResourceAction(el);
     clearMessageTimers(el);
     el.innerHTML = html;
     sidebarRenderSignature = signature;
+    if (el && el.querySelectorAll) {
+      var nextDetails = el.querySelectorAll('details.atp-resource-details');
+      for (var nd = 0; nd < nextDetails.length; nd++) {
+        var nextType = nextDetails[nd].getAttribute('data-details-type');
+        if (nextType && openTypes[nextType]) nextDetails[nd].open = true;
+      }
+    }
     if (actionKey && !restoreResourceActionFocus(el, actionKey)) {
       focusFirstResourceAction(el);
     }
     return true;
   }
 
-  function showThreadResources(panel) {
+  function showThreadResources(panel, explicitlySelected) {
     var state = panel && panel.__atpResourceThread;
     if (!state) return;
+    if (!explicitlySelected && !hasThreadResourcesOrText(state) && state !== pinnedThread) return;
+    if (!explicitlySelected && state !== currentThread &&
+        (sidebarHovering || sidebarFocused || (sidebar && sidebar.contains(document.activeElement)))) return;
     clearHoverClearTimer();
+    clearHoverIntentTimer();
     hoverThread = state;
-    renderThread(state);
+    renderThread(pinnedThread && !explicitlySelected ? pinnedThread : state);
   }
 
   function scheduleThreadResourceClear(panel) {
@@ -1054,18 +1309,15 @@
       return;
     }
     if (btn.hasAttribute('data-copy-type')) {
-      renderThread(threadState);
-      copyType(btn.getAttribute('data-copy-type'), box);
+      copyType(threadState, btn.getAttribute('data-copy-type'), box);
       return;
     }
     if (btn.hasAttribute('data-copy-all')) {
-      renderThread(threadState);
-      copyAllLinks(box);
+      copyAllLinks(threadState, box);
       return;
     }
     if (btn.hasAttribute('data-copy-passwords')) {
-      renderThread(threadState);
-      copyPasswordsOnly(box);
+      copyPasswordsOnly(threadState, box);
       return;
     }
     if (btn.hasAttribute('data-parse-txt')) {
@@ -1122,9 +1374,11 @@
     var el = ensureSidebar();
     if (!threadState) {
       if (previousThread) updateThreadExpandedState(previousThread, false);
+      if (el.classList) el.classList.add('atp-resource-sidebar-idle');
       setSidebarHtml(el, 'empty', '<div class="atp-resource-title">本帖资源</div><div class="atp-resource-empty" role="status" aria-live="polite" aria-atomic="true">聚焦或移到帖子缩略图区域查看资源链接</div>');
       return;
     }
+    if (el.classList) el.classList.remove('atp-resource-sidebar-idle');
 
     var resources = SharedUtils.normalizeResources(threadState.resources);
     var groups = getGroupsFromNormalized(resources);
@@ -1133,10 +1387,11 @@
     var emptyMessage = getTextResourceStatusMessage(threadState, true);
     var statusMessage = getTextResourceStatusMessage(threadState, false);
     var renderSignature = getSidebarRenderSignature(threadState, resources, groups, emptyMessage, statusMessage, hasPendingAttachments, showTextFallbackActions);
-    var html = '<div class="atp-resource-title">本帖资源';
+    var html = '<div class="atp-resource-title"><span class="atp-resource-title-text">本帖资源</span>';
     if (threadState === pinnedThread) html += '<span class="atp-resource-pin-badge">已固定</span>';
     if (resourcesHaveTxtFromNormalized(resources)) html += '<span class="atp-resource-source-badge">含 TXT 提取</span>';
     html += getPinToggleHtml(threadState, 'atp-resource-sidebar-pin', 'data-sidebar-pin-toggle');
+    html += '<button type="button" class="atp-resource-sidebar-close" data-sidebar-close="1" aria-label="关闭资源面板" title="关闭面板">✕</button>';
     html += '</div>';
     if (threadState.title) {
       html += '<div class="atp-resource-thread-title" title="' + esc(threadState.title) + '">' + esc(threadState.title);
@@ -1146,6 +1401,7 @@
     if (!groups.length) {
       if (resources.passwords.length) {
         html += '<div class="atp-resource-passwords">附带密码 ' + esc(resources.passwords.length) + ' 个</div>';
+        html += getPasswordPillsHtml(resources.passwords);
         html += '<button type="button" class="atp-resource-copy-all" data-copy-passwords="1">复制密码</button>';
         if (statusMessage) {
           html += getStatusRegionHtml('div', 'atp-resource-status', statusMessage);
@@ -1167,14 +1423,18 @@
     }
 
     for (var i = 0; i < groups.length; i++) {
+      html += '<div class="atp-resource-group">';
       html += '<div class="atp-resource-row" data-type="' + esc(groups[i].type) + '">';
       html += '<span class="atp-resource-kind">' + esc(groups[i].label) + '</span>';
       html += '<span class="atp-resource-count">共 ' + esc(groups[i].items.length) + ' 条' + (hasTxtSource(groups[i].items) ? ' · TXT' : '') + '</span>';
       html += '<button type="button" class="atp-resource-copy" data-copy-type="' + esc(groups[i].type) + '" aria-label="' + esc(getCopyLabel(groups[i])) + '">复制</button>';
       html += '</div>';
+      html += getGroupDetailsHtml(groups[i]);
+      html += '</div>';
     }
     if (resources.passwords.length) {
       html += '<div class="atp-resource-passwords">附带密码 ' + esc(resources.passwords.length) + ' 个</div>';
+      html += getPasswordPillsHtml(resources.passwords);
     }
     if (statusMessage) {
       html += getStatusRegionHtml('div', 'atp-resource-status', statusMessage);
@@ -1307,45 +1567,50 @@
 
   // The copy happens either way; a copy that could not be backed up says so.
   function copyAndRecord(threadState, text, sourceEl, scope) {
-    return copyText(text, sourceEl).then(function(copied) {
-      if (!copied) return false;
-      return recordCopy(threadState, scope).then(function(result) {
+    var shouldBackUp = !!text && isMarkingEnabled();
+    // TXT parsing can add links while the clipboard write is pending.
+    var snapshot = shouldBackUp && threadState
+      ? ATPMarks.buildSnapshot(threadState, threadState.markIdentity, scope)
+      : null;
+    return copyText(text, sourceEl, threadState).then(function(copied) {
+      if (!copied || !shouldBackUp) return copied;
+      return recordCopy(snapshot, scope).then(function(result) {
         if (!result || !result.ok) {
           var why = result && result.error === 'invalid_thread' ? '无法识别本帖' : ((result && MARK_ERROR_TEXT[result.error]) || '请重试');
-          showMessage('已复制，但未能备份：' + why, sourceEl, true);
+          showMessage('已复制，但未能备份：' + why, sourceEl, true, threadState);
         }
         return copied;
       });
     });
   }
 
-  function copyType(type, sourceEl) {
-    if (!currentThread) return;
-    copyAndRecord(currentThread, formatTypeText(currentThread.resources, type), sourceEl, 'type:' + type);
+  function copyType(threadState, type, sourceEl) {
+    if (!threadState) return;
+    copyAndRecord(threadState, formatTypeText(threadState.resources, type), sourceEl, 'type:' + type);
   }
 
-  function copyAllLinks(sourceEl) {
-    if (!currentThread) return;
-    copyAndRecord(currentThread, formatAllText(currentThread.resources), sourceEl, 'all');
+  function copyAllLinks(threadState, sourceEl) {
+    if (!threadState) return;
+    copyAndRecord(threadState, formatAllText(threadState.resources), sourceEl, 'all');
   }
 
-  function copyPasswordsOnly(sourceEl) {
-    if (!currentThread) return;
-    copyAndRecord(currentThread, formatPasswordsOnly(currentThread.resources), sourceEl, 'passwords');
+  function copyPasswordsOnly(threadState, sourceEl) {
+    if (!threadState) return;
+    copyAndRecord(threadState, formatPasswordsOnly(threadState.resources), sourceEl, 'passwords');
   }
 
-  function copyText(text, sourceEl) {
+  function copyText(text, sourceEl, threadState) {
     if (!text) {
-      showMessage('无可复制内容', sourceEl, true);
+      showMessage('无可复制内容', sourceEl, true, threadState);
       return Promise.resolve(false);
     }
     return writeTextWithFallback(text)
       .then(function() {
-        showMessage('已复制', sourceEl, false);
+        showMessage('已复制', sourceEl, false, threadState);
         return true;
       })
       .catch(function() {
-        showMessage('复制失败', sourceEl, true);
+        showMessage('复制失败', sourceEl, true, threadState);
         return false;
       });
   }
@@ -1411,10 +1676,14 @@
     }
   }
 
-  function showMessage(text, sourceEl, isError) {
+  function showMessage(text, sourceEl, isError, threadState) {
     var root = sourceEl || sidebar;
+    if (threadState) {
+      if (root === sidebar && currentThread !== threadState) return;
+      if (root !== sidebar && threadState.panel) root = threadState.panel.querySelector('.atp-resource-inline') || root;
+    }
     var el = root ? root.querySelector('.atp-resource-msg, .atp-resource-inline-msg') : null;
-    if (!el && sidebar) el = sidebar.querySelector('.atp-resource-msg');
+    if (!el && sidebar && (!threadState || currentThread === threadState)) el = sidebar.querySelector('.atp-resource-msg');
     if (!el) return;
     el.className = el.className.replace(/\s*atp-resource-msg-error/g, '');
     el.setAttribute('role', isError ? 'alert' : 'status');
@@ -1434,9 +1703,58 @@
   }
 
   var ATPResourcePanel = {
+    formatAllText: formatAllText,
+    formatPasswordsOnly: formatPasswordsOnly,
+    formatTypeText: formatTypeText,
+
+    getMarkedCount: function() {
+      var count = 0;
+      for (var k in markedIds) {
+        if (markedIds[k]) count++;
+      }
+      return count;
+    },
+
+    setPanelEnabled: function(enabled) {
+      if (window.ATPState && window.ATPState.settings) {
+        window.ATPState.settings.showResourcePanel = enabled !== false;
+      }
+      if (!enabled) {
+        updateThreadExpandedState(currentThread, false);
+        updateThreadExpandedState(pinnedThread, false);
+        updateThreadExpandedState(hoverThread, false);
+        currentThread = null;
+        pinnedThread = null;
+        hoverThread = null;
+        sidebarHovering = false;
+        sidebarFocused = false;
+        sidebarRenderSignature = '';
+        clearHoverClearTimer();
+        clearHoverIntentTimer();
+        clearMessageTimers(sidebar);
+        if (sidebar && sidebar.parentNode) sidebar.remove();
+        sidebar = null;
+      } else {
+        bindResourceLayoutListener();
+      }
+      attachedPanels.forEach(function(panel) {
+        if (!panel || (document.contains && !document.contains(panel))) {
+          attachedPanels.delete(panel);
+          return;
+        }
+        var ts = panel.__atpResourceThread;
+        if (!ts) return;
+        syncResourceTrigger(panel, ts);
+        syncMarkToggle(panel, ts);
+        renderInline(panel, ts);
+      });
+    },
+
     attachThread: function(panel, threadState) {
       if (!panel || !threadState) return;
+      attachedPanels.add(panel);
       bindResourceLayoutListener();
+      trackResourceLayout(panel);
       var previousThread = panel.__atpResourceThread;
       panel.__atpResourceThread = threadState;
       if (currentThread === previousThread) currentThread = threadState;
@@ -1452,14 +1770,31 @@
       renderInline(panel, threadState);
       if (!panel.__atpResourcePanelBound) {
         panel.__atpResourcePanelBound = true;
-        panel.addEventListener('mouseenter', function() {
+        panel.addEventListener('mouseenter', function(e) {
+          var nextX = e && typeof e.clientX === 'number' ? e.clientX : null;
+          var prevX = lastPointerClientX;
+          if (nextX !== null) lastPointerClientX = nextX;
+          var state = panel.__atpResourceThread;
+          if (currentThread && currentThread !== state && !pinnedThread &&
+              nextX !== null && prevX !== null && nextX > prevX && isSidebarVisible()) {
+            clearHoverIntentTimer();
+            hoverIntentPanel = panel;
+            hoverIntentTimer = setTimeout(function() {
+              hoverIntentTimer = null;
+              hoverIntentPanel = null;
+              if (!sidebarHovering && !sidebarFocused) showThreadResources(panel);
+            }, HOVER_INTENT_DELAY_MS);
+            return;
+          }
+          clearHoverIntentTimer();
           showThreadResources(panel);
         });
         panel.addEventListener('mouseleave', function() {
+          if (hoverIntentPanel === panel) clearHoverIntentTimer();
           scheduleThreadResourceClear(panel);
         });
-        panel.addEventListener('focusin', function() {
-          showThreadResources(panel);
+        panel.addEventListener('focusin', function(e) {
+          if (e.target !== sidebarReturnFocusTrigger) showThreadResources(panel);
         });
         panel.addEventListener('focusout', function(e) {
           if (e.relatedTarget && panel.contains(e.relatedTarget)) return;
@@ -1467,25 +1802,24 @@
           scheduleThreadResourceClear(panel);
         });
       }
-      // 用户正悬停/聚焦在侧栏上时不自动切换内容，防止复制按钮在点击瞬间指向另一个帖子
-      if (!pinnedThread && !hoverThread && !sidebarHovering && !sidebarFocused && hasResourcePayload(threadState.resources)) renderThread(threadState);
     },
 
     updateThread: function(threadState) {
       if (!threadState) return;
       if (!isThreadAttached(threadState)) {
-        var wasDisplayed = currentThread === threadState || pinnedThread === threadState || hoverThread === threadState;
+        var wasDisplayed = currentThread === threadState;
         clearThreadRefs(threadState);
         if (wasDisplayed) renderThread(pinnedThread || hoverThread || null);
         return;
       }
       if (threadState.panel) {
+        attachedPanels.add(threadState.panel);
         syncResourceTrigger(threadState.panel, threadState);
         syncMarkToggle(threadState.panel, threadState);
         renderInline(threadState.panel, threadState);
       }
       scheduleMarkUpdate(threadState);
-      if (currentThread === threadState || pinnedThread === threadState || hoverThread === threadState) {
+      if (currentThread === threadState) {
         renderThread(threadState);
       }
     },
@@ -1500,7 +1834,38 @@
       sidebarHovering = false;
       sidebarFocused = false;
       sidebarRenderSignature = '';
+      lastPointerClientX = null;
       clearHoverClearTimer();
+      clearHoverIntentTimer();
+      attachedPanels.forEach(function(panel) {
+        var ts = panel && panel.__atpResourceThread;
+        if (ts && ts.__atpMarkUpdateTimer) {
+          clearTimeout(ts.__atpMarkUpdateTimer);
+          ts.__atpMarkUpdateTimer = null;
+        }
+      });
+      if (typeof document !== 'undefined' && document.querySelectorAll) {
+        var domPanels = document.querySelectorAll('.atp-thread-panel');
+        for (var i = 0; i < domPanels.length; i++) {
+          var domTs = domPanels[i] && domPanels[i].__atpResourceThread;
+          if (domTs && domTs.__atpMarkUpdateTimer) {
+            clearTimeout(domTs.__atpMarkUpdateTimer);
+            domTs.__atpMarkUpdateTimer = null;
+          }
+        }
+      }
+      attachedPanels.clear();
+      if (marksListenerBound) {
+        try {
+          if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.onChanged) {
+            chrome.storage.onChanged.removeListener(handleMarksStorageChange);
+          }
+        } catch (e) {}
+        if (typeof window !== 'undefined' && window.removeEventListener) {
+          window.removeEventListener('pageshow', handleMarksPageShow);
+        }
+        marksListenerBound = false;
+      }
       clearMessageTimers(sidebar);
       if (sidebar && sidebar.parentNode) sidebar.remove();
       sidebar = null;

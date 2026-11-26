@@ -12,6 +12,7 @@
   var initInFlight = false;
   var settingsListenerInstalled = false;
   var startupCancelled = false;
+  var forumEntryOnly = false;
   var processing = false;
   var scanPending = false;
   var rescanRequested = false;
@@ -44,8 +45,10 @@
   // Threads whose retry also waits for the pacer's pause: the pause is read
   // live, so a pause lifted early (a normal page load) frees them at once.
   var emptyRetryPaceBound = {};
+  var offlineArticleRetries = new Set();
   var EMPTY_RETRY_DELAY = 15000;
   var EMPTY_RETRY_MAX_DELAY = 60000;
+  var MAX_RETRY_TIMER_DELAY = 2147483647;
   // A page answer that is not the thread (notice, blocked or unknown page)
   // is retried this many times; retrying it forever would keep spending the
   // forum's request allowance.
@@ -58,11 +61,25 @@
   // behind it.
   var PACE_DEFER_MIN_PAUSE_MS = 1000;
   var FORUM_WAIT_NOTE_CLASS = 'atp-forum-wait';
-  var FORUM_WAIT_NOTE_TEXT = {
-    held: '论坛限流，排队中',
-    retry: '论坛限流，稍后自动重试',
-    gaveUp: '论坛限流未加载，刷新页面可重试'
+  var FORUM_WAIT_CAUSES = {
+    offline: { label: '网络已断开', detail: '恢复连接后重新请求正文。' },
+    forum_cooldown: { label: '目标论坛请求暂缓', detail: '正在等待目标论坛的冷却或恢复请求。' },
+    http_503: { label: '论坛服务暂不可用', detail: '论坛服务暂不可用（HTTP 503）。' },
+    http_429: { label: '论坛限流', detail: '论坛返回 HTTP 429（请求过多）。' },
+    rate_limited: { label: '论坛限流', detail: '论坛提示请求过于频繁。' },
+    challenge_page: { label: '论坛验证', detail: '论坛返回了验证页。' },
+    cloudflare: { label: '论坛验证', detail: '论坛返回了 Cloudflare 验证页。' }
   };
+  var ARTICLE_ACCESS_CAUSES = {
+    login_redirect: '请先登录论坛',
+    login_page: '请先登录论坛',
+    http_401: '请先登录论坛',
+    http_403: '正文访问受限',
+    permission_page: '阅读权限不足'
+  };
+  var forumWaitJobSequence = 0;
+  var clearedForumWaitJob = 0;
+  var forumWaitJobByLink = new WeakMap();
   var scanGeneration = 0;
   var processCandidateQueue = [];
   var processCandidateQueueCursor = 0;
@@ -74,6 +91,21 @@
   // then one pass over the prefetch band above the screen.
   var processCandidateAbovePass = false;
   var bfcacheRecoveryPending = false;
+  var initialPrewarmedCandidates = null;
+  var lastAppliedSettingsSignature = '';
+  var manualPagePaused = false;
+  var lastUserScrollAt = 0;
+  var scrollStopCommitTimer = null;
+  var activeVisibleArticleCheck = null;
+
+  function getSettingsSignature(settings) {
+    if (!settings || typeof settings !== 'object') return '';
+    try {
+      return JSON.stringify(settings);
+    } catch (e) {
+      return '';
+    }
+  }
 
   function logUrl(url) {
     return Logger.sanitizeUrl ? Logger.sanitizeUrl(url) : String(url || '').replace(/[?#].*$/, '').substring(0, 240);
@@ -134,6 +166,35 @@
       ATPLoader.syncVisibilityPauseState();
     }
     if (!changedKeys.length) return;
+    if (
+      changedKeys.indexOf('gridCols') !== -1 ||
+      changedKeys.indexOf('thumbWidth') !== -1 ||
+      changedKeys.indexOf('thumbHeight') !== -1 ||
+      changedKeys.indexOf('gridGap') !== -1
+    ) {
+      if (window.ATPRenderer && typeof ATPRenderer.relayoutAllPanels === 'function') {
+        ATPRenderer.relayoutAllPanels(nextSettings);
+      }
+    }
+    if (changedKeys.indexOf('animatedThumbnailMode') !== -1) {
+      if (typeof ATPLoader !== 'undefined' && typeof ATPLoader.applyAnimatedMode === 'function') {
+        ATPLoader.applyAnimatedMode(nextSettings.animatedThumbnailMode);
+      }
+    }
+    if (changedKeys.indexOf('showResourcePanel') !== -1) {
+      if (window.ATPResourcePanel && typeof ATPResourcePanel.setPanelEnabled === 'function') {
+        ATPResourcePanel.setPanelEnabled(nextSettings.showResourcePanel !== false);
+      }
+    }
+    if (changedKeys.indexOf('showFloatingLauncher') !== -1) {
+      var showLauncher = nextSettings.showFloatingLauncher !== false;
+      if (window.__bfpPanel && typeof window.__bfpPanel.setLauncherVisible === 'function') {
+        window.__bfpPanel.setLauncherVisible(showLauncher);
+      } else if (typeof document !== 'undefined' && document.getElementById) {
+        var bfpRoot = document.getElementById('bfp-root');
+        if (bfpRoot && bfpRoot.style) bfpRoot.style.display = showLauncher ? '' : 'none';
+      }
+    }
     if (Logger.event) {
       Logger.event('loading_policy', Object.assign({
         changedKeys: changedKeys.join(',')
@@ -161,14 +222,10 @@
 
   function isRetryableEmptyReason(reason) {
     return reason === 'negative_cache' ||
-      reason === 'login_redirect' ||
-      reason === 'cloudflare' ||
-      reason === 'blocked' ||
-      reason === 'http_401' ||
-      reason === 'http_403' ||
-      reason === 'unrecognized_page' ||
-      reason === 'forum_message' ||
       reason === 'pace_deferred' ||
+      reason === 'offline' ||
+      reason === 'forum_cooldown' ||
+      PAGE_ANSWER_REASONS[reason] === true ||
       isForumFloodReason(reason);
   }
 
@@ -178,7 +235,10 @@
     unrecognized_page: true,
     forum_message: true,
     blocked: true,
+    login_redirect: true,
     login_page: true,
+    http_401: true,
+    http_403: true,
     permission_page: true,
     download_blocked: true,
     purchase_page: true
@@ -212,29 +272,82 @@
     return title || (entry && entry.link) || null;
   }
 
-  // A short note after the thread title while the forum holds its content
-  // back, so a row without thumbnails does not look forgotten.
-  function setForumWaitNote(entries, state) {
-    if (typeof document.createElement !== 'function') return;
+  function renderArticleAccessNote(note, text, link, entry, job) {
+    if (!note.firstElementChild) {
+      note.textContent = '';
+      var message = document.createElement('span');
+      message.setAttribute('role', 'status');
+      note.appendChild(message);
+      var button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'atp-forum-retry';
+      button.textContent = '重试';
+      button.setAttribute('aria-label', '重试加载本帖正文');
+      note.appendChild(button);
+    }
+    note.firstElementChild.textContent = text;
+    note.lastElementChild.onclick = function(event) {
+      event.stopPropagation();
+      if (!ATPConfig.isEnabled() || forumWaitJobByLink.get(link) !== job.waitNoteId ||
+          job.waitNoteId <= clearedForumWaitJob || link.nextElementSibling !== note ||
+          !isLiveCommitEntry(entry, job.url)) return;
+      clearRetryableEmpty(job.url);
+      var entries = getLiveCommitEntries(job);
+      updateForumWaitNotes(job, entries, 'manualRetry');
+      if (articleDispatchWake && articleDispatchWake(entries)) return;
+      clearProcessCandidateQueue();
+      detectAndProcess(true, true);
+    };
+  }
+
+  // Multiple scans can use the same title. A granted ticket or late result
+  // from an older job must leave a newer pause/retry message in place.
+  function updateForumWaitNotes(job, entries, state, reason) {
+    job.waitNoteState = state;
+    if (typeof document.createElement !== 'function' || job.waitNoteId <= clearedForumWaitJob) return;
+    var text, title;
+    var accessCause = state === 'retry' || state === 'gaveUp' ? ARTICLE_ACCESS_CAUSES[reason] : '';
+    if (state === 'held') {
+      text = '正文请求排队中';
+      title = '插件正在分批请求帖子正文，轮到这篇帖子时会自动加载。';
+    } else if (state === 'manualRetry') {
+      text = '正在重试正文';
+      title = '等待重新加载本帖。';
+    } else if (accessCause) {
+      text = accessCause;
+      title = state === 'gaveUp' ? '本帖已停止自动重试，处理后可点击重试。' : '处理后可点击重试，插件也会稍后重试本帖。';
+    } else if (state) {
+      var cause = FORUM_WAIT_CAUSES[reason] || { label: '正文暂未加载', detail: '' };
+      if (state === 'gaveUp') {
+        text = '正文未加载，刷新页面可重试';
+        title = cause.detail + '本页已停止自动重试，刷新列表页可重新请求。';
+      } else {
+        text = cause.label + '，稍后自动重试';
+        title = cause.detail + '插件稍后会自动重试这篇帖子。';
+      }
+    }
     for (var i = 0; i < entries.length; i++) {
       var link = getForumWaitNoteAnchor(entries[i]);
       if (!link || !link.parentNode || typeof link.insertAdjacentElement !== 'function') continue;
+      if ((forumWaitJobByLink.get(link) || 0) > job.waitNoteId) continue;
+      forumWaitJobByLink.set(link, job.waitNoteId);
       var note = link.nextElementSibling;
-      if (!note || !note.classList || !note.classList.contains(FORUM_WAIT_NOTE_CLASS)) {
+      var hasNote = note && note.classList && note.classList.contains(FORUM_WAIT_NOTE_CLASS);
+      if (!accessCause && hasNote && note.contains && note.contains(document.activeElement) && link.focus) {
+        link.focus({ preventScroll: true });
+      }
+      if (!state) {
+        if (hasNote) note.remove();
+        continue;
+      }
+      if (!hasNote) {
         note = document.createElement('span');
         note.className = FORUM_WAIT_NOTE_CLASS;
-        note.title = '论坛对短时间内的大量请求返回了验证页，插件已放慢抓取并会自动重试';
         link.insertAdjacentElement('afterend', note);
       }
-      note.textContent = FORUM_WAIT_NOTE_TEXT[state] || FORUM_WAIT_NOTE_TEXT.retry;
-    }
-  }
-
-  function clearForumWaitNote(entries) {
-    for (var i = 0; i < entries.length; i++) {
-      var link = getForumWaitNoteAnchor(entries[i]);
-      var note = link && link.nextElementSibling;
-      if (note && note.classList && note.classList.contains(FORUM_WAIT_NOTE_CLASS) && note.remove) note.remove();
+      note.title = title;
+      if (accessCause) renderArticleAccessNote(note, text, link, entries[i], job);
+      else note.textContent = text;
     }
   }
 
@@ -292,6 +405,7 @@
       forumRequestIntervalMs: paceState ? paceState.refillMs : undefined,
       imageTimeout: settings.imageTimeout,
       imageTaskDeadline: settings.imageTaskDeadline,
+      readyImageAttemptTimeout: ATPLoadPolicy.getReadyImageAttemptTimeout(settings),
       largeImageTimeout: ATPLoadPolicy.getLargeImageTimeout(settings),
       largeImageTaskDeadline: ATPLoadPolicy.getLargeImageTaskDeadline(settings),
       largeImageHostConcurrency: ATPLoadPolicy.getLargeImageHostConcurrency(settings),
@@ -341,7 +455,7 @@
     var url = entry && entry.link && entry.link.href;
     if (!url || ATPScanner.shouldExcludeUrl(url) || !ATPScanner.isArticlePageUrl(url) || !isArticleUrlInPageZone(url)) return false;
     var retryKey = getRetryableEmptyKey(url);
-    if (emptyRetryGivenUp[retryKey]) return false;
+    if (emptyRetryGivenUp[retryKey] || offlineArticleRetries.has(retryKey)) return false;
     var retryAfter = emptyRetryAfterByUrl[retryKey];
     scanContext = scanContext || createProcessScanContext();
     if (retryAfter && emptyRetryPaceBound[retryKey]) retryAfter = Math.max(retryAfter, getLivePauseUntil());
@@ -446,14 +560,15 @@
     processCandidateQueueCursor = 0;
     processCandidateQueueGeneration = scanGeneration;
     var hasSentinelCandidate = processCandidateQueue.length > scanLimit;
+    var passedViewport = scanContext && scanContext.reachedBelowViewport && !processCandidateScanState.viewportOrderUncertain;
     var nearPhaseDone = shouldAutoLoadOffscreenFirstRows() && !processCandidateScanAllPhase &&
-      (processCandidateScanState.exhausted || (scanContext && scanContext.reachedBelowViewport && !processCandidateQueue.length));
+      (processCandidateScanState.exhausted || (passedViewport && !processCandidateQueue.length));
     if (nearPhaseDone) {
       processCandidateScanAllPhase = true;
       processCandidateScanState = null;
     }
     var shouldContinueScan = !!(processCandidateScanState && !processCandidateScanState.exhausted &&
-      (processCandidateScanAllPhase || !scanContext || !scanContext.reachedBelowViewport || processCandidateQueue.length > 0));
+      (processCandidateScanAllPhase || !passedViewport || processCandidateQueue.length > 0));
     var startAbovePass = !processCandidateScanAllPhase && !processCandidateAbovePass && !nearPhaseDone &&
       !hasSentinelCandidate && !shouldContinueScan;
     if (startAbovePass) {
@@ -471,10 +586,67 @@
     return processCandidateQueueCursor < processCandidateQueue.length || processCandidateQueueMayHaveMore;
   }
 
+  function prewarmInitialVisibleCandidates() {
+    initialPrewarmedCandidates = null;
+    if (typeof document === 'undefined' || document.readyState === 'loading') return;
+    if (document.visibilityState && document.visibilityState !== 'visible') return;
+    if (!window.ATPScanner || typeof ATPScanner.detectArticleContainers !== 'function') return;
+    try {
+      var vh = window.innerHeight || (document.documentElement && document.documentElement.clientHeight) || 800;
+      var scanState = {};
+      var found = ATPScanner.detectArticleContainers({
+        limit: 24,
+        scanState: scanState,
+        seekViewportStart: true,
+        viewportTop: 0,
+        skipServiceThreads: true,
+        accept: function(entry) {
+          var url = entry && entry.link && entry.link.href;
+          if (!url || ATPScanner.shouldExcludeUrl(url) || !ATPScanner.isArticlePageUrl(url) || !isArticleUrlInPageZone(url)) return false;
+          var el = entry.container;
+          if (!el || !el.getBoundingClientRect) return true;
+          var rect = el.getBoundingClientRect();
+          return rect.bottom >= 0 && rect.top <= vh + 600;
+        }
+      });
+      if (found && found.length) {
+        initialPrewarmedCandidates = {
+          entries: found,
+          generation: scanGeneration
+        };
+      }
+    } catch (e) {
+      initialPrewarmedCandidates = null;
+    }
+  }
+
   function detectProcessCandidates(limit) {
     limit = Math.max(1, Number(limit) || getArticleQueueHighWatermark());
     if (processCandidateQueueGeneration !== scanGeneration) clearProcessCandidateQueue();
     var scanContext = createProcessScanContext();
+    if (initialPrewarmedCandidates) {
+      var prewarmed = initialPrewarmedCandidates;
+      initialPrewarmedCandidates = null;
+      var curSettings = window.ATPState && window.ATPState.settings;
+      if (prewarmed.generation === scanGeneration && (!curSettings || curSettings.skipServiceThreads !== false)) {
+        var validPrewarmed = [];
+        for (var pi = 0; pi < prewarmed.entries.length; pi++) {
+          if (isQueuedProcessCandidate(prewarmed.entries[pi], scanContext)) {
+            validPrewarmed.push(prewarmed.entries[pi]);
+          }
+        }
+        if (validPrewarmed.length) {
+          processCandidateQueueMayHaveMore = true;
+          if (validPrewarmed.length > limit) {
+            processCandidateQueue = validPrewarmed.slice(limit);
+            processCandidateQueueCursor = 0;
+            processCandidateQueueGeneration = scanGeneration;
+            return validPrewarmed.slice(0, limit);
+          }
+          return validPrewarmed;
+        }
+      }
+    }
     var candidates = takeQueuedProcessCandidates(limit, scanContext);
     if (candidates.length) return candidates;
     var abovePassArmed = refillProcessCandidateQueue(limit, scanContext);
@@ -497,6 +669,7 @@
       cls.contains('atp-thumbnail-wrapper') ||
       cls.contains('atp-thumbnail-img') ||
       cls.contains('atp-thumbnail-loading') ||
+      cls.contains('atp-more-overlay-badge') ||
       cls.contains('atp-heavy-preview-canvas') ||
       cls.contains('atp-resource-sidebar') ||
       cls.contains('atp-resource-inline') ||
@@ -538,6 +711,23 @@
     return false;
   }
 
+  function mutationsRemoveThreadRows(mutations) {
+    var selector = 'tbody,tr,.atp-thread-panel,.atp-processed';
+    for (var i = 0; i < mutations.length; i++) {
+      var mutation = mutations[i];
+      if (!mutation.removedNodes || !mutation.removedNodes.length) continue;
+      // Loading indicators, resource buttons and other contents of our own
+      // panel change frequently. They cannot contain a registered forum row.
+      if (mutation.target && mutation.target.closest && mutation.target.closest('.atp-thread-panel')) continue;
+      for (var j = 0; j < mutation.removedNodes.length; j++) {
+        var node = mutation.removedNodes[j];
+        if (node.nodeType !== 1) continue;
+        if ((node.matches && node.matches(selector)) || (node.querySelector && node.querySelector(selector))) return true;
+      }
+    }
+    return false;
+  }
+
   function mutationsHaveThreadRowAdd(mutations) {
     for (var i = 0; i < mutations.length; i++) {
       var added = mutations[i].addedNodes;
@@ -549,6 +739,39 @@
       }
     }
     return false;
+  }
+
+  function isATPMutationTarget(target) {
+    if (!target || target.nodeType !== 1) return false;
+    var cls = target.classList;
+    if (cls && (
+      cls.contains('atp-thread-panel') ||
+      cls.contains('atp-thumb-row') ||
+      cls.contains('atp-scroll-viewport') ||
+      cls.contains('atp-thumbnail-container') ||
+      cls.contains('atp-thumbnail-wrapper') ||
+      cls.contains('atp-resource-sidebar') ||
+      cls.contains('atp-resource-inline') ||
+      cls.contains(FORUM_WAIT_NOTE_CLASS)
+    )) return true;
+    return !!(target.closest && target.closest('.atp-thread-panel,.atp-thumb-row,.atp-resource-sidebar,.atp-resource-inline,.' + FORUM_WAIT_NOTE_CLASS));
+  }
+
+  function areAllMutationsSelfGenerated(mutations) {
+    if (!mutations || !mutations.length) return true;
+    for (var i = 0; i < mutations.length; i++) {
+      var m = mutations[i];
+      if (isATPMutationTarget(m.target)) continue;
+      var added = m.addedNodes;
+      var removed = m.removedNodes;
+      for (var a = 0; added && a < added.length; a++) {
+        if (added[a] && added[a].nodeType === 1 && !isATPAddedNode(added[a])) return false;
+      }
+      for (var r = 0; removed && r < removed.length; r++) {
+        if (removed[r] && removed[r].nodeType === 1 && !isATPAddedNode(removed[r])) return false;
+      }
+    }
+    return true;
   }
 
   function disconnectContainerParentObserver() {
@@ -582,14 +805,13 @@
 
   function rebindThreadObserver(reason) {
     Logger.info('Observer', reason);
-    if (observer) {
-      observer.disconnect();
-      observer = null;
-    }
-    disconnectContainerParentObserver();
-    bumpScanGeneration();
-    setupObserver('rebind');
+    // An already pending timer belongs to the old scan generation. Leave
+    // the new root free to schedule its first scan immediately.
+    clearScanTimers();
+    bumpScanGeneration(true);
+    var bound = setupObserver('rebind');
     detectAndProcess(true);
+    return bound;
   }
 
   function setupContainerParentObserver(container) {
@@ -598,9 +820,17 @@
     if (!parent) return;
     var nextParentObserver = new MutationObserver(function(ms) {
       if (pauseScanningForHiddenPage()) return;
-      if (!document.contains(container) || mutationsHaveExternalArticleAdd(ms)) {
+      if (!document.contains(container) || container.parentNode !== parent) {
         rebindThreadObserver('Thread container parent changed, rebinding');
+        return;
       }
+      if (!mutationsHaveExternalArticleAdd(ms)) return;
+      if (ATPScanner.findThreadContainer(true) !== container) {
+        rebindThreadObserver('Preferred thread container changed, rebinding');
+        return;
+      }
+      clearProcessCandidateQueue();
+      detectAndProcess(true);
     });
     nextParentObserver.observe(parent, { childList: true });
     containerParentObserver = nextParentObserver;
@@ -615,41 +845,64 @@
     emptyRetryGivenUp = {};
     emptyRetryClassAttempts = {};
     emptyRetryPaceBound = {};
+    offlineArticleRetries.clear();
     clearProcessCandidateQueue();
   }
 
-  function syncScanGeneration() {
-    if (window.ATPState) window.ATPState.generation = scanGeneration;
-  }
-
-  function bumpScanGeneration() {
+  function bumpScanGeneration(keepAttachedThreads) {
     scanGeneration++;
-    syncScanGeneration();
+    initialPrewarmedCandidates = null;
     clearProcessCandidateQueue();
-    pruneStaleThreadStates();
+    if (articleDispatchWake) articleDispatchWake();
+    var retained = reconcileThreadStates(!keepAttachedThreads);
+    // A forum can move live rows into a replacement list. Their existing
+    // image tasks and previews still own the same rendered generation.
+    if (!retained && window.ATPState) window.ATPState.generation = scanGeneration;
     return scanGeneration;
   }
 
-  // 清理代际过期或已脱离文档的 threadState，避免长期驻留导致内存与调度开销累积。
-  // 代际过期的条目对调度器已永久不可见（isThreadCurrent 恒为 false），删除不改变行为。
-  function pruneStaleThreadStates() {
+  function reconcileThreadStates(invalidateAll) {
     var threads = window.ATPState && window.ATPState.threads;
-    if (!threads) return;
+    if (!threads) return false;
+    var retained = false;
+    var removedThreads = null;
     // 删除前先落地该帖挂起的 loadedUrls 缓存写回（flushCacheNow 需要 ts 仍在表中），
     // 否则 1s 批量定时器稍后触发时查不到 ts，这批已加载标记会被静默丢弃
     var pendingFlush = window.ATPCache && ATPCache.getPendingFlush ? ATPCache.getPendingFlush() : null;
     for (var tid in threads) {
       var ts = threads[tid];
       if (!ts) { delete threads[tid]; continue; }
-      var stale = typeof ts.generation === 'number' && ts.generation !== scanGeneration;
-      if (!stale && ts.panel && !document.contains(ts.panel)) stale = true;
-      if (stale) {
-        if (pendingFlush && pendingFlush[tid] && ATPCache.flushCacheNow) {
-          ATPCache.flushCacheNow(tid);
+      if (!invalidateAll && (!ts.container || document.contains(ts.container))) {
+        // TBODY holds its panel. With TR and non-table templates the panel
+        // follows its source as a sibling, including after the forum moves it.
+        if (ts.container && ts.container.tagName !== 'TBODY') {
+          var sibling = ts.outerRow || ts.panel;
+          if (sibling && ts.container.insertAdjacentElement && ts.container.nextElementSibling !== sibling) {
+            ts.container.insertAdjacentElement('afterend', sibling);
+          }
         }
-        delete threads[tid];
+        if (!ts.panel || document.contains(ts.panel)) {
+          retained = true;
+          continue;
+        }
+      }
+      if (pendingFlush && pendingFlush[tid] && ATPCache.flushCacheNow) ATPCache.flushCacheNow(tid);
+      delete threads[tid];
+      if (!invalidateAll) {
+        if (!removedThreads) removedThreads = new Set();
+        removedThreads.add(tid);
+        // The UI is a sibling for TR and non-table templates. Remove both
+        // halves even in a detached subtree so reinsertion can redecorate it.
+        if (ts.outerRow && ts.outerRow.parentNode) ts.outerRow.remove();
+        if (ts.panel && ts.panel.parentNode) ts.panel.remove();
+        if (ts.container && ts.container.classList) ts.container.classList.remove('atp-processed');
+        if (window.ATPResourcePanel) ATPResourcePanel.updateThread(ts);
       }
     }
+    if (removedThreads && window.ATPLoader && ATPLoader.discardThreadImages) {
+      ATPLoader.discardThreadImages(removedThreads);
+    }
+    return retained;
   }
 
   function clearScanTimers() {
@@ -675,6 +928,10 @@
       clearTimeout(followupScanTimer);
       followupScanTimer = null;
     }
+    if (scrollStopCommitTimer) {
+      clearTimeout(scrollStopCommitTimer);
+      scrollStopCommitTimer = null;
+    }
   }
 
   function clearObserverRetryTimer(resetCount) {
@@ -696,6 +953,7 @@
     clearScanTimers();
     clearObserverRetryTimer();
     clearProcessCandidateQueue();
+    if (articleDispatchWake) articleDispatchWake();
     return true;
   }
 
@@ -737,7 +995,7 @@
       if (pauseScanningForHiddenPage()) return;
       clearProcessCandidateQueue();
       detectAndProcess(true);
-    }, Math.max(0, fireAt - Date.now()));
+    }, Math.min(MAX_RETRY_TIMER_DELAY, Math.max(0, fireAt - Date.now())));
   }
 
   function scheduleThrottledScan(delay) {
@@ -755,6 +1013,19 @@
     var retryKey = getRetryableEmptyKey(url);
     var reason = getRetryableEmptyReason(info);
     var explicitRetryAfter = getRetryableEmptyRetryAfter(info);
+    if (reason === 'offline') {
+      if (isNetworkOffline()) offlineArticleRetries.add(retryKey);
+      else scheduleRetryScanAt(Date.now());
+      return true;
+    }
+    offlineArticleRetries.delete(retryKey);
+    if (reason === 'forum_cooldown') {
+      var targetDueAt = Math.max(explicitRetryAfter, Date.now() + 1000);
+      emptyRetryAfterByUrl[retryKey] = targetDueAt;
+      delete emptyRetryPaceBound[retryKey];
+      scheduleRetryScanAt(targetDueAt);
+      return true;
+    }
     if (reason === 'pace_deferred') {
       // Never sent: no attempt used, back when the pacer's pause ends.
       var deferredDue = Date.now() + 1000;
@@ -794,12 +1065,28 @@
 
   function clearRetryableEmpty(url) {
     var retryKey = getRetryableEmptyKey(url);
+    offlineArticleRetries.delete(retryKey);
     delete emptyRetryAfterByUrl[retryKey];
     delete emptyRetryAttemptsByUrl[retryKey];
     delete emptyRetryGivenUp[retryKey];
     delete emptyRetryPaceBound[retryKey];
     delete emptyRetryClassAttempts[retryKey + '|flood'];
     delete emptyRetryClassAttempts[retryKey + '|page'];
+  }
+
+  function isNetworkOffline() {
+    return typeof navigator !== 'undefined' && navigator.onLine === false;
+  }
+
+  function releaseOfflineArticleRetries() {
+    if (!offlineArticleRetries.size || isNetworkOffline() || forumEntryOnly || !ATPConfig.isEnabled()) return false;
+    offlineArticleRetries.clear();
+    return true;
+  }
+
+  function handleNetworkOnline() {
+    if (articleDispatchWake) articleDispatchWake();
+    if (releaseOfflineArticleRetries()) scheduleRetryScanAt(Date.now());
   }
 
   function getLivePauseUntil() {
@@ -819,7 +1106,9 @@
   // due now rather than at the old pause end.
   function handleForumPacerStorage(event) {
     var pacer = getForumPacer();
-    if (!pacer || !event || event.key !== pacer.STORE_KEY || !hasPaceBoundRetries()) return;
+    if (!pacer || !event || event.key !== pacer.STORE_KEY) return;
+    if (articleDispatchWake) articleDispatchWake();
+    if (!hasPaceBoundRetries()) return;
     if (!ATPConfig.isEnabled() || pacer.getPauseUntil() - Date.now() > PACE_DEFER_MIN_PAUSE_MS) return;
     scheduleRetryScanAt(Date.now());
   }
@@ -831,15 +1120,21 @@
   function makeArticlePaceOptions(job, generation) {
     var pacer = getForumPacer();
     job.paceDeferred = false;
-    return {
+    job.offlineDeferred = false;
+    var options = {
+      abortSignal: job.abortController ? job.abortController.signal : null,
       getPriority: function() {
         if (!pacer) return 0;
         return isArticleJobVisible(job) ? pacer.PRIORITY_VISIBLE : pacer.PRIORITY_ARTICLE;
       },
       isCancelled: function() {
-        if (generation !== scanGeneration || shouldPauseScanningWhenHidden() || !ATPConfig.isEnabled()) return true;
+        if (!isArticleJobCurrent(job, generation)) return true;
         if (typeof job.shouldHandBack === 'function' && job.shouldHandBack(job)) {
           job.handedBack = true;
+          return true;
+        }
+        if (isNetworkOffline()) {
+          job.offlineDeferred = true;
           return true;
         }
         if (pacer && pacer.getPauseUntil() - Date.now() > PACE_DEFER_MIN_PAUSE_MS) {
@@ -848,14 +1143,22 @@
         }
         return false;
       },
+      isCurrent: function() { return isArticleJobCurrent(job, generation); },
       onHeld: function() {
-        if (generation === scanGeneration) setForumWaitNote(getLiveCommitEntries(job), 'held');
+        if (job.waitingPaceOptions === options && generation === scanGeneration && ATPConfig.isEnabled()) {
+          updateForumWaitNotes(job, getLiveCommitEntries(job), 'held');
+        }
       },
       onGranted: function(waitMs) {
+        if (job.waitingPaceOptions !== options) return;
+        job.waitingPaceOptions = null;
         job.paceWaitMs = waitMs;
+        if (generation === scanGeneration && ATPConfig.isEnabled()) updateForumWaitNotes(job, getLiveCommitEntries(job), null);
         if (typeof job.onPaceGranted === 'function') job.onPaceGranted();
       }
     };
+    job.waitingPaceOptions = options;
+    return options;
   }
 
   var articleCommitQueue = [];
@@ -890,6 +1193,27 @@
     return out;
   }
 
+  function isArticleScanCurrent(generation) {
+    return generation === scanGeneration && !bfcacheRecoveryPending && !startupCancelled &&
+      ATPConfig.isEnabled() && !pauseScanningForHiddenPage();
+  }
+
+  function isArticleJobCurrent(job, generation) {
+    return isArticleScanCurrent(generation) &&
+      job.entries.some(function(entry) { return isLiveCommitEntry(entry, job.url); });
+  }
+
+  function requestArticleRescan() {
+    clearProcessCandidateQueue();
+    rescanRequested = true;
+  }
+
+  function isArticleCommitCacheCurrent(job) {
+    if (ATPCache.isArticleCacheReadCurrent(job.cacheState || job.data)) return true;
+    requestArticleRescan();
+    return false;
+  }
+
   // How far the job's row is from the viewport (0 when on screen); Infinity
   // when it cannot be measured or the page is hidden.
   function getArticleJobViewportDistance(job) {
@@ -899,25 +1223,35 @@
     var best = Infinity;
     for (var i = 0; i < entries.length; i++) {
       var el = entries[i].container;
-      if (!el || !el.getBoundingClientRect) return 0;
+      if (!el || !el.getBoundingClientRect) {
+        best = 0;
+        continue;
+      }
       var rect = el.getBoundingClientRect();
       var distance = rect.top > vh ? rect.top - vh : (rect.bottom < 0 ? -rect.bottom : 0);
+      entries[i].lastViewportVisible = distance === 0;
       if (distance < best) best = distance;
     }
     return best;
   }
 
   function isArticleJobVisible(job) {
+    return getArticleJobViewportDistance(job) === 0;
+  }
+
+  function isJobStrictlyAboveViewport(job) {
     if (document.visibilityState && document.visibilityState !== 'visible') return false;
     var entries = getLiveCommitEntries(job);
-    var vh = window.innerHeight || document.documentElement.clientHeight || 800;
+    if (!entries.length) return false;
+    var anyAbove = false;
     for (var i = 0; i < entries.length; i++) {
       var el = entries[i].container;
-      if (!el || !el.getBoundingClientRect) return true;
+      if (!el || !el.getBoundingClientRect) return false;
       var rect = el.getBoundingClientRect();
-      if (rect.bottom >= 0 && rect.top <= vh) return true;
+      if (rect.bottom >= 0) return false;
+      anyAbove = true;
     }
-    return false;
+    return anyAbove;
   }
 
   function pickBestArticleEntry(entries) {
@@ -929,10 +1263,11 @@
     return best;
   }
 
-  function commitArticleResult(job, summary, generation) {
-    if (generation !== scanGeneration || !ATPConfig.isEnabled() || pauseScanningForHiddenPage()) return;
+  function commitArticleResult(job, summary, generation, gallery) {
+    if (!isArticleScanCurrent(generation)) return;
     var entries = getLiveCommitEntries(job);
     if (!entries.length) return;
+    if (!isArticleCommitCacheCurrent(job)) return;
     var data = job.data || ATPCache.normalizeArticleData(null);
     if (!job.summaryCounted) {
       job.summaryCounted = true;
@@ -942,29 +1277,54 @@
     }
     if (!hasArticlePayload(data)) {
       if (job.retryableEmpty) {
+        var retryReason = getRetryableEmptyReason(job.retryableEmpty);
         if (!job.retryRemembered) {
           job.retryRemembered = true;
           var retryScheduled = rememberRetryableEmpty(job.url, job.retryableEmpty);
-          var retryReason = getRetryableEmptyReason(job.retryableEmpty);
-          if (retryReason === 'pace_deferred') {
-            setForumWaitNote(entries, 'held');
-          } else if (isForumFloodReason(retryReason)) {
-            setForumWaitNote(entries, retryScheduled ? 'retry' : 'gaveUp');
-          } else {
-            clearForumWaitNote(entries);
-          }
+          job.waitNoteState = retryReason === 'pace_deferred' ? 'held' :
+            (retryReason === 'offline' || retryReason === 'forum_cooldown' || isForumFloodReason(retryReason) ||
+              ARTICLE_ACCESS_CAUSES[retryReason]) ? (retryScheduled ? 'retry' : 'gaveUp') : null;
         }
+        updateForumWaitNotes(job, entries, job.waitNoteState, retryReason);
         return;
       }
       clearRetryableEmpty(job.url);
-      clearForumWaitNote(entries);
+      updateForumWaitNotes(job, entries, null);
       for (var i = 0; i < entries.length; i++) entries[i].container.classList.add('atp-processed');
       return;
     }
     clearRetryableEmpty(job.url);
-    clearForumWaitNote(entries);
+    updateForumWaitNotes(job, entries, null);
     var best = pickBestArticleEntry(entries);
-    ATPRenderer.injectThumbnails(best.container, data, best.link, job.fetchStartedAt);
+    var docEl = document.documentElement;
+    var beforeScrollY = typeof window.scrollY === 'number' ? window.scrollY : (window.pageYOffset || 0);
+    var anchorCompensate = false;
+    var beforeHeight = 0;
+    if (beforeScrollY > 0 && docEl && typeof docEl.scrollHeight === 'number' &&
+        best.container && typeof best.container.getBoundingClientRect === 'function') {
+      var targetRect = best.container.getBoundingClientRect();
+      if (targetRect.bottom < 0) {
+        anchorCompensate = true;
+        beforeHeight = docEl.scrollHeight;
+      }
+    }
+    ATPRenderer.injectThumbnails(best.container, data, best.link, job.fetchStartedAt, best.lastViewportVisible, gallery);
+    if (anchorCompensate && typeof window.scrollBy === 'function') {
+      var afterHeight = docEl.scrollHeight;
+      var afterScrollY = typeof window.scrollY === 'number' ? window.scrollY : (window.pageYOffset || 0);
+      var deltaH = afterHeight - beforeHeight;
+      var scrollAdjusted = afterScrollY - beforeScrollY;
+      var uncompensated = deltaH - scrollAdjusted;
+      if (deltaH > 0 && uncompensated > 1) {
+        window.scrollBy(0, uncompensated);
+      }
+    }
+  }
+
+  function finishArticleCommit(work) {
+    work.job.commitQueued = false;
+    work.job.commitPromise = null;
+    work.resolve();
   }
 
   function runArticleCommit(work) {
@@ -973,7 +1333,7 @@
     var debugCommit = Logger.event && (!Logger.isEnabled || Logger.isEnabled('DEBUG'));
     var wasVisible = debugCommit ? isArticleJobVisible(work.job) : undefined;
     try {
-      commitArticleResult(work.job, work.summary, work.generation);
+      commitArticleResult(work.job, work.summary, work.generation, work.gallery);
     } catch (e) {
       Logger.error('正文提交异常', e && e.message ? e.message : String(e));
     } finally {
@@ -987,20 +1347,42 @@
         }, 'DEBUG');
       }
     }
-    work.job.commitQueued = false;
-    work.job.commitPromise = null;
-    work.resolve();
+    finishArticleCommit(work);
+  }
+
+  function scheduleScrollStopCommitFlush() {
+    if (scrollStopCommitTimer) return;
+    scrollStopCommitTimer = setTimeout(function() {
+      scrollStopCommitTimer = null;
+      if (articleCommitQueue.length) scheduleArticleCommitFlush();
+    }, 180);
   }
 
   function flushArticleCommitQueue() {
     articleCommitScheduled = false;
     var batchSize = ATPLoadPolicy.getArticleCommitBatchSize(getLoadPolicySettings());
     var processed = 0;
+    var activelyScrolling = lastUserScrollAt > 0 && (Date.now() - lastUserScrollAt < 160);
+    var deferredAbove = null;
     while (articleCommitQueue.length && processed < batchSize) {
-      runArticleCommit(articleCommitQueue.shift());
+      var work = articleCommitQueue.shift();
+      if (activelyScrolling && isJobStrictlyAboveViewport(work.job)) {
+        if (!deferredAbove) deferredAbove = [];
+        deferredAbove.push(work);
+        continue;
+      }
+      runArticleCommit(work);
       processed++;
     }
-    if (articleCommitQueue.length) scheduleArticleCommitFlush();
+    if (deferredAbove && deferredAbove.length) {
+      for (var d = deferredAbove.length - 1; d >= 0; d--) {
+        articleCommitQueue.unshift(deferredAbove[d]);
+      }
+      scheduleScrollStopCommitFlush();
+    }
+    if (articleCommitQueue.length && (!activelyScrolling || articleCommitQueue.length > (deferredAbove ? deferredAbove.length : 0))) {
+      scheduleArticleCommitFlush();
+    }
   }
 
   function scheduleArticleCommitFlush() {
@@ -1023,88 +1405,150 @@
 
   function enqueueArticleCommit(job, summary, generation) {
     if (job.commitQueued && job.commitPromise) return job.commitPromise;
-    if (isArticleJobVisible(job)) {
-      return new Promise(function(resolve) {
-        job.commitQueued = true;
-        runArticleCommit({ job: job, summary: summary, generation: generation, resolve: resolve });
-      });
-    }
+    var data = job.data;
+    var work = { job: job, summary: summary, generation: generation, gallery: null };
+    var promise = new Promise(function(resolve) { work.resolve = resolve; });
     job.commitQueued = true;
-    job.commitPromise = new Promise(function(resolve) {
-      var work = { job: job, summary: summary, generation: generation, resolve: resolve };
-      articleCommitQueue.push(work);
-      scheduleArticleCommitFlush();
-    });
-    return job.commitPromise;
+    job.commitPromise = promise;
+    function isCurrent() {
+      return job.data === data && isArticleJobCurrent(job, generation) && isArticleCommitCacheCurrent(job);
+    }
+    function enqueuePrepared(gallery) {
+      if (!isCurrent()) {
+        finishArticleCommit(work);
+        return;
+      }
+      work.gallery = gallery;
+      if (isArticleJobVisible(job)) {
+        runArticleCommit(work);
+      } else {
+        articleCommitQueue.push(work);
+        scheduleArticleCommitFlush();
+      }
+    }
+    function onPreparationError(error) {
+      Logger.warn('缩略图准备失败', error && error.message ? error.message : String(error));
+      finishArticleCommit(work);
+    }
+    try {
+      var preparation = data && data.images.length && ATPRenderer.prepareArticleGallery
+        ? ATPRenderer.prepareArticleGallery(data, isCurrent) : null;
+      if (preparation) {
+        preparation.then(function(gallery) {
+          if (gallery) enqueuePrepared(gallery);
+          else {
+            if (isCurrent()) requestArticleRescan();
+            finishArticleCommit(work);
+          }
+        }).catch(onPreparationError);
+      } else enqueuePrepared(null);
+    } catch (error) { onPreparationError(error); }
+    return promise;
   }
 
   function makeArticleFetchOutcome(data, retryableEmpty) {
     return {
-      data: ATPCache.normalizeArticleData(data),
+      data: data || ATPCache.normalizeArticleData(null),
       retryableEmpty: retryableEmpty || null
     };
   }
 
-  // 调用方已经持有规范化结果时走这个入口：再规范化一次要对整份候选表重跑
-  // 实体解码 + URL 归一（100 条约 0.3~0.8ms），还会多造一份等价对象
-  function makeNormalizedArticleFetchOutcome(data, retryableEmpty) {
-    return {
-      data: data,
-      retryableEmpty: retryableEmpty || null
-    };
-  }
-
-  async function fetchCrossOriginArticle(job, generation) {
-    var cacheState = await ATPCache.getArticleCacheState(job.url);
-    if (generation !== scanGeneration || pauseScanningForHiddenPage()) return null;
-    if (cacheState && cacheState.cached) return makeArticleFetchOutcome(cacheState.cached, null);
-    if (cacheState && cacheState.negative) {
-      return makeArticleFetchOutcome(null, makeRetryableEmptyInfo('negative_cache', cacheState.negativeExpiresAt));
+  async function readArticleCacheForJob(job, cacheState) {
+    if (cacheState && ATPCache.isArticleCacheReadCurrent(cacheState)) return cacheState;
+    if (job.prefetchedCacheState && ATPCache.isArticleCacheReadCurrent(job.prefetchedCacheState)) {
+      return job.prefetchedCacheState;
     }
+    if (job.cachePrefetchPromise) {
+      var prefetched = await job.cachePrefetchPromise;
+      if (prefetched && ATPCache.isArticleCacheReadCurrent(prefetched)) {
+        job.prefetchedCacheState = prefetched;
+        return prefetched;
+      }
+    }
+    if (typeof ATPCache.getArticleCacheState === 'function') {
+      return ATPCache.getArticleCacheState(job.url);
+    }
+    if (typeof ATPCache.getCachedArticleData === 'function') {
+      var fallbackData = await ATPCache.getCachedArticleData(job.url);
+      return fallbackData ? { cached: fallbackData, negative: false, negativeExpiresAt: 0 } : null;
+    }
+    return null;
+  }
+
+  function getCachedArticleOutcome(cacheState) {
+    if (!cacheState || !ATPCache.isArticleCacheReadCurrent(cacheState)) return null;
+    if (cacheState.cached) return makeArticleFetchOutcome(cacheState.cached, null);
+    if (!cacheState.negative || cacheState.negativeExpiresAt <= Date.now()) return null;
+    var outcome = makeArticleFetchOutcome(null, makeRetryableEmptyInfo('negative_cache', cacheState.negativeExpiresAt));
+    outcome.cacheState = cacheState;
+    return outcome;
+  }
+
+  async function fetchCrossOriginArticle(job, generation, cacheState) {
+    cacheState = await readArticleCacheForJob(job, cacheState);
+    if (!isArticleJobCurrent(job, generation)) return null;
+    var cachedOutcome = getCachedArticleOutcome(cacheState);
+    if (cachedOutcome) return cachedOutcome;
     var data = await ATPFetcher.fetchArticleDataByBackground(job.url, makeArticlePaceOptions(job, generation));
-    if (generation !== scanGeneration || pauseScanningForHiddenPage()) return null;
+    if (data && data.aborted) return { aborted: true };
+    if (!isArticleJobCurrent(job, generation)) return null;
+    if (!data && isNetworkOffline()) return makeArticleFetchOutcome(null, makeRetryableEmptyInfo('offline', 0));
     if (!data) return makeArticleFetchOutcome(null, makeRetryableEmptyInfo('background_timeout', 0));
-    data = ATPCache.normalizeArticleData(data);
     if (hasArticlePayload(data)) {
-      cacheFetchedArticleData(job.url, data, job.fetchStartedAt);
-      return makeNormalizedArticleFetchOutcome(data, null);
+      if (!data.cachedByBackground) {
+        ATPCache.setCachedArticleData(job.url, data, !data.partial, job.fetchStartedAt);
+      }
+      return makeArticleFetchOutcome(data, null);
     }
     if (data.retryableEmpty) {
-      return makeNormalizedArticleFetchOutcome(data, makeRetryableEmptyInfo(data.emptyReason || 'background_retryable', data.retryAfter));
+      return makeArticleFetchOutcome(data, makeRetryableEmptyInfo(data.emptyReason || 'background_retryable', data.retryAfter));
     }
     if (data.partial) {
-      return makeNormalizedArticleFetchOutcome(data, makeRetryableEmptyInfo(data.emptyReason || 'partial_empty', data.retryAfter));
+      return makeArticleFetchOutcome(data, makeRetryableEmptyInfo(data.emptyReason || 'partial_empty', data.retryAfter));
     }
     if (shouldNegativeCacheEmptyReason(data.emptyReason || '')) ATPCache.setNegativeCache(job.url, job.fetchStartedAt);
-    return makeNormalizedArticleFetchOutcome(data, null);
+    return makeArticleFetchOutcome(data, null);
   }
 
-  async function fetchArticleJob(job, generation) {
+  async function fetchArticleJob(job, generation, cacheState) {
     if (!job.fetchStartedAt) job.fetchStartedAt = Date.now();
-    if (!job.sameOrigin) return await fetchCrossOriginArticle(job, generation);
+    if (!job.sameOrigin) return await fetchCrossOriginArticle(job, generation, cacheState);
     try {
-      var result = await fetchSameOriginArticle(job.url, makeArticlePaceOptions(job, generation));
-      if (generation !== scanGeneration || pauseScanningForHiddenPage()) return null;
-      var data = ATPCache.normalizeArticleData(result && result.data);
-      if (result && result.data && Array.isArray(result.data.freshTextAttachments)) {
-        data.freshTextAttachments = result.data.freshTextAttachments;
-        data.freshTextAttachmentsAt = result.data.freshTextAttachmentsAt;
+      cacheState = await readArticleCacheForJob(job, cacheState);
+      if (!isArticleJobCurrent(job, generation)) return null;
+      var cachedOutcome = getCachedArticleOutcome(cacheState);
+      if (cachedOutcome) return cachedOutcome;
+      var paceOptions = makeArticlePaceOptions(job, generation);
+      paceOptions.cacheState = cacheState;
+      var result = await fetchSameOriginArticle(job.url, paceOptions);
+      var data = result && result.data;
+      if (data && data.aborted) return { aborted: true };
+      if (!data || !isArticleJobCurrent(job, generation)) return null;
+      if (!ATPCache.isArticleCacheReadCurrent(data.cacheState || data)) {
+        requestArticleRescan();
+        return null;
       }
       if (data.retryableEmpty) {
-        return makeNormalizedArticleFetchOutcome(data, makeRetryableEmptyInfo(data.emptyReason || 'same_origin_retryable', data.retryAfter));
+        var outcome = makeArticleFetchOutcome(data, makeRetryableEmptyInfo(data.emptyReason || 'same_origin_retryable', data.retryAfter));
+        outcome.cacheState = data.cacheState;
+        return outcome;
       }
       if (!hasArticlePayload(data) && data.partial) {
-        return makeNormalizedArticleFetchOutcome(data, makeRetryableEmptyInfo(data.emptyReason || 'partial_empty', data.retryAfter));
+        return makeArticleFetchOutcome(data, makeRetryableEmptyInfo(data.emptyReason || 'partial_empty', data.retryAfter));
       }
-      return makeNormalizedArticleFetchOutcome(data, null);
+      return makeArticleFetchOutcome(data, null);
     } catch (e) {
+      if (job.abortedForVisible || (job.abortController && job.abortController.signal.aborted)) {
+        return { aborted: true };
+      }
+      if (!isArticleJobCurrent(job, generation)) return null;
       Logger.warn('同源文章抓取异常', logUrl(job.url));
       return await fetchCrossOriginArticle(job, generation);
     }
   }
 
   async function processContainers(containers, generation) {
-    if (generation !== scanGeneration || !ATPConfig.isEnabled() || pauseScanningForHiddenPage()) return;
+    if (!isArticleScanCurrent(generation)) return;
     var summary = { articles: 0, images: 0, resources: 0, sameOrigin: 0, crossOrigin: 0 };
     var jobs = [];
     var jobCursor = 0;
@@ -1121,9 +1565,101 @@
     // so a scroll can still hand them rows that came on screen.
     var busyWorkers = 0;
     var gateWaiters = [];
+    var inflightJobs = new Set();
+    var workerCount = getArticleFetchConcurrency();
 
     function queuedJobCount() {
       return queuedCount;
+    }
+
+    function normalizeBatchCacheEntry(raw) {
+      if (!raw || typeof raw !== 'object') return null;
+      if (Object.prototype.hasOwnProperty.call(raw, 'cached') ||
+          Object.prototype.hasOwnProperty.call(raw, 'negative')) {
+        return raw;
+      }
+      if (Array.isArray(raw.images) || raw.resources) {
+        return { cached: raw, negative: false, negativeExpiresAt: 0 };
+      }
+      return null;
+    }
+
+    function prefetchQueuedJobsCache() {
+      if (!window.ATPCache || typeof ATPCache.getCachedArticlesBatch !== 'function') return;
+      var batchJobs = [];
+      var batchUrls = [];
+      for (var i = jobCursor; i < jobs.length; i++) {
+        var candidateJob = jobs[i];
+        if (candidateJob.state !== 'queued' || candidateJob.cachePrefetchPromise || candidateJob.prefetchedCacheState) continue;
+        batchJobs.push(candidateJob);
+        batchUrls.push(candidateJob.url);
+      }
+      if (!batchUrls.length) return;
+      var sharedPromise = null;
+      try {
+        sharedPromise = Promise.resolve(ATPCache.getCachedArticlesBatch(batchUrls)).catch(function() { return null; });
+      } catch (e) {
+        return;
+      }
+      for (var j = 0; j < batchJobs.length; j++) {
+        (function(targetJob) {
+          targetJob.cachePrefetchPromise = sharedPromise.then(function(batchMap) {
+            if (!batchMap || typeof batchMap !== 'object') return null;
+            var hit = Object.prototype.hasOwnProperty.call(batchMap, targetJob.key)
+              ? batchMap[targetJob.key]
+              : batchMap[targetJob.url];
+            var normalized = normalizeBatchCacheEntry(hit);
+            if (normalized && (!ATPCache.isArticleCacheReadCurrent || ATPCache.isArticleCacheReadCurrent(normalized))) {
+              targetJob.prefetchedCacheState = normalized;
+              return normalized;
+            }
+            return null;
+          });
+        })(batchJobs[j]);
+      }
+    }
+
+    function getArticleJobBand(job) {
+      var distance = getArticleJobViewportDistance(job);
+      if (distance === 0) return 0;
+      var prefetchDist = getArticlePrefetchDistance();
+      if (distance <= prefetchDist) return distance <= prefetchDist * 0.5 ? 1 : 2;
+      return 3;
+    }
+
+    function hasActiveVisibleArticleWork() {
+      if (articleVisibleBoostRequested || hasQueuedVisibleJob()) return true;
+      var iter = inflightJobs.values();
+      var step = iter.next();
+      while (!step.done) {
+        var activeJob = step.value;
+        if (activeJob && isArticleJobVisible(activeJob)) return true;
+        step = iter.next();
+      }
+      return false;
+    }
+
+    function notifyTextQueueIfVisibleArticleIdle() {
+      if (!hasActiveVisibleArticleWork() && window.ATPRenderer && typeof ATPRenderer.wakeAutomaticTextResourceQueue === 'function') {
+        ATPRenderer.wakeAutomaticTextResourceQueue();
+      }
+    }
+
+    function preemptFarOffscreenForVisible() {
+      if (busyWorkers < workerCount || gateWaiters.length) return;
+      if (!articleVisibleBoostRequested && !hasQueuedVisibleJob()) return;
+      var iter = inflightJobs.values();
+      var step = iter.next();
+      while (!step.done) {
+        var runningJob = step.value;
+        if (runningJob && runningJob.abortController && !runningJob.abortController.signal.aborted &&
+            getArticleJobBand(runningJob) === 3) {
+          runningJob.abortedForVisible = true;
+          runningJob.abortController.abort();
+          break;
+        }
+        step = iter.next();
+      }
     }
 
     function addEntryToJob(job, entry) {
@@ -1132,22 +1668,31 @@
       }
       job.entries.push(entry);
       if (job.state === 'done') commitPromises.push(enqueueArticleCommit(job, summary, generation));
+      else if (job.waitNoteState === 'held' && isLiveCommitEntry(entry, job.url)) updateForumWaitNotes(job, [entry], 'held');
     }
 
-    function enqueueContainers(nextContainers) {
+    function enqueueContainers(nextContainers, retry) {
       for (var i = 0; i < nextContainers.length; i++) {
         var entry = nextContainers[i];
         var url = entry && entry.link && entry.link.href;
         if (!url || ATPScanner.shouldExcludeUrl(url) || !ATPScanner.isArticlePageUrl(url) || !isArticleUrlInPageZone(url)) continue;
         var key = getArticleGroupKey(url);
         var existing = jobsByKey[key];
-        if (existing) {
+        if (existing && (!retry || existing.state !== 'done')) {
           addEntryToJob(existing, entry);
+          if (retry && existing.state === 'queued') {
+            var queuedIndex = jobs.indexOf(existing, jobCursor);
+            if (queuedIndex > jobCursor) {
+              jobs.splice(queuedIndex, 1);
+              jobs.splice(jobCursor, 0, existing);
+            }
+          }
           continue;
         }
         var job = {
           key: key,
           url: url,
+          waitNoteId: ++forumWaitJobSequence,
           entries: [entry],
           sameOrigin: isSameOriginUrl(url),
           state: 'queued',
@@ -1163,7 +1708,8 @@
           fetchCompletedAt: 0
         };
         jobsByKey[key] = job;
-        jobs.push(job);
+        if (retry) jobs.splice(jobCursor, 0, job);
+        else jobs.push(job);
         queuedCount++;
       }
     }
@@ -1208,39 +1754,38 @@
       return false;
     }
 
-    function wakeArticleGate() {
+    function notifyArticleGate() {
       var waiting = gateWaiters;
       gateWaiters = [];
       for (var i = 0; i < waiting.length; i++) waiting[i]();
     }
 
     function waitArticleGate() {
-      // A scroll asked for the rows now on screen: go take them at once.
-      if (articleVisibleBoostRequested) return Promise.resolve();
+      if (articleVisibleBoostRequested || !isArticleScanCurrent(generation) || !busyWorkers) {
+        return Promise.resolve();
+      }
       return new Promise(function(resolve) {
         var finished = false;
-        var timer = null;
+        var timer = setTimeout(finish, 1000);
         function finish() {
           if (finished) return;
           finished = true;
-          if (timer) clearTimeout(timer);
-          // Timed rechecks resume the worker too: keep only live idle workers
-          // here, since shouldHandBack uses this list to decide who can help.
+          clearTimeout(timer);
           var index = gateWaiters.indexOf(finish);
           if (index !== -1) gateWaiters.splice(index, 1);
           resolve();
         }
-        timer = setTimeout(finish, 1000);
         gateWaiters.push(finish);
       });
     }
 
     function releaseParkedJob(job) {
       var released = false;
+      job.waitingPaceOptions = null;
       if (job.awaitingTurn) {
         job.awaitingTurn = false;
         awaitingTurn = Math.max(0, awaitingTurn - 1);
-        released = awaitingTurn === 0;
+        released = true;
       }
       if (job.parkedOffscreen) {
         job.parkedOffscreen = false;
@@ -1248,7 +1793,7 @@
         released = true;
       }
       job.onPaceGranted = null;
-      if (released) wakeArticleGate();
+      if (released) notifyArticleGate();
     }
 
     function admitJob(job, offscreen) {
@@ -1285,32 +1830,38 @@
       return true;
     }
 
-    // Whether this job may go to the fetcher now. On-screen jobs always may
-    // (the pacer serves them first). An offscreen job may while no other
-    // offscreen job waits for the pacer or a request could start at once;
-    // otherwise its worker hands it back and idles, so the next turn goes to
-    // whatever is on screen when it comes instead of a job bound in page
-    // order. Jobs the cache answers need no request and never wait.
-    async function admitArticleJob(job) {
+    function tryAdmitArticleRequest(job) {
       var pacer = getForumPacer();
-      if (!pacer || typeof pacer.canStartNow !== 'function') return true;
+      var paced = pacer && typeof pacer.canStartNow === 'function';
       if (isArticleJobVisible(job)) {
-        admitJob(job, false);
+        if (paced) admitJob(job, false);
         return true;
       }
-      // canStartNow only sees requests already queued, so a second offscreen
-      // job may go only when no admitted job is still on its way there.
-      if (parkedOffscreen < 1 || (!awaitingTurn && pacer.canStartNow(pacer.PRIORITY_ARTICLE))) {
-        admitJob(job, true);
-        return true;
-      }
+      if (workerCount > 1 && busyWorkers >= workerCount) return false;
+      if (!paced) return true;
+      // canStartNow cannot see jobs still on their way to the pacer.
+      if (parkedOffscreen >= 1 && (awaitingTurn || !pacer.canStartNow(pacer.PRIORITY_ARTICLE))) return false;
+      admitJob(job, true);
+      return true;
+    }
+
+    // Keep the last worker available for a cold row that scrolls into view.
+    // Cache hits can still use it, and all workers can serve visible rows.
+    async function admitArticleJob(job) {
+      if (tryAdmitArticleRequest(job)) return { cacheState: job.prefetchedCacheState || null };
       var cacheState = null;
       try {
-        cacheState = await ATPCache.getArticleCacheState(job.url);
+        cacheState = await readArticleCacheForJob(job, null);
       } catch (e) {
         cacheState = null;
       }
-      return !!(cacheState && (cacheState.cached || cacheState.negative));
+      if (cacheState && ATPCache.isArticleCacheReadCurrent(cacheState) &&
+          (cacheState.cached || (cacheState.negative && cacheState.negativeExpiresAt > Date.now()))) {
+        return { cacheState: cacheState };
+      }
+      // The row may have scrolled into view or a worker may have finished
+      // during the cache read. Recheck before waiting for the next gate tick.
+      return tryAdmitArticleRequest(job) ? { cacheState: cacheState } : null;
     }
 
     function returnJob(job) {
@@ -1324,8 +1875,7 @@
       var highWatermark = getArticleQueueHighWatermark();
       var scanPasses = 0;
       while (
-        generation === scanGeneration &&
-        !pauseScanningForHiddenPage() &&
+        isArticleScanCurrent(generation) &&
         queuedJobCount() < highWatermark &&
         hasMoreProcessCandidates() &&
         scanPasses < highWatermark * 4 + 8
@@ -1345,6 +1895,7 @@
     function takeJob() {
       refillJobs();
       boostVisibleJobs();
+      prefetchQueuedJobsCache();
       var pick = -1;
       var bestDistance = Infinity;
       for (var i = jobCursor; i < jobs.length; i++) {
@@ -1368,24 +1919,109 @@
       return job;
     }
 
+    function finishArticleJob(job, outcome, cached) {
+      if (job.sameOrigin) summary.sameOrigin++;
+      else summary.crossOrigin++;
+      job.data = outcome.data;
+      job.cacheState = outcome.cacheState;
+      job.retryableEmpty = outcome.retryableEmpty;
+      job.state = 'done';
+      job.fetchCompletedAt = Date.now();
+      if (Logger.event && (!Logger.isEnabled || Logger.isEnabled('DEBUG'))) {
+        Logger.event('article_fetch_done', {
+          url: logUrl(job.url),
+          sameOrigin: job.sameOrigin,
+          queueWaitMs: Math.max(0, job.fetchStartedAt - job.createdAt),
+          fetchMs: Math.max(0, job.fetchCompletedAt - job.fetchStartedAt),
+          paceWaitMs: job.paceWaitMs || 0,
+          cached: cached || undefined,
+          images: job.data.images.length,
+          resources: SharedUtils.countResources(job.data.resources),
+          retryable: !!job.retryableEmpty
+        }, 'DEBUG');
+      }
+      commitPromises.push(enqueueArticleCommit(job, summary, generation));
+    }
+
+    // A visible cached row can render while every network worker is busy.
+    // A miss stays in the normal priority queue and never starts a request.
+    async function checkVisibleArticleCache(job) {
+      var startedAt = Date.now();
+      var cached = null;
+      try {
+        if (job.prefetchedCacheState && ATPCache.isArticleCacheReadCurrent(job.prefetchedCacheState)) {
+          cached = job.prefetchedCacheState.cached;
+          if (!cached) return;
+        } else if (job.cachePrefetchPromise) {
+          var prefetched = await job.cachePrefetchPromise;
+          if (prefetched && ATPCache.isArticleCacheReadCurrent(prefetched)) {
+            if (!prefetched.cached) return;
+            cached = prefetched.cached;
+          }
+        }
+        if (!cached) cached = await ATPCache.getCachedArticleData(job.url);
+      } catch (e) { return; }
+      if (!cached || job.state !== 'queued' || !isArticleJobCurrent(job, generation) || !ATPCache.isArticleCacheReadCurrent(cached)) return;
+      queuedCount--;
+      job.fetchStartedAt = startedAt;
+      finishArticleJob(job, { data: cached, retryableEmpty: null }, true);
+    }
+
+    function checkWaitingVisibleRows() {
+      for (var i = jobCursor; i < jobs.length; i++) {
+        var job = jobs[i];
+        if (job.state !== 'queued' || job.checkedVisibleCache || !isArticleJobVisible(job)) continue;
+        job.checkedVisibleCache = true;
+        checkVisibleArticleCache(job);
+      }
+    }
+
+    function wakeForArticleWork(retryEntries) {
+      if (!isArticleScanCurrent(generation)) {
+        notifyArticleGate();
+        return false;
+      }
+      if (retryEntries) {
+        enqueueContainers(retryEntries, true);
+        prefetchQueuedJobsCache();
+      }
+      if (busyWorkers >= workerCount) {
+        boostVisibleJobs();
+        prefetchQueuedJobsCache();
+        checkWaitingVisibleRows();
+      }
+      notifyArticleGate();
+      return true;
+    }
+
     async function worker() {
-      while (generation === scanGeneration && ATPConfig.isEnabled() && !pauseScanningForHiddenPage()) {
+      while (isArticleScanCurrent(generation)) {
         var job = takeJob();
         if (!job) {
+          notifyTextQueueIfVisibleArticleIdle();
           if (!busyWorkers) break;
           await waitArticleGate();
           continue;
         }
         busyWorkers++;
-        if (!(await admitArticleJob(job))) {
+        if (busyWorkers >= workerCount) {
+          checkWaitingVisibleRows();
+        }
+        var admission = await admitArticleJob(job);
+        if (!admission) {
           busyWorkers--;
+          if (!busyWorkers) notifyArticleGate();
+          if (!isArticleScanCurrent(generation)) return;
           returnJob(job);
           await waitArticleGate();
           continue;
         }
         job.handedBack = false;
+        job.abortedForVisible = false;
+        job.abortController = typeof AbortController === 'function' ? new AbortController() : null;
         job.shouldHandBack = shouldHandBack;
         job.fetchStartedAt = Date.now();
+        inflightJobs.add(job);
         if (Logger.event && (!Logger.isEnabled || Logger.isEnabled('DEBUG'))) {
           Logger.event('article_fetch_start', {
             url: logUrl(job.url),
@@ -1396,61 +2032,62 @@
         }
         var outcome;
         try {
-          outcome = await fetchArticleJob(job, generation);
+          outcome = await fetchArticleJob(job, generation, admission.cacheState);
         } catch (e) {
           Logger.warn('正文抓取异常', logUrl(job.url) + ' ' + (e && e.message ? e.message : String(e)));
           outcome = makeArticleFetchOutcome(null, makeRetryableEmptyInfo('transient_exception', 0));
         } finally {
+          inflightJobs.delete(job);
+          job.abortController = null;
           busyWorkers--;
           job.shouldHandBack = null;
           releaseParkedJob(job);
+          notifyArticleGate();
+          notifyTextQueueIfVisibleArticleIdle();
         }
-        if (job.handedBack) {
+        if (!isArticleScanCurrent(generation)) return;
+        if (job.handedBack || (outcome && outcome.aborted) || (job.abortedForVisible && (!outcome || !hasArticlePayload(outcome.data)))) {
           job.handedBack = false;
-          if (generation !== scanGeneration || pauseScanningForHiddenPage()) return;
+          job.abortedForVisible = false;
+          job.fetchStartedAt = 0;
           returnJob(job);
           if (!hasQueuedVisibleJob()) await waitArticleGate();
           continue;
         }
-        if (job.sameOrigin) summary.sameOrigin++;
-        else summary.crossOrigin++;
-        if (job.paceDeferred && outcome) {
+        if (job.offlineDeferred && outcome) {
+          outcome = makeArticleFetchOutcome(null, makeRetryableEmptyInfo('offline', 0));
+        } else if (job.paceDeferred && outcome) {
           var deferPacer = getForumPacer();
           outcome = makeArticleFetchOutcome(null, makeRetryableEmptyInfo('pace_deferred', deferPacer ? deferPacer.getPauseUntil() : 0));
         }
-        if (!outcome || generation !== scanGeneration || pauseScanningForHiddenPage()) return;
-        job.data = outcome.data;
-        job.retryableEmpty = outcome.retryableEmpty;
-        job.state = 'done';
-        job.fetchCompletedAt = Date.now();
-        if (Logger.event && (!Logger.isEnabled || Logger.isEnabled('DEBUG'))) {
-          Logger.event('article_fetch_done', {
-            url: logUrl(job.url),
-            sameOrigin: job.sameOrigin,
-            queueWaitMs: Math.max(0, job.fetchStartedAt - job.createdAt),
-            fetchMs: Math.max(0, job.fetchCompletedAt - job.fetchStartedAt),
-            paceWaitMs: job.paceWaitMs || 0,
-            images: job.data.images.length,
-            resources: SharedUtils.countResources(job.data.resources),
-            retryable: !!job.retryableEmpty
-          }, 'DEBUG');
+        if (!outcome) {
+          if (jobsByKey[job.key] === job) delete jobsByKey[job.key];
+          continue;
         }
-        commitPromises.push(enqueueArticleCommit(job, summary, generation));
+        finishArticleJob(job, outcome, false);
       }
       // Idle workers see the run is over and exit too.
-      wakeArticleGate();
+      notifyArticleGate();
     }
 
     enqueueContainers(containers);
     refillJobs();
-    articleDispatchWake = wakeArticleGate;
-    var workerCount = getArticleFetchConcurrency();
+    prefetchQueuedJobsCache();
+    articleDispatchWake = wakeForArticleWork;
+    activeVisibleArticleCheck = hasActiveVisibleArticleWork;
     var workers = new Array(workerCount);
     for (var i = 0; i < workerCount; i++) workers[i] = worker();
-    await Promise.all(workers);
-    if (articleDispatchWake === wakeArticleGate) articleDispatchWake = null;
+    try {
+      await Promise.all(workers);
+    } finally {
+      if (articleDispatchWake === wakeForArticleWork) articleDispatchWake = null;
+      if (activeVisibleArticleCheck === hasActiveVisibleArticleWork) activeVisibleArticleCheck = null;
+      if (window.ATPRenderer && typeof ATPRenderer.wakeAutomaticTextResourceQueue === 'function') {
+        ATPRenderer.wakeAutomaticTextResourceQueue();
+      }
+    }
     await Promise.all(commitPromises);
-    if (generation !== scanGeneration || !ATPConfig.isEnabled() || pauseScanningForHiddenPage()) return;
+    if (!isArticleScanCurrent(generation)) return;
     Logger.info('扫描完成', '文章' + summary.articles + ' 图片' + summary.images + ' 资源' + summary.resources + ' (同源' + summary.sameOrigin + '+跨域' + summary.crossOrigin + ')');
     if (Logger.event && (!Logger.isEnabled || Logger.isEnabled('DEBUG'))) {
       Logger.event('scan_complete', {
@@ -1466,37 +2103,8 @@
     }
   }
 
-  function cacheFetchedArticleData(url, data, writeStartedAt) {
-    data = ATPCache.normalizeArticleData(data);
-    var cachedAttachments = [];
-    var hasTransientAttachment = !!data.hasTextAttachments;
-    for (var i = 0; i < data.textAttachments.length; i++) {
-      var attachment = data.textAttachments[i];
-      if (attachment && SharedUtils.isTransientTextAttachmentUrl(attachment.url, url)) {
-        hasTransientAttachment = true;
-      } else if (attachment) {
-        cachedAttachments.push(attachment);
-      }
-    }
-    var cacheData = {
-      images: data.images,
-      resources: data.resources,
-      textAttachments: cachedAttachments,
-      loadedUrls: data.loadedUrls,
-      hasTextAttachments: hasTransientAttachment || cachedAttachments.length > 0,
-      textAttachmentCount: data.textAttachmentCount || data.textAttachments.length,
-      textAttachmentsLimited: data.textAttachmentsLimited === true,
-      textResourcesComplete: data.textResourcesComplete,
-      textResourcesAttemptedCount: data.textResourcesAttemptedCount,
-      textResourcesUnresolvedCount: data.textResourcesUnresolvedCount,
-      textResourcesRetryableCount: data.textResourcesRetryableCount,
-      partial: data.partial
-    };
-    ATPCache.setCachedArticleData(url, cacheData, !data.partial, writeStartedAt);
-  }
-
   function detectAndProcess(fromMutation, immediate) {
-    if (!ATPConfig.isEnabled()) return;
+    if (!ATPConfig.isEnabled() || bfcacheRecoveryPending || startupCancelled) return;
     if (pauseScanningForHiddenPage()) return;
     if (processing) {
       rescanRequested = true;
@@ -1531,6 +2139,9 @@
           Logger.error('扫描处理异常', e && e.message ? e.message : String(e));
         }).finally(function() {
           processing = false;
+          if (typeof ATPLoader !== 'undefined' && typeof ATPLoader.globalSchedule === 'function') {
+            ATPLoader.globalSchedule();
+          }
           if (generation !== scanGeneration) {
             if (rescanRequested && ATPConfig.isEnabled()) {
               rescanRequested = false;
@@ -1564,9 +2175,12 @@
   // 隐藏期间容器观察器从未断开（pauseScanningForHiddenPage 只清定时器），
   // 恢复可见 / bfcache 回来时容器多半还是同一个元素，无需拆了重建
   function ensureObserverBound(reason) {
-    // 父节点也要没变：containerParentObserver 挂在旧父上，容器被搬走时必须全量重绑
-    if (observer && boundContainer && document.contains(boundContainer) &&
-      boundContainerParent && boundContainer.parentNode === boundContainerParent) {
+    if (observer && boundContainer) {
+      if (!document.contains(boundContainer) || boundContainer.parentNode !== boundContainerParent ||
+          ATPScanner.findThreadContainer(true) !== boundContainer) return rebindThreadObserver(reason);
+      // Mutation callbacks skip scanning while hidden. Reconcile removals
+      // made by the forum in the meantime before scanning the visible list.
+      reconcileThreadStates();
       bindScroll();
       Logger.debug('Observer', '容器绑定仍有效，跳过重绑 (' + reason + ')');
       return true;
@@ -1609,17 +2223,17 @@
     observerRetryCount = 0;
     dormantRestartCount = 0;
     observer = new MutationObserver(function(ms) {
+      if (areAllMutationsSelfGenerated(ms)) return;
       if (pauseScanningForHiddenPage()) return;
       if (!document.contains(container)) {
         rebindThreadObserver('Thread container replaced, rebinding');
         return;
       }
-      for (var i = 0; i < ms.length; i++) {
-        if (ms[i].addedNodes.length && mutationHasExternalAdd(ms[i]) && mutationHasArticleAdd(ms[i])) {
-          clearProcessCandidateQueue();
-          detectAndProcess(true);
-          break;
-        }
+      var removedRows = mutationsRemoveThreadRows(ms);
+      if (removedRows) reconcileThreadStates();
+      if (removedRows || mutationsHaveExternalArticleAdd(ms)) {
+        clearProcessCandidateQueue();
+        detectAndProcess(true);
       }
     });
     observer.observe(container, { childList: true, subtree: true });
@@ -1657,6 +2271,8 @@
     removeClassFromNodes(containers, 'atp-processed');
 
     removeNodes(document.querySelectorAll('.' + FORUM_WAIT_NOTE_CLASS));
+    clearedForumWaitJob = forumWaitJobSequence;
+    forumWaitJobByLink = new WeakMap();
 
     if (window.ATPState) {
       window.ATPState.threads = {};
@@ -1666,6 +2282,7 @@
     emptyRetryGivenUp = {};
     emptyRetryClassAttempts = {};
     emptyRetryPaceBound = {};
+    offlineArticleRetries.clear();
 
     if (window.ATPViewport) {
       ATPViewport.destroy();
@@ -1708,9 +2325,13 @@
     if (!ATPConfig.isEnabled() || !hasPaceBoundRetries()) return;
     scheduleRetryScanAt(Date.now());
   });
+  window.addEventListener('atp-forum-pacer-reset', function() {
+    if (articleDispatchWake) articleDispatchWake();
+  });
 
   window.ATPArticleWork = {
-    isBusy: function() { return processing; }
+    isBusy: function() { return processing; },
+    isVisibleBusy: function() { return !!(processing && activeVisibleArticleCheck && activeVisibleArticleCheck()); }
   };
 
   function requestArticleVisibleBoost() {
@@ -1719,6 +2340,7 @@
   }
 
   function handleScrollScan() {
+    lastUserScrollAt = Date.now();
     if (pauseScanningForHiddenPage()) return;
     if (scrollScanTimer) return;
     scrollScanTimer = setTimeout(function() {
@@ -1752,6 +2374,8 @@
   }
 
   function disableCurrentPage() {
+    if (window.ATPForumEntry) window.ATPForumEntry.cancel();
+    forumEntryOnly = false;
     Logger.info('停用', '清理当前页');
     flushPendingData(); // 先落地挂起的缓存写回，再 bump 代际清理 threadStates
     bumpScanGeneration();
@@ -1798,6 +2422,11 @@
   }
 
   function enableCurrentPage() {
+    forumEntryOnly = !!(window.ATPForumEntry && window.ATPForumEntry.handlePage(ATPConfig.settings.autoEnterAgeGate));
+    if (forumEntryOnly) {
+      rescanRequested = false;
+      return;
+    }
     Logger.startFlushTimer();
     syncLoaderVisibilityPauseState();
     // 启用入口没有 mutation 抖动要合并，去抖只会把首图往后推 150ms
@@ -1827,6 +2456,147 @@
     return true;
   }
 
+  function readMarkedExportText() {
+    return new Promise(function(resolve) {
+      if (!window.ATPMarks || typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) {
+        resolve({ ok: false, count: 0, text: '' });
+        return;
+      }
+      try {
+        chrome.storage.local.get(ATPMarks.KEYS.INDEX, function(idxData) {
+          if (chrome.runtime && chrome.runtime.lastError) {
+            resolve({ ok: false, count: 0, text: '' });
+            return;
+          }
+          var index = ATPMarks.readIndex(idxData && idxData[ATPMarks.KEYS.INDEX]);
+          if (!index.items.length) {
+            resolve({ ok: true, count: 0, text: '', ids: [], snapshots: [] });
+            return;
+          }
+          var itemKeys = [];
+          for (var i = 0; i < index.items.length; i++) {
+            itemKeys.push(ATPMarks.itemKey(index.items[i].id));
+          }
+          chrome.storage.local.get(itemKeys, function(recData) {
+            if (chrome.runtime && chrome.runtime.lastError) {
+              resolve({ ok: false, count: 0, text: '' });
+              return;
+            }
+            var records = [];
+            var ids = [];
+            var snapshots = [];
+            for (var k = 0; k < index.items.length; k++) {
+              var id = index.items[k].id;
+              var rawRec = recData && recData[ATPMarks.itemKey(id)];
+              var sanitized = ATPMarks.sanitizeSnapshot(rawRec, true);
+              if (sanitized) {
+                var merged = ATPMarks.mergeRecord(null, sanitized, rawRec.markedAt || Date.now()).record;
+                merged.markedAt = rawRec.markedAt || merged.markedAt;
+                merged.updatedAt = rawRec.updatedAt || merged.updatedAt;
+                records.push(merged);
+                ids.push(id);
+                snapshots.push(ATPMarks.recordToSnapshot(merged));
+              }
+            }
+            if (!records.length) {
+              resolve({ ok: true, count: 0, text: '', ids: [], snapshots: [] });
+              return;
+            }
+            var version = chrome.runtime && chrome.runtime.getManifest ? chrome.runtime.getManifest().version : '';
+            var text = ATPMarks.formatExport(records, { now: Date.now(), version: version });
+            resolve({ ok: true, count: records.length, text: text, ids: ids, snapshots: snapshots });
+          });
+        });
+      } catch (e) {
+        resolve({ ok: false, count: 0, text: '' });
+      }
+    });
+  }
+
+  function copyPlainTextInPage(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).then(function() { return true; }).catch(function() {
+        return fallbackExecCopy(text);
+      });
+    }
+    return Promise.resolve(fallbackExecCopy(text));
+  }
+
+  function fallbackExecCopy(text) {
+    var ta = null;
+    try {
+      ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = document.execCommand('copy');
+      if (ta.parentNode) ta.remove();
+      return !!ok;
+    } catch (e) {
+      if (ta && ta.parentNode) ta.remove();
+      return false;
+    }
+  }
+
+  function notifyMarksExportEvent(op, info) {
+    if (!info || !info.ids || !info.ids.length || typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.sendMessage) return;
+    try {
+      chrome.runtime.sendMessage({
+        type: SharedUtils.MESSAGE_TYPES.MARKS_MUTATION,
+        op: op,
+        ids: info.ids,
+        snapshots: info.snapshots
+      }, function() {});
+    } catch (e) {}
+  }
+
+  function buildLivePageStatus() {
+    var loaderStats = (typeof ATPLoader !== 'undefined' && typeof ATPLoader.getLivePageStats === 'function')
+      ? ATPLoader.getLivePageStats()
+      : null;
+    var threads = window.ATPState && window.ATPState.threads;
+    var fallbackTotalThreads = 0;
+    var fallbackLoadedThreads = 0;
+    var fallbackFailedImages = 0;
+    if (!loaderStats && threads) {
+      for (var tid in threads) {
+        var ts = threads[tid];
+        if (!ts) continue;
+        fallbackTotalThreads++;
+        if (ts.firstScreenDone || !ts.firstScreenTotal) fallbackLoadedThreads++;
+        fallbackFailedImages += Number(ts.failedCount) || 0;
+      }
+    }
+    var pacer = getForumPacer();
+    var paceState = pacer && typeof pacer.getState === 'function' ? pacer.getState() : null;
+    var now = Date.now();
+    var pacerText = '正常';
+    if (paceState) {
+      if (paceState.pauseUntil && paceState.pauseUntil > now) {
+        pacerText = '冷却 ' + Math.max(1, Math.ceil((paceState.pauseUntil - now) / 1000)) + 's';
+      } else if (paceState.queued > 0) {
+        pacerText = '排队 ' + paceState.queued;
+      }
+    }
+    var markedCount = (window.ATPResourcePanel && typeof ATPResourcePanel.getMarkedCount === 'function')
+      ? ATPResourcePanel.getMarkedCount()
+      : 0;
+    var allExpanded = !!(window.ATPRenderer && typeof ATPRenderer.areAllThreadsExpanded === 'function' && ATPRenderer.areAllThreadsExpanded());
+    return {
+      paused: manualPagePaused || !!(loaderStats && loaderStats.paused),
+      activeLoads: loaderStats ? (Number(loaderStats.activeLoads) || 0) : 0,
+      queuedImages: loaderStats ? (Number(loaderStats.queuedImages) || 0) : 0,
+      loadedThreads: loaderStats ? (Number(loaderStats.loadedThreads) || 0) : fallbackLoadedThreads,
+      totalThreads: loaderStats ? (Number(loaderStats.totalThreads) || 0) : fallbackTotalThreads,
+      failedImages: loaderStats ? (Number(loaderStats.failedImages) || 0) : fallbackFailedImages,
+      markedCount: markedCount,
+      pacerText: pacerText,
+      allExpanded: allExpanded
+    };
+  }
+
   function initFloatPanel() {
     if (window.__bfpPanel) return;
     if (typeof FloatingPanel === 'undefined') {
@@ -1845,22 +2615,99 @@
         initialSettings: ATPConfig.settings,
         business: {
           onSettingsChange: function(newSettings, meta) {
+            var wasEnabled = ATPConfig.isEnabled();
             var previousSettings = ATPConfig.settings || {};
             var nextSettings = ATPNormalizeSettings(Object.assign({}, ATPConfig.settings || {}, newSettings));
+            var nextSig = getSettingsSignature(nextSettings);
+            if (nextSig && nextSig === lastAppliedSettingsSignature && wasEnabled === (nextSettings.enabled !== false)) {
+              return;
+            }
             var reloadNeeded = needsSettingsReload(previousSettings, nextSettings);
             ATPConfig.settings = nextSettings;
+            lastAppliedSettingsSignature = nextSig;
             if (!window.ATPState) window.ATPState = {};
             window.ATPState.settings = ATPConfig.settings;
             if (Logger.setDebugEnabled) Logger.setDebugEnabled(nextSettings.debugLogging === true);
-            if (reloadNeeded) {
+            var nowEnabled = ATPConfig.isEnabled();
+            if (!nowEnabled) {
+              disableCurrentPage();
+            } else if (!wasEnabled) {
+              enableCurrentPage();
+            } else if (reloadNeeded) {
               reloadThumbnails();
             } else {
               applyLiveSettings(previousSettings, nextSettings);
             }
+          },
+          getPageStatus: function() {
+            return buildLivePageStatus();
+          },
+          onTogglePause: function() {
+            manualPagePaused = !manualPagePaused;
+            if (typeof ATPLoader !== 'undefined') {
+              if (manualPagePaused && typeof ATPLoader.pause === 'function') {
+                ATPLoader.pause();
+              } else if (!manualPagePaused && typeof ATPLoader.resume === 'function') {
+                ATPLoader.resume();
+                if (!processing) detectAndProcess(true, true);
+              }
+            }
+            return { paused: manualPagePaused };
+          },
+          onRetryFailed: function() {
+            var retried = (typeof ATPLoader !== 'undefined' && typeof ATPLoader.retryAllFailedImages === 'function')
+              ? ATPLoader.retryAllFailedImages()
+              : 0;
+            return { retried: Number(retried) || 0 };
+          },
+          onToggleExpandAll: function() {
+            var currentExpanded = !!(window.ATPRenderer && typeof ATPRenderer.areAllThreadsExpanded === 'function' && ATPRenderer.areAllThreadsExpanded());
+            var nextExpanded = !currentExpanded;
+            if (window.ATPRenderer && typeof ATPRenderer.setAllThreadsExpanded === 'function') {
+              return ATPRenderer.setAllThreadsExpanded(nextExpanded);
+            }
+            return { expanded: nextExpanded, count: 0 };
+          },
+          onCopyMarked: function() {
+            return readMarkedExportText().then(function(info) {
+              if (!info.ok || !info.count || !info.text) return { ok: false, count: 0 };
+              return copyPlainTextInPage(info.text).then(function(copied) {
+                if (copied) notifyMarksExportEvent('copied_marks', info);
+                return { ok: !!copied, count: copied ? info.count : 0 };
+              });
+            });
+          },
+          onExportMarked: function() {
+            return readMarkedExportText().then(function(info) {
+              if (!info.ok || !info.count || !info.text) return { ok: false, count: 0 };
+              try {
+                var blob = new Blob([info.text], { type: 'text/plain;charset=utf-8' });
+                var blobUrl = URL.createObjectURL(blob);
+                var a = document.createElement('a');
+                a.href = blobUrl;
+                a.download = 'marked-resources-' + ATPMarks.formatDate(Date.now()) + '.txt';
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                setTimeout(function() { URL.revokeObjectURL(blobUrl); }, 2000);
+                notifyMarksExportEvent('exported', info);
+                return { ok: true, count: info.count };
+              } catch (e) {
+                return { ok: false, count: 0 };
+              }
+            });
           }
         }
       });
       window.__bfpPanel = panel;
+      if (ATPConfig.settings && ATPConfig.settings.showFloatingLauncher === false) {
+        if (typeof panel.setLauncherVisible === 'function') {
+          panel.setLauncherVisible(false);
+        } else if (typeof document !== 'undefined' && document.getElementById) {
+          var bfpRoot = document.getElementById('bfp-root');
+          if (bfpRoot && bfpRoot.style) bfpRoot.style.display = 'none';
+        }
+      }
     } catch (e) {
       console.error('[ATP] initFloatPanel failed:', e);
     }
@@ -1908,13 +2755,17 @@
         }, 'INFO');
       }
       initATPState();
+      if (ATPConfig._hydratesForumPacer) ATPConfig.getSettings();
+      prewarmInitialVisibleCandidates();
       await ATPConfig.getSettings();
+      lastAppliedSettingsSignature = getSettingsSignature(ATPConfig.settings);
       if (Logger.setDebugEnabled) Logger.setDebugEnabled(ATPConfig.settings && ATPConfig.settings.debugLogging === true);
       logDiagnosticConfig(ATPConfig.settings, 'startup');
       if (startupCancelled) return;
       addSettingsChangedListener();
       initialized = true;
       if (ATPConfig.isEnabled()) enableCurrentPage();
+      else if (window.ATPForumEntry) window.ATPForumEntry.cancel();
     } catch (e) {
       cleanupFailedStartup();
       Logger.error('插件启动失败', e && e.message ? e.message : String(e || '未知错误'));
@@ -1929,8 +2780,16 @@
       var wasEnabled = ATPConfig.isEnabled();
       var previousSettings = ATPConfig.settings || {};
       var nextSettings = ATPNormalizeSettings(Object.assign({}, ATPConfig.settings || {}, changes.settings.newValue));
+      var nextSig = getSettingsSignature(nextSettings);
+      if (nextSig && nextSig === lastAppliedSettingsSignature && wasEnabled === (nextSettings.enabled !== false)) {
+        if (window.__bfpPanel && typeof window.__bfpPanel.setSettings === 'function') {
+          window.__bfpPanel.setSettings(ATPConfig.settings);
+        }
+        return;
+      }
       var reloadNeeded = needsSettingsReload(previousSettings, nextSettings);
       ATPConfig.settings = nextSettings;
+      lastAppliedSettingsSignature = nextSig;
       if (!window.ATPState) window.ATPState = {};
       window.ATPState.settings = ATPConfig.settings;
       if (Logger.setDebugEnabled) Logger.setDebugEnabled(nextSettings.debugLogging === true);
@@ -1944,10 +2803,12 @@
         disableCurrentPage();
       } else if (!wasEnabled) {
         enableCurrentPage();
+      } else if (forumEntryOnly) {
+        if (previousSettings.autoEnterAgeGate !== nextSettings.autoEnterAgeGate) enableCurrentPage();
       } else if (!reloadNeeded) {
         applyLiveSettings(previousSettings, nextSettings);
       }
-      if (nowEnabled && wasEnabled && reloadNeeded) {
+      if (nowEnabled && wasEnabled && reloadNeeded && !forumEntryOnly) {
         reloadThumbnails();
       }
     }
@@ -1979,10 +2840,12 @@
     if (document.visibilityState === 'hidden') {
       flushPendingData();
       Logger.flush();
-      pauseScanningForHiddenPage();
+      if (!forumEntryOnly) pauseScanningForHiddenPage();
+    } else if (forumEntryOnly) {
+      return;
     } else if (bfcacheRecoveryPending && ATPConfig.isEnabled()) {
       resumeFromBfcache();
-    } else if (rescanRequested && ATPConfig.isEnabled()) {
+    } else if ((releaseOfflineArticleRetries() || rescanRequested) && ATPConfig.isEnabled()) {
       rescanRequested = false;
       ensureObserverBound('visibility');
       detectAndProcess(true);
@@ -1996,10 +2859,12 @@
       loadInitTimer = null;
     }
     window.removeEventListener('load', scheduleInit);
+    window.removeEventListener('online', handleNetworkOnline);
     document.removeEventListener('DOMContentLoaded', scheduleInit);
     document.removeEventListener('visibilitychange', handleVisibilityChange);
     window.removeEventListener('pagehide', handlePageHide);
     window.removeEventListener('pageshow', handlePageShow);
+    offlineArticleRetries.clear();
     if (!initialized) {
       Logger.flush();
       return;
@@ -2039,10 +2904,11 @@
   }
 
   function handlePageHide(event) {
+    if (window.ATPForumEntry) window.ATPForumEntry.stopWatching();
     flushPendingData();
     Logger.flush();
     if (event && event.persisted) {
-      if (!initialized || !ATPConfig.isEnabled()) {
+      if (!initialized || !ATPConfig.isEnabled() || forumEntryOnly) {
         bfcacheRecoveryPending = false;
         rescanRequested = false;
         clearScanTimers();
@@ -2051,6 +2917,9 @@
         return;
       }
       bfcacheRecoveryPending = true;
+      // Retire pending article work while keeping already rendered galleries.
+      scanGeneration++;
+      if (articleDispatchWake) articleDispatchWake();
       clearScanTimers();
       clearObserverRetryTimer();
       clearProcessCandidateQueue();
@@ -2083,6 +2952,7 @@
       return false;
     }
     bfcacheRecoveryPending = false;
+    releaseOfflineArticleRetries();
     if (typeof ATPLoader !== 'undefined' && typeof ATPLoader.recoverActiveImageLoads === 'function') {
       ATPLoader.recoverActiveImageLoads('bfcache_pageshow');
     }
@@ -2106,6 +2976,7 @@
   }
 
   document.addEventListener('visibilitychange', handleVisibilityChange);
+  window.addEventListener('online', handleNetworkOnline);
   window.addEventListener('storage', handleForumPacerStorage);
   window.addEventListener('pagehide', handlePageHide);
   window.addEventListener('pageshow', handlePageShow);

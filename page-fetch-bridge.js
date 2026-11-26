@@ -6,11 +6,17 @@
   var MAX_BYTES = 512 * 1024;
   var MAX_TIMEOUT_MS = 10000;
 
-  function postResponse(id, payload) {
+  function postResponse(id, payload, transfer) {
     var message = Object.assign({
       type: RESPONSE_TYPE,
       id: id
     }, payload || {});
+    if (transfer && transfer.length) {
+      try {
+        window.postMessage(message, location.origin, transfer);
+        return;
+      } catch (e) {}
+    }
     window.postMessage(message, location.origin);
   }
 
@@ -76,16 +82,12 @@
     return merged;
   }
 
-  function bytesToBase64(bytes) {
-    var parts = [];
-    var chunkSize = 0x8000;
-    for (var i = 0; i < bytes.length; i += chunkSize) {
-      var chunk = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
-      var chars = '';
-      for (var j = 0; j < chunk.length; j++) chars += String.fromCharCode(chunk[j]);
-      parts.push(chars);
+  function toTransferBuffer(bytes) {
+    if (!bytes || !bytes.buffer) return new ArrayBuffer(0);
+    if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) {
+      return bytes.buffer;
     }
-    return btoa(parts.join(''));
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
   }
 
   window.addEventListener('message', async function (event) {
@@ -100,8 +102,15 @@
 
     var maxBytes = Math.max(1, Math.min(MAX_BYTES, Number(request.maxBytes) || MAX_BYTES));
     var timeoutMs = Math.max(1, Math.min(MAX_TIMEOUT_MS, Number(request.timeoutMs) || MAX_TIMEOUT_MS));
+    var now = Date.now();
+    var deadline = now + timeoutMs;
+    if (Number.isFinite(request.deadline) && request.deadline > 0) deadline = Math.min(deadline, request.deadline);
+    if (deadline <= now) {
+      postResponse(request.id, { ok: false, error: 'timeout' });
+      return;
+    }
     var controller = new AbortController();
-    var timer = setTimeout(function () { controller.abort(); }, timeoutMs);
+    var timer = setTimeout(function () { controller.abort(); }, deadline - now);
     try {
       var response = await fetch(request.url, {
         signal: controller.signal,
@@ -111,22 +120,32 @@
         referrer: getSafeReferrer(request.referrer),
         referrerPolicy: 'strict-origin-when-cross-origin'
       });
+      if (controller.signal.aborted || Date.now() >= deadline) throw new Error('timeout');
       if (!isAllowedAttachmentUrl(response.url || request.url)) {
         postResponse(request.id, { ok: false, error: 'redirect_not_allowed', status: response.status });
         return;
       }
-      if (!response.ok) {
-        postResponse(request.id, { ok: false, error: 'http_' + response.status, status: response.status });
+      var challenge = String(response.headers.get('cf-mitigated') || '').toLowerCase() === 'challenge';
+      var retryAfter = response.headers.get('retry-after') || '';
+      if (retryAfter.length > 128) retryAfter = '';
+      if (challenge || !response.ok) {
+        var failure = { ok: false, error: challenge ? 'forum_challenge' : 'http_' + response.status, status: response.status };
+        if (retryAfter && (challenge || response.status === 429 || response.status === 503)) failure.retryAfter = retryAfter;
+        postResponse(request.id, failure);
         return;
       }
       var bytes = await readResponseLimited(response, maxBytes);
-      postResponse(request.id, {
+      if (controller.signal.aborted || Date.now() >= deadline) throw new Error('timeout');
+      var buffer = toTransferBuffer(bytes);
+      var payload = {
         ok: true,
         status: response.status,
         finalUrl: response.url || request.url,
         contentType: response.headers.get('content-type') || '',
-        base64: bytesToBase64(bytes)
-      });
+        buffer: buffer
+      };
+      if (retryAfter) payload.retryAfter = retryAfter;
+      postResponse(request.id, payload, [buffer]);
     } catch (e) {
       postResponse(request.id, {
         ok: false,

@@ -33,7 +33,7 @@ assert(!Object.prototype.hasOwnProperty.call(heavyPreset, 'backgroundConcurrency
 assert.strictEqual(gentleOrdinaryPreset.firstScreenConcurrency, 6, '100M ordinary preset must keep useful visible concurrency');
 assert.strictEqual(balancedOrdinaryPreset.firstScreenConcurrency, 8, '200M ordinary preset must speed up visible weak images');
 assert.strictEqual(fastOrdinaryPreset.firstScreenConcurrency, 16, 'fast ordinary preset must expose a higher visible weak-image ceiling');
-assert.strictEqual(balancedOrdinaryPreset.viewportPriorityReservedSlots, 5, '200M ordinary preset must reserve capacity for visible images');
+assert.strictEqual(balancedOrdinaryPreset.viewportPriorityReservedSlots, 4, '200M ordinary preset must reserve capacity for visible images');
 assert.strictEqual(fastOrdinaryPreset.ordinaryHostConcurrency, 10, 'fast ordinary preset must coordinate host concurrency with visible concurrency');
 assert.strictEqual(fastOrdinaryPreset.backgroundConcurrency, 2, 'fast ordinary preset must keep offscreen work subordinate to visible images');
 assert.strictEqual(fastOrdinaryPreset.globalImageConcurrency, 0, 'ordinary presets must reset stale explicit global ceilings to automatic mode');
@@ -110,7 +110,7 @@ assert.strictEqual(policy.getLargeImageTaskDeadline({ imageTaskDeadline: 8000 })
 assert.strictEqual(policy.getLargeImageTaskDeadline({ imageTaskDeadline: 0 }), 0, 'GIFs must have no task deadline when none is configured');
 assert.strictEqual(policy.getLargeImageTimeout({ imageTimeout: 8000 }), 30000, 'the GIF per-attempt timeout must not drop below 30s');
 assert.strictEqual(policy.getLargeImageTimeout({ imageTimeout: 15000 }), 45000, 'GIFs must get three times the per-attempt timeout');
-assert.strictEqual(policy.getLargeImageTimeout({ imageTimeout: 0 }), 45000, 'a zero image timeout must fall back to the default before scaling');
+assert.strictEqual(policy.getLargeImageTimeout({ imageTimeout: 0 }), 36000, 'a zero image timeout must fall back to the default before scaling');
 assert.strictEqual(policy.getLargeImageHostConcurrency({}), 2, 'the GIF lane must start at two GIFs per ordinary host');
 assert.strictEqual(policy.getLargeImageFastMs({ imageTimeout: 8000 }), 3200, 'a GIF within 40% of the image timeout counts as fast');
 assert.strictEqual(policy.getLargeImageFastMs({ imageTimeout: 3000 }), 2000, 'the fast GIF threshold must not drop below 2s');
@@ -119,6 +119,9 @@ assert.strictEqual(policy.getLargeImageSlowMs({ imageTimeout: 8000 }), 8000, 'a 
 assert.strictEqual(policy.getLargeImageSlowMs({ imageTimeout: 3000 }), 6000, 'the slow GIF threshold must not drop below 6s');
 assert.strictEqual(policy.getLargeImageSlowMs({ imageTimeout: 60000 }), 15000, 'the slow GIF threshold must not exceed 15s');
 const snapshotWithLane = policy.getPublicSnapshot({ imageTimeout: 8000, imageTaskDeadline: 16000 });
+assert.strictEqual(snapshotWithLane.readyImageAttemptTimeout, 8000);
+assert.strictEqual(policy.getReadyImageAttemptTimeout({ imageTimeout: 15000, imageTaskDeadline: 0 }), 15000);
+assert.strictEqual(policy.getReadyImageAttemptTimeout({ imageTimeout: 15000, imageTaskDeadline: 5000 }), 5000);
 assert(snapshotWithLane.largeImageTimeout === 30000 && snapshotWithLane.largeImageTaskDeadline === 48000 &&
   snapshotWithLane.largeImageHostConcurrency === 2, 'the public policy snapshot must report the GIF lane settings');
 

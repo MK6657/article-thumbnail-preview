@@ -4,7 +4,19 @@ English | [简体中文](README.md)
 
 A Chrome / Edge Manifest V3 extension that adds image previews and copyable resource links to supported Discuz! forum listing pages.
 
-Current version: **1.18.18**. Install the unpacked extension directly in the browser.
+Current version: **1.18.27**. Install the unpacked extension directly in the browser.
+
+Version 1.18.27 shares concurrent reads of the same cached post and spreads validation and gallery preparation across frames. Preview labels read the image count directly. Log maintenance uses the size of each stored log shard.
+
+Version 1.18.26 fixes image URL filtering and uses spare candidates for failed first-batch thumbnails within the loading budget. The background worker shares the forum’s `Retry-After` deadline with tabs on that origin. When a settings write fails, the popup restores the saved values. Press Escape to close the resource sidebar.
+
+Version 1.18.23 clicks the Chinese entry link on the forum’s bilingual age notice and returns to the original board or thread after the forum home page loads. The option is on by default and can be turned off in the loading settings. The queue notice clears as soon as a post request is admitted.
+
+Version 1.18.22 makes room for a newly visible thumbnail when slow images from a previous screen occupy the same host's connections. Long galleries prepare images in batches. Cached posts can render while article requests are busy. A post with TXT attachments on the forum and a separate download site shows copy buttons as resources arrive.
+
+Version 1.18.21 preserves imported TXT resources across tabs and keeps existing thumbnails clickable after a listing update. Forum TXT downloads respect rate limits, mixed galleries honor the destination image host’s connection limit, and timed-out previews can be retried in place.
+
+Version 1.18.20 checks host availability again while images wait for a connection. When a thumbnail switches hosts, full-size images served from a separate directory or port keep their original URLs. Resource actions move into or out of the post when the listing shifts horizontally. To retain local settings and saved resources, update and reload the unpacked extension from its existing directory.
 
 Version 1.18.18 restores sibling-host recovery for the ordinary image queue and allows previously successful hosts to be treated as temporarily unavailable after repeated failures. Unsigned forum attachments re-enter destination-host admission using their remaining request budget, preserving the original cache URLs and grid cells. Existing concurrency and hidden-page pause settings remain unchanged.
 
@@ -18,9 +30,7 @@ Version 1.18.6 fixes races when clearing and backing up marks, stale snapshot up
 
 Version 1.18.5 adds resource marking: mark threads on a list page (「标记」) to keep their title, links, share codes and archive passwords, then export them from the popup as a TXT file. Every export or copy is also kept in a dated daily backup. Share codes no longer get paired with a neighbouring link.
 
-From version 1.18.4 the reset button works from the popup on any page and resets every forum domain at once.
-
-Version 1.18.3 adds “立即重置论坛节流” (reset forum pacing now) to the popup maintenance section, which also shows the current forum tab's pace. After the forum shows its verification page the extension slows itself down and keeps that for 24 hours; this button brings back the normal pace at once.
+Open the popup on any page and go to Maintenance to see the pace for each forum domain. “重置论坛节流速度” (Reset forum pacing) clears the extension’s learned slowdown. When a server’s `Retry-After` deadline expires, the extension sends one request to check that the forum has recovered.
 
 Version 1.18.2 loads the first screen by what you are looking at: forum requests go to the threads on screen first, so after opening a page or scrolling the visible threads appear almost at once instead of one every 2 seconds from the top down. When the forum hands out an attachment host that is down, images are fetched from a working host of the same attachment store.
 

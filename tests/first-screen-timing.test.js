@@ -26,7 +26,7 @@ function element(tag) {
 
 function createRun(extraSettings) {
   let now = 10000, sequence = 0, timerId = 0;
-  const events = [], infos = [], timers = new Map();
+  const events = [], infos = [], cacheFlushes = [], timers = new Map();
   class ClockDate extends Date { static now() { return now; } }
   const sandbox = {
     Date: ClockDate, URL, TextDecoder, console,
@@ -48,7 +48,7 @@ function createRun(extraSettings) {
       info(label, message) { infos.push({ label, message }); },
       debug() {}, warn() {}, error() {}
     },
-    ATPCache: { scheduleCacheFlush() {}, flushCacheNow() {} },
+    ATPCache: { scheduleCacheFlush() {}, flushCacheNow(id, complete) { cacheFlushes.push({ id, complete }); } },
     ATPState: { generation: 0, threads: {}, settings: Object.assign({
       firstScreenConcurrency: 8, backgroundConcurrency: 2,
       globalImageConcurrency: 12, ordinaryHostAdaptive: false,
@@ -59,7 +59,7 @@ function createRun(extraSettings) {
   };
   sandbox.window = sandbox;
   vm.createContext(sandbox);
-  for (const name of ['shared-utils.js', 'loading-policy.js', 'loader.js']) {
+  for (const name of ['shared-utils.js', 'loading-policy.js', 'host-health.js', 'heavy-budget.js', 'image-runner.js', 'loader.js']) {
     vm.runInContext(fs.readFileSync(path.join(root, name), 'utf8'), sandbox, { filename: name });
   }
   const loader = sandbox.ATPLoader;
@@ -67,7 +67,7 @@ function createRun(extraSettings) {
   // request/slot/cancellation/retry/success handlers below.
   loader.globalSchedule = function() {};
   return {
-    loader, sandbox, events, infos,
+    loader, sandbox, events, infos, cacheFlushes,
     advance(ms) { now += ms; },
     register(count, urls) {
       const id = 'timing-' + (++sequence);
@@ -157,6 +157,8 @@ assert.strictEqual(parallelFields.taskElapsedTotalMs, 1250);
 assert.strictEqual(parallelFields.lastTaskQueueWaitMs, 150);
 assert.strictEqual(parallelFields.maxQueueWaitMs, 150);
 assert.strictEqual(parallelFields.requestCount, 2);
+assert.deepStrictEqual(parallel.cacheFlushes, [{ id: parallelThread.id, complete: true }],
+  'the last first-screen image must flush once when it also completes the post');
 checkPartition(parallelFields);
 assert(!parallel.infos.some(record => record.message.includes('直载')), 'a direct request can still have long queue/offscreen wait');
 parallel.loader.threadImageDone(b, true);

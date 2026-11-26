@@ -41,6 +41,7 @@
   ];
   var ARTICLE_SCAN_NODE_BUDGET = 120;
   var ARTICLE_VIEWPORT_SEEK_BACKTRACK = 8;
+  var skippedServiceContainers = typeof WeakSet !== 'undefined' ? new WeakSet() : null;
 
   function createScanContext() {
     return {
@@ -57,6 +58,8 @@
     scanState.context = createScanContext();
     scanState.skipServiceThreads = skipServiceThreads;
     scanState.exhausted = false;
+    scanState.viewportOrderUncertain = false;
+    scanState.primaryNormalthreadMatched = false;
   }
 
   function getReusableScanRoot(scanState) {
@@ -69,16 +72,39 @@
 
   function getViewportSeekStartIndex(nodes, viewportTop) {
     if (!nodes || !nodes.length || typeof viewportTop !== 'number' || !isFinite(viewportTop)) return 0;
-    var measured = false;
-    for (var i = 0; i < nodes.length; i++) {
-      var node = nodes[i];
-      if (!node || typeof node.getBoundingClientRect !== 'function') continue;
-      var rect = node.getBoundingClientRect();
-      if (!rect || typeof rect.bottom !== 'number') continue;
-      measured = true;
-      if (rect.bottom >= viewportTop) return Math.max(0, i - ARTICLE_VIEWPORT_SEEK_BACKTRACK);
+    function bottomAt(index) {
+      var node = nodes[index];
+      var rect = node && node.getBoundingClientRect && node.getBoundingClientRect();
+      return rect && Number.isFinite(rect.bottom) && !(rect.width === 0 && rect.height === 0) ? rect.bottom : null;
     }
-    return measured ? Math.max(0, nodes.length - 1 - ARTICLE_VIEWPORT_SEEK_BACKTRACK) : 0;
+    var low = 0;
+    var high = nodes.length - 1;
+    // Normal forum rows are in visual order within their table. For mixed
+    // tables or irregular geometry, -1 asks for a bounded, exhaustive scan.
+    var table = nodes[low].closest && nodes[low].closest('table');
+    if (!table || !nodes[high].closest || nodes[high].closest('table') !== table) return -1;
+    if (typeof window.getComputedStyle === 'function') {
+      var display = window.getComputedStyle(table).display;
+      if (display !== 'table' && display !== 'inline-table') return -1;
+    }
+    var lowBottom = bottomAt(low);
+    if (lowBottom === null) return -1;
+    if (lowBottom >= viewportTop) return 0;
+    var highBottom = bottomAt(high);
+    if (highBottom === null || highBottom < lowBottom) return -1;
+    while (highBottom >= viewportTop && high - low > 1) {
+      var mid = Math.floor((low + high) / 2);
+      var bottom = bottomAt(mid);
+      if (bottom === null || bottom < lowBottom || bottom > highBottom || !nodes[mid].closest || nodes[mid].closest('table') !== table) return -1;
+      if (bottom < viewportTop) {
+        low = mid;
+        lowBottom = bottom;
+      } else {
+        high = mid;
+        highBottom = bottom;
+      }
+    }
+    return Math.max(0, high - ARTICLE_VIEWPORT_SEEK_BACKTRACK);
   }
 
   function findArticleLink(tbody) {
@@ -230,7 +256,6 @@
       var selectorIndex = 0;
       var nodeIndex = 0;
       var nodes = null;
-      var didResetScanState = false;
       if (scanState) {
         if (
           scanState.root !== root ||
@@ -238,7 +263,6 @@
           scanState.exhausted
         ) {
           resetArticleScanState(scanState, root, skipServiceThreads);
-          didResetScanState = true;
         }
         seen = scanState.seen;
         context = scanState.context;
@@ -250,15 +274,31 @@
         context = createScanContext();
       }
       var viewportTop = Number(options.viewportTop);
-      var shouldSeekViewportStart = !!(scanState && didResetScanState && options.seekViewportStart && isFinite(viewportTop));
+      var shouldSeekViewportStart = !!(scanState && options.seekViewportStart && isFinite(viewportTop));
       var scannedNodes = 0;
+      var primaryNormalthreadMatched = !!(scanState && scanState.primaryNormalthreadMatched);
+      var isPrimaryThreadlistRoot = !!(root && root.id === 'threadlist');
       for (var i = selectorIndex; i < selectors.length; i++) {
-        if (!nodes) nodes = root.matches && root.matches(selectors[i]) ? [root] : root.querySelectorAll(selectors[i]);
-        if (shouldSeekViewportStart && nodes && nodes.length) {
-          nodeIndex = getViewportSeekStartIndex(nodes, viewportTop);
-          shouldSeekViewportStart = false;
+        if (isPrimaryThreadlistRoot && primaryNormalthreadMatched && (skipServiceThreads ? i >= 1 : i >= 2)) {
+          break;
         }
-        for (var j = i === selectorIndex ? nodeIndex : 0; j < nodes.length; j++) {
+        if (!nodes) {
+          nodes = root.matches && root.matches(selectors[i]) ? [root] : root.querySelectorAll(selectors[i]);
+          if (i === 0 && nodes.length > 0) {
+            primaryNormalthreadMatched = true;
+            if (scanState) scanState.primaryNormalthreadMatched = true;
+          }
+          // A template can mix pinned TBODYs and ordinary TRs. Each new
+          // selector list needs its own start; a saved list already has a cursor.
+          if (shouldSeekViewportStart && nodes.length) {
+            nodeIndex = getViewportSeekStartIndex(nodes, viewportTop);
+            if (nodeIndex < 0) {
+              scanState.viewportOrderUncertain = true;
+              nodeIndex = 0;
+            }
+          }
+        }
+        for (var j = nodeIndex; j < nodes.length; j++) {
           scannedNodes++;
           var tbody = nodes[j];
           if (scanState) {
@@ -281,6 +321,13 @@
             }
             continue;
           }
+          if (skipServiceThreads && skippedServiceContainers && skippedServiceContainers.has(tbody)) {
+            if (scannedNodes >= nodeBudget) {
+              if (scanState) scanState.exhausted = false;
+              return results;
+            }
+            continue;
+          }
           var link = findArticleLink(tbody);
           if (isUsableThreadLink(link)) {
             var entry = { container: tbody, link: link };
@@ -292,6 +339,7 @@
               continue;
             }
             if (skipServiceThreads && ATPScanner.isForumServiceThread(tbody, link, context)) {
+              if (skippedServiceContainers) skippedServiceContainers.add(tbody);
               if (scannedNodes >= nodeBudget) {
                 if (scanState) scanState.exhausted = false;
                 return results;
@@ -310,6 +358,7 @@
           }
         }
         nodes = null;
+        nodeIndex = 0;
         if (scanState) {
           scanState.selectorIndex = i + 1;
           scanState.nodeIndex = 0;

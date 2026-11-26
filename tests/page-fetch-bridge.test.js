@@ -46,6 +46,7 @@ async function runFetcherBridgeIntegration(text, scenario) {
   const sandbox = {
     URL: URL,
     AbortController: AbortController,
+    ArrayBuffer: ArrayBuffer,
     Uint8Array: Uint8Array,
     TextDecoder: TextDecoder,
     TextEncoder: TextEncoder,
@@ -125,7 +126,7 @@ async function runFetcherBridgeIntegration(text, scenario) {
   };
   sandbox.window = sandbox;
   vm.createContext(sandbox);
-  vm.runInContext(fs.readFileSync(path.join(root, 'shared-utils.js'), 'utf8') + '\nthis.SharedUtils = SharedUtils;', sandbox, { filename: 'shared-utils.js' });
+  vm.runInContext(fs.readFileSync(path.join(root, 'shared-utils.js'), 'utf8') + '\n' + fs.readFileSync(path.join(root, 'html-extractors.js'), 'utf8') + '\nthis.SharedUtils = SharedUtils;', sandbox, { filename: 'shared-utils.js' });
   vm.runInContext(fs.readFileSync(path.join(root, 'loading-policy.js'), 'utf8'), sandbox, { filename: 'loading-policy.js' });
   vm.runInContext(source, sandbox, { filename: 'page-fetch-bridge.js' });
   vm.runInContext(fs.readFileSync(path.join(root, 'fetcher.js'), 'utf8'), sandbox, { filename: 'fetcher.js' });
@@ -167,6 +168,7 @@ async function run() {
   const sandbox = {
     URL: URL,
     AbortController: AbortController,
+    ArrayBuffer: ArrayBuffer,
     Uint8Array: Uint8Array,
     Object: Object,
     Math: Math,
@@ -221,7 +223,7 @@ async function run() {
   assert.strictEqual(posted.length, 1, 'successful page fetch must post one response');
   assert.strictEqual(posted[0].targetOrigin, sandbox.location.origin, 'page bridge response must stay on the current origin');
   assert.strictEqual(posted[0].message.ok, true, 'page bridge must return a successful payload');
-  assert.strictEqual(Buffer.from(posted[0].message.base64, 'base64').toString('utf8'), text, 'page bridge must preserve TXT bytes');
+  assert.strictEqual(Buffer.from(posted[0].message.bodyBuffer || posted[0].message.buffer).toString('utf8'), text, 'page bridge must preserve TXT bytes');
 
   posted.length = 0;
   await listener({
@@ -267,6 +269,17 @@ async function run() {
   assert.strictEqual(posted[0].message.error, 'response_too_large');
   assert.strictEqual(bodyRead, false, 'oversized declared body must not be buffered');
   assert.strictEqual(limitedSignal.aborted, true, 'rejected response must cancel the unread network body');
+
+  for (const status of [429, 503]) {
+    posted.length = 0;
+    sandbox.fetch = async url => ({ ok: false, status, url, headers: makeHeaders({ 'retry-after': 120 }) });
+    await listener({ source: contextWindow, origin: sandbox.location.origin, data: {
+      type: 'ATP_PAGE_TEXT_FETCH_REQUEST_V1', id: 'request_forum_busy',
+      url: sandbox.location.origin + '/busy.txt', timeoutMs: 1000
+    } });
+    assert.strictEqual(posted[0].message.status, status);
+    assert.strictEqual(posted[0].message.retryAfter, '120', 'the main-world response must forward the explicit wait');
+  }
 
   await runFetcherBridgeIntegration(text);
   await runFetcherBridgeIntegration(text, { redirectsCrossOrigin: true });

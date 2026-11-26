@@ -6,7 +6,7 @@ const vm = require('vm');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'content.js'), 'utf8');
 const dispatchSource = source.slice(source.indexOf('  async function processContainers('),
-  source.indexOf('  function cacheFetchedArticleData('));
+  source.indexOf('  function detectAndProcess('));
 assert(dispatchSource.includes('var gateWaiters = [];'), 'article dispatch test must load the real worker pool');
 
 function createDispatch() {
@@ -15,6 +15,7 @@ function createDispatch() {
   const sandbox = {
     Promise, Date,
     scanGeneration: 0,
+    forumWaitJobSequence: 0,
     articleVisibleBoostRequested: false,
     articleDispatchWake: null,
     window: {},
@@ -22,7 +23,10 @@ function createDispatch() {
     Logger: { info() {}, warn() {} },
     ATPConfig: { isEnabled: () => true },
     ATPScanner: { shouldExcludeUrl: () => false, isArticlePageUrl: () => true },
-    ATPCache: { getArticleCacheState: async () => ({ cached: null, negative: false }) },
+    ATPCache: {
+      getArticleCacheState: async () => ({ cached: null, negative: false }),
+      isArticleCacheReadCurrent: () => true
+    },
     setTimeout(fn, delay) { timers.set(++timerId, { fn, delay }); return timerId; },
     clearTimeout(id) { timers.delete(id); },
     pauseScanningForHiddenPage: () => false,
@@ -35,6 +39,8 @@ function createDispatch() {
     getForumPacer: () => ({ PRIORITY_ARTICLE: 1, canStartNow: () => false }),
     getArticleJobViewportDistance: job => job.entries[0].visible ? 0 : 3000,
     isArticleJobVisible: job => job.entries[0].visible,
+    isArticleJobCurrent: () => sandbox.scanGeneration === 0,
+    isArticleScanCurrent: () => sandbox.scanGeneration === 0,
     fetchArticleJob: job => new Promise(resolve => requests.push({ job, resolve })),
     enqueueArticleCommit: () => Promise.resolve()
   };
@@ -120,6 +126,51 @@ async function run() {
   assert.strictEqual(priority.requests[2].job.url, rows[2].link.href,
     'the remaining visible row must take the handed-back worker');
   await cancel(priority, priorityScan);
+
+  // Both workers have issued slow requests. Reading an article from local
+  // storage must not need one of those workers, including after a scroll.
+  const cached = createDispatch();
+  const active = [entry('network-1'), entry('network-2')];
+  active.forEach(row => { row.visible = true; });
+  const cachedRow = entry('cached'), miss = entry('miss');
+  const reads = [], commits = [];
+  cached.sandbox.ATPCache.getCachedArticleData = async url => {
+    reads.push(url);
+    return url === cachedRow.link.href ? { images: [{ src: 'test.jpg' }] } : null;
+  };
+  cached.sandbox.enqueueArticleCommit = job => { commits.push(job.url); return Promise.resolve(); };
+  const cachedScan = cached.start(active.concat(cachedRow, miss));
+  await settle();
+  assert.strictEqual(cached.requests.length, 2);
+  cached.requests.forEach(request => request.job.onPaceGranted());
+  cachedRow.visible = miss.visible = true;
+  cached.sandbox.articleDispatchWake();
+  cached.sandbox.articleDispatchWake();
+  await settle();
+  assert.deepStrictEqual(reads, [cachedRow.link.href, miss.link.href], 'each newly visible row may be checked once per scan');
+  assert.deepStrictEqual(commits, [cachedRow.link.href], 'the visible cache hit must render before either network request returns');
+  assert.strictEqual(cached.requests.length, 2, 'a visible cache miss must wait for an actual worker');
+  await cancel(cached, cachedScan);
+
+  const racing = createDispatch();
+  const racingRows = [entry('busy-a'), entry('busy-b'), entry('cache-race')];
+  racingRows.forEach(row => { row.visible = true; });
+  let resolveProbe;
+  racing.sandbox.ATPCache.getCachedArticleData = () => new Promise(resolve => { resolveProbe = resolve; });
+  const racedCommits = [];
+  racing.sandbox.enqueueArticleCommit = job => { racedCommits.push(job.url); return Promise.resolve(); };
+  const racingScan = racing.start(racingRows);
+  await settle();
+  const outcome = { data: { images: [] }, retryableEmpty: null };
+  racing.requests[0].resolve(outcome);
+  await settle();
+  assert.strictEqual(racing.requests[2].job.url, racingRows[2].link.href);
+  resolveProbe({ images: [{ src: 'late.jpg' }] });
+  racing.requests[2].resolve(outcome);
+  await settle();
+  assert.strictEqual(racedCommits.filter(url => url === racingRows[2].link.href).length, 1,
+    'a cache callback must not commit again once a normal worker has claimed the row');
+  await cancel(racing, racingScan);
   console.log('Article queue gate lifecycle tests ok');
 }
 run().catch(error => { console.error(error); process.exitCode = 1; });

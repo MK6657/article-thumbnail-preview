@@ -84,7 +84,7 @@ function createRun(options = {}) {
   };
   sandbox.window = sandbox;
   vm.createContext(sandbox);
-  vm.runInContext(read('shared-utils.js') + '\nthis.SharedUtils = SharedUtils;', sandbox, { filename: 'shared-utils.js' });
+  vm.runInContext(read('shared-utils.js') + '\n' + read('html-extractors.js') + '\nthis.SharedUtils = SharedUtils;', sandbox, { filename: 'shared-utils.js' });
   for (const filename of ['loading-policy.js', 'fetcher.js', 'renderer.js']) {
     vm.runInContext(read(filename), sandbox, { filename });
   }
@@ -188,6 +188,7 @@ function createRun(options = {}) {
   }
   return {
     sandbox, waiters, requests, grants, events, failWrites, articleWrites, textCache, timers,
+    now: () => now, advance: ms => { now += ms; },
     thread, attachment, resources, flush, microtasks, poll, grantNext, respond, drain,
     queue: state => { assert.strictEqual(sandbox.ATPRenderer.queueAutomaticTextResourceLoad(state), true); },
     state: () => sandbox.ATPRenderer.getAutomaticTextResourceQueueState(),
@@ -404,15 +405,153 @@ async function checkManualRetryRefreshesTransientLinks() {
   run.respond(refresh, '<html>' + refreshed.map((url, index) =>
     '<a href="' + url + '">' + index + '.txt</a>').join('') + '</html>');
   await run.flush();
-  const worker = run.requests[1];
-  assert.strictEqual(worker.kind, 'background');
-  assert.deepStrictEqual(Array.from(worker.message.attachments, item => item.url), refreshed,
-    'the previous signed URLs must not occupy slots in the refreshed request');
-  worker.callback({ resources: run.resources(501), attemptedCount: 3, unresolvedCount: 1, retryableCount: 1, accessDeniedCount: 1 });
-  await run.flush();
+  const deadline = run.requests[1].message.deadline;
+  for (const [index, url] of refreshed.entries()) {
+    const worker = run.requests[index + 1];
+    assert.strictEqual(run.requests.length, index + 2, 'only one refreshed attachment may reach the worker at a time');
+    assert.strictEqual(worker.kind, 'background');
+    assert.deepStrictEqual(Array.from(worker.message.attachments, item => item.url), [url],
+      'each current signed URL must be handed off once, in order');
+    assert.strictEqual(worker.message.deadline, deadline);
+    const denied = index === refreshed.length - 1;
+    worker.callback({
+      resources: denied ? run.sandbox.SharedUtils.emptyResources() : run.resources(501),
+      attemptedCount: 1, unresolvedCount: Number(denied), retryableCount: Number(denied), accessDeniedCount: Number(denied)
+    });
+    await run.flush();
+    assert.strictEqual(run.count(state), 1, 'completed resources must appear while the remaining handoffs settle');
+  }
+  assert.strictEqual(run.requests.length, refreshed.length + 1);
   assert.strictEqual(run.count(state), 1);
   assert.strictEqual(state.textResourcesRetryable, true);
   assert(state.textResourceMessage.includes('站点拒绝读取 1 个 TXT 附件'));
+}
+
+async function checkManualRetryStopsUnsentWorkAfterReload() {
+  const run = createRun();
+  const attachments = [run.attachment('first'), run.attachment('second')];
+  const state = run.thread('manual-reload', { visible: true, attachments });
+  state.textResourcesRetryable = true;
+  assert.strictEqual(run.sandbox.ATPRenderer.scheduleTextResourceLoad(state, true), true);
+  await run.flush();
+  assert.strictEqual(run.requests.length, 1);
+  assert.strictEqual(run.requests[0].url, attachments[0].url);
+
+  run.sandbox.ATPState.generation++;
+  run.sandbox.ATPState.threads = {};
+  run.respond(run.requests[0]);
+  await run.flush();
+  assert.strictEqual(run.requests.length, 1, 'the old manual retry must leave the second attachment unsent');
+  assert(run.textCache.has(attachments[0].url), 'the sent request may still fill its own TXT cache');
+  assert.strictEqual(run.count(state), 0, 'the old run must not update the detached thread');
+  assert.strictEqual(run.articleWrites.length, 0);
+  assertNoFailure(run);
+}
+
+async function checkSameSiteCachedAttachmentProgress() {
+  const run = createRun();
+  const slow = run.attachment('slow-first');
+  const cached = run.attachment('cached-second');
+  run.sandbox.ATPCache.setCachedTextResources(cached.url, run.resources(42));
+  const thread = run.thread('cache-ahead', { visible: true, attachments: [slow, cached] });
+  run.queue(thread);
+  await run.flush();
+  await run.grantNext();
+  assert.deepStrictEqual(run.requests.map(request => request.url), [slow.url], 'only the cache miss may send a forum request');
+  assert.strictEqual(run.count(thread), 1, 'the cached second attachment must display while the first request is pending');
+  assert.strictEqual(thread.textResourcesLoading, true);
+  run.advance(8000);
+  await run.flush();
+  assert.strictEqual(run.count(thread), 1);
+  await run.drain();
+  assert.strictEqual(run.requests.length, 1, 'cached attachment must remain a cache-only result');
+  assert.strictEqual(run.count(thread), 2);
+  assert.strictEqual(thread.textResourcesDone, true);
+}
+
+async function checkMixedAttachmentProgress() {
+  for (const first of ['forum', 'download']) {
+    const run = createRun();
+    const forum = run.attachment('same-origin');
+    const relay = { name: 'relay.txt', url: 'https://dl.ldkms.la/independent.txt' };
+    const state = run.thread('mixed', { visible: true, attachments: [forum, relay] });
+    run.queue(state);
+    await run.flush();
+    assert.deepStrictEqual(run.requests.map(r => r.url), [relay.url], 'a paced forum must not strand an independent download');
+    assert.strictEqual(run.waiters.length, 1, 'a slow download must not delay the forum admission request');
+    const articleTurn = run.sandbox.ATPForumPacer.acquire({ priority: 0 });
+    await run.grantNext();
+    (await articleTurn).done('ok');
+    if (first === 'forum') await run.grantNext();
+    const firstUrl = first === 'forum' ? forum.url : relay.url;
+    run.respond(run.requests.find(request => request.url === firstUrl));
+    await run.flush();
+    assert.strictEqual(run.count(state), 1, 'the first usable resource must become visible while the other site is pending');
+    assert.strictEqual(state.textResolvedAttachmentIds.length, 1);
+    assert.strictEqual(state.textResourcesLoading, true);
+    assert.strictEqual(run.state().active, 1, 'the pending request must keep its thread slot');
+    if (first === 'download') await run.grantNext();
+    await run.drain();
+    assert.strictEqual(run.requests.length, 2);
+    assert.strictEqual(run.count(state), 2);
+    assert.strictEqual(state.textResolvedAttachmentIds.length, 2);
+    assert.strictEqual(state.textResourcesDone, true);
+    assert.strictEqual(run.events.find(event => event.name === 'txt_result').fields.addedResources, 2);
+    assertNoFailure(run);
+  }
+
+  const changed = createRun();
+  const mixed = changed.thread('replaced', { visible: true, attachments: [changed.attachment('old-forum'),
+    { name: 'old-download.txt', url: 'https://dl.ldkms.la/old-download.txt' }] });
+  changed.queue(mixed);
+  await changed.flush();
+  await changed.grantNext();
+  changed.sandbox.ATPState.generation++;
+  await changed.drain();
+  assert.strictEqual(changed.count(mixed), 0, 'late partial and final results must leave a replaced page alone');
+  assert.strictEqual(changed.articleWrites.length, 0);
+}
+
+async function checkFreshRunDeadline() {
+  const justInTime = createRun();
+  const end = justInTime.now() + 100;
+  const remote = justInTime.sandbox.ATPFetcher.fetchTextAttachmentsFresh('https://www.sehuatang.net/thread-1-1-1.html', { deadline: end });
+  await justInTime.flush();
+  justInTime.advance(90);
+  await justInTime.grantNext();
+  assert.strictEqual(justInTime.requests[0].message.deadline, end, 'a worker re-read must retain the run deadline after pacing');
+  justInTime.advance(10);
+  await justInTime.flush();
+  assert.strictEqual(await remote, null, 'an unanswered worker re-read must release its ticket at the original deadline');
+  justInTime.requests[0].callback({ ok: true, textAttachments: [justInTime.attachment('late')] });
+
+  const direct = createRun();
+  let signal;
+  direct.sandbox.fetch = (url, options) => new Promise((resolve, reject) => {
+    signal = options.signal;
+    signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+  });
+  const deadline = direct.now() + 100;
+  const local = direct.sandbox.ATPFetcher.fetchTextAttachmentsFresh(origin + '/thread-1-1-1.html', { deadline });
+  await direct.flush();
+  direct.advance(90);
+  await direct.grantNext();
+  assert(signal && !signal.aborted);
+  direct.advance(10);
+  await direct.flush();
+  assert(signal.aborted && await local === null, 'a same-origin re-read must use only the budget left after pacing');
+
+  const tooLate = createRun();
+  const tickets = [];
+  tooLate.sandbox.ATPForumPacer.acquire = async () => {
+    tooLate.advance(101);
+    return { done: outcome => tickets.push(outcome) };
+  };
+  for (const host of [origin, 'https://www.sehuatang.net']) {
+    assert.strictEqual(await tooLate.sandbox.ATPFetcher.fetchTextAttachmentsFresh(host + '/thread-2-1-1.html', { deadline: tooLate.now() + 100 }), null);
+  }
+  assert.deepStrictEqual(tickets, ['unused', 'unused'], 'grants arriving after expiry must be returned without a network attempt');
+  assert.strictEqual(tooLate.requests.length, 0);
 }
 
 async function main() {
@@ -424,6 +563,10 @@ async function main() {
   await checkImportAndGeneration();
   await checkLateCallbackKeepsRequeuedWork();
   await checkManualRetryRefreshesTransientLinks();
+  await checkManualRetryStopsUnsentWorkAfterReload();
+  await checkSameSiteCachedAttachmentProgress();
+  await checkMixedAttachmentProgress();
+  await checkFreshRunDeadline();
   console.log('TXT visible queue integration tests ok');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

@@ -17,7 +17,7 @@
   var REFILL_MS = 2000;
   var MIN_BURST = 4;
   var MAX_REFILL_MS = 4000;
-  var BASE_PAUSE_MS = 20000;
+  var BASE_PAUSE_MS = SharedUtils.FORUM_BASE_PAUSE_MS;
   var MAX_PAUSE_MS = 300000;
   var MAX_LEVEL = 5;
   var RECOVERY_SUCCESSES = 3;
@@ -27,11 +27,17 @@
   var WAIT_POLL_MS = 500;
   // A caller that never settles its ticket must not hold probe mode forever.
   var TICKET_MAX_AGE_MS = 90000;
+  // A one-click retry may leave this much of its TXT budget waiting for a probe.
+  var MANUAL_PROBE_WAIT_MS = SharedUtils.TEXT_ATTACHMENT_TIMEOUT || 10000;
   // The forum limits the browser, not the tab: the allowance and any pause are
   // shared by every tab of this forum origin, and forgotten after five idle
   // minutes.
   var STORE_KEY = 'atp.forumPacer.v2';
   var STORE_MAX_AGE_MS = 300000;
+  // Keep an explicit Retry-After separate from the learned state and normal
+  // allowance writes. Successful navigation and local resets cannot erase it.
+  var RETRY_AFTER_KEY = 'atp.forumPacer.retryAfter.v1';
+  var retryAfterUntil = 0;
   var PROBE_KEY = 'atp.forumPacer.probe.v1';
   var PROBE_LOCK = 'atp.forumPacer.probe.v1';
   var probeOwner = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
@@ -54,7 +60,12 @@
   // each forum host's current pace for the popup to show on any page.
   var RESET_MARKER_KEY = 'atp_forum_pacer_reset_at';
   var STATUS_KEY = 'atp_forum_pacer_status_v1';
-  var STATUS_MAX_HOSTS = 10;
+  var SERVER_WAIT_KEY = 'atp_forum_server_wait_v1';
+  var backgroundRetryAfterUntil = 0;
+  var initialExtensionState = null;
+  var initialExtensionStateResolve = null;
+  var needsInitialHydration = false;
+  var receivedResetChange = false;
   // A tab still at work republishes at least this often, so the popup can
   // tell when a host nobody uses any more has gone back to its normal pace.
   var STATUS_REFRESH_MS = 60000;
@@ -85,6 +96,7 @@
       refillMs: limits.refillMs,
       level: 0,
       pauseUntil: 0,
+      separatesRetryAfter: true,
       lastFloodAt: 0,
       // Last time a tab loaded a normal forum page; a pause from before that
       // gives way to single probes.
@@ -189,7 +201,10 @@
   // Adopts the state other tabs (or earlier pages) left behind.
   function load(now) {
     var store = getStore();
-    if (!store || storeReadOnly) return;
+    if (!store) return;
+    var savedRetryAfter = safeCall(function() { return Number(store.getItem(RETRY_AFTER_KEY)); }, 0);
+    if (Number.isFinite(savedRetryAfter)) retryAfterUntil = Math.max(retryAfterUntil, savedRetryAfter);
+    if (storeReadOnly) return;
     loadLimits(now, store);
     state.burst = Math.min(state.burst, limits.burst);
     state.refillMs = Math.max(state.refillMs, limits.refillMs);
@@ -199,7 +214,7 @@
     var at = Number(saved.at);
     // Idle time counts from the end of a pause, so the longest pause does not
     // expire the very state that says to probe afterwards.
-    var idleSince = Math.max(at, Math.min(Number(saved.pauseUntil) || 0, now));
+    var idleSince = Math.max(at, Math.min(Math.max(Number(saved.pauseUntil) || 0, retryAfterUntil), now));
     if (!isFinite(at) || now - idleSince > STORE_MAX_AGE_MS) {
       var cleared = Math.min(state.clearedAt, now);
       state = makeDefaultState(now);
@@ -222,17 +237,30 @@
     state.calm = Math.round(clampNumber(saved.calm, 0, RECOVERY_SUCCESSES, 0));
     state.relax = Math.round(clampNumber(saved.relax, 0, RELAX_AFTER_SUCCESSES, 0));
     state.resetId = typeof saved.resetId === 'string' ? saved.resetId.slice(0, 120) : '';
+    // Old records combined both waits. A longer-than-learned pause still
+    // applies after an upgrade or while another tab is using the old format.
+    if (!saved.separatesRetryAfter && !skewed && state.lastFloodAt > state.clearedAt &&
+        state.pauseUntil > state.lastFloodAt + learnedPauseDuration(state.level)) {
+      noteRetryAfter(now, state.pauseUntil);
+    }
     if (skewed) save(now);
   }
+
+  var savingLocalStorage = false;
 
   function save(now) {
     var store = getStore();
     if (!store) return;
     state.at = now;
-    storeReadOnly = !safeCall(function() {
-      store.setItem(STORE_KEY, JSON.stringify(state));
-      return true;
-    }, false);
+    savingLocalStorage = true;
+    try {
+      storeReadOnly = !safeCall(function() {
+        store.setItem(STORE_KEY, JSON.stringify(state));
+        return true;
+      }, false);
+    } finally {
+      savingLocalStorage = false;
+    }
   }
 
   function refill(now) {
@@ -244,11 +272,53 @@
     }
   }
 
-  // The pause in force: set by a challenge seen after the last normal page
-  // load, and never longer than the maximum even if the clock moved.
-  function getPauseUntil(now) {
+  function getLearnedPauseUntil(now) {
     if (state.lastFloodAt <= state.clearedAt) return 0;
     return Math.min(state.pauseUntil, now + MAX_PAUSE_MS);
+  }
+
+  function learnedPauseDuration(level) {
+    return Math.min(MAX_PAUSE_MS, BASE_PAUSE_MS * Math.pow(2, Math.max(0, level - 1)));
+  }
+
+  function getPauseUntil(now) {
+    return Math.max(getLearnedPauseUntil(now), retryAfterUntil > now ? retryAfterUntil : 0);
+  }
+
+  function noteRetryAfter(now, value) {
+    var until = Number(value);
+    if (!Number.isFinite(until) || until <= Math.max(now, retryAfterUntil)) return false;
+    saveRetryAfter(until);
+    return true;
+  }
+
+  function saveRetryAfter(until) {
+    retryAfterUntil = until;
+    var store = getStore();
+    if (store) safeCall(function() {
+      var saved = Number(store.getItem(RETRY_AFTER_KEY));
+      if (Number.isFinite(saved)) retryAfterUntil = Math.max(saved, until);
+      store.setItem(RETRY_AFTER_KEY, String(retryAfterUntil));
+    }, null);
+  }
+
+  // An explicit server deadline may have been observed in another origin's
+  // background request. Carry it into this origin's normal admission and probe
+  // state without teaching the local allowance from an imported report.
+  function applyBackgroundServerWait(waits) {
+    var origin = safeCall(function() { return location.origin; }, '');
+    var wait = waits && waits[origin];
+    var now = Date.now();
+    if (!wait || !Number.isFinite(wait.at) || !Number.isFinite(wait.until) || wait.until + STORE_MAX_AGE_MS <= now) return;
+    backgroundRetryAfterUntil = Math.max(backgroundRetryAfterUntil, wait.until);
+    load(now);
+    if (wait.until <= retryAfterUntil) return;
+    saveRetryAfter(wait.until);
+    state.lastFloodAt = Math.max(state.lastFloodAt, Math.min(wait.at, now));
+    state.level = Math.max(1, state.level);
+    state.calm = 0;
+    save(now);
+    if (waiters.length) schedulePump(0);
   }
 
   function countActive(now) {
@@ -277,10 +347,11 @@
 
   // 0: a request of this cost may start now; >0: ms until it may; -1: only
   // after the request in flight settles (one probe at a time after a flood).
-  function getStartDelay(now, cost, reserve) {
-    var pauseUntil = getPauseUntil(now);
+  function getStartDelay(now, cost, reserve, manual) {
+    var pauseUntil = manual ? retryAfterUntil : getPauseUntil(now);
     if (now < pauseUntil) return pauseUntil - now;
     if (state.level > 0 && (countActive(now) > 0 || readProbeLease(now))) return -1;
+    if (manual) return 0;
     // The allowance may have shrunk since this request queued.
     var need = Math.min(cost, state.burst) + (reserve || 0);
     refill(now);
@@ -300,12 +371,11 @@
         state.level = Math.min(state.level + 1, MAX_LEVEL);
         state.lastFloodAt = now;
         if (state.clearedAt >= now) state.clearedAt = now - 1;
-        state.pauseUntil = Math.max(state.pauseUntil, now + Math.min(MAX_PAUSE_MS, BASE_PAUSE_MS * Math.pow(2, state.level - 1)));
+        state.pauseUntil = Math.max(state.pauseUntil, now + learnedPauseDuration(state.level));
         state.burst = Math.max(MIN_BURST, Math.floor(state.burst / 2));
         state.refillMs = Math.min(MAX_REFILL_MS, Math.round(state.refillMs * 1.5));
       }
-      retryAfter = Number(retryAfter) || 0;
-      if (retryAfter > state.pauseUntil) state.pauseUntil = Math.min(retryAfter, now + MAX_PAUSE_MS);
+      noteRetryAfter(now, retryAfter);
       state.calm = 0;
       state.relax = 0;
       state.tokens = 0;
@@ -316,7 +386,7 @@
       }
       return;
     }
-    if (outcome !== 'ok' || startedAt <= state.lastFloodAt) return;
+    if (outcome !== 'ok' || startedAt <= state.lastFloodAt || startedAt < retryAfterUntil) return;
     if (state.level > 0) {
       state.calm++;
       if (state.calm < RECOVERY_SUCCESSES) {
@@ -338,6 +408,15 @@
       state.refillMs = Math.max(limits.refillMs, Math.round(state.refillMs / 1.5));
     }
     save(now);
+  }
+
+  // A TXT relay can reach the forum without requesting a local ticket first.
+  function noteExternalCooldown(retryAfter, observedAt) {
+    var now = Date.now();
+    var at = Number(observedAt);
+    noteOutcome('flood', at > 0 && at <= now ? at : now, retryAfter);
+    publishStatus();
+    schedulePump(0);
   }
 
   function grant(cost, waitStartedAt, probeId) {
@@ -362,26 +441,32 @@
       // outcome: 'ok' when the forum served real content, 'flood' for a
       // challenge / rate-limit answer, 'unused' when no request was sent after
       // all (returns the allowance); anything else says nothing about the forum.
-      done: function(outcome, retryAfter) {
+      done: function(outcome, retryAfter, observedAt) {
         if (settled) return;
         settled = true;
         if (probeTimer) clearTimeout(probeTimer);
         var index = active.indexOf(entry);
         if (index !== -1) active.splice(index, 1);
         if (probeId) clearProbeLease(probeId);
-        // An expired probe no longer owns recovery. Its late answer must not
-        // count toward another tab's successful probes or refund old tokens.
-        if (expired || (probeId && Date.now() - entry.startedAt >= TICKET_MAX_AGE_MS)) return;
-        load(Date.now());
-        if (entry.resetId !== state.resetId) return;
-        if (outcome === 'unused') {
-          var at = Date.now();
-          load(at);
+        var at = Date.now();
+        load(at);
+        var stale = expired || (probeId && at - entry.startedAt >= TICKET_MAX_AGE_MS) || entry.resetId !== state.resetId;
+        if (stale) {
+          // A late refusal can carry a new server deadline across a reset or
+          // an expired lease. Preserve the current allowance and learn no rate from it.
+          if (outcome !== 'flood' || !noteRetryAfter(at, retryAfter)) return;
+          state.level = Math.max(1, state.level);
+          state.calm = 0;
+          save(at);
+        } else if (outcome === 'unused') {
           refill(at);
           state.tokens = Math.min(state.burst, state.tokens + cost);
           save(at);
         } else {
-          noteOutcome(outcome, entry.startedAt, retryAfter);
+          // Two worker batches can report the same 429. Only a new request
+          // that actually reached the forum can escalate the backoff again.
+          var startedAt = observedAt > 0 ? Math.min(entry.startedAt, observedAt) : entry.startedAt;
+          noteOutcome(outcome, startedAt, retryAfter);
         }
         publishStatus();
         schedulePump(0);
@@ -396,6 +481,10 @@
   }
 
   function pickNextWaiter() {
+    if (waiters[0].manual) {
+      waiters[0].rankedPriority = PRIORITY_VISIBLE;
+      return 0;
+    }
     var best = 0;
     var bestPriority = getWaiterPriority(waiters[0]);
     for (var i = 1; i < waiters.length; i++) {
@@ -412,7 +501,8 @@
   function releaseDroppedWaiters(now) {
     for (var i = waiters.length - 1; i >= 0; i--) {
       var waiter = waiters[i];
-      var dropped = (waiter.deadline && now >= waiter.deadline) ||
+      var dropped = (waiter.manual && retryAfterUntil > now) ||
+        (waiter.deadline && now >= waiter.deadline) ||
         (waiter.isCancelled && safeCall(waiter.isCancelled, false));
       if (!dropped) continue;
       waiters.splice(i, 1);
@@ -441,7 +531,7 @@
     if (!waiters.length) return false;
     var index = pickNextWaiter();
     var waiter = waiters[index];
-    if (getStartDelay(now, waiter.cost, getReserve(waiter.rankedPriority, waiter.cost)) !== 0) return false;
+    if (getStartDelay(now, waiter.cost, getReserve(waiter.rankedPriority, waiter.cost), waiter.manual) !== 0) return false;
     var probeId = '';
     if (state.level > 0) {
       probeId = probeOwner + '-' + (++probeSeq);
@@ -493,13 +583,13 @@
     load(now);
     releaseDroppedWaiters(now);
     while (waiters.length) {
-      var delay = getStartDelay(now, 1);
+      var delay = getStartDelay(now, 1, 0, waiters[0].manual);
       var index = -1;
       if (delay === 0) {
-        // Rank only when a request can actually start: which thread is on
-        // screen right now decides who goes first, not who asked first.
+        // Pick the current viewport priority when a request is ready to go.
         index = pickNextWaiter();
-        delay = getStartDelay(now, waiters[index].cost, getReserve(waiters[index].rankedPriority, waiters[index].cost));
+        var next = waiters[index];
+        delay = getStartDelay(now, next.cost, getReserve(next.rankedPriority, next.cost), next.manual);
       }
       if (delay !== 0) {
         if (isHolding(now)) notifyHeldWaiters();
@@ -522,24 +612,47 @@
   // caller cancelled or its deadline passed first. Every ticket must be
   // settled with ticket.done(outcome) after the request.
   function acquire(options) {
+    if (needsInitialHydration && !initialExtensionState) {
+      startInitialExtensionStateRead();
+    }
+    if (initialExtensionState) {
+      return initialExtensionState.then(function() { return acquire(options); });
+    }
     options = options || {};
-    load(Date.now());
+    var now = Date.now();
+    load(now);
     var cost = Math.max(1, Math.min(state.burst, Math.floor(Number(options.cost) || 1)));
-    // A user's explicit click goes out at once; its answer still counts.
-    if (options.manual) return Promise.resolve(grant(cost, 0));
+    var deadline = Number(options.deadline) || 0;
+    if (options.manual) {
+      if (retryAfterUntil > now || (deadline && now >= deadline) ||
+          (typeof options.isCancelled === 'function' && safeCall(options.isCancelled, false))) return Promise.resolve(null);
+      if (state.level === 0) return Promise.resolve(grant(cost, 0));
+      // An explicit click may try during a learned pause. In recovery it uses
+      // the same shared probe as automatic work, with a bounded wait.
+      deadline = Math.min(deadline || Infinity, now + MANUAL_PROBE_WAIT_MS);
+    }
     return new Promise(function(resolve) {
-      waiters.push({
+      var waiter = {
         seq: ++waiterSeq,
         cost: cost,
+        manual: !!options.manual,
         priority: typeof options.priority === 'number' ? options.priority : PRIORITY_ARTICLE,
         getPriority: typeof options.getPriority === 'function' ? options.getPriority : null,
         isCancelled: typeof options.isCancelled === 'function' ? options.isCancelled : null,
         onHeld: typeof options.onHeld === 'function' ? options.onHeld : null,
         heldNotified: false,
-        deadline: Number(options.deadline) || 0,
+        deadline: deadline,
         queuedAt: Date.now(),
         resolve: resolve
-      });
+      };
+      // Keep explicit retries ahead of automatic work while preserving FIFO
+      // between clicks. The pump can check this group without measuring rows.
+      var index = waiters.length;
+      if (waiter.manual) {
+        index = waiters.findIndex(function(queued) { return !queued.manual; });
+        if (index === -1) index = waiters.length;
+      }
+      waiters.splice(index, 0, waiter);
       pump();
     });
   }
@@ -556,6 +669,7 @@
       learnedBurst: limits.burst,
       learnedRefillMs: limits.refillMs,
       pauseUntil: pauseUntil,
+      retryAfterUntil: retryAfterUntil > now ? retryAfterUntil : 0,
       pausedMs: Math.max(0, pauseUntil - now),
       level: state.level,
       calm: state.calm,
@@ -569,7 +683,7 @@
   // Reports this host's pace to the popup when it changes (not on every
   // request: tokens are left out of the signature).
   function publishStatus() {
-    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return;
+    if (needsInitialHydration || initialExtensionState || typeof chrome === 'undefined' || !chrome.runtime || typeof chrome.runtime.sendMessage !== 'function') return;
     var now = Date.now();
     load(now);
     var host = safeCall(function() { return location.hostname; }, '');
@@ -582,37 +696,45 @@
       learnedRefillMs: limits.refillMs,
       level: state.level,
       pauseUntil: pauseUntil,
+      // The worker already published an imported deadline to the popup.
+      // Reporting it back would make the same signal look like a new refusal.
+      retryAfterUntil: retryAfterUntil > Math.max(now, backgroundRetryAfterUntil) ? retryAfterUntil : 0,
       // When the learned pace lapses, and when this state is forgotten unless
       // a tab of this host does more work first: the popup applies both.
       limitsUntil: limits.at ? limits.at + LIMIT_MAX_AGE_MS : 0,
       idleUntil: Math.max(now, pauseUntil) + STORE_MAX_AGE_MS,
       at: now
     };
-    var signature = host + '|' + [entry.burst, entry.refillMs, entry.learnedBurst, entry.learnedRefillMs, entry.level, entry.pauseUntil, entry.limitsUntil].join('|');
+    var signature = host + '|' + [entry.burst, entry.refillMs, entry.learnedBurst, entry.learnedRefillMs, entry.level,
+      entry.pauseUntil, entry.retryAfterUntil, entry.limitsUntil, appliedMarker].join('|');
     if (signature === publishedSignature && now - publishedAt < STATUS_REFRESH_MS) return;
     publishedSignature = signature;
     publishedAt = now;
-    safeCall(function() {
-      chrome.storage.local.get(STATUS_KEY, function(result) {
-        var all = result && result[STATUS_KEY] && typeof result[STATUS_KEY] === 'object' ? result[STATUS_KEY] : {};
-        all[host] = entry;
-        var hosts = Object.keys(all).sort(function(a, b) { return (all[b].at || 0) - (all[a].at || 0); });
-        for (var i = STATUS_MAX_HOSTS; i < hosts.length; i++) delete all[hosts[i]];
-        var items = {};
-        items[STATUS_KEY] = all;
-        safeCall(function() { chrome.storage.local.set(items); }, null);
+    function allowRetry() {
+      if (publishedSignature === signature && publishedAt === now) publishedSignature = '';
+    }
+    try {
+      chrome.runtime.sendMessage({ type: SharedUtils.MESSAGE_TYPES.REPORT_FORUM_PACER_STATUS, entry: entry,
+        resetMarker: appliedMarker }, function(response) {
+        if (chrome.runtime.lastError || !response || !response.ok) allowRetry();
       });
-    }, null);
+    } catch (e) {
+      allowRetry();
+    }
   }
 
   function describePace(now) {
     return [state.burst, state.refillMs, state.level, getPauseUntil(now), limits.burst, limits.refillMs].join('|');
   }
 
-  // Forgets the pace learned from challenges and any pause: the normal pace
-  // and a full burst again, for every tab of this forum origin (they share
-  // the store).
+  // Restore the default allowance across this origin. An active server
+  // deadline still governs when those requests may start.
   function clearLearnedPace(now) {
+    load(now);
+    // A pending recovery after an explicit server pause survives a reset of
+    // the learned pace, including when that pause has just expired.
+    var keepRecovery = retryAfterUntil > now ||
+      (state.level > 0 && retryAfterUntil > 0 && retryAfterUntil >= state.lastFloodAt);
     var store = getStore();
     storeReadOnly = false;
     limits = { burst: BURST, refillMs: REFILL_MS, at: 0 };
@@ -627,16 +749,16 @@
     }
     var clearedAt = Math.min(state.clearedAt, now);
     var oldProbe = readProbeLease(now);
-    if (oldProbe) clearProbeLease(oldProbe.id);
+    if (oldProbe && !keepRecovery) clearProbeLease(oldProbe.id);
     state = makeDefaultState(now);
+    if (keepRecovery) state.level = 1;
     state.resetId = probeOwner + '-reset-' + (++probeSeq);
     state.clearedAt = clearedAt;
     save(now);
   }
 
-  // A reset the reader asked for in the popup (on any page), for every forum
-  // domain: the first page of this origin to see it clears the learned pace
-  // and any pause; other tabs of the origin pick that up from the store.
+  // Apply the popup reset once per origin. Other tabs read the updated
+  // allowance and server deadline from the shared store.
   function applyResetMarker(value) {
     value = Number(value) || 0;
     if (!(value > 0) || value === appliedMarker) return;
@@ -664,11 +786,8 @@
     }
   }
 
-  // The reader's explicit reset (popup button): forget the pace learned from
-  // earlier challenges and any pause, and start again from the normal pace
-  // with a full burst. Every tab of this forum origin shares the store, so
-  // they all follow. The forum's own verification page is not touched; if it
-  // pushes back again, the pacer slows down again by itself.
+  // Explicit reset for this forum origin, with the same server deadline
+  // handling as a popup reset.
   function reset() {
     var now = Date.now();
     clearLearnedPace(now);
@@ -686,6 +805,7 @@
   // Whether a request of this priority would be granted right now, before
   // anything else queued in this tab.
   function canStartNow(priority, cost) {
+    if (needsInitialHydration || initialExtensionState) return false;
     var now = Date.now();
     load(now);
     if (waiters.length) return false;
@@ -693,35 +813,100 @@
     return getStartDelay(now, cost, getReserve(typeof priority === 'number' ? priority : PRIORITY_ARTICLE, cost)) === 0;
   }
 
-  // This document is a normal forum page (the challenge page carries none of
-  // the Discuz frame), so the reader's own page load got through whatever
-  // check the forum ran: pauses from before it give way to single probes.
+  // A real thread or list loaded in the browser is a recovery signal. Discuz
+  // can render a failure using its usual header or return the notice as 200.
   function noteForumPageLoaded() {
     var doc = typeof document !== 'undefined' ? document : null;
     if (!doc || typeof doc.querySelector !== 'function') return;
-    if (!safeCall(function() { return doc.querySelector('#wp, #hd, #toptb, #ft, #postlist, #threadlist'); }, null)) return;
     var now = Date.now();
-    load(now);
+    if (now >= getLearnedPauseUntil(now)) return;
+    var navigation = safeCall(function() { return performance.getEntriesByType('navigation')[0]; }, null);
+    if (navigation && navigation.responseStatus >= 400) return;
+    var normal = safeCall(function() {
+      return !doc.querySelector('#messagetext, #main_message, .showmessage, .alert_error, .alert_info, #challenge-form, #challenge-running, #challenge-stage, .cf-turnstile, .g-recaptcha, .h-captcha, iframe[src*="challenges.cloudflare.com"]') &&
+        doc.querySelector('#threadlist tbody[id^="normalthread"], #threadlist tbody[id^="stickthread"], #threadlist a.xst[href], #postlist [id^="postmessage_"]');
+    }, false);
+    if (!normal) return;
     state.clearedAt = now;
     save(now);
+  }
+
+  function hydrateInitialServerWait(raw, resetMarker) {
+    needsInitialHydration = false;
+    if (raw) applyBackgroundServerWait(raw);
+    if (resetMarker !== undefined && !receivedResetChange) applyResetMarker(resetMarker);
+    var pendingResolve = initialExtensionStateResolve;
+    initialExtensionStateResolve = null;
+    initialExtensionState = null;
+    if (pendingResolve) pendingResolve();
+    publishStatus();
+    if (waiters.length) schedulePump(0);
+  }
+
+  function startInitialExtensionStateRead() {
+    needsInitialHydration = false;
+    if (initialExtensionState || typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return;
+    initialExtensionState = new Promise(function(resolve) {
+      initialExtensionStateResolve = resolve;
+      try {
+        chrome.storage.local.get([RESET_MARKER_KEY, SERVER_WAIT_KEY], function(result) {
+          if (!initialExtensionStateResolve) {
+            resolve();
+            return;
+          }
+          initialExtensionStateResolve = null;
+          if (result && !(chrome.runtime && chrome.runtime.lastError)) {
+            applyBackgroundServerWait(result[SERVER_WAIT_KEY]);
+            if (!receivedResetChange) applyResetMarker(result[RESET_MARKER_KEY]);
+          }
+          resolve();
+        });
+      } catch (e) {
+        initialExtensionStateResolve = null;
+        resolve();
+      }
+    }).then(function() {
+      initialExtensionState = null;
+      publishStatus();
+    });
+  }
+
+  function handleCrossTabStorage(event) {
+    if (savingLocalStorage) return;
+    if (event && event.key && event.key !== STORE_KEY && event.key !== PROBE_KEY &&
+        event.key !== RETRY_AFTER_KEY && event.key !== LIMIT_KEY && event.key !== RESET_APPLIED_KEY) {
+      return;
+    }
+    var now = Date.now();
+    load(now);
+    if (waiters.length && getStartDelay(now, 1, 0, waiters[0].manual) === 0) {
+      schedulePump(0);
+    }
   }
 
   load(Date.now());
   noteForumPageLoaded();
 
-  // The popup's reset marker: read once at start, then followed live.
+  if (typeof window !== 'undefined' && window && typeof window.addEventListener === 'function') {
+    safeCall(function() { window.addEventListener('storage', handleCrossTabStorage); }, null);
+  }
+
+  // Read the shared state before sending the first request, then follow updates.
   if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
-    safeCall(function() {
-      chrome.storage.local.get(RESET_MARKER_KEY, function(result) {
-        applyResetMarker(result && result[RESET_MARKER_KEY]);
-        publishStatus();
-      });
-    }, null);
     if (chrome.storage.onChanged && chrome.storage.onChanged.addListener) {
       chrome.storage.onChanged.addListener(function(changes, areaName) {
-        if (areaName !== 'local' || !changes || !changes[RESET_MARKER_KEY]) return;
-        applyResetMarker(changes[RESET_MARKER_KEY].newValue);
+        if (areaName !== 'local' || !changes) return;
+        if (changes[SERVER_WAIT_KEY]) applyBackgroundServerWait(changes[SERVER_WAIT_KEY].newValue);
+        if (changes[RESET_MARKER_KEY]) {
+          receivedResetChange = true;
+          applyResetMarker(changes[RESET_MARKER_KEY].newValue);
+        }
       });
+    }
+    if (typeof window !== 'undefined' && window && window.ATPConfig && window.ATPConfig._hydratesForumPacer === true) {
+      needsInitialHydration = true;
+    } else {
+      startInitialExtensionStateRead();
     }
   }
 
@@ -731,8 +916,10 @@
     STORE_KEY: STORE_KEY,
     RESET_MARKER_KEY: RESET_MARKER_KEY,
     STATUS_KEY: STATUS_KEY,
+    hydrateInitialServerWait: hydrateInitialServerWait,
     acquire: acquire,
     canStartNow: canStartNow,
+    noteExternalCooldown: noteExternalCooldown,
     reset: reset,
     getState: getState,
     getPauseUntil: function() {

@@ -9,7 +9,7 @@ const fixturePath = path.join(__dirname, 'fixtures', 'resource-extraction.json')
 const sandbox = { URL: URL, TextDecoder: TextDecoder, console: console };
 vm.createContext(sandbox);
 vm.runInContext(
-  fs.readFileSync(path.join(root, 'shared-utils.js'), 'utf8') + '\nthis.SharedUtils = SharedUtils;',
+  fs.readFileSync(path.join(root, 'shared-utils.js'), 'utf8') + '\n' + fs.readFileSync(path.join(root, 'html-extractors.js'), 'utf8') + '\nthis.SharedUtils = SharedUtils;',
   sandbox,
   { filename: 'shared-utils.js' }
 );

@@ -19,7 +19,7 @@ function loadContent(fetchResponse, backgroundResponse) {
   let requests = 0;
   let contextWindow;
   const sandbox = {
-    URL, TextDecoder, TextEncoder, AbortController, Uint8Array, console, setTimeout, clearTimeout,
+    URL, TextDecoder, TextEncoder, AbortController, ArrayBuffer, Uint8Array, console, setTimeout, clearTimeout,
     btoa: value => Buffer.from(value, 'binary').toString('base64'),
     atob: value => Buffer.from(value, 'base64').toString('binary'),
     location: { origin: 'https://www.sehuatang.org', href: 'https://www.sehuatang.org/forum-2-1.html' },
@@ -42,7 +42,7 @@ function loadContent(fetchResponse, backgroundResponse) {
   };
   sandbox.window = sandbox;
   vm.createContext(sandbox);
-  vm.runInContext(read('shared-utils.js') + '\nthis.SharedUtils = SharedUtils;', sandbox);
+  vm.runInContext(read('shared-utils.js') + '\n' + read('html-extractors.js') + '\nthis.SharedUtils = SharedUtils;', sandbox);
   vm.runInContext(read('page-fetch-bridge.js'), sandbox);
   vm.runInContext(read('fetcher.js'), sandbox);
   contextWindow = vm.runInContext('window', sandbox);
@@ -54,6 +54,8 @@ function loadBackground(shared, fetchResponse) {
   let requests = 0;
   const sandbox = {
     SharedUtils: shared, URL, AbortController, setTimeout, clearTimeout,
+    chrome: { storage: {} },
+    textForumCooldowns: new Map(),
     TEXT_ATTACHMENT_TIMEOUT: shared.TEXT_ATTACHMENT_TIMEOUT,
     TEXT_ATTACHMENT_MAX_BYTES: shared.TEXT_ATTACHMENT_MAX_BYTES,
     TEXT_ATTACHMENT_MAX_COUNT: shared.TEXT_ATTACHMENT_MAX_COUNT,
@@ -70,7 +72,7 @@ function loadBackground(shared, fetchResponse) {
   // Execute the production helper and request function with network/cache
   // boundaries stubbed; no copy of its branching logic lives in this test.
   vm.runInContext(source.slice(source.indexOf('var bgTextDiagnosticSequence ='), source.indexOf('const TEXT_ATTACHMENT_MAX_COUNT =')), sandbox);
-  vm.runInContext(source.slice(source.indexOf('async function fetchTextAttachmentResource('), source.indexOf('async function fetchTextAttachmentResources(')), sandbox);
+  vm.runInContext(source.slice(source.indexOf('function textForumOrigin('), source.indexOf('async function fetchTextAttachmentResources(')), sandbox);
   return { sandbox, events, requests: () => requests };
 }
 

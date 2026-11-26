@@ -8,6 +8,8 @@
   var AUTO_TEXT_RESOURCE_CONCURRENCY = 2;
   var AUTO_TEXT_RESOURCE_DRAIN_SCHEDULED = false;
   var AUTO_TEXT_RESOURCE_RECHECK_TIMER = null;
+  var INLINE_GALLERY_ITEMS = 256;
+  var GALLERY_APPEND_BATCH_ITEMS = 64;
   // Attachment links read by the article fetch stay usable this long for the
   // automatic TXT run; Discuz attachment links are short-lived.
   var FRESH_TEXT_LINK_REUSE_MS = 3 * 60 * 1000;
@@ -50,6 +52,47 @@
       retryableCount: retryable,
       accessDeniedCount: hasWrappedResources ? Math.min(unresolved, Math.max(0, Number(result.accessDeniedCount) || 0)) : 0
     };
+  }
+
+  function getThreadAttachmentHints(thread) {
+    return SharedUtils.mergeTextAttachmentHints(SharedUtils.getTextAttachmentHints(thread.textAttachments),
+      SharedUtils.getTextAttachmentHints(thread.freshTextAttachments), thread.textAttachmentHints);
+  }
+
+  function rememberResolvedAttachments(thread, attachments) {
+    var hints = thread.textAttachmentHints = getThreadAttachmentHints(thread);
+    var ids = SharedUtils.getTextAttachmentHints(attachments).map(function(hint) {
+      return SharedUtils.textAttachmentProgressId(hint, hints);
+    });
+    thread.textResolvedAttachmentIds = SharedUtils.mergeResolvedTextIds(hints, thread.textResolvedAttachmentIds, ids);
+    return thread.textResolvedAttachmentIds.length;
+  }
+
+  function cacheThreadArticle(thread, complete, writeStartedAt, operation) {
+    var attachments = thread.textAttachments || [];
+    var hints = getThreadAttachmentHints(thread);
+    ATPCache.setCachedArticleData(thread.link, {
+      images: thread.cacheImages || thread.sourceCandidates || thread.candidates || [],
+      resources: thread.resources,
+      textAttachments: attachments.filter(function(item) { return item && SharedUtils.isPersistableTextAttachmentUrl(item.url, thread.link); }),
+      loadedUrls: thread.loadedUrls || [],
+      hasTextAttachments: !!(thread.hasTextAttachments || attachments.length || hints.length || thread.textAttachmentCount),
+      textAttachmentCount: Math.max(thread.textAttachmentCount || 0, attachments.length, hints.length),
+      textAttachmentHints: hints,
+      textResolvedAttachmentIds: thread.textResolvedAttachmentIds || [],
+      textResourcesComplete: thread.textResourcesDone && !thread.textResourcesRetryable,
+      textResourcesAttemptedCount: thread.textResourcesAttemptedCount,
+      textResourcesUnresolvedCount: thread.textResourcesUnresolvedCount,
+      textResourcesRetryableCount: thread.textResourcesRetryableCount,
+      partial: thread.partial,
+      readAt: thread.contentReadAt,
+      imageExtractionVersion: thread.imageExtractionVersion,
+      textResourcesImported: thread.textResourcesImported,
+      textAttachmentsLimited: thread.textAttachmentsLimited
+    }, complete && !thread.partial, writeStartedAt, operation);
+    if (complete && !thread.partial) {
+      thread.cacheImages = null;
+    }
   }
 
   function mergeTextAttachments(freshAttachments, stableAttachments, pageUrl) {
@@ -126,18 +169,41 @@
     return false;
   }
 
-  // Automatic TXT work costs forum requests. Threads on screen always go
-  // first; while the page's article fetches are still running, offscreen
-  // threads also wait so the posts themselves come first.
+  function shouldDeferAutomaticTextLoad(candidate) {
+    if (window.ATPArticleWork && typeof window.ATPArticleWork.isVisibleBusy === 'function' && window.ATPArticleWork.isVisibleBusy()) {
+      return true;
+    }
+    if (candidate && isThreadOnScreen(candidate)) return false;
+    return !!(window.ATPArticleWork && typeof window.ATPArticleWork.isBusy === 'function' && window.ATPArticleWork.isBusy());
+  }
+
+  function wakeAutomaticTextResourceQueue() {
+    if (AUTO_TEXT_RESOURCE_RECHECK_TIMER) {
+      clearTimeout(AUTO_TEXT_RESOURCE_RECHECK_TIMER);
+      AUTO_TEXT_RESOURCE_RECHECK_TIMER = null;
+    }
+    if (AUTO_TEXT_RESOURCE_QUEUE.length) {
+      scheduleAutomaticTextResourceDrain();
+    }
+  }
+
+  // Automatic TXT work costs forum requests. First-screen visible article HTML
+  // fetches always have token priority; once those clear, on-screen TXT threads
+  // go first, and offscreen TXT threads wait until background article fetches finish.
   function takeNextAutomaticTextResourceThread() {
     for (var i = 0; i < AUTO_TEXT_RESOURCE_QUEUE.length; i++) {
       var candidate = AUTO_TEXT_RESOURCE_QUEUE[i];
-      if (!candidate || !candidate.textResourcesAutoQueued || isThreadOnScreen(candidate)) {
+      if (!candidate || !candidate.textResourcesAutoQueued) {
         return AUTO_TEXT_RESOURCE_QUEUE.splice(i, 1)[0];
       }
+      if (isThreadOnScreen(candidate)) {
+        if (!shouldDeferAutomaticTextLoad(candidate)) {
+          return AUTO_TEXT_RESOURCE_QUEUE.splice(i, 1)[0];
+        }
+        break;
+      }
     }
-    var busy = !!(window.ATPArticleWork && typeof window.ATPArticleWork.isBusy === 'function' && window.ATPArticleWork.isBusy());
-    if (!busy) return AUTO_TEXT_RESOURCE_QUEUE.shift();
+    if (!shouldDeferAutomaticTextLoad(null)) return AUTO_TEXT_RESOURCE_QUEUE.shift();
     if (!AUTO_TEXT_RESOURCE_RECHECK_TIMER) {
       AUTO_TEXT_RESOURCE_RECHECK_TIMER = setTimeout(function() {
         AUTO_TEXT_RESOURCE_RECHECK_TIMER = null;
@@ -206,12 +272,13 @@
     }
   }
 
-  function summarizeImageHosts(candidates) {
+  function* summarizeImageHosts(candidates) {
     var counts = {};
     var topHosts = [];
     var heavyHosts = 0;
     candidates = candidates || [];
     for (var i = 0; i < candidates.length; i++) {
+      if (i) yield;
       var src = SharedUtils.getImagePreviewSrc ? SharedUtils.getImagePreviewSrc(candidates[i]) : (candidates[i] && candidates[i].src);
       if (!src) continue;
       var host = getImageHost(src);
@@ -245,6 +312,111 @@
     var out = new Array(length);
     for (var i = 0; i < length; i++) out[i] = candidates[i];
     return out;
+  }
+
+  function getGalleryOptions(settings) {
+    return {
+      fetchLimit: SharedUtils.effectiveFetchLimit(settings),
+      displayLimit: SharedUtils.effectiveDisplayLimit(settings),
+      cols: (settings && settings.gridCols) || 5,
+      optimizeHeavy: !!settings && settings.heavyImageOptimization !== false,
+      lightweight: ATPRenderer.isLightweightHeavyThumbnailMode(settings)
+    };
+  }
+
+  function isGalleryOptionsCurrent(options) {
+    var current = getGalleryOptions(ATPRenderer.getSettings());
+    return options.fetchLimit === current.fetchLimit && options.displayLimit === current.displayLimit &&
+      options.cols === current.cols && options.optimizeHeavy === current.optimizeHeavy &&
+      options.lightweight === current.lightweight;
+  }
+
+  function isGalleryDebugEnabled() {
+    return typeof Logger !== 'undefined' && Logger.event && (!Logger.isEnabled || Logger.isEnabled('DEBUG'));
+  }
+
+  function finishGalleryPreparation(iterator) {
+    var step = iterator.next();
+    while (!step.done) step = iterator.next();
+    return step.value;
+  }
+
+  function* prepareHeavyImagePlan(candidates, options) {
+    if (!options.optimizeHeavy) return { enabled: false, limit: candidates.length };
+    var heavyCount = 0;
+    for (var i = 0; i < candidates.length; i++) {
+      if (i) yield;
+      if (ATPRenderer.isHeavyImage(candidates[i])) heavyCount++;
+    }
+    // Keep the threshold used by SharedUtils.isHeavyImageCandidateSet.
+    if (heavyCount < 3 || heavyCount / candidates.length < 0.5) {
+      return { enabled: false, limit: candidates.length };
+    }
+    return {
+      enabled: true,
+      lightweight: options.lightweight,
+      limit: options.lightweight
+        ? Math.min(candidates.length, options.displayLimit || candidates.length)
+        : Math.min(candidates.length, Math.max(3, Math.min(options.cols || 5, 6))),
+      heavyCount: heavyCount
+    };
+  }
+
+  function* orderLoadedCandidates(candidates, loadedUrls) {
+    candidates = Array.isArray(candidates) ? candidates : [];
+    loadedUrls = Array.isArray(loadedUrls) ? loadedUrls : [];
+    if (!candidates.length || !loadedUrls.length) return candidates;
+
+    var indexByNormalized = {};
+    var previewKeys = new Array(candidates.length);
+    var displayKeys = new Array(candidates.length);
+    for (var i = 0; i < candidates.length; i++) {
+      if (i) yield;
+      var candidate = candidates[i];
+      var candidatePreviewSrc = SharedUtils.getImagePreviewSrc(candidate);
+      if (!candidate || !candidatePreviewSrc) continue;
+      var normalized = SharedUtils.normalizeImageUrl(candidatePreviewSrc);
+      previewKeys[i] = normalized;
+      if (typeof indexByNormalized[normalized] !== 'number') indexByNormalized[normalized] = i;
+      var candidateDisplaySrc = SharedUtils.getImageDisplaySrc(candidate);
+      var displayNormalized = SharedUtils.normalizeImageUrl(candidateDisplaySrc);
+      displayKeys[i] = displayNormalized;
+      if (displayNormalized && typeof indexByNormalized[displayNormalized] !== 'number') indexByNormalized[displayNormalized] = i;
+    }
+
+    var out = [];
+    var used = {};
+    for (var l = 0; l < loadedUrls.length; l++) {
+      yield;
+      var loaded = SharedUtils.normalizeImageUrl(loadedUrls[l]);
+      var matchIndex = indexByNormalized[loaded];
+      if (typeof matchIndex !== 'number' || used[loaded]) continue;
+      var matchedPreviewKey = previewKeys[matchIndex] || '';
+      var matchedDisplayKey = displayKeys[matchIndex] || '';
+      if (matchedPreviewKey) used[matchedPreviewKey] = true;
+      if (matchedDisplayKey) used[matchedDisplayKey] = true;
+      out.push(candidates[matchIndex]);
+    }
+    for (var j = 0; j < candidates.length; j++) {
+      // Appending works on cached keys. A short batch keeps it within the
+      // time slice without spending one URL-work step per cheap lookup.
+      if (j % GALLERY_APPEND_BATCH_ITEMS === 0) yield;
+      var key = previewKeys[j] || '';
+      if (!key || used[key]) continue;
+      used[key] = true;
+      out.push(candidates[j]);
+    }
+    return out;
+  }
+
+  function* prepareGallery(data, options) {
+    var images = data.images;
+    var fetchLimit = options.fetchLimit;
+    var candidatePool = copyCandidatePrefix(images, fetchLimit);
+    var heavyPlan = yield* prepareHeavyImagePlan(candidatePool, options);
+    if (heavyPlan.enabled) candidatePool = yield* orderLoadedCandidates(candidatePool, data.loadedUrls);
+    var hostMix = isGalleryDebugEnabled() ? yield* summarizeImageHosts(candidatePool) : undefined;
+    return { data: data, options: options, candidatePool: candidatePool, heavyPlan: heavyPlan, hostMix: hostMix };
   }
 
   function countTableCells(row) {
@@ -302,71 +474,31 @@
     },
 
     getHeavyImagePlan: function(candidates, settings, cols, displayLimit) {
-      if (!settings || settings.heavyImageOptimization === false) {
-        return { enabled: false, limit: candidates.length };
-      }
-      var heavyCount = 0;
-      for (var i = 0; i < candidates.length; i++) {
-        if (ATPRenderer.isHeavyImage(candidates[i])) heavyCount++;
-      }
-      // 阈值与 SharedUtils.isHeavyImageCandidateSet 完全一致（heavyCount>=3 且占比>=0.5），
-      // 上面已把整表扫过一遍（且全轻图时那一遍的结果原本被直接丢弃），不必再扫第二遍
-      var enabled = candidates.length > 0 && heavyCount >= 3 && heavyCount / candidates.length >= 0.5;
-      if (!enabled) return { enabled: false, limit: candidates.length };
-      var lightweight = ATPRenderer.isLightweightHeavyThumbnailMode(settings);
-      return {
-        enabled: true,
-        lightweight: lightweight,
-        limit: lightweight
-          ? Math.min(candidates.length, displayLimit || candidates.length)
-          : Math.min(candidates.length, Math.max(3, Math.min(cols || 5, 6))),
-        heavyCount: heavyCount
-      };
+      var options = getGalleryOptions(settings);
+      options.cols = cols;
+      options.displayLimit = displayLimit;
+      return finishGalleryPreparation(prepareHeavyImagePlan(candidates, options));
     },
 
     prioritizeLoadedCandidates: function(candidates, loadedUrls) {
-      candidates = Array.isArray(candidates) ? candidates : [];
-      loadedUrls = Array.isArray(loadedUrls) ? loadedUrls : [];
-      if (!candidates.length || !loadedUrls.length) return candidates;
-
-      var indexByNormalized = {};
-      var previewKeys = new Array(candidates.length);
-      var displayKeys = new Array(candidates.length);
-      for (var i = 0; i < candidates.length; i++) {
-        var candidate = candidates[i];
-        var candidatePreviewSrc = SharedUtils.getImagePreviewSrc(candidate);
-        if (!candidate || !candidatePreviewSrc) continue;
-        var normalized = SharedUtils.normalizeImageUrl(candidatePreviewSrc);
-        previewKeys[i] = normalized;
-        if (typeof indexByNormalized[normalized] !== 'number') indexByNormalized[normalized] = i;
-        var candidateDisplaySrc = SharedUtils.getImageDisplaySrc(candidate);
-        var displayNormalized = SharedUtils.normalizeImageUrl(candidateDisplaySrc);
-        displayKeys[i] = displayNormalized;
-        if (displayNormalized && typeof indexByNormalized[displayNormalized] !== 'number') indexByNormalized[displayNormalized] = i;
-      }
-
-      var out = [];
-      var used = {};
-      for (var l = 0; l < loadedUrls.length; l++) {
-        var loaded = SharedUtils.normalizeImageUrl(loadedUrls[l]);
-        var matchIndex = indexByNormalized[loaded];
-        if (typeof matchIndex !== 'number' || used[loaded]) continue;
-        var matchedPreviewKey = previewKeys[matchIndex] || '';
-        var matchedDisplayKey = displayKeys[matchIndex] || '';
-        if (matchedPreviewKey) used[matchedPreviewKey] = true;
-        if (matchedDisplayKey) used[matchedDisplayKey] = true;
-        out.push(candidates[matchIndex]);
-      }
-      for (var j = 0; j < candidates.length; j++) {
-        var key = previewKeys[j] || '';
-        if (!key || used[key]) continue;
-        used[key] = true;
-        out.push(candidates[j]);
-      }
-      return out;
+      return finishGalleryPreparation(orderLoadedCandidates(candidates, loadedUrls));
     },
 
-    injectThumbnails: function(container, articleData, link, cacheWriteStartedAt) {
+    // data is the same normalized object eventually supplied to injectThumbnails.
+    // A null return uses the synchronous small-gallery path. A queued plan
+    // resolves to null if the caller's article or display settings expire.
+    prepareArticleGallery: function(data, isCurrent) {
+      if (!data || !Array.isArray(data.images) || !ATPCache.runArticlePreparation) return null;
+      var options = getGalleryOptions(ATPRenderer.getSettings());
+      var candidateCount = Math.min(data.images.length, options.fetchLimit);
+      var loadedCount = options.optimizeHeavy && candidateCount >= 3 && data.loadedUrls ? data.loadedUrls.length : 0;
+      if (candidateCount + loadedCount <= INLINE_GALLERY_ITEMS) return null;
+      return ATPCache.runArticlePreparation(prepareGallery(data, options), function() {
+        return (!isCurrent || isCurrent()) && isGalleryOptionsCurrent(options);
+      });
+    },
+
+    injectThumbnails: function(container, articleData, link, cacheWriteStartedAt, visibleBeforeCommit, preparedGallery) {
       if (container.tagName === 'TH' || container.tagName === 'TD') {
         container = container.parentElement;
         if (!container || (container.tagName !== 'TR' && container.tagName !== 'TBODY')) return;
@@ -374,6 +506,7 @@
       if (isDecoratedArticleContainer(container)) return;
 
       var data = ATPCache.normalizeArticleData(articleData);
+      if (preparedGallery && (preparedGallery.data !== data || !isGalleryOptionsCurrent(preparedGallery.options))) return;
       var images = data.images;
       var resources = data.resources;
       var textAttachments = data.textAttachments || [];
@@ -385,20 +518,17 @@
       var cols = settings.gridCols || 5;
       var visRows = settings.visibleRows || 2;
       var gap = settings.gridGap === undefined || settings.gridGap === null ? 6 : settings.gridGap;
-      var fetchLimit = SharedUtils.effectiveFetchLimit(settings);
-      var displayLimit = SharedUtils.effectiveDisplayLimit(settings);
-      var candidatePool = copyCandidatePrefix(images, fetchLimit);
-      var heavyPlan = ATPRenderer.getHeavyImagePlan(candidatePool, settings, cols, displayLimit);
-      // A copy: a rendered slot can move to a sibling attachment host while
-      // the thread registers, and the cache keeps the forum's own URLs.
+      var gallery = preparedGallery || finishGalleryPreparation(prepareGallery(data, getGalleryOptions(settings)));
+      var displayLimit = gallery.options.displayLimit;
+      var candidatePool = gallery.candidatePool;
+      var heavyPlan = gallery.heavyPlan;
       var cacheImages = candidatePool.slice();
-      if (heavyPlan.enabled) {
-        candidatePool = ATPRenderer.prioritizeLoadedCandidates(candidatePool, data.loadedUrls);
-        cacheImages = candidatePool.slice();
-      }
       var sourceCandidates = candidatePool;
       var renderLimit = heavyPlan.enabled ? heavyPlan.limit : displayLimit;
       var allCandidates = copyCandidatePrefix(candidatePool, renderLimit);
+      // The loader can replace a slot with a mirror or fallback as soon as
+      // it registers. Keep the trusted data and the preview source order.
+      if (allCandidates === candidatePool) allCandidates = candidatePool.slice();
       var visibleRowsForRender = heavyPlan.enabled && !heavyPlan.lightweight ? 1 : visRows;
       var visibleCount = cols * visibleRowsForRender;
       var firstAutoCount = Math.min(heavyPlan.enabled && heavyPlan.lightweight ? cols : visibleCount, allCandidates.length);
@@ -409,19 +539,93 @@
 
       var panel = document.createElement('div');
       panel.className = 'atp-thread-panel';
-      var threadState = null;
-      function reserveReadyScrollRows(limit) {
-        // One extra row of height allows scrolling to the next row without
-        // creating image elements or admitting requests for it yet.
-        var rows = Math.min(Math.ceil(allCandidates.length / cols), Math.ceil(limit / cols) + 1);
-        grid.style.minHeight = (rows * h + Math.max(0, rows - 1) * gap) + 'px';
+      if (panel.style && typeof panel.style.setProperty === 'function') {
+        panel.style.setProperty('--atp-cols', String(cols));
+        panel.style.setProperty('--atp-thumb-w', w + 'px');
+        panel.style.setProperty('--atp-thumb-h', h + 'px');
+        panel.style.setProperty('--atp-gap', gap + 'px');
       }
+      var threadState = null;
+      var isPanelExpanded = false;
+      var expandBtn = null;
+      var moreBadge = null;
+      var viewport = null;
+      var grid = null;
+
+      function getExpandButtonLabel(expanded) {
+        return expanded ? '收起' : ('展开全部 (' + allCandidates.length + ')');
+      }
+
+      function applyViewportStyles() {
+        if (!viewport) return;
+        var currentRowsNeeded = Math.min(visibleRowsForRender, Math.ceil(allCandidates.length / cols));
+        var reservedH = isPanelExpanded
+          ? (Math.ceil(allCandidates.length / cols) * h + Math.max(0, Math.ceil(allCandidates.length / cols) - 1) * gap + 12)
+          : Math.min(viewportH, currentRowsNeeded * h + Math.max(0, currentRowsNeeded - 1) * gap + 12);
+        var cellStripes = 'repeating-linear-gradient(90deg, rgba(15,23,42,0.04) 0, rgba(15,23,42,0.04) ' + w + 'px, transparent ' + w + 'px, transparent ' + (w + gap) + 'px), ' +
+          'repeating-linear-gradient(180deg, rgba(15,23,42,0.04) 0, rgba(15,23,42,0.04) ' + h + 'px, transparent ' + h + 'px, transparent ' + (h + gap) + 'px)';
+        var cappedCount = isPanelExpanded ? allCandidates.length : Math.min(allCandidates.length, visibleCount);
+        var fullRows = Math.floor(cappedCount / cols);
+        var lastRowCols = cappedCount - fullRows * cols;
+        var skeletonW = fullRows > 0 ? gridWidth : (lastRowCols * w + Math.max(0, lastRowCols - 1) * gap);
+        var skeletonRows = fullRows > 0 ? fullRows : 1;
+        var skeletonH = skeletonRows * h + Math.max(0, skeletonRows - 1) * gap;
+        var maxHText = isPanelExpanded ? 'none' : (viewportH + 'px');
+        var overflowText = isPanelExpanded ? 'overflow-x:auto;overflow-y:visible;' : 'overflow-x:auto;overflow-y:hidden;scrollbar-width:none;';
+        viewport.style.cssText = 'position:relative;width:100%;max-height:' + maxHText + ';min-height:' + reservedH + 'px;' + overflowText + 'box-sizing:border-box;background-image:' + cellStripes + ';background-size:' + skeletonW + 'px ' + skeletonH + 'px;background-repeat:no-repeat;background-attachment:local;background-origin:content-box;background-clip:content-box;';
+      }
+
+      function applyGridStyles() {
+        if (!grid) return;
+        grid.style.cssText = 'display:grid;grid-template-columns:repeat(' + cols + ',' + w + 'px);grid-auto-rows:' + h + 'px;gap:' + gap + 'px;width:' + gridWidth + 'px;max-width:none;box-sizing:border-box;';
+        if (isPanelExpanded) {
+          var totalRows = Math.ceil(allCandidates.length / cols);
+          grid.style.minHeight = (totalRows * h + Math.max(0, totalRows - 1) * gap) + 'px';
+        }
+      }
+
+      function updateMoreBadge() {
+        if (!viewport) return;
+        var hiddenCount = allCandidates.length - firstAutoCount;
+        if (hiddenCount <= 0) {
+          if (moreBadge) moreBadge.hidden = true;
+          return;
+        }
+        if (!moreBadge) {
+          moreBadge = document.createElement('button');
+          moreBadge.type = 'button';
+          moreBadge.className = 'atp-more-overlay-badge';
+          moreBadge.onclick = function(e) {
+            if (e && e.stopPropagation) e.stopPropagation();
+            setExpanded(true);
+          };
+          viewport.appendChild(moreBadge);
+        }
+        moreBadge.hidden = isPanelExpanded;
+        moreBadge.textContent = '+' + hiddenCount;
+        moreBadge.setAttribute('aria-label', '展开剩余 ' + hiddenCount + ' 张缩略图');
+        moreBadge.title = '点击展开剩余 ' + hiddenCount + ' 张缩略图';
+        var lastVisibleIdx = Math.max(0, firstAutoCount - 1);
+        var badgeCol = lastVisibleIdx % cols;
+        var badgeRow = Math.floor(lastVisibleIdx / cols);
+        var slotLeft = 6 + badgeCol * (w + gap);
+        var slotTop = 6 + badgeRow * (h + gap);
+        moreBadge.style.left = slotLeft + 'px';
+        moreBadge.style.top = slotTop + 'px';
+        moreBadge.style.width = w + 'px';
+        moreBadge.style.height = h + 'px';
+      }
+
       function setReadyImageLimit(limit) {
-        if (threadState.readyImageLimit === limit) return;
+        if (!threadState || threadState.readyImageLimit === limit) return;
         threadState.readyImageLimit = limit;
-        if (viewport.style.maxHeight !== 'none') reserveReadyScrollRows(Math.max(limit, threadState.nextIdx));
+        if (isPanelExpanded && grid) {
+          var rows = Math.ceil(Math.min(allCandidates.length, Math.max(limit, threadState.nextIdx)) / cols);
+          grid.style.minHeight = (rows * h + Math.max(0, rows - 1) * gap) + 'px';
+        }
         if (window.ATPLoader && ATPLoader.enqueueBgForThread) ATPLoader.enqueueBgForThread(threadState.id);
       }
+
       function unlockBackgroundImages() {
         if (!threadState || threadState.backgroundUnlocked) return;
         threadState.backgroundUnlocked = true;
@@ -431,9 +635,14 @@
         if (window.ATPViewport && ATPViewport.retryVisiblePending) ATPViewport.retryVisiblePending();
         if (window.ATPLoader && ATPLoader.globalSchedule) ATPLoader.globalSchedule();
       }
+
       var viewportId = 'atp-scroll-' + Date.now() + '-' + Math.random().toString(36).substring(2, 8);
-      var intrinsicH = (allCandidates.length ? viewportH : 0) + 30;
+      var displayCount = allCandidates.length;
+      var toolbarH = 30;
+      var rowsNeeded = allCandidates.length ? Math.min(visibleRowsForRender, Math.ceil(displayCount / cols)) : 0;
+      var intrinsicH = (rowsNeeded ? (rowsNeeded * h + Math.max(0, rowsNeeded - 1) * gap + 16) : 0) + toolbarH;
       panel.style.containIntrinsicHeight = 'auto ' + intrinsicH + 'px';
+
       var toolbar = document.createElement('div');
       toolbar.className = 'atp-toolbar';
       var statusEl = document.createElement('span');
@@ -452,71 +661,74 @@
           : '检测到高分辨率重图，仅加载一行代表图以降低滚动卡顿';
         toolbar.appendChild(heavyBadge);
       }
-      if (allCandidates.length > visibleCount) {
-        var expandBtn = document.createElement('button');
-        expandBtn.type = 'button';
-        expandBtn.className = 'atp-thumbnail-expand';
-        expandBtn.textContent = '展开';
-        expandBtn.setAttribute('aria-expanded', 'false');
-        expandBtn.setAttribute('aria-label', '展开缩略图列表');
-        expandBtn.setAttribute('aria-controls', viewportId);
-        var setExpanded = function(expanded) {
-          viewport.style.maxHeight = expanded ? 'none' : viewportH + 'px';
-          expandBtn.textContent = expanded ? '收起' : '展开';
+
+      var setExpanded = function(expanded) {
+        expanded = !!expanded;
+        if (allCandidates.length <= firstAutoCount) expanded = false;
+        isPanelExpanded = expanded;
+        if (panel.classList) panel.classList.toggle('atp-panel-expanded', expanded);
+        if (viewport) {
+          applyViewportStyles();
+          applyGridStyles();
+        }
+        if (expandBtn) {
+          expandBtn.hidden = allCandidates.length <= firstAutoCount;
+          expandBtn.textContent = getExpandButtonLabel(expanded);
           expandBtn.setAttribute('aria-expanded', expanded ? 'true' : 'false');
           expandBtn.setAttribute('aria-label', expanded ? '收起缩略图列表' : '展开缩略图列表');
-        };
-        expandBtn.onclick = function() {
-          if (!viewport) return;
-          var expanded = viewport.style.maxHeight !== 'none';
-          setExpanded(expanded);
-          if (threadState && threadState.readyImageQueue) {
-            setReadyImageLimit(expanded ? allCandidates.length : threadState.firstScreenTotal);
-          } else if (expanded) {
-            unlockBackgroundImages();
-            if (threadState && window.ATPLoader && ATPLoader.enqueueBgForThread) {
-              ATPLoader.enqueueBgForThread(threadState.id);
-            }
+        }
+        updateMoreBadge();
+        if (threadState && threadState.readyImageQueue) {
+          setReadyImageLimit(expanded ? allCandidates.length : Math.max(threadState.firstScreenTotal, firstAutoCount));
+        } else if (expanded) {
+          unlockBackgroundImages();
+          if (threadState && window.ATPLoader && ATPLoader.enqueueBgForThread) {
+            ATPLoader.enqueueBgForThread(threadState.id);
           }
-        };
-        toolbar.appendChild(expandBtn);
+        }
+      };
+
+      function ensureExpandButton() {
+        if (allCandidates.length <= firstAutoCount) {
+          if (expandBtn) expandBtn.hidden = true;
+          return;
+        }
+        if (!expandBtn) {
+          expandBtn = document.createElement('button');
+          expandBtn.type = 'button';
+          expandBtn.className = 'atp-thumbnail-expand';
+          expandBtn.textContent = getExpandButtonLabel(false);
+          expandBtn.setAttribute('aria-expanded', 'false');
+          expandBtn.setAttribute('aria-label', '展开缩略图列表');
+          expandBtn.setAttribute('aria-controls', viewportId);
+          expandBtn.onclick = function() {
+            if (!viewport) return;
+            setExpanded(!isPanelExpanded);
+          };
+          var anchorBefore = toolbar.querySelector ? (toolbar.querySelector('[data-resource-trigger]') || toolbar.querySelector('[data-mark-toggle]')) : null;
+          if (anchorBefore && toolbar.insertBefore) toolbar.insertBefore(expandBtn, anchorBefore);
+          else toolbar.appendChild(expandBtn);
+        } else {
+          expandBtn.hidden = false;
+          expandBtn.textContent = getExpandButtonLabel(isPanelExpanded);
+        }
       }
+
+      ensureExpandButton();
       panel.appendChild(toolbar);
 
-      var grid = null;
       if (allCandidates.length) {
-        var viewport = document.createElement('div');
+        viewport = document.createElement('div');
         viewport.className = 'atp-scroll-viewport';
         viewport.id = viewportId;
-        // 预留最终高度（行数在渲染时已知，封顶为可视高度）：
-        // 否则 wrapper 逐个插入时面板逐行长高，每长一行下方整页内容跟着位移
-        var rowsNeeded = Math.ceil(allCandidates.length / cols);
-        var reservedH = Math.min(viewportH, rowsNeeded * h + Math.max(0, rowsNeeded - 1) * gap + 12);
-        // 预留区画上静态骨架格（两向条纹交叠成格子），避免「大片空白等待」的观感；
-        // wrapper 逐个装填时会自然盖住对应格子，纯静态背景无逐帧成本
-        var cellStripes = 'repeating-linear-gradient(90deg, rgba(0,0,0,0.045) 0, rgba(0,0,0,0.045) ' + w + 'px, transparent ' + w + 'px, transparent ' + (w + gap) + 'px), ' +
-          'repeating-linear-gradient(180deg, rgba(0,0,0,0.045) 0, rgba(0,0,0,0.045) ' + h + 'px, transparent ' + h + 'px, transparent ' + (h + gap) + 'px)';
-        // 只画「整行」的格子：末行通常不满，按满列宽画会在装填完成后留下永久的幽灵格；
-        // background-attachment:local 让骨架随视口内容滚动（默认 scroll 锚定 padding box 会错位）
-        var fullRows = Math.floor(allCandidates.length / cols);
-        var lastRowCols = allCandidates.length - fullRows * cols;
-        var skeletonW = fullRows > 0 ? gridWidth : (lastRowCols * w + Math.max(0, lastRowCols - 1) * gap);
-        var skeletonRows = fullRows > 0 ? fullRows : 1;
-        var skeletonH = skeletonRows * h + Math.max(0, skeletonRows - 1) * gap;
-        // background-origin:content-box 抵消 .atp-scroll-viewport 的 6px padding，
-        // 否则骨架相对真实 grid 恒偏移一个 padding
-        viewport.style.cssText = 'width:100%;max-height:' + viewportH + 'px;min-height:' + reservedH + 'px;overflow-y:auto;overflow-x:auto;box-sizing:border-box;background-image:' + cellStripes + ';background-size:' + skeletonW + 'px ' + skeletonH + 'px;background-repeat:no-repeat;background-attachment:local;background-origin:content-box;background-clip:content-box;';
+        applyViewportStyles();
         panel.appendChild(viewport);
 
         grid = document.createElement('div');
         grid.className = THUMB_CLASS;
-        grid.style.cssText = 'display:grid;grid-template-columns:repeat(' + cols + ',' + w + 'px);grid-auto-rows:' + h + 'px;gap:' + gap + 'px;width:' + gridWidth + 'px;max-width:none;box-sizing:border-box;';
-        if (!heavyPlan.enabled && allCandidates.length > firstAutoCount) {
-          reserveReadyScrollRows(firstAutoCount);
-        } else if (settings.autoLoadOffscreenFirstRowsEnabled === true && allCandidates.length > firstAutoCount) {
-          grid.style.minHeight = ((visibleRowsForRender + 1) * h + visibleRowsForRender * gap) + 'px';
-        }
+        applyGridStyles();
         viewport.appendChild(grid);
+        updateMoreBadge();
       }
 
       var outerRow = null;
@@ -539,8 +751,65 @@
         if (container.classList) container.classList.add(CONTAINER_CLASS);
       }
 
-      threadState = ATPRenderer.registerThread(allCandidates, resources, grid, statusEl, container, link.href, outerRow, panel, textAttachments, sourceCandidates, heavyPlan, data.hasTextAttachments, data.textAttachmentCount, data.partial, cacheWriteStartedAt, data.textResourcesComplete, data.textResourcesAttemptedCount, data.textResourcesUnresolvedCount, data.textResourcesRetryableCount, { readAt: data.readAt, textResourcesImported: data.textResourcesImported, textAttachmentsLimited: data.textAttachmentsLimited });
+      threadState = ATPRenderer.registerThread(allCandidates, resources, grid, statusEl, container, link.href, outerRow, panel, textAttachments, sourceCandidates, heavyPlan, data.hasTextAttachments, data.textAttachmentCount, data.partial, cacheWriteStartedAt, data.textResourcesComplete, data.textResourcesAttemptedCount, data.textResourcesUnresolvedCount, data.textResourcesRetryableCount, Object.assign({}, data, { visibleBeforeCommit: visibleBeforeCommit, gallery: gallery }));
       threadState.cacheImages = cacheImages;
+      threadState._setExpanded = setExpanded;
+      threadState._isExpanded = function() { return isPanelExpanded; };
+      threadState._canExpand = function() { return allCandidates.length > firstAutoCount; };
+      threadState._relayout = function(nextSettings) {
+        nextSettings = nextSettings || ATPRenderer.getSettings() || {};
+        w = nextSettings.thumbWidth || 110;
+        h = nextSettings.thumbHeight || 82;
+        cols = nextSettings.gridCols || 5;
+        gap = nextSettings.gridGap === undefined || nextSettings.gridGap === null ? 6 : nextSettings.gridGap;
+        visibleCount = cols * visibleRowsForRender;
+        firstAutoCount = Math.min(heavyPlan.enabled && heavyPlan.lightweight ? cols : visibleCount, allCandidates.length);
+        gridWidth = cols * w + (cols - 1) * gap;
+        viewportContentH = visibleRowsForRender * h + (visibleRowsForRender - 1) * gap;
+        viewportH = viewportContentH + 12;
+        if (panel.style && typeof panel.style.setProperty === 'function') {
+          panel.style.setProperty('--atp-cols', String(cols));
+          panel.style.setProperty('--atp-thumb-w', w + 'px');
+          panel.style.setProperty('--atp-thumb-h', h + 'px');
+          panel.style.setProperty('--atp-gap', gap + 'px');
+        }
+        var nextRowsNeeded = allCandidates.length ? Math.min(visibleRowsForRender, Math.ceil(allCandidates.length / cols)) : 0;
+        var nextIntrinsicH = (nextRowsNeeded ? (nextRowsNeeded * h + Math.max(0, nextRowsNeeded - 1) * gap + 16) : 0) + toolbarH;
+        panel.style.containIntrinsicHeight = 'auto ' + nextIntrinsicH + 'px';
+        if (allCandidates.length <= firstAutoCount && isPanelExpanded) {
+          isPanelExpanded = false;
+          if (panel.classList) panel.classList.remove('atp-panel-expanded');
+        }
+        ensureExpandButton();
+        applyViewportStyles();
+        applyGridStyles();
+        updateMoreBadge();
+        if (grid && grid.children) {
+          for (var wi = 0; wi < grid.children.length; wi++) {
+            var childWrapper = grid.children[wi];
+            if (!childWrapper || !childWrapper.style) continue;
+            childWrapper.style.width = w + 'px';
+            childWrapper.style.height = h + 'px';
+            var task = childWrapper.__atpLoadTask;
+            var slotIdx = task && typeof task.idx === 'number' ? task.idx : wi;
+            if (threadState.readyImageQueue) {
+              childWrapper.style.gridColumnStart = (slotIdx % cols) + 1;
+              childWrapper.style.gridRowStart = Math.floor(slotIdx / cols) + 1;
+            }
+            var loadingChild = childWrapper.querySelector ? childWrapper.querySelector('.atp-thumbnail-loading') : null;
+            if (loadingChild && loadingChild.style) {
+              loadingChild.style.width = w + 'px';
+              loadingChild.style.height = h + 'px';
+            }
+          }
+        }
+        if (threadState.readyImageQueue && firstAutoCount > threadState.readyImageLimit) {
+          setReadyImageLimit(isPanelExpanded ? allCandidates.length : firstAutoCount);
+        }
+      };
+      if (window.ATPViewport && typeof ATPViewport.trackThreadPanel === 'function') {
+        ATPViewport.trackThreadPanel(panel, threadState);
+      }
       // Which thread this is and what the list calls it, for marking and the
       // copy backup.
       if (window.ATPMarks) {
@@ -551,21 +820,6 @@
       if (articleData && Array.isArray(articleData.freshTextAttachments) && articleData.freshTextAttachmentsAt) {
         threadState.freshTextAttachments = articleData.freshTextAttachments;
         threadState.freshTextAttachmentsAt = articleData.freshTextAttachmentsAt;
-      }
-      if (viewport && allCandidates.length > threadState.firstScreenTotal) {
-        viewport.addEventListener('scroll', function() {
-          if (threadState.readyImageQueue) {
-            if (viewport.style.maxHeight === 'none' || viewport.scrollTop <= 0) return;
-            var rows = visibleRowsForRender + Math.ceil(viewport.scrollTop / (h + gap));
-            var limit = Math.min(allCandidates.length, rows * cols);
-            if (limit > threadState.readyImageLimit) setReadyImageLimit(limit);
-            return;
-          }
-          if (viewport.scrollTop > 0) unlockBackgroundImages();
-          if (window.ATPLoader && ATPLoader.enqueueBgForThread) {
-            ATPLoader.enqueueBgForThread(threadState.id);
-          }
-        });
       }
       queueAutomaticTextResourceLoad(threadState);
       if (window.ATPResourcePanel) {
@@ -594,7 +848,7 @@
         var attachment = textAttachments[tai];
         normalizedTextAttachments.push(!attachment || attachment.pageUrl ? attachment : Object.assign({}, attachment, { pageUrl: linkUrl }));
       }
-      var normalizedResources = SharedUtils.normalizeResources(resources);
+      var normalizedResources = extra && extra.gallery ? resources : SharedUtils.normalizeResources(resources);
       var hasCachedTextResources = textResourcesComplete === true;
       var threadState = {
         id: threadId,
@@ -655,10 +909,16 @@
       // When the thread's content was actually read: a cache hit is not a
       // fresh read.
       threadState.contentReadAt = Number(extra && extra.readAt) || threadState.cacheWriteStartedAt;
+      threadState.imageExtractionVersion = extra && extra.imageExtractionVersion;
       threadState.textResourcesImported = !!(extra && extra.textResourcesImported);
       threadState.textAttachmentsLimited = !!(extra && extra.textAttachmentsLimited);
+      threadState.textAttachmentHints = SharedUtils.mergeTextAttachmentHints(SharedUtils.getTextAttachmentHints(normalizedTextAttachments), extra && extra.textAttachmentHints);
+      threadState.textResolvedAttachmentIds = SharedUtils.mergeResolvedTextIds(threadState.textAttachmentHints, extra && extra.textResolvedAttachmentIds);
+      if (extra && typeof extra.visibleBeforeCommit === 'boolean') {
+        threadState.readyImageVisible = extra.visibleBeforeCommit;
+      }
 
-      if (typeof Logger !== 'undefined' && Logger.event && (!Logger.isEnabled || Logger.isEnabled('DEBUG'))) {
+      if (isGalleryDebugEnabled()) {
         Logger.event('thread_registered', {
           threadId: threadId,
           heavyMode: threadState.heavyMode,
@@ -671,7 +931,7 @@
           textAttachments: threadState.textAttachments.length,
           hasTextAttachments: threadState.hasTextAttachments,
           partial: threadState.partial,
-          hostMix: summarizeImageHosts(threadState.sourceCandidates),
+          hostMix: extra && extra.gallery ? extra.gallery.hostMix : finishGalleryPreparation(summarizeImageHosts(threadState.sourceCandidates)),
           link: linkUrl
         });
       }
@@ -701,21 +961,7 @@
 
       if (!threadState.firstScreenTotal) {
         container.classList.add(CONTAINER_CLASS);
-        ATPCache.setCachedArticleData(linkUrl, {
-          images: threadState.sourceCandidates || [],
-          resources: threadState.resources,
-          textAttachments: threadState.textAttachments,
-          hasTextAttachments: threadState.hasTextAttachments,
-          textAttachmentCount: threadState.textAttachmentCount,
-          textResourcesComplete: threadState.textResourcesDone && !threadState.textResourcesRetryable,
-          textResourcesAttemptedCount: threadState.textResourcesAttemptedCount,
-          textResourcesUnresolvedCount: threadState.textResourcesUnresolvedCount,
-          textResourcesRetryableCount: threadState.textResourcesRetryableCount,
-          partial: threadState.partial,
-          readAt: threadState.contentReadAt,
-          textResourcesImported: threadState.textResourcesImported,
-          textAttachmentsLimited: threadState.textAttachmentsLimited
-        }, !threadState.partial, threadState.cacheWriteStartedAt);
+        cacheThreadArticle(threadState, true, threadState.cacheWriteStartedAt, 'preview');
         return threadState;
       }
 
@@ -753,10 +999,17 @@
         return threadState.textResourcesRun === run && isThreadCurrent(threadState);
       };
 
+      var initialResourceCount = SharedUtils.countResources(threadState.resources);
+      var showResolvedTextResources = function(resources, attachments) {
+        if (!isRunCurrent()) return;
+        threadState.resources = SharedUtils.mergeResources(threadState.resources, resources);
+        if (attachments && attachments.length) rememberResolvedAttachments(threadState, attachments);
+        if (!threadState.candidates.length && threadState.statusEl) threadState.statusEl.textContent = '资源链接';
+        if (window.ATPResourcePanel) ATPResourcePanel.updateThread(threadState);
+      };
+
       var shouldYieldBeforeRequest = function() {
-        if (!run.automatic || manualRetry) return false;
-        if (!isRunCurrent()) return true;
-        return hasQueuedVisibleTextResourceThread(threadState) && !isThreadOnScreen(threadState);
+        return run.automatic && hasQueuedVisibleTextResourceThread(threadState) && !isThreadOnScreen(threadState);
       };
 
       var getTextRunPriority = function(stage) {
@@ -774,8 +1027,10 @@
           manualRetry: !!manualRetry,
           diagnosticThreadId: threadState.id || '',
           diagnosticRunId: run.id,
+          isStale: function() { return !isRunCurrent(); },
           isCancelled: shouldYieldBeforeRequest,
-          getPriority: getTextRunPriority
+          getPriority: getTextRunPriority,
+          onResources: showResolvedTextResources
         };
       };
 
@@ -799,7 +1054,7 @@
           return;
         }
         var retainedResources = SharedUtils.normalizeResources(result && result.resources);
-        var before = SharedUtils.countResources(threadState.resources);
+        rememberResolvedAttachments(threadState, result && result.resolvedAttachments);
         threadState.resources = SharedUtils.mergeResources(threadState.resources, retainedResources);
         threadState.textResourcesLoading = false;
         threadState.textResourcesDone = false;
@@ -815,7 +1070,7 @@
         if (window.ATPResourcePanel) ATPResourcePanel.updateThread(threadState);
         logTextResourceResult('yielded', {
           fetchedResources: SharedUtils.countResources(retainedResources),
-          addedResources: Math.max(0, SharedUtils.countResources(threadState.resources) - before),
+          addedResources: Math.max(0, SharedUtils.countResources(threadState.resources) - initialResourceCount),
           totalResources: SharedUtils.countResources(threadState.resources)
         });
       };
@@ -882,16 +1137,22 @@
           var textStatus = normalizeTextResourceLoadResult(result, attachments.length);
           var resources = textStatus.resources;
           var hasFetchedResources = SharedUtils.hasResourcePayload(resources);
-          var unresolvedCount = textStatus.unresolvedCount + pendingCount;
-          var retryableCount = textStatus.retryableCount + pendingCount;
-          threadState.textResourcesDone = hasFetchedResources && unresolvedCount === 0;
-          threadState.textResourcesRetryable = retryableCount > 0 || !hasFetchedResources;
-          threadState.textResourcesAttemptedCount = textStatus.attemptedCount;
+          var resolvedAttachments = Array.isArray(result && result.resolvedAttachments) ? result.resolvedAttachments :
+            (hasFetchedResources && !textStatus.unresolvedCount ? attachments : []);
+          var confirmed = rememberResolvedAttachments(threadState, resolvedAttachments);
+          var remaining = Math.max(0, Math.max(expectedAttachmentCount, attachments.length + pendingCount) - confirmed);
+          var unresolvedCount = Math.min(remaining, textStatus.unresolvedCount + pendingCount);
+          if (!hasFetchedResources) unresolvedCount = remaining;
+          var retryableCount = Math.min(unresolvedCount, textStatus.retryableCount + pendingCount);
+          threadState.textResourcesDone = unresolvedCount === 0 && (hasFetchedResources || confirmed > 0);
+          threadState.textResourcesRetryable = !threadState.textResourcesDone && (retryableCount > 0 || !hasFetchedResources);
+          threadState.textResourcesAttemptedCount = Math.max(threadState.textResourcesAttemptedCount || 0, textStatus.attemptedCount, confirmed);
           threadState.textResourcesUnresolvedCount = unresolvedCount;
           threadState.textResourcesRetryableCount = retryableCount;
-          var previousResourceCount = SharedUtils.countResources(threadState.resources);
           threadState.resources = SharedUtils.mergeResources(threadState.resources, resources);
-          if (textStatus.accessDeniedCount > 0) {
+          if (threadState.textResourcesDone) {
+            threadState.textResourceMessage = '';
+          } else if (textStatus.accessDeniedCount > 0 && unresolvedCount > 0) {
             threadState.textResourceMessage = '站点拒绝读取 ' + textStatus.accessDeniedCount + ' 个 TXT 附件，可在原帖下载后导入';
           } else if (unresolvedCount > 0 && hasFetchedResources) {
             threadState.textResourceMessage = '已解析部分 TXT 资源，仍有 ' + unresolvedCount + ' 个附件待重试';
@@ -914,32 +1175,7 @@
           }
 
           var imageDone = !threadState.candidates.length || (threadState.nextIdx >= threadState.candidates.length && threadState.loaded + threadState.failedCount >= threadState.candidates.length);
-          // 写回缓存前过滤临时 TXT 附件 URL，避免不稳定入口长期缓存
-          var cachedAttachments = [];
-          var hasTransientUrl = false;
-          for (var ta = 0; ta < threadState.textAttachments.length; ta++) {
-            if (SharedUtils.isTransientTextAttachmentUrl(threadState.textAttachments[ta].url, threadState.link)) {
-              hasTransientUrl = true;
-            } else {
-              cachedAttachments.push(threadState.textAttachments[ta]);
-            }
-          }
-          ATPCache.setCachedArticleData(threadState.link, {
-            images: threadState.cacheImages || threadState.sourceCandidates || threadState.candidates || [],
-            resources: threadState.resources,
-            textAttachments: cachedAttachments,
-            loadedUrls: threadState.loadedUrls || [],
-            hasTextAttachments: hasTransientUrl || !!cachedAttachments.length,
-            textAttachmentCount: threadState.textAttachmentCount || threadState.textAttachments.length,
-            textResourcesComplete: threadState.textResourcesDone && !threadState.textResourcesRetryable,
-            textResourcesAttemptedCount: threadState.textResourcesAttemptedCount,
-            textResourcesUnresolvedCount: threadState.textResourcesUnresolvedCount,
-            textResourcesRetryableCount: threadState.textResourcesRetryableCount,
-            partial: threadState.partial,
-            readAt: threadState.contentReadAt,
-            textResourcesImported: threadState.textResourcesImported,
-            textAttachmentsLimited: threadState.textAttachmentsLimited
-          }, imageDone && !threadState.partial, writeStartedAt);
+          cacheThreadArticle(threadState, imageDone, writeStartedAt, 'text');
           var totalResourceCount = SharedUtils.countResources(threadState.resources);
           logTextResourceResult(threadState.textResourcesDone ? 'complete' : (hasFetchedResources ? 'partial' : 'failed'), {
             attemptedCount: textStatus.attemptedCount,
@@ -947,7 +1183,7 @@
             retryableCount: retryableCount,
             accessDeniedCount: textStatus.accessDeniedCount,
             fetchedResources: SharedUtils.countResources(resources),
-            addedResources: Math.max(0, totalResourceCount - previousResourceCount),
+            addedResources: Math.max(0, totalResourceCount - initialResourceCount),
             totalResources: totalResourceCount
           });
         }, function(e) {
@@ -1057,18 +1293,41 @@
         SharedUtils.RESOURCE_GROUP_ORDER.forEach(function(type) {
           normalized.groups[type].forEach(function(item) { item.source = SharedUtils.mergeResourceSource(item.source, 'import'); });
         });
-        usable.push({ name: String(imports[i].name || ''), resources: normalized });
+        usable.push({ nameKey: SharedUtils.textFileNameKey(imports[i].name), resources: normalized });
         merged = SharedUtils.mergeResources(merged, normalized);
       }
       if (!SharedUtils.hasResourcePayload(merged)) return false;
 
       var writeStartedAt = Date.now();
+      var hints = threadState.textAttachmentHints = getThreadAttachmentHints(threadState);
+      var ids = [];
+      var filesByName = new Map();
+      usable.forEach(function(file) { filesByName.set(file.nameKey, (filesByName.get(file.nameKey) || 0) + 1); });
+      for (var ui = 0; ui < usable.length; ui++) {
+        var file = usable[ui];
+        if (!file.nameKey || filesByName.get(file.nameKey) !== 1) continue;
+        var matches = hints.filter(function(hint) { return hint.nameKey === file.nameKey; });
+        if (matches.length !== 1) continue;
+        var match = matches[0];
+        ids.push(SharedUtils.textAttachmentProgressId(match, hints));
+        if (!match.urlKey) continue;
+        var attachment = (threadState.textAttachments || []).find(function(item) {
+          return item && SharedUtils.isPersistableTextAttachmentUrl(item.url, threadState.link) &&
+            SharedUtils.getTextAttachmentCacheKeySuffix(item.url) === match.urlKey;
+        });
+        if (attachment) {
+          ATPCache.setCachedTextResources(attachment.url, file.resources, writeStartedAt);
+          ATPCache.clearTextFailCache(attachment.url);
+        }
+      }
+      threadState.textResolvedAttachmentIds = SharedUtils.mergeResolvedTextIds(hints, threadState.textResolvedAttachmentIds, ids);
       var expectedImportCount = Math.max(
-        1,
+        1, hints.length,
         Number(threadState.textAttachmentCount || 0) || 0,
         (threadState.textAttachments && threadState.textAttachments.length) || 0
       );
-      var importUnresolvedCount = Math.max(0, expectedImportCount - usable.length);
+      var importUnresolvedCount = threadState.textResourcesDone ? 0 : Math.max(0, expectedImportCount - threadState.textResolvedAttachmentIds.length);
+      if (threadState.textResourcesUnresolvedCount > 0) importUnresolvedCount = Math.min(importUnresolvedCount, threadState.textResourcesUnresolvedCount);
       threadState.textResourcesRunId = Math.max(0, Number(threadState.textResourcesRunId || 0) || 0) + 1;
       threadState.textResourcesRun = null;
       threadState.textResourcesAutoQueued = false;
@@ -1078,64 +1337,69 @@
       threadState.textResourcesImporting = false;
       threadState.textResourcesDone = importUnresolvedCount === 0;
       threadState.textResourcesRetryable = importUnresolvedCount > 0;
-      threadState.textResourcesAttemptedCount = usable.length;
+      threadState.textResourcesAttemptedCount = Math.max(threadState.textResourcesAttemptedCount || 0, threadState.textResolvedAttachmentIds.length);
       threadState.textResourcesUnresolvedCount = importUnresolvedCount;
       threadState.textResourcesRetryableCount = importUnresolvedCount;
-      threadState.textResourceMessage = '已从本地 TXT 导入 ' + SharedUtils.countResources(merged) + ' 条资源' + (
+      threadState.textResourceMessage = '已从本地 TXT 导入 ' + SharedUtils.countResources(merged) + ' 条资源' +
+        (ids.length < usable.length ? '，部分文件无法按名称对应到原帖附件' : '') + (
         importUnresolvedCount ? '，仍有 ' + importUnresolvedCount + ' 个附件待补齐' : ''
       );
       threadState.textResourcesAutoAttempted = true;
       threadState.textResourcesImported = true;
       if (!threadState.candidates.length && threadState.statusEl) threadState.statusEl.textContent = '资源链接';
 
-      function normalizeFileName(name) {
-        name = String(name || '').replace(/\\/g, '/');
-        var slash = name.lastIndexOf('/');
-        if (slash !== -1) name = name.slice(slash + 1);
-        return name.trim().toLowerCase();
-      }
-
-      var attachments = threadState.textAttachments || [];
-      for (var ui = 0; ui < usable.length; ui++) {
-        var importName = normalizeFileName(usable[ui].name);
-        for (var ai = 0; ai < attachments.length; ai++) {
-          var attachment = attachments[ai];
-          var namesMatch = importName && importName === normalizeFileName(attachment && attachment.name);
-          if (!namesMatch && !(usable.length === 1 && attachments.length === 1)) continue;
-          ATPCache.setCachedTextResources(attachment.url, usable[ui].resources, writeStartedAt);
-          ATPCache.clearTextFailCache(attachment.url);
-        }
-      }
-
-      var cachedAttachments = [];
-      var hasTransientUrl = false;
-      for (var ta = 0; ta < attachments.length; ta++) {
-        if (SharedUtils.isTransientTextAttachmentUrl(attachments[ta].url, threadState.link)) hasTransientUrl = true;
-        else cachedAttachments.push(attachments[ta]);
-      }
       var imageDone = !threadState.candidates.length || (threadState.nextIdx >= threadState.candidates.length && threadState.loaded + threadState.failedCount >= threadState.candidates.length);
-      ATPCache.setCachedArticleData(threadState.link, {
-        images: threadState.cacheImages || threadState.sourceCandidates || threadState.candidates || [],
-        resources: threadState.resources,
-        textAttachments: cachedAttachments,
-        loadedUrls: threadState.loadedUrls || [],
-        hasTextAttachments: hasTransientUrl || !!cachedAttachments.length,
-        textAttachmentCount: threadState.textAttachmentCount || attachments.length,
-        textResourcesComplete: threadState.textResourcesDone,
-        textResourcesAttemptedCount: threadState.textResourcesAttemptedCount,
-        textResourcesUnresolvedCount: threadState.textResourcesUnresolvedCount,
-        textResourcesRetryableCount: threadState.textResourcesRetryableCount,
-        partial: threadState.partial,
-        readAt: threadState.contentReadAt,
-        textResourcesImported: true,
-        textAttachmentsLimited: threadState.textAttachmentsLimited
-      }, imageDone && !threadState.partial, writeStartedAt);
+      cacheThreadArticle(threadState, imageDone, writeStartedAt, 'text');
       if (window.ATPResourcePanel) ATPResourcePanel.updateThread(threadState);
       Logger.debug('本地TXT资源导入', threadState.link + ' 资源' + SharedUtils.countResources(merged));
       return true;
     },
 
     queueAutomaticTextResourceLoad: queueAutomaticTextResourceLoad,
+    wakeAutomaticTextResourceQueue: wakeAutomaticTextResourceQueue,
+
+    relayoutAllPanels: function(settings) {
+      var threads = window.ATPState && window.ATPState.threads;
+      if (!threads) return 0;
+      var updated = 0;
+      for (var tid in threads) {
+        var ts = threads[tid];
+        if (!ts || !isThreadCurrent(ts) || typeof ts._relayout !== 'function') continue;
+        ts._relayout(settings);
+        updated++;
+      }
+      return updated;
+    },
+
+    setAllThreadsExpanded: function(expanded) {
+      expanded = !!expanded;
+      var threads = window.ATPState && window.ATPState.threads;
+      var count = 0;
+      if (threads) {
+        for (var tid in threads) {
+          var ts = threads[tid];
+          if (!ts || !isThreadCurrent(ts) || typeof ts._setExpanded !== 'function') continue;
+          if (typeof ts._canExpand === 'function' && !ts._canExpand()) continue;
+          ts._setExpanded(expanded);
+          count++;
+        }
+      }
+      return { expanded: expanded, count: count };
+    },
+
+    areAllThreadsExpanded: function() {
+      var threads = window.ATPState && window.ATPState.threads;
+      if (!threads) return false;
+      var expandable = 0;
+      for (var tid in threads) {
+        var ts = threads[tid];
+        if (!ts || !isThreadCurrent(ts) || typeof ts._isExpanded !== 'function') continue;
+        if (typeof ts._canExpand === 'function' && !ts._canExpand()) continue;
+        expandable++;
+        if (!ts._isExpanded()) return false;
+      }
+      return expandable > 0;
+    },
 
     getAutomaticTextResourceQueueState: function() {
       return {

@@ -3,45 +3,64 @@
 
   var els = {};
   (function() {
-    var ids = ['toggleEnabled','settingsContainer',
-      'clearImageCache','clearFailCache','clearAllCache','clearTestCache','resetSettings','resetForumPacer','forumPacerInfo',
-      'toggleLogs','logPanel','logViewer','logCount','logFilter','logSearch','exportLogs','clearLogs',
-      'currentSite','firstScreenInfo','popupStatus','toggleHelp','helpPanel',
-      'marksSection','marksCount','marksSummary','marksList','exportMarks','copyMarks','clearExportedMarks','clearAllMarks',
-      'backupSection','backupCount','backupList','downloadAllBackups'];
+    var ids = [
+      'toggleEnabled', 'versionBadge', 'currentSiteDot', 'currentSite', 'firstScreenInfo',
+      'jumpToMirrorBtn', 'currentForumPace', 'popupStatus',
+      'popupTabList', 'tabBtnOverview', 'tabBtnMarks', 'tabBtnSettings', 'tabBtnLogs',
+      'tabMarksCount', 'tabLogCount',
+      'tabPanelOverview', 'tabPanelMarks', 'tabPanelSettings', 'tabPanelLogs',
+      'presetCardsContainer', 'quickSettingsContainer', 'settingsContainer',
+      'cacheStatsSummary',
+      'clearImageCache', 'clearFailCache', 'clearAllCache', 'clearTestCache',
+      'resetSettings', 'resetForumPacer', 'forumPacerInfo',
+      'toggleLogs', 'logPanel', 'logViewer', 'logCount', 'logFilter', 'logSearch', 'exportLogs', 'clearLogs',
+      'toggleHelp', 'helpPanel',
+      'marksSection', 'marksHeading', 'marksCount', 'marksSummary', 'marksSearchWrap', 'marksSearch',
+      'marksList', 'exportMarks', 'copyMarks', 'clearExportedMarks', 'clearAllMarks',
+      'backupSection', 'backupCount', 'backupList', 'downloadAllBackups',
+      'mirrorSection', 'addCurrentMirror'
+    ];
     for (var i = 0; i < ids.length; i++) { els[ids[i]] = document.getElementById(ids[i]); }
   })();
 
   var DEFAULTS = ATP_DEFAULTS;
-  var LOG_KEYS = ['atp_logs', 'atp_logs_content', 'atp_logs_bg'];
-  var LOG_KEY_PREFIXES = ['atp_logs_content_'];
-  var LOG_KEY_INDEX = (typeof SharedUtils !== 'undefined' && SharedUtils.CONTENT_LOG_INDEX_KEY) || 'atp_logs_content_keys';
-  var LOG_CLEARED_AT_KEY = 'atp_logs_cleared_at';
-  var LOG_RETENTION_TYPE = 'log_retention';
   var CACHE_GENERATION_KEY = (typeof SharedUtils !== 'undefined' && SharedUtils.CACHE_GENERATION_KEY) || 'atp_cache_generation_v1';
-  var MAX_CONTENT_LOG_KEYS = (typeof SharedUtils !== 'undefined' && SharedUtils.MAX_CONTENT_LOG_KEYS) || 20;
-  var LOG_VIEW_LIMIT = 1000;
-  var LOG_RENDER_LIMIT = 150;
-  var LOG_SEARCH_DEBOUNCE_MS = 180;
-  var logReloadTimer = null;
-  var logLoadSeq = 0;
-  var logCountSeq = 0;
-  var loadedLogEntries = null;
-  var logLoadInFlight = false;
   var popupStatusTimer = null;
   var saveStatusSeq = 0;
   var saveWriteChain = Promise.resolve();
-  var settingSaveSeqByKey = {};
-  var siteSaveSeqByHost = {};
+  var pendingSettingsWrites = new Map();
   var dirtySettingInputByKey = {};
   var settingsLoadFailed = false;
   var DESTRUCTIVE_CONFIRM_MS = 3000;
   var pendingDestructiveButton = null;
-  var CACHE_PREFIXES = (typeof SharedUtils !== 'undefined' && SharedUtils.CACHE_PREFIXES) || { IMAGE: 'thumb_cache_v2_', ARTICLE: 'article_cache_v12_', TEXT_RESOURCE: 'txt_resource_cache_v3_', TEXT_FAIL: 'atp_text_fail_v1_', NEGATIVE: 'atp_empty_v9_', IMAGE_BASE: 'thumb_cache_', ARTICLE_BASE: 'article_cache_', TEXT_RESOURCE_BASE: 'txt_resource_cache_', TEXT_FAIL_BASE: 'atp_text_fail_', NEGATIVE_BASE: 'atp_empty_' };
+  var CACHE_PREFIXES = (typeof SharedUtils !== 'undefined' && SharedUtils.CACHE_PREFIXES) || {
+    IMAGE: 'thumb_cache_v2_',
+    ARTICLE: 'article_cache_v12_',
+    TEXT_RESOURCE: 'txt_resource_cache_v3_',
+    TEXT_FAIL: 'atp_text_fail_v1_',
+    NEGATIVE: 'atp_empty_v9_',
+    IMAGE_BASE: 'thumb_cache_',
+    ARTICLE_BASE: 'article_cache_',
+    TEXT_RESOURCE_BASE: 'txt_resource_cache_',
+    TEXT_FAIL_BASE: 'atp_text_fail_',
+    NEGATIVE_BASE: 'atp_empty_'
+  };
   var HEAVY_ORIGINAL_PRESET = ATPGetSettingsPreset('heavyOriginal', SETTINGS_SCHEMA);
 
+  var confirmedSettings = null;
   var settings = null;
   var currentSiteHost = '';
+  var currentForumPaceHost = '';
+  var activeTabName = 'overview';
+
+  function esc(s) {
+    if (typeof SharedUtils !== 'undefined' && SharedUtils && typeof SharedUtils.escapeHtml === 'function') {
+      return SharedUtils.escapeHtml(s);
+    }
+    return String(s === null || s === undefined ? '' : s).replace(/[&<>"']/g, function(ch) {
+      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch];
+    });
+  }
 
   function errorMessage(e) {
     return e && e.message ? e.message : String(e || '未知错误');
@@ -72,46 +91,6 @@
       padNumber(date.getHours(), 2) + '-' +
       padNumber(date.getMinutes(), 2) + '-' +
       padNumber(date.getSeconds(), 2);
-  }
-
-  function formatTimezoneOffset(minutes) {
-    if (typeof minutes !== 'number' || isNaN(minutes)) return '';
-    var sign = minutes >= 0 ? '+' : '-';
-    var abs = Math.abs(minutes);
-    return sign + padNumber(Math.floor(abs / 60), 2) + ':' + padNumber(abs % 60, 2);
-  }
-
-  function getTimezoneName() {
-    try {
-      return Intl.DateTimeFormat().resolvedOptions().timeZone || '';
-    } catch (e) {
-      return '';
-    }
-  }
-
-  function parseLogTimestamp(value) {
-    if (!value) return 0;
-    var text = String(value);
-    var m = text.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?/);
-    var hasTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(text);
-    if (m && !hasTimezone) {
-      var milliseconds = m[7] ? Number((m[7] + '00').slice(0, 3)) : 0;
-      return new Date(
-        Number(m[1]),
-        Number(m[2]) - 1,
-        Number(m[3]),
-        Number(m[4]),
-        Number(m[5]),
-        Number(m[6]),
-        milliseconds
-      ).getTime();
-    }
-    var parsed = Date.parse(text);
-    return isNaN(parsed) ? 0 : parsed;
-  }
-
-  function getLogSortTimestamp(entry) {
-    return parseLogTimestamp(entry && (entry.tsUtc || entry.ts));
   }
 
   function warnStorage(action, e) {
@@ -161,6 +140,48 @@
       warnStorage(action || '删除 storage', e);
       throw e;
     }
+  }
+
+  function uniqueKeys(keys) {
+    var seen = {};
+    var out = [];
+    for (var i = 0; i < (keys || []).length; i++) {
+      var key = keys[i];
+      if (!key || seen[key]) continue;
+      seen[key] = true;
+      out.push(key);
+    }
+    return out;
+  }
+
+  function collectUniqueKeys(groups, extraKey, predicate) {
+    var seen = {};
+    var out = [];
+    for (var gi = 0; gi < (groups || []).length; gi++) {
+      var group = groups[gi] || [];
+      for (var i = 0; i < group.length; i++) {
+        var key = group[i];
+        if (!key || seen[key]) continue;
+        if (predicate && !predicate(key)) continue;
+        seen[key] = true;
+        out.push(key);
+      }
+    }
+    if (extraKey && !seen[extraKey] && (!predicate || predicate(extraKey))) out.push(extraKey);
+    return out;
+  }
+
+  function appendUniqueKeys(out, keys, predicate) {
+    var seen = {};
+    for (var oi = 0; oi < out.length; oi++) seen[out[oi]] = true;
+    for (var i = 0; i < (keys || []).length; i++) {
+      var key = keys[i];
+      if (!key || seen[key]) continue;
+      if (predicate && !predicate(key)) continue;
+      seen[key] = true;
+      out.push(key);
+    }
+    return out;
   }
 
   function clearButtonTextTimer(btn) {
@@ -244,28 +265,21 @@
     if (shouldRestoreFocus) button.focus();
   }
 
-  function setLogViewerBusy(busy, text) {
-    if (!els.logViewer) return;
-    els.logViewer.setAttribute('aria-busy', busy ? 'true' : 'false');
-    if (text) {
-      els.logViewer.innerHTML = '<div class="log-entry" style="color:#808080">' + esc(text) + '</div>';
-    }
-  }
-
   function clearInputError(el) {
     if (!el || typeof el.removeAttribute !== 'function') return;
     el.removeAttribute('aria-invalid');
     el.removeAttribute('aria-describedby');
+    var error = el.id && document.getElementById(el.id + '-error');
+    if (error) error.textContent = '';
   }
 
   function reportNumberInputError(el, item) {
     if (!el || !item) return;
     el.setAttribute('aria-invalid', 'true');
-    el.setAttribute('aria-describedby', 'popupStatus');
-    var range = item.min !== undefined && item.max !== undefined
-      ? item.min + '-' + item.max
-      : '有效';
-    setPopupStatus('请输入' + item.label + '的' + range + '范围内数值', 'err', true);
+    var errorId = item.key + '-error';
+    var error = document.getElementById(errorId);
+    el.setAttribute('aria-describedby', errorId);
+    if (error) error.textContent = ATPGetNumberSettingError(item);
     flashError(el);
   }
 
@@ -375,83 +389,93 @@
     return runButtonAction(btn, workingText, successText, restoreText, action);
   }
 
-  function isLogKey(key) {
-    if (typeof key !== 'string') return false;
-    if (key === LOG_KEY_INDEX) return false;
-    if (LOG_KEYS.indexOf(key) !== -1) return true;
-    for (var i = 0; i < LOG_KEY_PREFIXES.length; i++) {
-      if (key.indexOf(LOG_KEY_PREFIXES[i]) === 0) {
-        var suffix = key.slice(LOG_KEY_PREFIXES[i].length);
-        return /^\d+(?:_|$)/.test(suffix);
+  // ---- Logs subsystem wired from popup-logs.js ----
+  var popupLogs = typeof ATPPopupLogs !== 'undefined' && ATPPopupLogs && typeof ATPPopupLogs.create === 'function'
+    ? ATPPopupLogs.create({
+        els: els,
+        storageGet: storageGet,
+        storageGetKeys: storageGetKeys,
+        storageSet: storageSet,
+        storageRemove: storageRemove,
+        setPopupStatus: setPopupStatus,
+        setDisclosureState: setDisclosureState,
+        runButtonAction: runButtonAction,
+        esc: esc,
+        errorMessage: errorMessage,
+        formatLocalTimestamp: formatLocalTimestamp,
+        formatLocalFilenameTimestamp: formatLocalFilenameTimestamp,
+        appendUniqueKeys: appendUniqueKeys,
+        collectUniqueKeys: collectUniqueKeys
+      })
+    : null;
+
+  // ---- Segmented 4-Tab Navigation ----
+  var TAB_ORDER = ['overview', 'marks', 'settings', 'logs'];
+
+  function switchPopupTab(tabName, focusTabBtn) {
+    if (TAB_ORDER.indexOf(tabName) === -1) tabName = 'overview';
+    activeTabName = tabName;
+    var tabButtons = [
+      ['overview', els.tabBtnOverview, els.tabPanelOverview],
+      ['marks', els.tabBtnMarks, els.tabPanelMarks],
+      ['settings', els.tabBtnSettings, els.tabPanelSettings],
+      ['logs', els.tabBtnLogs, els.tabPanelLogs]
+    ];
+    for (var i = 0; i < tabButtons.length; i++) {
+      var name = tabButtons[i][0];
+      var btn = tabButtons[i][1];
+      var panel = tabButtons[i][2];
+      var selected = name === tabName;
+      if (btn) {
+        if (btn.classList) btn.classList.toggle('is-active', selected);
+        btn.setAttribute('aria-selected', selected ? 'true' : 'false');
+        btn.setAttribute('tabindex', selected ? '0' : '-1');
+        if (selected && focusTabBtn && typeof btn.focus === 'function') btn.focus();
+      }
+      if (panel) {
+        if (panel.classList) panel.classList.toggle('hidden', !selected);
+        panel.hidden = !selected;
       }
     }
-    return false;
-  }
-
-  function isContentLogKey(key) {
-    if (typeof key !== 'string') return false;
-    return isLogKey(key) && key.indexOf(LOG_KEY_PREFIXES[0]) === 0;
-  }
-
-  function isLogEntry(entry) {
-    return entry && typeof entry === 'object' && !Array.isArray(entry);
-  }
-
-  function getLogKeysFromItems(items) {
-    var itemKeys = [];
-    items = items || {};
-    for (var key in items) {
-      if (Object.prototype.hasOwnProperty.call(items, key)) itemKeys.push(key);
+    if (tabName === 'settings') {
+      refreshCacheStatsDisplay();
+    } else if (tabName === 'logs' && popupLogs) {
+      popupLogs.onTabActivated();
     }
-    return getLogKeysFromNames(itemKeys);
   }
 
-  function getLogKeysFromNames(names) {
-    var keys = [];
-    var seen = {};
-    for (var i = 0; i < LOG_KEYS.length; i++) {
-      keys.push(LOG_KEYS[i]);
-      seen[LOG_KEYS[i]] = true;
-    }
-    for (var ni = 0; ni < (names || []).length; ni++) {
-      var key = names[ni];
-      if (isLogKey(key) && !seen[key]) {
-        seen[key] = true;
-        keys.push(key);
+  function bindTabNavigation() {
+    if (!els.popupTabList) return;
+    els.popupTabList.addEventListener('click', function(e) {
+      var btn = e.target && e.target.closest ? e.target.closest('[data-tab]') : null;
+      if (!btn) return;
+      switchPopupTab(btn.getAttribute('data-tab'), false);
+    });
+    els.popupTabList.addEventListener('keydown', function(e) {
+      var idx = TAB_ORDER.indexOf(activeTabName);
+      if (idx === -1) idx = 0;
+      var nextIdx = -1;
+      if (e.key === 'ArrowRight') nextIdx = (idx + 1) % TAB_ORDER.length;
+      else if (e.key === 'ArrowLeft') nextIdx = (idx - 1 + TAB_ORDER.length) % TAB_ORDER.length;
+      else if (e.key === 'Home') nextIdx = 0;
+      else if (e.key === 'End') nextIdx = TAB_ORDER.length - 1;
+      if (nextIdx !== -1) {
+        e.preventDefault();
+        switchPopupTab(TAB_ORDER[nextIdx], true);
       }
+    });
+    if (els.jumpToMirrorBtn) {
+      els.jumpToMirrorBtn.addEventListener('click', function() {
+        switchPopupTab('settings', false);
+        if (els.mirrorSection) els.mirrorSection.open = true;
+        if (els.addCurrentMirror && !els.addCurrentMirror.classList.contains('hidden') && typeof els.addCurrentMirror.focus === 'function') {
+          els.addCurrentMirror.focus();
+        }
+      });
     }
-    return keys;
   }
 
-  function uniqueKeys(keys) {
-    var seen = {};
-    var out = [];
-    for (var i = 0; i < (keys || []).length; i++) {
-      var key = keys[i];
-      if (!key || seen[key]) continue;
-      seen[key] = true;
-      out.push(key);
-    }
-    return out;
-  }
-
-  function collectUniqueKeys(groups, extraKey, predicate) {
-    var seen = {};
-    var out = [];
-    for (var gi = 0; gi < (groups || []).length; gi++) {
-      var group = groups[gi] || [];
-      for (var i = 0; i < group.length; i++) {
-        var key = group[i];
-        if (!key || seen[key]) continue;
-        if (predicate && !predicate(key)) continue;
-        seen[key] = true;
-        out.push(key);
-      }
-    }
-    if (extraKey && !seen[extraKey] && (!predicate || predicate(extraKey))) out.push(extraKey);
-    return out;
-  }
-
+  // ---- Cache stats & maintenance ----
   async function countExistingKeys(keys, action) {
     var names = await storageGetKeys(action || '统计存在 storage 键');
     return countExistingKeysFromNames(keys, names);
@@ -467,59 +491,6 @@
       if (exists[keys[ki]]) count++;
     }
     return count;
-  }
-
-  function appendUniqueKeys(out, keys, predicate) {
-    var seen = {};
-    for (var oi = 0; oi < out.length; oi++) seen[out[oi]] = true;
-    for (var i = 0; i < (keys || []).length; i++) {
-      var key = keys[i];
-      if (!key || seen[key]) continue;
-      if (predicate && !predicate(key)) continue;
-      seen[key] = true;
-      out.push(key);
-    }
-    return out;
-  }
-
-  function getContentLogKeyTimestamp(key) {
-    var prefix = LOG_KEY_PREFIXES[0];
-    if (!isContentLogKey(key)) return 0;
-    var ts = parseInt(key.slice(prefix.length), 10);
-    return isNaN(ts) ? 0 : ts;
-  }
-
-  // protectedKeys: live shards (the tab just flushed for export) that must
-  // survive even when 20+ newer page sessions outrank them.
-  function getPrunableContentLogKeys(keys, protectedKeys) {
-    var newest = [];
-    var contentCount = 0;
-    keys = keys || [];
-    for (var i = 0; i < keys.length; i++) {
-      var key = keys[i];
-      if (!isContentLogKey(key)) continue;
-      contentCount++;
-      insertNewestContentLogKey(newest, key);
-    }
-    if (contentCount <= MAX_CONTENT_LOG_KEYS) return [];
-    var keepMap = {};
-    for (var ki = 0; ki < newest.length; ki++) keepMap[newest[ki]] = true;
-    for (var pk = 0; protectedKeys && pk < protectedKeys.length; pk++) keepMap[protectedKeys[pk]] = true;
-    var stale = [];
-    for (var si = 0; si < keys.length; si++) {
-      var staleKey = keys[si];
-      if (isContentLogKey(staleKey) && !keepMap[staleKey]) stale.push(staleKey);
-    }
-    return stale;
-  }
-
-  function insertNewestContentLogKey(keys, key) {
-    var ts = getContentLogKeyTimestamp(key);
-    var insertAt = keys.length;
-    while (insertAt > 0 && ts > getContentLogKeyTimestamp(keys[insertAt - 1])) insertAt--;
-    if (insertAt >= MAX_CONTENT_LOG_KEYS) return;
-    keys.splice(insertAt, 0, key);
-    if (keys.length > MAX_CONTENT_LOG_KEYS) keys.length = MAX_CONTENT_LOG_KEYS;
   }
 
   function readCacheIndex(options) {
@@ -547,6 +518,71 @@
         });
       });
     });
+  }
+
+  function formatBytesSize(bytes) {
+    var n = Math.max(0, Number(bytes) || 0);
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (Math.round((n / 1024) * 10) / 10) + ' KB';
+    return (Math.round((n / (1024 * 1024)) * 100) / 100) + ' MB';
+  }
+
+  function readCacheBytesUsed() {
+    return new Promise(function(resolve) {
+      if (typeof SharedUtils === 'undefined' || typeof SharedUtils.getCacheBytesInUse !== 'function') {
+        resolve(null);
+        return;
+      }
+      if (!chrome || !chrome.storage || !chrome.storage.local || typeof chrome.storage.local.getBytesInUse !== 'function') {
+        resolve(null);
+        return;
+      }
+      try {
+        SharedUtils.getCacheBytesInUse(function(bytes) {
+          if (chrome.runtime && chrome.runtime.lastError) {
+            resolve(null);
+            return;
+          }
+          resolve(typeof bytes === 'number' && isFinite(bytes) ? Math.max(0, bytes) : null);
+        });
+      } catch (e) {
+        resolve(null);
+      }
+    });
+  }
+
+  async function refreshCacheStatsDisplay() {
+    if (!els.cacheStatsSummary) return;
+    try {
+      var pair = await Promise.all([
+        readCacheIndex({ rebuild: false }),
+        readCacheBytesUsed()
+      ]);
+      var entries = pair[0];
+      var bytes = pair[1];
+      var T = SharedUtils && SharedUtils.cacheIndex && SharedUtils.cacheIndex.TYPE;
+      var articleCount = 0;
+      var totalCount = 0;
+      if (entries && typeof entries === 'object') {
+        for (var key in entries) {
+          if (!Object.prototype.hasOwnProperty.call(entries, key)) continue;
+          totalCount++;
+          var entry = entries[key];
+          if (entry && T && entry.t === T.ARTICLE) articleCount++;
+        }
+      }
+      var parts = [];
+      if (entries && typeof entries === 'object') {
+        parts.push('已缓存 ' + articleCount + ' 篇帖子');
+        if (totalCount > articleCount) parts.push('共 ' + totalCount + ' 项');
+      }
+      if (bytes !== null) {
+        parts.push('占用 ' + formatBytesSize(bytes));
+      }
+      els.cacheStatsSummary.textContent = parts.length ? parts.join(' · ') : '暂无缓存统计';
+    } catch (e) {
+      els.cacheStatsSummary.textContent = '暂无缓存统计';
+    }
   }
 
   function cacheKeysFromEntries(entries, types) {
@@ -609,7 +645,9 @@
   async function clearCacheTypes(types) {
     await markCacheGeneration();
     var keys = await getCacheKeysByTypes(types);
-    return removeCacheKeys(keys);
+    var res = await removeCacheKeys(keys);
+    refreshCacheStatsDisplay();
+    return res;
   }
 
   async function removeCacheKeys(keys) {
@@ -689,154 +727,23 @@
     var indexedKeys = entries ? cacheKeysFromEntries(entries, types) : [];
     var discoveredKeys = cacheKeysFromNames(storageNames, types);
     var cacheKeys = collectUniqueKeys([indexedKeys, discoveredKeys]);
-    var logKeys = getLogKeysFromNames(storageNames);
-    var keys = collectUniqueKeys([cacheKeys, logKeys], LOG_KEY_INDEX);
+    var logKeys = popupLogs ? popupLogs.getLogKeysFromNames(storageNames) : [];
+    var logIndexKey = popupLogs ? popupLogs.LOG_KEY_INDEX : 'atp_logs_content_keys';
+    var keys = collectUniqueKeys([cacheKeys, logKeys], logIndexKey);
     var removedCount = countExistingKeysFromNames(keys, storageNames);
-    await removeKeysWithLogClearMarker(keys, '一键清空缓存');
-    await markCacheGeneration();
-    invalidateLogLoadState();
-    loadedLogEntries = [];
-    if (els.logPanel.classList.contains('hidden')) {
-      els.logCount.textContent = 0;
+    if (popupLogs) {
+      await popupLogs.removeKeysWithLogClearMarker(keys, '一键清空缓存');
+      popupLogs.resetAfterMaintenanceClear();
     } else {
-      renderLoadedLogs(loadedLogEntries);
+      await storageRemove(keys, '一键清空缓存');
     }
+    await markCacheGeneration();
     var cacheIndexStatus = await removeCacheIndexEntries(cacheKeys);
+    refreshCacheStatsDisplay();
     return { count: removedCount, cacheIndexStatus: cacheIndexStatus };
   }
 
-  async function writeLogIndex(keys, prunedKeys) {
-    // 与内容脚本的 rememberLogKey 并发写同一索引键：写前重读合并，
-    // 避免用本地快照整体覆盖导致刚注册的会话键被丢（丢了也能靠前缀发现自愈，但没必要）
-    var merged = appendUniqueKeys([], keys, isContentLogKey);
-    try {
-      var current = await storageGet(LOG_KEY_INDEX, '合并日志索引');
-      var stored = Array.isArray(current[LOG_KEY_INDEX]) ? current[LOG_KEY_INDEX] : [];
-      var prunedMap = {};
-      for (var pi = 0; pi < (prunedKeys || []).length; pi++) prunedMap[prunedKeys[pi]] = true;
-      var extras = [];
-      for (var si = 0; si < stored.length; si++) {
-        if (!prunedMap[stored[si]]) extras.push(stored[si]);
-      }
-      appendUniqueKeys(merged, extras, isContentLogKey);
-    } catch (e) {
-      // 合并读失败时退回本地快照写入
-    }
-    var d = {};
-    d[LOG_KEY_INDEX] = merged;
-    await storageSet(d, '写入日志索引');
-  }
-
-  async function markLogsCleared() {
-    var data = {};
-    data[LOG_CLEARED_AT_KEY] = new Date().toISOString();
-    await storageSet(data, '标记日志清空时间');
-  }
-
-  async function removeKeysWithLogClearMarker(keys, action) {
-    await markLogsCleared();
-    try {
-      await storageRemove(keys, action);
-      await markLogsCleared();
-    } catch (e) {
-      try {
-        await storageRemove(LOG_CLEARED_AT_KEY, '回滚日志清空标记');
-      } catch (rollbackError) {
-        console.warn('[popup] 日志清空标记回滚失败:', errorMessage(rollbackError));
-      }
-      throw e;
-    }
-  }
-
-  function getLogClearedAtMs(value) {
-    var ms = Date.parse(value || '');
-    return isNaN(ms) ? 0 : ms;
-  }
-
-  function getLogEntryTimeMs(entry) {
-    if (!entry || typeof entry !== 'object') return 0;
-    var ms = Date.parse(entry.tsUtc || '');
-    if (!isNaN(ms)) return ms;
-    return Date.parse(entry.ts || '') || 0;
-  }
-
-  function filterLogsAfterClearedAt(logs, clearedAtMs) {
-    if (!clearedAtMs || !Array.isArray(logs) || !logs.length) return logs || [];
-    var out = [];
-    for (var i = 0; i < logs.length; i++) {
-      if (getLogEntryTimeMs(logs[i]) > clearedAtMs) out.push(logs[i]);
-    }
-    return out;
-  }
-
-  async function writeLogIndexBestEffort(keys, prunedKeys) {
-    try {
-      await writeLogIndex(keys, prunedKeys);
-      return true;
-    } catch (e) {
-      console.warn('[popup] 日志索引写回失败:', errorMessage(e));
-      return false;
-    }
-  }
-
-  async function discoverLogKeysFromStorage() {
-    // Capture the old index before discovery so stale keys can be removed without
-    // dropping a new content-script session registered while discovery is running.
-    var previous = [];
-    try {
-      var snapshot = await storageGet(LOG_KEY_INDEX, '读取待校验日志索引');
-      previous = Array.isArray(snapshot[LOG_KEY_INDEX]) ? snapshot[LOG_KEY_INDEX] : [];
-    } catch (e) {
-      console.warn('[popup] 日志索引预读失败:', errorMessage(e));
-    }
-    var names = await storageGetKeys('发现日志键');
-    return await discoverLogKeysFromNames(names, previous);
-  }
-
-  async function discoverLogKeysFromNames(names, previous) {
-    var keys = getLogKeysFromNames(names);
-    var indexed = appendUniqueKeys([], keys, isContentLogKey);
-    var present = new Set(names);
-    var stale = (previous || []).filter(function(key) { return isContentLogKey(key) && !present.has(key); });
-    await writeLogIndexBestEffort(indexed, stale);
-    return keys;
-  }
-
-  async function getLogKeysForRead(allowDiscovery) {
-    if (allowDiscovery) return await discoverLogKeysFromStorage();
-    var result = await storageGet(LOG_KEY_INDEX, '读取日志索引');
-    var indexed = Array.isArray(result[LOG_KEY_INDEX]) ? result[LOG_KEY_INDEX] : [];
-    var keys = appendUniqueKeys([], LOG_KEYS);
-    appendUniqueKeys(keys, indexed, isLogKey);
-    return keys;
-  }
-
-  async function pruneContentLogKeys(logKeys, protectedKeys) {
-    var stale = getPrunableContentLogKeys(logKeys, protectedKeys);
-    if (!stale.length) return stale;
-    try {
-      await storageRemove(stale, '裁剪旧日志');
-    } catch (e) {
-      console.warn('[popup] 旧日志裁剪失败:', errorMessage(e));
-      return [];
-    }
-    var staleMap = {};
-    for (var si = 0; si < stale.length; si++) staleMap[stale[si]] = true;
-    var kept = [];
-    for (var ki = 0; ki < (logKeys || []).length; ki++) {
-      var key = logKeys[ki];
-      if (isContentLogKey(key) && !staleMap[key]) kept.push(key);
-    }
-    await writeLogIndexBestEffort(kept, stale);
-    return stale;
-  }
-
-  async function getSettings() {
-    var stored = await storageGet('settings', '读取设置');
-    settings = ATPNormalizeSettings(stored.settings);
-    return settings;
-  }
-
+  // ---- Settings Save & Live/HotReload/PageReload ----
   function cloneSiteConfigsForSave(siteConfigs) {
     var out = {};
     if (siteConfigs && typeof siteConfigs === 'object' && !Array.isArray(siteConfigs)) {
@@ -886,19 +793,59 @@
     return saveWriteChain;
   }
 
+  function settingsWithPatches(base, patches) {
+    var next = Object.assign({}, base, { siteConfigs: cloneSiteConfigsForSave(base.siteConfigs) });
+    patches.forEach(function(patch) {
+      Object.keys(patch).forEach(function(key) {
+        if (key !== 'siteConfigs') next[key] = patch[key];
+      });
+      Object.keys(patch.siteConfigs || {}).forEach(function(host) {
+        next.siteConfigs[host] = Object.assign({}, next.siteConfigs[host], patch.siteConfigs[host]);
+      });
+    });
+    return next;
+  }
+
   function applySavedSettings(savedSettings) {
-    if (!savedSettings) return;
-    settings = ATPNormalizeSettings(savedSettings);
-    els.toggleEnabled.checked = settings.enabled;
-    if (typeof SETTINGS_SCHEMA !== 'undefined') {
-      SETTINGS_SCHEMA.forEach(function(item) { setUIValue(item.key); });
+    confirmedSettings = ATPNormalizeSettings(savedSettings);
+    settings = settingsWithPatches(confirmedSettings, pendingSettingsWrites);
+    renderSettingsFields(getAllSettingsPatchKeys().concat('siteConfigs'));
+  }
+
+  function renderSettingsFields(keys) {
+    keys.forEach(function(key) {
+      if (key === 'enabled') {
+        if (els.toggleEnabled) els.toggleEnabled.checked = settings.enabled;
+      } else if (key === 'siteConfigs') {
+        var disableEl = getSettingEl('disableSite');
+        if (disableEl && disableEl.__atpHostname) {
+          disableEl.checked = !!((settings.siteConfigs[disableEl.__atpHostname] || {}).disabled);
+        }
+        syncSiteDot();
+      } else {
+        setUIValue(key);
+      }
+    });
+    if (
+      keys.indexOf('gridCols') !== -1 ||
+      keys.indexOf('visibleRows') !== -1 ||
+      keys.indexOf('heavyImageOptimization') !== -1 ||
+      keys.indexOf('heavyThumbnailClarity') !== -1
+    ) {
+      updateFirstScreen();
     }
-    var disableEl = getSettingEl('disableSite');
-    if (disableEl && disableEl.__atpHostname) {
-      disableEl.checked = !!((settings.siteConfigs[disableEl.__atpHostname] || {}).disabled);
-    }
-    updateFirstScreen();
     updateDependentControls();
+  }
+
+  function getRevertedSettingsKeys(snapshot, previous) {
+    return Object.keys(snapshot).filter(function(key) {
+      if (key !== 'siteConfigs') return settings[key] !== previous[key];
+      return Object.keys(snapshot.siteConfigs || {}).some(function(host) {
+        var before = previous.siteConfigs[host] || {};
+        var after = settings.siteConfigs[host] || {};
+        return !!before.disabled !== !!after.disabled;
+      });
+    });
   }
 
   function formatRefreshFailureStatus(refreshResult, prefix) {
@@ -907,42 +854,86 @@
   }
 
   function getSettingsApplyMode(changedKeys) {
-    // settings-schema.js 在 popup.html 中先于本文件加载，ATPGetSettingsApplyMode 必定存在
     return ATPGetSettingsApplyMode(changedKeys, typeof SETTINGS_SCHEMA !== 'undefined' ? SETTINGS_SCHEMA : []);
   }
 
-  async function saveSettings(applyMode, changedKeys, patchOverride) {
+  async function saveSettings(applyMode, changedKeys, patchOverride, errorControl) {
     if (settingsLoadFailed || !settings) throw new Error('settings not loaded');
     var seq = ++saveStatusSeq;
     var snapshot = patchOverride || cloneSettingsForSave(settings, changedKeys);
+    pendingSettingsWrites.set(seq, snapshot);
     applyMode = applyMode || getSettingsApplyMode(changedKeys);
     setPopupStatus('保存中...', 'info', true);
+    var savedSettings;
     try {
-      var savedSettings = await queueSettingsWrite(snapshot);
-      if (seq !== saveStatusSeq) return;
-      applySavedSettings(savedSettings);
-      if (applyMode === 'pageReload') {
-        var refreshResult = await refreshCurrentPage();
-        if (seq !== saveStatusSeq) return;
-        if (!refreshResult.ok) {
-          setPopupStatus(formatRefreshFailureStatus(refreshResult, '已保存'), 'warn', true);
-          return { ok: true, refresh: refreshResult };
-        }
-        if (refreshResult.skipped) {
-          setPopupStatus('已保存，打开论坛页面后生效', 'ok');
-          return { ok: true, refresh: refreshResult };
-        }
-        setPopupStatus('已保存，刷新后生效', 'ok');
-        return { ok: true, refresh: refreshResult };
-      }
-      setPopupStatus(applyMode === 'hotReload' ? '已保存，缩略图已自动重新加载' : '已保存', 'ok');
-      return { ok: true };
+      savedSettings = await queueSettingsWrite(snapshot);
     } catch (e) {
+      var previous = settings;
+      pendingSettingsWrites.delete(seq);
+      settings = settingsWithPatches(confirmedSettings, pendingSettingsWrites);
+      var revertedKeys = getRevertedSettingsKeys(snapshot, previous);
+      if (revertedKeys.length) {
+        renderSettingsFields(revertedKeys);
+        if (errorControl) flashError(errorControl);
+      }
       if (seq === saveStatusSeq) {
         setPopupStatus('保存失败：' + errorMessage(e), 'err', true);
       }
       throw e;
     }
+    pendingSettingsWrites.delete(seq);
+    applySavedSettings(savedSettings || settingsWithPatches(confirmedSettings, [snapshot]));
+    if (seq !== saveStatusSeq) return;
+    if (applyMode === 'pageReload') {
+      var refreshResult = await refreshCurrentPage();
+      if (seq !== saveStatusSeq) return;
+      if (!refreshResult.ok) {
+        setPopupStatus(formatRefreshFailureStatus(refreshResult, '已保存'), 'warn', true);
+        return { ok: true, refresh: refreshResult };
+      }
+      if (refreshResult.skipped) {
+        setPopupStatus('已保存，打开论坛页面后生效', 'ok');
+        return { ok: true, refresh: refreshResult };
+      }
+      if (refreshResult.liveApplied) {
+        setPopupStatus('已保存，当前页已即时生效', 'ok');
+        return { ok: true, refresh: refreshResult };
+      }
+      setPopupStatus('已保存，刷新后生效', 'ok');
+      return { ok: true, refresh: refreshResult };
+    }
+    setPopupStatus(applyMode === 'hotReload' ? '已保存，缩略图已自动重新加载' : '已保存', 'ok');
+    return { ok: true };
+  }
+
+  function pingContentScriptInTab(tabId) {
+    return new Promise(function(resolve) {
+      if (!chrome.tabs || typeof chrome.tabs.sendMessage !== 'function') {
+        resolve(false);
+        return;
+      }
+      var settled = false;
+      var timer = setTimeout(function() {
+        if (settled) return;
+        settled = true;
+        resolve(false);
+      }, 240);
+      try {
+        chrome.tabs.sendMessage(tabId, { type: 'ATP_FLUSH_CONTENT_LOGS' }, function(response) {
+          var runtimeError = chrome.runtime.lastError;
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(!runtimeError && !!(response && response.ok === true));
+        });
+      } catch (e) {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(false);
+        }
+      }
+    });
   }
 
   function refreshCurrentPage() {
@@ -962,27 +953,32 @@
             resolve({ ok: false, error: '未找到可刷新的当前标签页' });
             return;
           }
-          // 只刷新扩展实际生效的论坛页面：避免误刷新用户正在其他站点填写的表单或 chrome:// 页
           var tabHost = getTabHostname(tab.url);
           if (!tabHost || !SharedUtils.isSupportedForumHost(tabHost)) {
             resolve({ ok: true, skipped: true });
             return;
           }
-          if (!chrome.tabs || typeof chrome.tabs.reload !== 'function') {
-            resolve({ ok: false, error: 'tabs.reload 不可用' });
-            return;
-          }
-          try {
-            chrome.tabs.reload(tab.id, function() {
-              if (chrome.runtime.lastError) {
-                resolve({ ok: false, error: errorMessage(chrome.runtime.lastError) });
-                return;
-              }
-              resolve({ ok: true });
-            });
-          } catch (e) {
-            resolve({ ok: false, error: errorMessage(e) });
-          }
+          pingContentScriptInTab(tab.id).then(function(alive) {
+            if (alive) {
+              resolve({ ok: true, liveApplied: true });
+              return;
+            }
+            if (!chrome.tabs || typeof chrome.tabs.reload !== 'function') {
+              resolve({ ok: false, error: 'tabs.reload 不可用' });
+              return;
+            }
+            try {
+              chrome.tabs.reload(tab.id, function() {
+                if (chrome.runtime.lastError) {
+                  resolve({ ok: false, error: errorMessage(chrome.runtime.lastError) });
+                  return;
+                }
+                resolve({ ok: true });
+              });
+            } catch (e) {
+              resolve({ ok: false, error: errorMessage(e) });
+            }
+          });
         });
       } catch (e) {
         resolve({ ok: false, error: errorMessage(e) });
@@ -991,37 +987,15 @@
   }
 
   function updateFirstScreen() {
-    var n = (settings.gridCols || 5) * (settings.visibleRows || 2);
-    els.firstScreenInfo.textContent = n + ' 张';
-  }
-
-  function markSettingSaveAttempt(key, value) {
-    settingSaveSeqByKey[key] = (settingSaveSeqByKey[key] || 0) + 1;
-    return { key: key, value: value, seq: settingSaveSeqByKey[key] };
-  }
-
-  function markSettingsSaveAttempt(keys) {
-    var attempts = {};
-    for (var i = 0; i < keys.length; i++) {
-      var key = keys[i];
-      attempts[key] = markSettingSaveAttempt(key, settings[key]);
+    if (!els.firstScreenInfo || !settings) return;
+    var cols = settings.gridCols || 5;
+    var rows = settings.visibleRows || 2;
+    var n = cols * rows;
+    if (settings.heavyImageOptimization && settings.heavyThumbnailClarity !== 'lightweight') {
+      els.firstScreenInfo.textContent = n + ' 张 · 重图首行 ' + cols + ' 张';
+    } else {
+      els.firstScreenInfo.textContent = n + ' 张';
     }
-    return attempts;
-  }
-
-  function isSettingSaveAttemptCurrent(attempt) {
-    return attempt &&
-      settingSaveSeqByKey[attempt.key] === attempt.seq &&
-      settings[attempt.key] === attempt.value;
-  }
-
-  function areSettingSaveAttemptsCurrent(attempts) {
-    for (var key in attempts) {
-      if (Object.prototype.hasOwnProperty.call(attempts, key) && !isSettingSaveAttemptCurrent(attempts[key])) {
-        return false;
-      }
-    }
-    return true;
   }
 
   function getAllSettingsPatchKeys() {
@@ -1034,22 +1008,32 @@
     return keys;
   }
 
-  function markSiteSaveAttempt(hostname, value) {
-    siteSaveSeqByHost[hostname] = (siteSaveSeqByHost[hostname] || 0) + 1;
-    return { hostname: hostname, value: value, seq: siteSaveSeqByHost[hostname] };
-  }
-
-  function isSiteSaveAttemptCurrent(attempt) {
-    var current = settings.siteConfigs[attempt.hostname] || {};
-    return siteSaveSeqByHost[attempt.hostname] === attempt.seq && !!current.disabled === !!attempt.value;
-  }
-
   function flashError(el) {
+    if (!el || !el.classList) return;
     el.classList.add('input-error');
     setTimeout(function() { el.classList.remove('input-error'); }, 800);
   }
 
   function getSettingEl(key) { return document.getElementById(key); }
+
+  function getSettingsRoots() {
+    var roots = [];
+    if (els.presetCardsContainer) roots.push(els.presetCardsContainer);
+    if (els.quickSettingsContainer) roots.push(els.quickSettingsContainer);
+    if (els.settingsContainer) roots.push(els.settingsContainer);
+    return roots;
+  }
+
+  function queryInSettingsRoots(selector) {
+    var roots = getSettingsRoots();
+    for (var i = 0; i < roots.length; i++) {
+      if (roots[i] && typeof roots[i].querySelector === 'function') {
+        var found = roots[i].querySelector(selector);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
 
   function markSettingInputDirty(el) {
     if (!el || !el.id) return;
@@ -1059,12 +1043,6 @@
   function clearSettingInputDirty(key) {
     if (!key) return;
     delete dirtySettingInputByKey[key];
-  }
-
-  function setControlValue(el, value) {
-    if (!el) return;
-    if (el.type === 'checkbox') el.checked = !!value;
-    else el.value = value;
   }
 
   function isSettingInputProtected(key, el) {
@@ -1084,44 +1062,59 @@
       var enabled = isSettingItemEnabled(item);
       el.disabled = !enabled;
       if (!enabled) clearInputError(el);
-      var reset = els.settingsContainer.querySelector('.btn-reset[data-key="' + item.key + '"]');
-      if (reset) reset.disabled = !enabled;
+      var reset = queryInSettingsRoots('.btn-reset[data-key="' + item.key + '"]');
+      if (reset) {
+        reset.disabled = !enabled;
+        if (settings && typeof ATPSettingsUI !== 'undefined' && ATPSettingsUI.syncResetButtonState) {
+          ATPSettingsUI.syncResetButtonState(reset, item, settings);
+        }
+      }
     });
-    var heavyPreset = els.settingsContainer.querySelector('.btn-heavy-preset');
-    if (heavyPreset) heavyPreset.disabled = !settings.heavyImageOptimization;
+    var heavyPreset = queryInSettingsRoots('.btn-heavy-preset');
+    if (heavyPreset && settings) heavyPreset.disabled = !settings.heavyImageOptimization;
+    if (typeof ATPSettingsUI !== 'undefined' && ATPSettingsUI.syncPresetButtons) {
+      var roots = getSettingsRoots();
+      for (var ri = 0; ri < roots.length; ri++) {
+        ATPSettingsUI.syncPresetButtons(roots[ri], settings, SETTINGS_SCHEMA);
+      }
+    }
   }
 
   function setSettingsControlsDisabled(disabled) {
     if (els.toggleEnabled) els.toggleEnabled.disabled = !!disabled;
     if (els.resetSettings) els.resetSettings.disabled = !!disabled;
+    var disableSite = getSettingEl('disableSite');
+    if (disabled && disableSite) disableSite.disabled = true;
     if (els.settingsContainer) els.settingsContainer.setAttribute('aria-busy', disabled && !settings ? 'true' : 'false');
-    if (!els.settingsContainer || !els.settingsContainer.querySelectorAll) return;
-    var controls = els.settingsContainer.querySelectorAll('input, select, button');
-    for (var i = 0; i < controls.length; i++) {
-      controls[i].disabled = !!disabled;
-      if (disabled && controls[i].matches && controls[i].matches('input[type="number"]')) {
-        clearInputError(controls[i]);
+    var roots = getSettingsRoots();
+    for (var r = 0; r < roots.length; r++) {
+      var root = roots[r];
+      if (!root || !root.querySelectorAll) continue;
+      var controls = root.querySelectorAll('input, select, button');
+      for (var i = 0; i < controls.length; i++) {
+        controls[i].disabled = !!disabled;
+        if (disabled && controls[i].matches && controls[i].matches('input[type="number"]')) {
+          clearInputError(controls[i]);
+        }
       }
     }
-    // 解除禁用后恢复 enabledWhen 依赖态与站点开关可用性，避免整片控件被无差别启用
     if (!disabled && settings) {
       updateDependentControls();
       setDisableSiteHost(currentSiteHost);
     }
   }
 
-  function getTabHostname(url) {
+  function getTabHostname(url, preserveSubdomain) {
     try {
       var parsed = new URL(url || '');
       if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
-      return parsed.hostname.replace(/\.$/, '').replace(/^www\./, '');
+      var host = parsed.hostname.replace(/\.$/, '');
+      return preserveSubdomain ? host : host.replace(/^www\./, '');
     } catch (e) {
       return '';
     }
   }
 
-  // activeTab exposes every active tab's URL, so the per-site toggle is only
-  // offered where the content scripts actually run (built-in or approved).
   function getSupportedTabHostname(url) {
     var host = getTabHostname(url);
     return host && SharedUtils.isSupportedForumHost(host) ? host : '';
@@ -1133,13 +1126,33 @@
     try {
       await mirrors.ready;
     } catch (e) {}
+    syncMirrorOfferShortcut();
   }
 
-  function setDisableSiteHost(hostname) {
+  function syncMirrorOfferShortcut() {
+    if (!els.jumpToMirrorBtn || !els.addCurrentMirror) return;
+    var hasOffer = !els.addCurrentMirror.classList.contains('hidden');
+    els.jumpToMirrorBtn.classList.toggle('hidden', !hasOffer);
+  }
+
+  function syncSiteDot() {
+    if (!els.currentSiteDot || !els.currentSiteDot.classList) return;
+    els.currentSiteDot.classList.remove('is-supported', 'is-disabled');
+    if (!currentSiteHost) return;
+    var siteDisabled = !!(settings && (!settings.enabled || (settings.siteConfigs && settings.siteConfigs[currentSiteHost] && settings.siteConfigs[currentSiteHost].disabled)));
+    els.currentSiteDot.classList.add(siteDisabled ? 'is-disabled' : 'is-supported');
+  }
+
+  function setDisableSiteHost(hostname, paceHost) {
     currentSiteHost = hostname || '';
+    if (!currentSiteHost || paceHost !== undefined) {
+      currentForumPaceHost = paceHost || '';
+      renderForumPacerInfo();
+    }
     var disableEl = getSettingEl('disableSite');
     var hintEl = document.getElementById('disableSiteHint');
     if (els.currentSite) els.currentSite.textContent = currentSiteHost || '--';
+    syncSiteDot();
     if (!disableEl) return;
     disableEl.__atpHostname = currentSiteHost;
     if (!currentSiteHost) {
@@ -1158,7 +1171,7 @@
       hintEl.textContent = '';
       hintEl.classList.add('site-disable-hint-empty');
     }
-    disableEl.checked = !!((settings.siteConfigs[currentSiteHost] || {}).disabled);
+    disableEl.checked = !!((settings && settings.siteConfigs && settings.siteConfigs[currentSiteHost] || {}).disabled);
   }
 
   function forEachHeavyOriginalPreset(callback) {
@@ -1180,7 +1193,6 @@
       flashError(presetBtn);
       return;
     }
-    var previousPreset = Object.assign({}, settings);
     for (var i = 0; i < presetKeys.length; i++) {
       var presetKey = presetKeys[i];
       settings[presetKey] = preset[presetKey];
@@ -1188,17 +1200,8 @@
     }
     updateDependentControls();
     setButtonBusy(presetBtn, true);
-    var attempts = markSettingsSaveAttempt(presetKeys);
-    saveSettings(getSettingsApplyMode(presetKeys), presetKeys).catch(function(err) {
-      if (areSettingSaveAttemptsCurrent(attempts)) {
-        settings = previousPreset;
-        for (var rollbackIndex = 0; rollbackIndex < presetKeys.length; rollbackIndex++) {
-          setUIValue(presetKeys[rollbackIndex]);
-        }
-        updateDependentControls();
-        flashError(presetBtn);
-      }
-      console.warn('[popup] 应用弱图预设失败:', errorMessage(err));
+    saveSettings(getSettingsApplyMode(presetKeys), presetKeys, null, presetBtn).catch(function(err) {
+      console.warn('[popup] 应用加载预设失败:', errorMessage(err));
     }).finally(function() {
       setButtonBusy(presetBtn, false);
       updateDependentControls();
@@ -1215,26 +1218,12 @@
     clearInputError(el);
   }
 
-  function rollbackSettingValue(key, previous, el) {
-    settings[key] = previous;
-    setUIValue(key);
-    setControlValue(el, previous);
-    if (['gridCols','visibleRows'].indexOf(key) !== -1) updateFirstScreen();
-    updateDependentControls();
-    if (el) flashError(el);
-  }
-
   async function loadUI() {
-    await getSettings();
+    var stored = await storageGet('settings', '读取设置');
     settingsLoadFailed = false;
+    applySavedSettings(stored.settings);
     setSettingsControlsDisabled(false);
-    els.toggleEnabled.checked = settings.enabled;
-    if (typeof SETTINGS_SCHEMA !== 'undefined') {
-      SETTINGS_SCHEMA.forEach(function(item) { setUIValue(item.key); });
-    }
     setDisableSiteHost('');
-    updateFirstScreen();
-    updateDependentControls();
 
     clearPopupStatusIfText('正在读取设置...');
     await waitForMirrorSites();
@@ -1250,7 +1239,9 @@
           setPopupStatus('读取当前标签页失败：' + errorMessage(chrome.runtime.lastError), 'warn', true);
           return;
         }
-        setDisableSiteHost(tabs[0] ? getSupportedTabHostname(tabs[0].url) : '');
+        var tabUrl = tabs[0] && tabs[0].url;
+        var host = getSupportedTabHostname(tabUrl);
+        setDisableSiteHost(host, host ? getTabHostname(tabUrl, true) : '');
       });
     } catch (e) {
       setDisableSiteHost('');
@@ -1258,7 +1249,6 @@
     }
   }
 
-  // 仅用于 header 的总开关；schema 字段由 bindSchemaControls 统一绑定
   function bind(id, key) {
     if (!els[id]) {
       console.warn('[popup] Element not found:', id);
@@ -1266,17 +1256,13 @@
     }
     els[id].addEventListener('change', function() {
       if (!ensureSettingsReady(els[id])) return;
-      var previous = settings[key];
       if (els[id].type === 'checkbox') {
         settings[key] = els[id].checked;
       } else {
         settings[key] = els[id].value;
       }
-      var attempt = markSettingSaveAttempt(key, settings[key]);
-      saveSettings(getSettingsApplyMode([key]), [key]).catch(function(e) {
-        if (isSettingSaveAttemptCurrent(attempt)) {
-          rollbackSettingValue(key, previous, els[id]);
-        }
+      syncSiteDot();
+      saveSettings(getSettingsApplyMode([key]), [key], null, els[id]).catch(function(e) {
         console.warn('[popup] 保存设置失败:', errorMessage(e));
       });
     });
@@ -1284,593 +1270,107 @@
 
   bind('toggleEnabled', 'enabled');
 
-  els.clearImageCache.addEventListener('click', function() {
-    runDestructiveButtonAction(els.clearImageCache, '再次点击清除', '再次点击确认清除文章/图片缓存', '清除中...', formatCacheCleanupSuccess, '清除文章/图片缓存', async function() {
-      var T = SharedUtils.cacheIndex.TYPE;
-      return clearCacheTypes([T.IMAGE, T.ARTICLE]);
+  if (els.clearImageCache) {
+    els.clearImageCache.addEventListener('click', function() {
+      runDestructiveButtonAction(els.clearImageCache, '再次点击清除', '再次点击确认清除文章与资源缓存', '清除中...', formatCacheCleanupSuccess, '清除文章与资源缓存', async function() {
+        var T = SharedUtils.cacheIndex.TYPE;
+        return clearCacheTypes([T.IMAGE, T.ARTICLE]);
+      });
     });
-  });
+  }
 
-  els.clearFailCache.addEventListener('click', function() {
-    runDestructiveButtonAction(els.clearFailCache, '再次点击清除', '再次点击确认清除失败缓存', '清除中...', formatCacheCleanupSuccess, '清除失败缓存', async function() {
-      var T = SharedUtils.cacheIndex.TYPE;
-      return clearCacheTypes([T.NEGATIVE, T.TEXT_FAIL]);
+  if (els.clearFailCache) {
+    els.clearFailCache.addEventListener('click', function() {
+      runDestructiveButtonAction(els.clearFailCache, '再次点击清除', '再次点击确认清除失败缓存', '清除中...', formatCacheCleanupSuccess, '清除失败缓存', async function() {
+        var T = SharedUtils.cacheIndex.TYPE;
+        return clearCacheTypes([T.NEGATIVE, T.TEXT_FAIL]);
+      });
     });
-  });
+  }
 
-  els.clearAllCache.addEventListener('click', function() {
-    runDestructiveButtonAction(els.clearAllCache, '再次点击清除', '再次点击确认清除全部缓存', '清除中...', formatCacheCleanupSuccess, '清除全部缓存', async function() {
-      var T = SharedUtils.cacheIndex.TYPE;
-      return clearCacheTypes([T.IMAGE, T.ARTICLE, T.TEXT_RESOURCE, T.NEGATIVE, T.TEXT_FAIL]);
+  if (els.clearAllCache) {
+    els.clearAllCache.addEventListener('click', function() {
+      runDestructiveButtonAction(els.clearAllCache, '再次点击清除', '再次点击确认清除全部缓存', '清除中...', formatCacheCleanupSuccess, '清除全部缓存', async function() {
+        var T = SharedUtils.cacheIndex.TYPE;
+        return clearCacheTypes([T.IMAGE, T.ARTICLE, T.TEXT_RESOURCE, T.NEGATIVE, T.TEXT_FAIL]);
+      });
     });
-  });
+  }
 
-  els.clearTestCache.addEventListener('click', function() {
-    runDestructiveButtonAction(els.clearTestCache, '再次点击清空', '再次点击确认清空缓存和日志', '清空中...', formatFullCleanupSuccess, '一键清空缓存和日志', async function() {
-      return clearTestCacheAndLogs();
+  if (els.clearTestCache) {
+    els.clearTestCache.addEventListener('click', function() {
+      runDestructiveButtonAction(els.clearTestCache, '再次点击清空', '再次点击确认清空缓存和日志', '清空中...', formatFullCleanupSuccess, '一键清空缓存和日志', async function() {
+        return clearTestCacheAndLogs();
+      });
     });
-  });
+  }
 
-  els.resetSettings.addEventListener('click', function() {
-    if (!ensureSettingsReady(els.resetSettings)) return;
-    runDestructiveButtonAction(els.resetSettings, '再次点击恢复', '再次点击确认恢复默认设置', '恢复中...', function(result) {
-      if (result && result.refresh && !result.refresh.ok) {
-        return { text: formatRefreshFailureStatus(result.refresh, '已恢复'), type: 'warn', persist: true };
-      }
-      if (result && result.reload && !result.reload.ok) {
-        return { text: '已恢复，但重新读取设置失败：' + (result.reload.error || '未知错误'), type: 'warn', persist: true };
-      }
-      return '已恢复';
-    }, '恢复默认设置', async function() {
-      var previousSettings = Object.assign({}, settings, { siteConfigs: cloneSiteConfigsForSave(settings.siteConfigs) });
-      settings = ATPNormalizeSettings({ siteConfigs: settings.siteConfigs });
-      setSettingsControlsDisabled(true);
-      try {
+  if (els.resetSettings) {
+    els.resetSettings.addEventListener('click', function() {
+      if (!ensureSettingsReady(els.resetSettings)) return;
+      runDestructiveButtonAction(els.resetSettings, '再次点击恢复', '再次点击确认恢复默认设置', '恢复中...', function(result) {
+        if (result && result.refresh && !result.refresh.ok) {
+          return { text: formatRefreshFailureStatus(result.refresh, '已恢复'), type: 'warn', persist: true };
+        }
+        if (result && result.reload && !result.reload.ok) {
+          return { text: '已恢复，但重新读取设置失败：' + (result.reload.error || '未知错误'), type: 'warn', persist: true };
+        }
+        return '已恢复';
+      }, '恢复默认设置', async function() {
+        setSettingsControlsDisabled(true);
         try {
           var resetKeys = getAllSettingsPatchKeys();
-          var saveResult = await saveSettings(getSettingsApplyMode(resetKeys), resetKeys);
-        } catch (e) {
-          settings = previousSettings;
-          applySavedSettings(previousSettings);
-          throw e;
+          var snapshot = cloneSettingsForSave(DEFAULTS, resetKeys);
+          var saveResult = await saveSettings(getSettingsApplyMode(resetKeys), resetKeys, snapshot);
+          try {
+            await loadUI();
+          } catch (e) {
+            console.warn('[popup] 恢复默认设置后刷新 UI 失败:', errorMessage(e));
+            return Object.assign({}, saveResult || { ok: true }, { reload: { ok: false, error: errorMessage(e) } });
+          }
+          return saveResult;
+        } finally {
+          setSettingsControlsDisabled(false);
         }
-        try {
-          await loadUI();
-        } catch (e) {
-          console.warn('[popup] 恢复默认设置后刷新 UI 失败:', errorMessage(e));
-          return Object.assign({}, saveResult || { ok: true }, { reload: { ok: false, error: errorMessage(e) } });
-        }
-        return saveResult;
-      } finally {
-        setSettingsControlsDisabled(false);
-      }
-    });
-  });
-
-  els.toggleHelp.addEventListener('click', function() {
-    var expanded = els.helpPanel.classList.contains('hidden');
-    setDisclosureState(els.toggleHelp, els.helpPanel, expanded);
-  });
-
-  els.toggleLogs.addEventListener('click', function() {
-    var expanded = els.logPanel.classList.contains('hidden');
-    setDisclosureState(els.toggleLogs, els.logPanel, expanded);
-    if (expanded) {
-      loadLogs({ allowDiscovery: true, prune: true });
-    } else {
-      logLoadSeq++;
-      loadedLogEntries = null;
-      logLoadInFlight = false;
-      setLogViewerBusy(false);
-    }
-  });
-
-  if (els.logFilter) {
-    els.logFilter.addEventListener('change', function() {
-      scheduleLogReload(0);
+      });
     });
   }
 
-  if (els.logSearch) {
-    els.logSearch.addEventListener('input', function() {
-      scheduleLogReload(LOG_SEARCH_DEBOUNCE_MS);
+  if (els.toggleHelp) {
+    els.toggleHelp.addEventListener('click', function() {
+      var expanded = els.helpPanel.classList.contains('hidden');
+      setDisclosureState(els.toggleHelp, els.helpPanel, expanded);
     });
   }
 
-  async function refreshLogCount() {
-    var seq = ++logCountSeq;
-    try {
-      var logs = await loadLogEntries({ allowDiscovery: false, prune: false });
-      if (seq !== logCountSeq) return;
-      if (!logs.length) {
-        logs = await loadLogEntries({ allowDiscovery: true, prune: false });
-        if (seq !== logCountSeq) return;
-      }
-      els.logCount.textContent = logs.length;
-    } catch (e) {
-      if (seq !== logCountSeq) return;
-      els.logCount.textContent = '!';
-      setPopupStatus('读取日志计数失败：' + errorMessage(e), 'err', true);
-    }
+  if (popupLogs) {
+    popupLogs.bindUI();
   }
 
-  function getLogFields(e) {
-    return e && e.fields && typeof e.fields === 'object' ? e.fields : {};
-  }
-
-  function scheduleLogReload(delay) {
-    if (!els.logPanel || els.logPanel.classList.contains('hidden')) return;
-    if (logReloadTimer) {
-      clearTimeout(logReloadTimer);
-      logReloadTimer = null;
-    }
-    logReloadTimer = setTimeout(function() {
-      logReloadTimer = null;
-      if (!els.logPanel || els.logPanel.classList.contains('hidden')) return;
-      if (loadedLogEntries) {
-        renderLoadedLogs(loadedLogEntries);
-      } else if (!logLoadInFlight) {
-        loadLogs({ allowDiscovery: false, prune: false });
-      }
-    }, Math.max(0, delay || 0));
-  }
-
-  function invalidateLogLoadState() {
-    logLoadSeq++;
-    logCountSeq++;
-    logLoadInFlight = false;
-    if (logReloadTimer) {
-      clearTimeout(logReloadTimer);
-      logReloadTimer = null;
-    }
-  }
-
-  function getLogType(e) {
-    return (e && e.type) || '';
-  }
-
-  function isLogUrlFieldKey(key) {
-    return /(?:url|urls|uri|uris|href|src|link|links|referrer|referer)$/i.test(String(key || ''));
-  }
-
-  function isLogUrlLikeKey(key) {
-    var raw = String(key || '');
-    return /^(?:https?:)?\/\//i.test(raw) ||
-      /\b(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?(?:\/|[?#]|$)/i.test(raw);
-  }
-
-  function isSensitiveLogExportKey(key) {
-    if (isLogUrlLikeKey(key)) return false;
-    var compact = String(key || '').replace(/[\s_.:-]+/g, '').toLowerCase();
-    return compact === 'auth' ||
-      /(?:accesstoken|refreshtoken|idtoken|authtoken|authorization|setcookie|cookie|token|secret|signature|password|passwd|pwd|credential|apikey|clientsecret|csrf|xsrf|jwt|bearer)/.test(compact);
-  }
-
-  function sanitizeLogExportUrl(url) {
-    if (url === null || url === undefined) return '';
-    var raw = String(url).trim();
-    if (!raw) return '';
-    try {
-      if (!/^https?:\/\//i.test(raw) && raw.indexOf('//') !== 0) {
-        return raw.replace(/[?#].*$/, '').substring(0, 240);
-      }
-      var u = new URL(raw, 'https://example.invalid/');
-      return (u.protocol + '//' + u.host + u.pathname).substring(0, 240);
-    } catch (e) {
-      return raw.replace(/[?#].*$/, '').substring(0, 240);
-    }
-  }
-
-  function sanitizeLogExportText(text) {
-    return String(text === null || text === undefined ? '' : text).replace(/(?:https?:)?\/\/[^\s"'<>]+/gi, function(raw) {
-      var trailing = '';
-      while (/[),.;，。！？!?]$/.test(raw)) {
-        trailing = raw.slice(-1) + trailing;
-        raw = raw.slice(0, -1);
-      }
-      return sanitizeLogExportUrl(raw) + trailing;
-    }).replace(/\b(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?(?:\/[^\s"'<>]*)?[?#][^\s"'<>]+/gi, function(raw) {
-      var trailing = '';
-      while (/[),.;，。！？!?]$/.test(raw)) {
-        trailing = raw.slice(-1) + trailing;
-        raw = raw.slice(0, -1);
-      }
-      return sanitizeLogExportUrl(raw) + trailing;
+  if (els.clearLogs) {
+    els.clearLogs.addEventListener('click', function() {
+      runDestructiveButtonAction(els.clearLogs, '再次点击清空', '再次点击确认清空诊断日志', '清空中...', '已清空!', '清空日志', async function() {
+        if (popupLogs) return popupLogs.clearLogsAction();
+      });
     });
   }
 
-  function sanitizeLogExportLabel(value) {
-    return sanitizeLogExportText(value).substring(0, 240);
-  }
-
-  function sanitizeLogExportKey(key, existing) {
-    var base = sanitizeLogExportLabel(key) || '[empty]';
-    var safe = base;
-    var n = 2;
-    while (existing && Object.prototype.hasOwnProperty.call(existing, safe)) {
-      var suffix = '_' + n++;
-      safe = base.substring(0, Math.max(1, 240 - suffix.length)) + suffix;
-    }
-    return safe;
-  }
-
-  function sanitizeLogExportValue(value, key, seenObjects) {
-    if (value === null || value === undefined) return value;
-    if (isSensitiveLogExportKey(key)) return '[redacted]';
-    if (typeof value === 'number' || typeof value === 'boolean') return value;
-    if (Array.isArray(value)) {
-      if (seenObjects && seenObjects.has(value)) return '[Circular]';
-      if (seenObjects) seenObjects.add(value);
-      var arr = [];
-      var arrayLimit = Math.min(value.length, 50);
-      for (var i = 0; i < arrayLimit; i++) {
-        arr.push(sanitizeLogExportValue(value[i], key, seenObjects));
-      }
-      if (seenObjects) seenObjects.delete(value);
-      return arr;
-    }
-    if (typeof value === 'object') {
-      if (seenObjects && seenObjects.has(value)) return '[Circular]';
-      return sanitizeLogExportFields(value, seenObjects);
-    }
-    return isLogUrlFieldKey(key) ? sanitizeLogExportUrl(value) : sanitizeLogExportText(value);
-  }
-
-  function sanitizeLogExportFields(fields, seenObjects) {
-    var out = {};
-    if (!fields || typeof fields !== 'object') return out;
-    seenObjects = seenObjects || (typeof WeakSet !== 'undefined' ? new WeakSet() : null);
-    if (seenObjects) {
-      if (seenObjects.has(fields)) return { circular: true };
-      seenObjects.add(fields);
-    }
-    var fieldCount = 0;
-    for (var key in fields) {
-      if (!Object.prototype.hasOwnProperty.call(fields, key)) continue;
-      if (fieldCount++ >= 120) break;
-      var outputKey = sanitizeLogExportKey(key, out);
-      try {
-        out[outputKey] = sanitizeLogExportValue(fields[key], key, seenObjects);
-      } catch (e) {
-        out[outputKey] = '[Unserializable]';
-      }
-    }
-    if (seenObjects) seenObjects.delete(fields);
-    return out;
-  }
-
-  function sanitizeLegacyLogDataText(data) {
-    var text = String(data);
-    var trimmed = text.trim();
-    if (trimmed && /^[\[{]/.test(trimmed)) {
-      try {
-        return JSON.stringify(sanitizeLogExportValue(JSON.parse(trimmed), ''));
-      } catch (e) {
-        // Fall through to text sanitization for truncated or legacy non-JSON data.
-      }
-    }
-    return sanitizeLogExportText(text);
-  }
-
-  function getLogDataText(e) {
-    if (!e) return '';
-    var fields = getLogFields(e);
-    if (hasLogFields(fields)) {
-      try {
-        return JSON.stringify(sanitizeLogExportFields(fields));
-      } catch (ex) {
-        // Fall back to the stored compact string if a legacy entry contains non-serializable fields.
-      }
-    }
-    if (e.data) return sanitizeLegacyLogDataText(e.data);
-    return '';
-  }
-
-  function hasLogFields(fields) {
-    for (var key in fields || {}) {
-      if (Object.prototype.hasOwnProperty.call(fields, key)) return true;
-    }
-    return false;
-  }
-
-  function isImageLog(e) {
-    var type = getLogType(e);
-    if (/^(content_start|image_|render_|first_screen_timing|diagnostic_summary|schedule_state|thread_registered|scan_complete|fallback_|log_retention)/.test(type)) return true;
-    return /High fanout|Image candidate fallback|图片无Referer|首屏完成|重图/.test(String((e && e.msg) || '') + ' ' + getLogDataText(e));
-  }
-
-  function isHeavyLog(e) {
-    var fields = getLogFields(e);
-    var text = [getLogType(e), e && e.msg, getLogDataText(e), fields.host, fields.channel].join(' ');
-    return /image\.imx\.to|high fanout|heavy|重图/i.test(text);
-  }
-
-  function getLatestSessionId(logs) {
-    for (var i = logs.length - 1; i >= 0; i--) {
-      if (logs[i] && logs[i].sessionId) return logs[i].sessionId;
-    }
-    return '';
-  }
-
-  function getLogHaystack(e) {
-    var fields = getLogFields(e);
-    return [
-      e && e.src,
-      e && e.lv,
-      e && e.msg,
-      getLogType(e),
-      e && e.pageHost,
-      fields.host,
-      fields.channel,
-      fields.reason,
-      fields.threadId,
-      getLogDataText(e)
-    ].join(' ').toLowerCase();
-  }
-
-  function filterLogEntries(logs) {
-    var filter = els.logFilter ? els.logFilter.value : 'all';
-    var query = els.logSearch ? String(els.logSearch.value || '').trim().toLowerCase() : '';
-    if (filter === 'all' && !query) return logs;
-    var latestSessionId = filter === 'session' ? getLatestSessionId(logs) : '';
-    var filtered = [];
-    for (var i = 0; i < logs.length; i++) {
-      var e = logs[i];
-      if (filter === 'session' && latestSessionId && e.sessionId !== latestSessionId) continue;
-      if (filter === 'warn' && ['WARN', 'ERROR'].indexOf(e.lv) === -1) continue;
-      if (filter === 'image' && !isImageLog(e)) continue;
-      if (filter === 'heavy' && !isHeavyLog(e)) continue;
-      if (query && getLogHaystack(e).indexOf(query) === -1) continue;
-      filtered.push(e);
-    }
-    return filtered;
-  }
-
-  function renderLogEntry(e) {
-    var cls = 'log-entry lv-' + esc(sanitizeLogExportLabel(e.lv || ''));
-    var ts = e.ts ? esc(sanitizeLogExportLabel(e.ts).substring(11, 19)) : '';
-    var rawType = getLogType(e);
-    var type = sanitizeLogExportLabel(rawType);
-    var typeHtml = type ? '<span class="type">' + esc(type) + '</span>' : '';
-    var msg = rawType && e.msg === rawType ? '' : sanitizeLogExportText(e.msg || '');
-    var d = getLogDataText(e);
-    var dataHtml = d ? ' <span class="data">' + esc(d) + '</span>' : '';
-    return '<div class="' + cls + '"><span class="ts">' + ts + '</span><span class="src">[' + esc(sanitizeLogExportLabel(e.src || '?')) + ']</span>' + typeHtml + esc(msg) + dataHtml + '</div>';
-  }
-
-  function renderLogEntries(entries, startIndex) {
-    var html = '';
-    startIndex = startIndex || 0;
-    for (var i = startIndex; i < entries.length; i++) {
-      html += renderLogEntry(entries[i]) + '\n';
-    }
-    return html;
-  }
-
-  function shouldFollowLogTail(viewer) {
-    if (!viewer) return false;
-    if (!viewer.innerHTML) return true;
-    var scrollHeight = Number(viewer.scrollHeight) || 0;
-    var clientHeight = Number(viewer.clientHeight) || 0;
-    var scrollTop = Number(viewer.scrollTop) || 0;
-    if (scrollHeight <= clientHeight) return true;
-    return scrollHeight - scrollTop - clientHeight <= 8;
-  }
-
-  function renderLoadedLogs(logs) {
-    logs = logs || [];
-    setLogViewerBusy(false);
-    var followTail = shouldFollowLogTail(els.logViewer);
-    var filtered = filterLogEntries(logs);
-    els.logCount.textContent = filtered.length === logs.length ? logs.length : filtered.length + '/' + logs.length;
-    if (!filtered.length) {
-      els.logViewer.innerHTML = '<div class="log-entry" style="color:#808080">暂无日志</div>';
-      return;
-    }
-    var renderStart = Math.max(0, filtered.length - LOG_RENDER_LIMIT);
-    els.logViewer.innerHTML = renderLogEntries(filtered, renderStart);
-    if (followTail) els.logViewer.scrollTop = els.logViewer.scrollHeight;
-  }
-
-  async function loadLogs(options) {
-    var seq = ++logLoadSeq;
-    logLoadInFlight = true;
-    setLogViewerBusy(true, '读取中...');
-    try {
-      var logs = await loadLogEntries(options || {});
-      if (seq !== logLoadSeq) return;
-      loadedLogEntries = logs;
-      renderLoadedLogs(loadedLogEntries);
-    } catch (e) {
-      if (seq !== logLoadSeq) return;
-      loadedLogEntries = null;
-      setLogViewerBusy(false);
-      els.logCount.textContent = '!';
-      var message = '读取日志失败：' + errorMessage(e);
-      els.logViewer.innerHTML = '<div class="log-entry lv-ERROR">' + esc(message) + '</div>';
-      setPopupStatus(message, 'err', true);
-    } finally {
-      if (seq === logLoadSeq) logLoadInFlight = false;
-    }
-  }
-
-  async function loadLogEntries(options) {
-    options = options || {};
-    var logKeys = await getLogKeysForRead(!!options.allowDiscovery);
-    if (options.prune) {
-      var staleLogKeys = await pruneContentLogKeys(logKeys, options.protectedLogKeys);
-      if (staleLogKeys.length) {
-        var prunedLogKeyMap = {};
-        for (var pi = 0; pi < staleLogKeys.length; pi++) prunedLogKeyMap[staleLogKeys[pi]] = true;
-        var liveLogKeys = [];
-        for (var li = 0; li < logKeys.length; li++) {
-          if (!prunedLogKeyMap[logKeys[li]]) liveLogKeys.push(logKeys[li]);
-        }
-        logKeys = liveLogKeys;
-      }
-    }
-    var readKeys = appendUniqueKeys([], logKeys);
-    appendUniqueKeys(readKeys, [LOG_CLEARED_AT_KEY]);
-    var result = await storageGet(readKeys, '读取日志内容');
-    var clearedAtMs = getLogClearedAtMs(result[LOG_CLEARED_AT_KEY]);
-    var logs = [];
-    for (var i = 0; i < logKeys.length; i++) {
-      if (Array.isArray(result[logKeys[i]])) {
-        for (var j = 0; j < result[logKeys[i]].length; j++) {
-          if (isLogEntry(result[logKeys[i]][j])) logs.push(result[logKeys[i]][j]);
-        }
-      }
-    }
-    logs = filterLogsAfterClearedAt(logs, clearedAtMs);
-    var retentionEntries = [];
-    for (var re = 0; re < logs.length; re++) {
-      if (logs[re].type === LOG_RETENTION_TYPE) retentionEntries.push(logs[re]);
-    }
-    logs.sort(function(a, b) {
-      var at = getLogSortTimestamp(a);
-      var bt = getLogSortTimestamp(b);
-      if (at !== bt) return at - bt;
-      return String(a.ts || '').localeCompare(String(b.ts || ''));
-    });
-    if (logs.length > LOG_VIEW_LIMIT) {
-      logs.splice(0, logs.length - LOG_VIEW_LIMIT);
-      var retainedSessions = {};
-      for (var li = 0; li < logs.length; li++) {
-        if (logs[li].sessionId) retainedSessions[logs[li].sessionId] = true;
-      }
-      for (var ri = 0; ri < retentionEntries.length; ri++) {
-        var retentionEntry = retentionEntries[ri];
-        if (!retainedSessions[retentionEntry.sessionId] || logs.indexOf(retentionEntry) !== -1) continue;
-        logs.splice(0, 1);
-        logs.push(retentionEntry);
-      }
-      logs.sort(function(a, b) { return getLogSortTimestamp(a) - getLogSortTimestamp(b); });
-    }
-    return logs;
-  }
-
-  function esc(s) { return SharedUtils.escapeHtml(s); }
-
-  function addLogSummaryCount(counts, value) {
-    var key = sanitizeLogExportLabel(value);
-    if (!key) return;
-    counts[key] = (counts[key] || 0) + 1;
-  }
-
-  function formatLogSummaryCounts(counts, limit) {
-    var keys = collectTopCountKeys(counts, limit || 10);
-    var parts = [];
-    for (var i = 0; i < keys.length; i++) {
-      parts.push(keys[i] + '=' + counts[keys[i]]);
-    }
-    return parts.join(', ');
-  }
-
-  function collectTopCountKeys(counts, limit) {
-    var topKeys = [];
-    counts = counts || {};
-    for (var key in counts) {
-      if (!Object.prototype.hasOwnProperty.call(counts, key)) continue;
-      var count = counts[key] || 0;
-      var insertAt = topKeys.length;
-      while (insertAt > 0 && count > (counts[topKeys[insertAt - 1]] || 0)) insertAt--;
-      if (insertAt >= limit) continue;
-      topKeys.splice(insertAt, 0, key);
-      if (topKeys.length > limit) topKeys.length = limit;
-    }
-    return topKeys;
-  }
-
-  function buildLogSummaryStats(logs) {
-    var stats = { types: {}, hosts: {}, levels: {} };
-    for (var i = 0; i < logs.length; i++) {
-      var e = logs[i];
-      var fields = getLogFields(e);
-      addLogSummaryCount(stats.types, getLogType(e) || e.msg || e.src);
-      addLogSummaryCount(stats.hosts, fields.host || e.pageHost || '');
-      addLogSummaryCount(stats.levels, e.lv || '?');
-    }
-    return stats;
-  }
-
-  function buildLogSummaryText(logs) {
-    var latestSessionId = sanitizeLogExportLabel(getLatestSessionId(logs) || '-') || '-';
-    var stats = buildLogSummaryStats(logs);
-    var typeSummary = formatLogSummaryCounts(stats.types, 12) || '-';
-    var hostSummary = formatLogSummaryCounts(stats.hosts, 12) || '-';
-    var levelSummary = formatLogSummaryCounts(stats.levels, 6) || '-';
-    var retentionLines = [];
-    var seenSessions = {};
-    for (var ri = 0; ri < logs.length; ri++) {
-      var entry = logs[ri];
-      if (!entry || entry.type !== LOG_RETENTION_TYPE) continue;
-      var fields = getLogFields(entry);
-      var session = sanitizeLogExportLabel(entry.sessionId || '-');
-      if (seenSessions[session]) continue;
-      seenSessions[session] = true;
-      retentionLines.push('会话 ' + session + ': 已裁剪' + (Number(fields.droppedEntries) || 0) +
-        '条，异常累计' + (Number(fields.incidentCount) || 0) +
-        (fields.firstDroppedAt ? '，最早裁剪于' + sanitizeLogExportLabel(fields.firstDroppedAt) : ''));
-    }
-    return [
-      '最近会话: ' + latestSessionId,
-      '级别统计: ' + levelSummary,
-      '事件统计: ' + typeSummary,
-      'Host统计: ' + hostSummary
-    ].concat(retentionLines).join('\n');
-  }
-
-  function formatLogLine(e) {
-    var rawType = getLogType(e);
-    var type = sanitizeLogExportLabel(rawType);
-    var line = '[' + sanitizeLogExportLabel(e.ts || '') + '] [' + sanitizeLogExportLabel(e.src || '?') + ':' + sanitizeLogExportLabel(e.lv || '?') + '] ';
-    if (type) line += '[' + type + '] ';
-    if (!rawType || e.msg !== rawType) line += sanitizeLogExportText(e.msg || '');
-    if (e.tsUtc) line += ' | utc=' + sanitizeLogExportLabel(e.tsUtc);
-    var timezoneOffset = formatTimezoneOffset(e.timezoneOffsetMinutes);
-    if (timezoneOffset) line += ' | tz=' + timezoneOffset;
-    if (e.timezone) line += ' | timezone=' + sanitizeLogExportLabel(e.timezone);
-    if (e.sessionId) line += ' | session=' + sanitizeLogExportLabel(e.sessionId);
-    if (e.pageHost) line += ' | pageHost=' + sanitizeLogExportLabel(e.pageHost);
-    var data = getLogDataText(e);
-    if (data) line += ' | ' + data;
-    return line;
-  }
-
-  function buildLogExportText(logs, version, exportDate, exportOffsetMinutes, exportTimezone) {
-    var parts = [
-      '=== 文章缩略图预览 v' + version + ' 诊断日志 ===\n',
-      '导出时间: ' + formatLocalTimestamp(exportDate) + '\n',
-      '导出UTC: ' + exportDate.toISOString() + '\n',
-      '导出时区: ' + formatTimezoneOffset(exportOffsetMinutes) + (exportTimezone ? ' ' + exportTimezone : '') + '\n',
-      '日志条数: ' + logs.length + '\n',
-      buildLogSummaryText(logs) + '\n',
-      '================================\n\n'
-    ];
-    for (var i = 0; i < logs.length; i++) {
-      parts.push(formatLogLine(logs[i]), '\n');
-    }
-    return parts.join('');
-  }
-
-  // Forum pacing: every forum page reports its pace to extension storage and
-  // follows the reset marker the popup writes there, so both work on any page
-  // and for every forum domain at once.
+  // ---- Forum pacing ----
   var FORUM_PACER_RESET_KEY = 'atp_forum_pacer_reset_at';
   var FORUM_PACER_STATUS_KEY = 'atp_forum_pacer_status_v1';
   var FORUM_PACER_NORMAL_BURST = 10;
   var FORUM_PACER_NORMAL_REFILL_MS = 2000;
-  // The pacer's own lifetimes, for entries written without them.
   var FORUM_PACER_LIMIT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
   var FORUM_PACER_IDLE_MAX_AGE_MS = 5 * 60 * 1000;
+  var forumPaceReports = {};
+  var forumPaceStatusRevision = 0;
+  var forumPaceTimer = null;
 
-  // The pace a host is at now, from what its pages last reported: the
-  // learned pace lapses after a day, and a host nobody has used for a while
-  // is back at its learned pace with no pause, as the pacer itself decides.
   function getForumPaceNow(entry, now) {
     if (!entry || typeof entry !== 'object') return null;
     var at = Number(entry.at) || 0;
-    var pauseUntil = Number(entry.pauseUntil) || 0;
+    var retryAfterUntil = Number(entry.retryAfterUntil) || 0;
+    var pauseUntil = Math.max(Number(entry.pauseUntil) || 0, retryAfterUntil);
     var limitsUntil = Number(entry.limitsUntil) || (at ? at + FORUM_PACER_LIMIT_MAX_AGE_MS : 0);
     var idleUntil = Number(entry.idleUntil) || (Math.max(at, pauseUntil) + FORUM_PACER_IDLE_MAX_AGE_MS);
     var learnedBurst = Number(entry.learnedBurst) || FORUM_PACER_NORMAL_BURST;
@@ -1879,12 +1379,17 @@
       learnedBurst = FORUM_PACER_NORMAL_BURST;
       learnedRefillMs = FORUM_PACER_NORMAL_REFILL_MS;
     }
-    if (now >= idleUntil) return { burst: learnedBurst, refillMs: learnedRefillMs, level: 0, pauseUntil: 0 };
+    var idle = now >= idleUntil;
+    var nextAt = limitsUntil > now ? limitsUntil : Infinity;
+    if (!idle) nextAt = Math.min(nextAt, idleUntil);
+    if (pauseUntil > now) nextAt = Math.min(nextAt, now + ((pauseUntil - now) % 1000 || 1000));
     return {
-      burst: Number(entry.burst) || learnedBurst,
-      refillMs: Number(entry.refillMs) || learnedRefillMs,
-      level: Number(entry.level) || 0,
-      pauseUntil: pauseUntil
+      burst: (!idle && Number(entry.burst)) || learnedBurst,
+      refillMs: (!idle && Number(entry.refillMs)) || learnedRefillMs,
+      level: idle ? 0 : Number(entry.level) || 0,
+      pauseUntil: pauseUntil,
+      retryAfterUntil: retryAfterUntil,
+      nextAt: nextAt
     };
   }
 
@@ -1897,88 +1402,83 @@
     );
   }
 
-  function describeForumPacerStatus(all) {
-    var hosts = all && typeof all === 'object' ? Object.keys(all) : [];
-    if (!hosts.length) return '尚无论坛节流记录；打开论坛页面后会显示当前速度。';
-    var now = Date.now();
-    var slowed = [];
-    for (var i = 0; i < hosts.length; i++) {
-      var pace = getForumPaceNow(all[hosts[i]], now);
-      if (!isForumPaceSlowed(pace, now)) continue;
-      var text = hosts[i] + '：突发 ' + pace.burst + '，之后每 ' + (Math.round(pace.refillMs / 100) / 10) + ' 秒 1 个';
-      if (pace.pauseUntil > now) text += '，暂停中（约 ' + Math.ceil((pace.pauseUntil - now) / 1000) + ' 秒）';
-      else if (pace.level > 0) text += '，限流后单路探测中';
-      slowed.push(text);
+  function describePace(pace, now) {
+    var text = '突发 ' + pace.burst + '，之后每 ' + (Math.round(pace.refillMs / 100) / 10) + ' 秒 1 个';
+    if (pace.pauseUntil > now) {
+      text += (pace.retryAfterUntil > now ? '，论坛要求等待' : '，暂停中') +
+        '（约 ' + Math.ceil((pace.pauseUntil - now) / 1000) + ' 秒）';
+    } else if (pace.level > 0) {
+      text += '，限流后单路恢复中';
     }
-    if (!slowed.length) return '论坛节流：正常速度（突发 10，之后每 2 秒 1 个）。';
-    return '论坛节流已放慢（此前触发过论坛验证页，自动放慢并保持 24 小时）：' + slowed.join('；') + '。可立即重置。';
+    return text;
+  }
+
+  function renderForumPacerInfo() {
+    if (forumPaceTimer !== null) {
+      clearTimeout(forumPaceTimer);
+      forumPaceTimer = null;
+    }
+    var now = Date.now();
+    var hosts = Object.keys(forumPaceReports);
+    var slowed = [];
+    var currentPace = null;
+    var nextAt = Infinity;
+    for (var i = 0; i < hosts.length; i++) {
+      var host = hosts[i];
+      var pace = getForumPaceNow(forumPaceReports[host], now);
+      if (!pace) continue;
+      nextAt = Math.min(nextAt, pace.nextAt);
+      if (host === currentForumPaceHost) currentPace = pace;
+      if (isForumPaceSlowed(pace, now)) slowed.push(host + '：' + describePace(pace, now));
+    }
+    if (els.currentForumPace) {
+      els.currentForumPace.hidden = !currentForumPaceHost;
+      var currentText = !currentPace ? '此站点暂无论坛节流记录。' :
+        (isForumPaceSlowed(currentPace, now) ? '论坛节流 · ' : '论坛节流正常 · ') + describePace(currentPace, now) + '。';
+      if (els.currentForumPace.textContent !== currentText) els.currentForumPace.textContent = currentText;
+    }
+    if (els.forumPacerInfo) {
+      var summary = !hosts.length ? '尚无论坛节流记录，打开论坛页面后会显示当前速度。' :
+        (slowed.length ? '论坛节流已放慢。' + slowed.join('；') + '。' : '论坛节流为正常速度（突发 10，之后每 2 秒 1 个）。');
+      if (els.forumPacerInfo.textContent !== summary) els.forumPacerInfo.textContent = summary;
+    }
+    if (Number.isFinite(nextAt)) forumPaceTimer = setTimeout(renderForumPacerInfo, Math.min(nextAt - now, 2147483647));
   }
 
   function refreshForumPacerInfo() {
-    if (!els.forumPacerInfo || !chrome.storage || !chrome.storage.local) return Promise.resolve(null);
-    return new Promise(function(resolve) {
-      try {
-        chrome.storage.local.get(FORUM_PACER_STATUS_KEY, function(result) {
-          var all = result && result[FORUM_PACER_STATUS_KEY];
-          els.forumPacerInfo.textContent = describeForumPacerStatus(all);
-          resolve(all || null);
-        });
-      } catch (e) { resolve(null); }
-    });
+    if (!chrome.storage || !chrome.storage.local) return;
+    var revision = forumPaceStatusRevision;
+    try {
+      chrome.storage.local.get(FORUM_PACER_STATUS_KEY, function(result) {
+        if (chrome.runtime.lastError || revision !== forumPaceStatusRevision) return;
+        forumPaceReports = result && result[FORUM_PACER_STATUS_KEY] || {};
+        renderForumPacerInfo();
+      });
+    } catch (e) {}
   }
 
-  // Every forum page applies the marker (open pages at once, others when
-  // they next load); the recorded statuses are set to the normal pace now so
-  // the popup does not keep showing hosts that are not open.
   async function resetForumPacing() {
-    var now = Date.now();
-    var items = {};
-    items[FORUM_PACER_RESET_KEY] = now;
-    var all = await new Promise(function(resolve) {
-      try {
-        chrome.storage.local.get(FORUM_PACER_STATUS_KEY, function(result) { resolve(result && result[FORUM_PACER_STATUS_KEY]); });
-      } catch (e) { resolve(null); }
-    });
-    if (all && typeof all === 'object') {
-      Object.keys(all).forEach(function(host) {
-        all[host] = {
-          burst: FORUM_PACER_NORMAL_BURST,
-          refillMs: FORUM_PACER_NORMAL_REFILL_MS,
-          learnedBurst: FORUM_PACER_NORMAL_BURST,
-          learnedRefillMs: FORUM_PACER_NORMAL_REFILL_MS,
-          level: 0,
-          pauseUntil: 0,
-          limitsUntil: 0,
-          idleUntil: now + FORUM_PACER_IDLE_MAX_AGE_MS,
-          at: now
-        };
-      });
-      items[FORUM_PACER_STATUS_KEY] = all;
-    }
-    await chrome.storage.local.set(items);
-    if (els.forumPacerInfo) els.forumPacerInfo.textContent = describeForumPacerStatus(all);
+    await chrome.storage.local.set({ [FORUM_PACER_RESET_KEY]: Date.now() });
     return true;
   }
 
   if (els.resetForumPacer) {
     els.resetForumPacer.addEventListener('click', function() {
-      runButtonAction(els.resetForumPacer, '重置中...', '已重置（所有论坛域名）', '立即重置论坛节流', resetForumPacing);
+      runButtonAction(els.resetForumPacer, '重置中...', '已重置节流速度', '重置论坛节流速度', resetForumPacing);
     });
   }
   if (chrome.storage && chrome.storage.onChanged && chrome.storage.onChanged.addListener) {
     chrome.storage.onChanged.addListener(function(changes, areaName) {
-      if (areaName === 'local' && changes && changes[FORUM_PACER_STATUS_KEY] && els.forumPacerInfo) {
-        els.forumPacerInfo.textContent = describeForumPacerStatus(changes[FORUM_PACER_STATUS_KEY].newValue);
+      if (areaName === 'local' && changes && changes[FORUM_PACER_STATUS_KEY]) {
+        forumPaceStatusRevision++;
+        forumPaceReports = changes[FORUM_PACER_STATUS_KEY].newValue || {};
+        renderForumPacerInfo();
       }
     });
   }
   refreshForumPacerInfo();
 
-  // ---- Marked resources and the daily backup ----
-  // The worker stores the marks; the popup reads them, builds the files here
-  // (never inside a forum page) and tells the worker what it exported or
-  // copied, which also goes into that day's backup. Nothing here deletes a
-  // backup.
+  // ---- Marked resources and daily backup ----
   var MARKS = typeof ATPMarks !== 'undefined' ? ATPMarks : null;
   var MARKS_LIST_LIMIT = 50;
   var MARKS_ERROR_TEXT = {
@@ -1989,8 +1489,18 @@
     invalid_snapshot: '导出或复制的资源快照无效'
   };
   var marksIndex = null;
+  var backupListSignature = null;
   var marksRefreshTimer = null;
   var marksClearConfirmRev = null;
+
+  function setMarksCountDisplay(count) {
+    var num = Number(count) || 0;
+    if (els.marksCount) els.marksCount.textContent = num;
+    if (els.tabMarksCount) {
+      els.tabMarksCount.textContent = num;
+      if (els.tabMarksCount.classList) els.tabMarksCount.classList.toggle('has-count', num > 0);
+    }
+  }
 
   function cancelChangedMarksConfirmation(index) {
     if (!els.clearAllMarks || !els.clearAllMarks.__atpConfirmArmed || index.rev === marksClearConfirmRev) return;
@@ -2036,10 +1546,40 @@
       (attention ? '，' + attention + ' 帖需注意（导出文件中有说明）' : '') + '。';
   }
 
+  function getListFocusRestorer(list, actionAttribute, fallback) {
+    var active = document.activeElement;
+    var key = active && active.getAttribute && active.getAttribute(actionAttribute);
+    if (!key) return null;
+    var selector = '[' + actionAttribute + ']';
+    var index = Array.from(list.querySelectorAll(selector)).indexOf(active);
+    if (index === -1) return null;
+    return function() {
+      var buttons = Array.from(list.querySelectorAll(selector));
+      var original = buttons.find(function(button) { return button.getAttribute(actionAttribute) === key; });
+      var target = original || buttons[Math.min(index, buttons.length - 1)] || fallback;
+      if (target) target.focus();
+    };
+  }
+
   function renderMarksList(index) {
-    if (!els.marksList) return;
+    if (!els.marksList || !index) return;
+    var restoreFocus = getListFocusRestorer(els.marksList, 'data-mark-remove', els.marksHeading);
     els.marksList.textContent = '';
-    var items = index.items.slice().reverse();
+    var query = els.marksSearch ? String(els.marksSearch.value || '').trim().toLowerCase() : '';
+    var allItems = index.items.slice().reverse();
+    if (els.marksSearchWrap && els.marksSearchWrap.classList) {
+      els.marksSearchWrap.classList.toggle('hidden', allItems.length === 0);
+    }
+    var items = query
+      ? allItems.filter(function(item) { return String(item.title || '').toLowerCase().indexOf(query) !== -1; })
+      : allItems;
+    if (allItems.length > 0 && items.length === 0) {
+      var emptyMatch = document.createElement('li');
+      emptyMatch.className = 'marks-item marks-item-more';
+      emptyMatch.textContent = '未找到匹配的已标记帖子';
+      els.marksList.appendChild(emptyMatch);
+      return;
+    }
     items.slice(0, MARKS_LIST_LIMIT).forEach(function(item) {
       var li = document.createElement('li');
       li.className = 'marks-item';
@@ -2068,48 +1608,59 @@
       more.textContent = '…另有 ' + (items.length - MARKS_LIST_LIMIT) + ' 帖（导出文件中完整列出）';
       els.marksList.appendChild(more);
     }
+    if (restoreFocus) restoreFocus();
   }
 
   function renderBackupDays(days) {
     if (!els.backupList) return;
-    var dates = Object.keys(days.days).sort().reverse();
-    if (els.backupCount) els.backupCount.textContent = dates.length;
-    els.backupList.textContent = '';
-    dates.forEach(function(date) {
+    var rows = Object.keys(days.days).sort().reverse().map(function(date) {
       var info = days.days[date] || {};
+      return { date: date, threads: info.threads || 0, links: info.links || 0 };
+    });
+    var signature = JSON.stringify(rows);
+    if (signature === backupListSignature) return;
+    backupListSignature = signature;
+    var summary = els.backupSection && els.backupSection.querySelector('summary');
+    var restoreFocus = getListFocusRestorer(els.backupList, 'data-backup-day', summary);
+    if (els.backupCount) els.backupCount.textContent = rows.length;
+    els.backupList.textContent = '';
+    rows.forEach(function(row) {
       var li = document.createElement('li');
       li.className = 'marks-item';
       var label = document.createElement('span');
       label.className = 'marks-item-title';
-      label.textContent = date + ' · ' + (info.threads || 0) + ' 帖 · ' + (info.links || 0) + ' 条链接';
+      label.textContent = row.date + ' · ' + row.threads + ' 帖 · ' + row.links + ' 条链接';
       var download = document.createElement('button');
       download.type = 'button';
       download.className = 'btn-link';
-      download.setAttribute('data-backup-day', date);
-      download.setAttribute('aria-label', '下载 ' + date + ' 的备份');
+      download.setAttribute('data-backup-day', row.date);
+      download.setAttribute('aria-label', '下载 ' + row.date + ' 的备份');
       download.textContent = '下载';
       li.appendChild(label);
       li.appendChild(download);
       els.backupList.appendChild(li);
     });
-    if (els.downloadAllBackups) els.downloadAllBackups.disabled = !dates.length;
+    if (els.downloadAllBackups) els.downloadAllBackups.disabled = !rows.length;
+    if (restoreFocus) restoreFocus();
   }
 
   async function refreshMarks() {
     if (!MARKS || !els.marksSection) return null;
     var items = await storageGet([MARKS.KEYS.INDEX, MARKS.KEYS.DAYS], '读取标记');
+    var previous = marksIndex;
     marksIndex = MARKS.readIndex(items && items[MARKS.KEYS.INDEX]);
     cancelChangedMarksConfirmation(marksIndex);
-    var days = MARKS.readDays(items && items[MARKS.KEYS.DAYS]);
-    if (els.marksCount) els.marksCount.textContent = marksIndex.items.length;
-    if (els.marksSummary) els.marksSummary.textContent = describeMarksSummary(marksIndex);
-    renderMarksList(marksIndex);
-    renderBackupDays(days);
-    var hasMarks = marksIndex.items.length > 0;
-    [els.exportMarks, els.copyMarks, els.clearAllMarks].forEach(function(btn) {
-      if (btn) btn.disabled = !hasMarks;
-    });
-    if (els.clearExportedMarks) els.clearExportedMarks.disabled = !marksIndex.items.some(MARKS.isExported);
+    if (!previous || previous.rev !== marksIndex.rev) {
+      setMarksCountDisplay(marksIndex.items.length);
+      if (els.marksSummary) els.marksSummary.textContent = describeMarksSummary(marksIndex);
+      renderMarksList(marksIndex);
+      var hasMarks = marksIndex.items.length > 0;
+      [els.exportMarks, els.copyMarks, els.clearAllMarks].forEach(function(btn) {
+        if (btn) btn.disabled = !hasMarks;
+      });
+      if (els.clearExportedMarks) els.clearExportedMarks.disabled = !marksIndex.items.some(MARKS.isExported);
+    }
+    renderBackupDays(MARKS.readDays(items && items[MARKS.KEYS.DAYS]));
     return marksIndex;
   }
 
@@ -2139,7 +1690,6 @@
     a.href = url;
     a.download = filename;
     a.click();
-    // Revoking at once can cancel the download in some browsers.
     setTimeout(function() { URL.revokeObjectURL(url); }, 10000);
   }
 
@@ -2212,6 +1762,11 @@
   }
 
   if (MARKS && els.marksSection) {
+    if (els.marksSearch) {
+      els.marksSearch.addEventListener('input', function() {
+        if (marksIndex) renderMarksList(marksIndex);
+      });
+    }
     if (els.exportMarks) {
       els.exportMarks.addEventListener('click', function() {
         runButtonAction(els.exportMarks, '导出中...', countSuccess('导出'), '导出 TXT', exportMarks);
@@ -2255,7 +1810,7 @@
         var btn = e.target && e.target.closest ? e.target.closest('[data-mark-remove]') : null;
         if (!btn) return;
         var id = btn.getAttribute('data-mark-remove');
-        runButtonAction(btn, '移除中...', null, '移除', async function() {
+        runButtonAction(btn, '移除中...', '已移除', '移除', async function() {
           await sendMarksMutation({ op: 'remove', ids: [id] });
           await refreshMarks();
         });
@@ -2282,12 +1837,11 @@
         });
       });
     }
-    // Turning the extension off with marks not yet exported: say so.
     if (els.toggleEnabled) {
       els.toggleEnabled.addEventListener('change', function() {
         if (els.toggleEnabled.checked || !marksIndex) return;
         var unexported = MARKS.countUnexported(marksIndex);
-        if (unexported) setPopupStatus('还有 ' + unexported + ' 个已标记的帖子未导出，可在上方「已标记资源」中导出。', 'info', true);
+        if (unexported) setPopupStatus('还有 ' + unexported + ' 个已标记的帖子未导出，可在「收藏」标签页中导出。', 'info', true);
       });
     }
     if (chrome.storage && chrome.storage.onChanged && chrome.storage.onChanged.addListener) {
@@ -2302,94 +1856,18 @@
     });
   }
 
-  // liveSession (optional) receives the flushed tab's log key so export
-  // pruning keeps that shard.
-  async function flushLiveContentLogsBeforeExport(liveSession) {
-    return new Promise(function(resolve) {
-      if (!chrome.tabs || !chrome.tabs.query || !chrome.tabs.sendMessage) { resolve(false); return; }
-      var done = false;
-      var timer = setTimeout(function() { finish(false); }, 1500);
-      function finish(ok) {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        resolve(ok === true);
-      }
-      try {
-        chrome.tabs.query({ active: true, currentWindow: true }, function(tabs) {
-          if (chrome.runtime.lastError || !tabs || !tabs[0] || typeof tabs[0].id !== 'number') { finish(false); return; }
-          try {
-            chrome.tabs.sendMessage(tabs[0].id, { type: 'ATP_FLUSH_CONTENT_LOGS' }, function(response) {
-              var ok = !chrome.runtime.lastError && response && response.ok === true;
-              if (ok && liveSession && typeof response.logKey === 'string') liveSession.logKey = response.logKey;
-              finish(ok);
-            });
-          } catch (e) { finish(false); }
-        });
-      } catch (e) { finish(false); }
-    });
-  }
-
-  els.exportLogs.addEventListener('click', function() {
-    runButtonAction(els.exportLogs, '导出中...', function(result) {
-      return result === 'empty' ? '无日志' : '已导出!';
-    }, '导出日志', async function() {
-      var liveSession = {};
-      var refreshed = await flushLiveContentLogsBeforeExport(liveSession);
-      var logs = await loadLogEntries({
-        allowDiscovery: true,
-        prune: true,
-        protectedLogKeys: liveSession.logKey ? [liveSession.logKey] : []
-      });
-      if (els.logPanel && !els.logPanel.classList.contains('hidden')) {
-        loadedLogEntries = logs;
-        renderLoadedLogs(loadedLogEntries);
-      }
-      if (!logs.length) {
-        return 'empty';
-      }
-      var version = chrome.runtime.getManifest().version;
-      var exportDate = new Date();
-      var exportOffsetMinutes = -exportDate.getTimezoneOffset();
-      var exportTimezone = getTimezoneName();
-      var text = buildLogExportText(logs, version, exportDate, exportOffsetMinutes, exportTimezone);
-      if (!refreshed) text = text.replace('================================\n\n',
-        '实时刷新: 未收到当前页面确认，最后几秒日志可能尚未写入\n================================\n\n');
-      var blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
-      var url = URL.createObjectURL(blob);
-      var a = document.createElement('a');
-      a.href = url;
-      a.download = 'thumbnail-preview-logs-' + formatLocalFilenameTimestamp(exportDate) + '.txt';
-      a.click();
-      URL.revokeObjectURL(url);
-      if (!els.logPanel || els.logPanel.classList.contains('hidden')) {
-        els.logCount.textContent = logs.length;
-      }
-    });
-  });
-
-  els.clearLogs.addEventListener('click', function() {
-    runDestructiveButtonAction(els.clearLogs, '再次点击清空', '再次点击确认清空诊断日志', '清空中...', '已清空!', '清空日志', async function() {
-      var names = await storageGetKeys('发现日志键');
-      var logKeys = getLogKeysFromNames(names);
-      await removeKeysWithLogClearMarker(collectUniqueKeys([logKeys], LOG_KEY_INDEX), '清空日志');
-      invalidateLogLoadState();
-      loadedLogEntries = [];
-      renderLoadedLogs(loadedLogEntries);
-    });
-  });
-
-  function renderSettingsGroup(groupName, items) {
+  // ---- Schema UI rendering & event binding ----
+  function renderSettingsGroupFallback(groupName, items) {
     var groupMeta = typeof ATPGetSettingsGroupMeta === 'function' ? ATPGetSettingsGroupMeta(groupName) : {};
     var collapsible = !!groupMeta.collapsible;
     var html = collapsible
       ? '<details class="settings-section settings-section-collapsible"' + (groupMeta.collapsed === false ? ' open' : '') + '><summary class="settings-section-summary">' + esc(groupName) + '</summary><div class="settings-section-body">'
       : '<section class="settings-section"><h2>' + esc(groupName) + '</h2>';
     if (groupName === '加载') {
-      html += '<div class="setting-row setting-row-presets"><span class="setting-preset-label">弱图加载预设</span><span class="setting-preset-actions">' +
-        '<button class="btn-ordinary-preset" type="button" data-preset="ordinaryGentle" title="100M：可见 6 / 后台 1 / 同域 6">100M</button>' +
-        '<button class="btn-ordinary-preset" type="button" data-preset="ordinaryBalanced" title="200M：可见 8 / 后台 2 / 同域 8">200M</button>' +
-        '<button class="btn-ordinary-preset" type="button" data-preset="ordinaryFast" title="推荐：可见 16 / 后台 2 / 同域 10">高速（推荐）</button>' +
+      html += '<div class="setting-row setting-row-presets"><span class="setting-preset-label">加载速度预设</span><span class="setting-preset-actions">' +
+        '<button class="btn-ordinary-preset" type="button" data-preset="ordinaryGentle">温和</button>' +
+        '<button class="btn-ordinary-preset" type="button" data-preset="ordinaryBalanced">均衡·推荐</button>' +
+        '<button class="btn-ordinary-preset" type="button" data-preset="ordinaryFast">极速</button>' +
         '</span></div>';
     }
     for (var i = 0; i < items.length; i++) {
@@ -2408,11 +1886,9 @@
         html += '</select></span></div>';
       } else {
         var range = (item.min !== undefined && item.max !== undefined) ? ' <small>' + esc(item.min) + '-' + esc(item.max) + '</small>' : '';
-        html += '<div class="setting-row"><label for="' + esc(item.key) + '">' + esc(item.label) + range + '</label><span class="input-wrap"><input type="number" id="' + esc(item.key) + '" min="' + (item.min !== undefined ? esc(item.min) : '') + '" max="' + (item.max !== undefined ? esc(item.max) : '') + '" step="' + esc(item.step || 1) + '"><button class="btn-reset" type="button" data-key="' + esc(item.key) + '" title="恢复默认" aria-label="恢复' + esc(item.label) + '默认值">↺</button></span></div>';
+        html += '<div class="setting-row setting-row-number"><label for="' + esc(item.key) + '">' + esc(item.label) + range + '</label><span class="input-wrap"><input type="number" id="' + esc(item.key) + '" min="' + (item.min !== undefined ? esc(item.min) : '') + '" max="' + (item.max !== undefined ? esc(item.max) : '') + '" step="' + esc(item.step || 1) + '"><button class="btn-reset" type="button" data-key="' + esc(item.key) + '" title="恢复默认" aria-label="恢复' + esc(item.label) + '默认值">↺</button></span>';
+        html += '<span id="' + esc(item.key) + '-error" class="setting-number-error" role="alert"></span></div>';
       }
-    }
-    if (groupName === '高级') {
-      html += '<div class="setting-row setting-row-site-disable"><label><input type="checkbox" id="disableSite"> 仅在此站点禁用</label><span id="disableSiteHint" class="site-disable-hint site-disable-hint-empty" role="status" aria-live="polite"></span></div>';
     }
     html += collapsible ? '</div></details>' : '</section>';
     return html;
@@ -2420,35 +1896,44 @@
 
   function renderSettingsUI() {
     if (typeof SETTINGS_SCHEMA === 'undefined') return;
-    var groups = {};
-    SETTINGS_SCHEMA.forEach(function(item) {
-      if (!groups[item.group]) groups[item.group] = [];
-      groups[item.group].push(item);
-    });
-
-    var html = '';
-    var rendered = {};
-    var groupOrder = ['显示', '加载', '高级', '专家调优', '资源'];
-    for (var g = 0; g < groupOrder.length; g++) {
-      var groupName = groupOrder[g];
-      var items = groups[groupName];
-      if (!items || !items.length) continue;
-      rendered[groupName] = true;
-      html += renderSettingsGroup(groupName, items);
+    if (typeof ATPSettingsUI !== 'undefined' && ATPSettingsUI) {
+      if (els.presetCardsContainer) {
+        els.presetCardsContainer.innerHTML = ATPSettingsUI.renderPresetCards(settings || DEFAULTS, SETTINGS_SCHEMA);
+      }
+      if (els.quickSettingsContainer) {
+        els.quickSettingsContainer.innerHTML = ATPSettingsUI.renderSettingsGroups(SETTINGS_SCHEMA, settings || DEFAULTS, {
+          variant: 'popup',
+          onlyGroups: ['常用'],
+          forceExpanded: true
+        });
+        if (els.settingsContainer) {
+          els.settingsContainer.innerHTML = ATPSettingsUI.renderSettingsGroups(SETTINGS_SCHEMA, settings || DEFAULTS, {
+            variant: 'popup',
+            excludeGroups: ['常用']
+          });
+        }
+        return;
+      }
+      if (els.settingsContainer) {
+        els.settingsContainer.innerHTML = ATPSettingsUI.renderSettingsGroups(SETTINGS_SCHEMA, settings || DEFAULTS, {
+          variant: 'popup'
+        });
+      }
+      return;
     }
-    for (var gn in groups) {
-      if (rendered[gn]) continue;
-      html += renderSettingsGroup(gn, groups[gn]);
+    if (els.settingsContainer) {
+      els.settingsContainer.innerHTML = ATPGetSettingsViewGroups(SETTINGS_SCHEMA).map(function(group) {
+        return renderSettingsGroupFallback(group[0], group[1]);
+      }).join('');
     }
-
-    els.settingsContainer.innerHTML = html;
   }
 
   function bindSchemaControls() {
     if (typeof SETTINGS_SCHEMA === 'undefined') return;
     SETTINGS_SCHEMA.forEach(function(item) {
       var el = document.getElementById(item.key);
-      if (!el) return;
+      if (!el || el.__atpSchemaBound) return;
+      el.__atpSchemaBound = true;
       el.addEventListener('input', function() {
         if (item.type === 'number' || el.tagName === 'SELECT') markSettingInputDirty(el);
       });
@@ -2457,11 +1942,9 @@
       });
       el.addEventListener('change', function() {
         if (!ensureSettingsReady(el)) return;
-        var previous = settings[item.key];
-        if (item.type === 'number' && item.min !== undefined && item.max !== undefined) {
-          var val = parseInt(el.value, 10);
-          if (isNaN(val) || val < item.min || val > item.max) {
-            el.value = settings[item.key];
+        if (item.type === 'number') {
+          var val = ATPReadNumberSetting(el.value, item);
+          if (val === null) {
             reportNumberInputError(el, item);
             return;
           }
@@ -2474,84 +1957,79 @@
           settings[item.key] = el.value;
           clearSettingInputDirty(item.key);
         }
-        if (['gridCols','visibleRows'].indexOf(item.key) !== -1) updateFirstScreen();
+        if (['gridCols', 'visibleRows', 'heavyImageOptimization', 'heavyThumbnailClarity'].indexOf(item.key) !== -1) {
+          updateFirstScreen();
+        }
         updateDependentControls();
-        var attempt = markSettingSaveAttempt(item.key, settings[item.key]);
-        saveSettings(getSettingsApplyMode([item.key]), [item.key]).catch(function(e) {
-          if (isSettingSaveAttemptCurrent(attempt)) {
-            rollbackSettingValue(item.key, previous, el);
-          }
+        saveSettings(getSettingsApplyMode([item.key]), [item.key], null, el).catch(function(e) {
           console.warn('[popup] 保存设置失败:', errorMessage(e));
         });
       });
     });
   }
 
-  function bindResetButtons() {
-    els.settingsContainer.addEventListener('click', function(e) {
-      var ordinaryPresetBtn = e.target.closest('.btn-ordinary-preset');
-      if (ordinaryPresetBtn) {
-        applyOrdinaryPresetButton(ordinaryPresetBtn);
-        return;
-      }
-      var presetBtn = e.target.closest('.btn-heavy-preset');
-      if (presetBtn) {
-        if (!ensureSettingsReady(presetBtn)) return;
-        if (presetBtn.__atpBusy) return;
-        if (!settings.heavyImageOptimization) return;
-        var previousPreset = Object.assign({}, settings);
-        forEachHeavyOriginalPreset(function(key) {
-          settings[key] = HEAVY_ORIGINAL_PRESET[key];
-          setUIValue(key);
-        });
-        updateDependentControls();
-        setButtonBusy(presetBtn, true);
-        var presetKeys = [];
-        forEachHeavyOriginalPreset(function(key) { presetKeys.push(key); });
-        var attempts = markSettingsSaveAttempt(presetKeys);
-        saveSettings(getSettingsApplyMode(presetKeys), presetKeys).catch(function(err) {
-          if (areSettingSaveAttemptsCurrent(attempts)) {
-            settings = previousPreset;
-            forEachHeavyOriginalPreset(function(key) { setUIValue(key); });
-            updateFirstScreen();
-            updateDependentControls();
-            flashError(presetBtn);
-          }
-          console.warn('[popup] 恢复重图预设失败:', errorMessage(err));
-        }).finally(function() {
-          setButtonBusy(presetBtn, false);
-          updateDependentControls();
-        });
-        return;
-      }
-      var btn = e.target.closest('.btn-reset');
-      if (!btn) return;
-      if (!ensureSettingsReady(btn)) return;
-      var key = btn.getAttribute('data-key');
-      if (!(key in DEFAULTS)) return;
-      var previous = settings[key];
-      settings[key] = DEFAULTS[key];
-      var el = document.getElementById(key);
-      if (el) {
-        if (el.type === 'checkbox') el.checked = DEFAULTS[key];
-        else el.value = DEFAULTS[key];
-        clearInputError(el);
-      }
-      if (['gridCols','visibleRows'].indexOf(key) !== -1) updateFirstScreen();
-      updateDependentControls();
-      var attempt = markSettingSaveAttempt(key, settings[key]);
-      saveSettings(getSettingsApplyMode([key]), [key]).catch(function(e) {
-        if (isSettingSaveAttemptCurrent(attempt)) {
-          rollbackSettingValue(key, previous, el);
-        }
-        console.warn('[popup] 保存设置失败:', errorMessage(e));
+  function handleSettingsRootClick(e) {
+    var target = e && e.target;
+    if (!target || typeof target.closest !== 'function') return;
+    var ordinaryPresetBtn = target.closest('.btn-ordinary-preset');
+    if (ordinaryPresetBtn) {
+      applyOrdinaryPresetButton(ordinaryPresetBtn);
+      return;
+    }
+    var presetBtn = target.closest('.btn-heavy-preset');
+    if (presetBtn) {
+      if (!ensureSettingsReady(presetBtn)) return;
+      if (presetBtn.__atpBusy) return;
+      if (!settings.heavyImageOptimization) return;
+      var presetKeys = [];
+      forEachHeavyOriginalPreset(function(key) {
+        presetKeys.push(key);
+        settings[key] = HEAVY_ORIGINAL_PRESET[key];
+        setUIValue(key);
       });
+      updateDependentControls();
+      setButtonBusy(presetBtn, true);
+      saveSettings(getSettingsApplyMode(presetKeys), presetKeys, null, presetBtn).catch(function(err) {
+        console.warn('[popup] 恢复重图预设失败:', errorMessage(err));
+      }).finally(function() {
+        setButtonBusy(presetBtn, false);
+        updateDependentControls();
+      });
+      return;
+    }
+    var btn = target.closest('.btn-reset');
+    if (!btn) return;
+    if (!ensureSettingsReady(btn)) return;
+    var key = btn.getAttribute('data-key');
+    if (!(key in DEFAULTS)) return;
+    settings[key] = DEFAULTS[key];
+    var el = document.getElementById(key);
+    if (el) {
+      if (el.type === 'checkbox') el.checked = DEFAULTS[key];
+      else el.value = DEFAULTS[key];
+      clearInputError(el);
+    }
+    if (['gridCols', 'visibleRows'].indexOf(key) !== -1) updateFirstScreen();
+    updateDependentControls();
+    saveSettings(getSettingsApplyMode([key]), [key], null, el).catch(function(e) {
+      console.warn('[popup] 保存设置失败:', errorMessage(e));
     });
+  }
+
+  function bindResetButtons() {
+    var roots = getSettingsRoots();
+    for (var i = 0; i < roots.length; i++) {
+      var root = roots[i];
+      if (!root || root.__atpResetBound) continue;
+      root.__atpResetBound = true;
+      root.addEventListener('click', handleSettingsRootClick);
+    }
   }
 
   function bindDisableSite() {
     var el = document.getElementById('disableSite');
-    if (!el) return;
+    if (!el || el.__atpDisableBound) return;
+    el.__atpDisableBound = true;
     el.addEventListener('change', function() {
       if (!ensureSettingsReady(el)) return;
       var hostname = currentSiteHost;
@@ -2563,128 +2041,53 @@
         return;
       }
       if (!settings.siteConfigs[hostname]) settings.siteConfigs[hostname] = {};
-      var previous = settings.siteConfigs[hostname].disabled;
       settings.siteConfigs[hostname].disabled = el.checked;
-      var attempt = markSiteSaveAttempt(hostname, el.checked);
+      syncSiteDot();
       var sitePatch = { siteConfigs: {} };
       sitePatch.siteConfigs[hostname] = { disabled: el.checked };
-      saveSettings(getSettingsApplyMode(['siteConfigs']), ['siteConfigs'], sitePatch).catch(function(e) {
-        if (isSiteSaveAttemptCurrent(attempt)) {
-          settings.siteConfigs[hostname].disabled = previous;
-          el.checked = !!previous;
-          flashError(el);
-        }
+      saveSettings(getSettingsApplyMode(['siteConfigs']), ['siteConfigs'], sitePatch, el).catch(function(e) {
         console.warn('[popup] 保存站点设置失败:', errorMessage(e));
       });
     });
   }
 
-  if (typeof window !== 'undefined' && window.__ATP_VERIFY_POPUP__) {
-    window.__ATPLogExportTest = {
-      getLogDataText: getLogDataText,
-      buildLogSummaryText: buildLogSummaryText,
-      formatLogLine: formatLogLine,
-      renderLogEntry: renderLogEntry,
-      isLogKey: isLogKey,
-      getLogKeysForRead: getLogKeysForRead,
-      discoverLogKeysFromStorage: discoverLogKeysFromStorage,
-      refreshLogCount: refreshLogCount,
-      loadLogEntries: loadLogEntries,
-      flushLiveContentLogsBeforeExport: flushLiveContentLogsBeforeExport,
-      loadLogs: loadLogs,
-      scheduleLogReload: scheduleLogReload,
-      renderLoadedLogs: renderLoadedLogs,
-      getLoadedLogEntries: function() { return loadedLogEntries; },
-      isLogLoadInFlight: function() { return logLoadInFlight; }
-    };
-    window.__ATPPopupTest = {
-      applySavedSettings: applySavedSettings,
-      bindSchemaControls: bindSchemaControls,
-      bindDisableSite: bindDisableSite,
-      renderHelpFromSchema: renderHelpFromSchema,
-      runButtonAction: runButtonAction,
-      runDestructiveButtonAction: runDestructiveButtonAction,
-      armDestructiveConfirm: armDestructiveConfirm,
-      handlePopupKeydown: handlePopupKeydown,
-      countExistingKeys: countExistingKeys,
-      getCacheKeysByTypes: getCacheKeysByTypes,
-      clearCacheTypes: clearCacheTypes,
-      markCacheGeneration: markCacheGeneration,
-      removeCacheKeys: removeCacheKeys,
-      removeCacheIndexEntries: removeCacheIndexEntries,
-      clearTestCacheAndLogs: clearTestCacheAndLogs,
-      formatCacheCleanupSuccess: formatCacheCleanupSuccess,
-      formatFullCleanupSuccess: formatFullCleanupSuccess,
-      setDisableSiteHost: setDisableSiteHost,
-      setSettingsControlsDisabled: setSettingsControlsDisabled,
-      saveSettings: saveSettings,
-      refreshCurrentPage: refreshCurrentPage,
-      loadUI: loadUI,
-      getSettings: function() { return settings; }
-    };
+  function formatDefaultValue(item) {
+    if (item.type === 'boolean') return item.default ? '开启' : '关闭';
+    if (item.type === 'select') {
+      var options = item.options || [];
+      for (var oi = 0; oi < options.length; oi++) {
+        if (options[oi].value === item.default) return options[oi].label;
+      }
+    }
+    return String(item.default) + (item.unit || '');
   }
 
-  document.addEventListener('DOMContentLoaded', function() {
-    var version = chrome.runtime.getManifest().version;
-    var footer = document.getElementById('versionFooter');
-    if (footer) footer.textContent = 'v' + version + ' | 技术学习交流';
-    renderSettingsUI();
-    bindSchemaControls();
-    bindResetButtons();
-    bindDisableSite();
-    // 弹窗打开期间设置被外部修改（悬浮面板/另一窗口）时同步 UI；
-    // setUIValue 内部已保护正在编辑的输入框不被覆盖
-    if (chrome.storage && chrome.storage.onChanged) {
-      chrome.storage.onChanged.addListener(function(changes, area) {
-        if (area !== 'local' || !changes.settings) return;
-        if (settingsLoadFailed || !settings) return;
-        applySavedSettings(changes.settings.newValue);
-      });
-    }
-    setSettingsControlsDisabled(true);
-    setPopupStatus('正在读取设置...', 'info', true);
-    loadUI().catch(function(e) {
-      settingsLoadFailed = true;
-      settings = ATPNormalizeSettings({ enabled: false });
-      // 同步头部开关显示，避免读取失败时仍显示「已启用」的误导状态
-      if (els.toggleEnabled) els.toggleEnabled.checked = false;
-      setSettingsControlsDisabled(true);
-      setPopupStatus('设置读取失败：' + errorMessage(e), 'err', true);
-      console.warn('[popup] 加载设置失败:', errorMessage(e));
-    });
-    refreshLogCount();
-    renderHelpFromSchema();
-  });
-
   function renderHelpFromSchema() {
-    if (typeof SETTINGS_SCHEMA === 'undefined') return;
-    var groups = {};
-    SETTINGS_SCHEMA.forEach(function(item) {
-      if (!groups[item.group]) groups[item.group] = [];
-      groups[item.group].push(item);
-    });
+    if (typeof SETTINGS_SCHEMA === 'undefined' || !els.helpPanel) return;
     var staticHelp = {
       '维护': [
         { label: '↺ 按钮', desc: '点击将该项恢复为默认值，其他项不变。' },
-        { label: '清除文章/图片缓存', desc: '删除文章提取结果和已缓存图片，刷新后重新抓取；不清除 TXT 资源缓存。' },
-        { label: '清除失败缓存', desc: '删除"无图"标记和 TXT 解析失败标记，让之前被误判的帖子或附件可立即重试。' },
-        { label: '清除全部缓存', desc: '同时清除文章/图片缓存、TXT 资源缓存和失败缓存。' },
-        { label: '恢复默认设置', desc: '重置所有设置为出厂默认值（保留站点禁用列表）。' }
+        { label: '清除文章与资源缓存', desc: '删除文章提取结果和已缓存图片，下次访问重新抓取；不清除 TXT 资源缓存与收藏。' },
+        { label: '清除失败缓存', desc: '删除“无图”标记和 TXT 解析失败标记，让之前被误判的帖子或附件可立即重试。' },
+        { label: '清除全部缓存', desc: '同时清除文章/图片缓存、TXT 资源缓存和失败缓存（不会删除已标记资源与每日备份）。' },
+        { label: '恢复默认设置', desc: '重置所有设置为推荐默认值（保留站点禁用列表与镜像授权）。' }
       ],
       '高级': [
         { label: '仅在此站点禁用', desc: '勾选后当前站点停止缩略图预览。' }
       ]
     };
-    function formatDefaultValue(item) {
-      if (item.type === 'boolean') return item.default ? '开启' : '关闭';
-      if (item.type === 'select') {
-        var options = item.options || [];
-        for (var oi = 0; oi < options.length; oi++) {
-          if (options[oi].value === item.default) return options[oi].label;
-        }
-      }
-      return String(item.default) + (item.unit || '');
+    if (typeof ATPSettingsUI !== 'undefined' && ATPSettingsUI && typeof ATPSettingsUI.buildHelpHtml === 'function') {
+      els.helpPanel.innerHTML = ATPSettingsUI.buildHelpHtml(SETTINGS_SCHEMA, {
+        variant: 'popup',
+        staticHelp: staticHelp
+      });
+      return;
     }
+    var groups = {};
+    SETTINGS_SCHEMA.forEach(function(item) {
+      if (!groups[item.group]) groups[item.group] = [];
+      groups[item.group].push(item);
+    });
     var html = '';
     for (var groupName in groups) {
       html += '<div class="help-cat">' + esc(groupName) + '</div>';
@@ -2710,4 +2113,68 @@
     }
     els.helpPanel.innerHTML = html;
   }
+
+  if (typeof window !== 'undefined' && window.__ATP_VERIFY_POPUP__) {
+    if (popupLogs) {
+      window.__ATPLogExportTest = popupLogs.getTestHooks();
+    }
+    window.__ATPPopupTest = {
+      applySavedSettings: applySavedSettings,
+      bindSchemaControls: bindSchemaControls,
+      bindDisableSite: bindDisableSite,
+      bindResetButtons: bindResetButtons,
+      renderHelpFromSchema: renderHelpFromSchema,
+      runButtonAction: runButtonAction,
+      runDestructiveButtonAction: runDestructiveButtonAction,
+      armDestructiveConfirm: armDestructiveConfirm,
+      handlePopupKeydown: handlePopupKeydown,
+      countExistingKeys: countExistingKeys,
+      getCacheKeysByTypes: getCacheKeysByTypes,
+      clearCacheTypes: clearCacheTypes,
+      markCacheGeneration: markCacheGeneration,
+      removeCacheKeys: removeCacheKeys,
+      removeCacheIndexEntries: removeCacheIndexEntries,
+      clearTestCacheAndLogs: clearTestCacheAndLogs,
+      formatCacheCleanupSuccess: formatCacheCleanupSuccess,
+      formatFullCleanupSuccess: formatFullCleanupSuccess,
+      setDisableSiteHost: setDisableSiteHost,
+      setSettingsControlsDisabled: setSettingsControlsDisabled,
+      saveSettings: saveSettings,
+      refreshCurrentPage: refreshCurrentPage,
+      loadUI: loadUI,
+      getSettings: function() { return settings; }
+    };
+  }
+
+  document.addEventListener('DOMContentLoaded', function() {
+    var version = chrome.runtime.getManifest().version;
+    if (els.versionBadge) els.versionBadge.textContent = 'v' + version;
+    var footer = document.getElementById('versionFooter');
+    if (footer) footer.textContent = 'v' + version + ' · 技术学习交流';
+    bindTabNavigation();
+    renderSettingsUI();
+    bindSchemaControls();
+    bindResetButtons();
+    bindDisableSite();
+    if (chrome.storage && chrome.storage.onChanged) {
+      chrome.storage.onChanged.addListener(function(changes, area) {
+        if (area !== 'local' || !changes.settings) return;
+        if (settingsLoadFailed || !settings) return;
+        applySavedSettings(changes.settings.newValue);
+      });
+    }
+    setSettingsControlsDisabled(true);
+    setPopupStatus('正在读取设置...', 'info', true);
+    loadUI().catch(function(e) {
+      settingsLoadFailed = true;
+      settings = ATPNormalizeSettings({ enabled: false });
+      if (els.toggleEnabled) els.toggleEnabled.checked = false;
+      setSettingsControlsDisabled(true);
+      setPopupStatus('设置读取失败：' + errorMessage(e), 'err', true);
+      console.warn('[popup] 加载设置失败:', errorMessage(e));
+    });
+    if (popupLogs) popupLogs.refreshLogCount();
+    refreshCacheStatsDisplay();
+    renderHelpFromSchema();
+  });
 })();

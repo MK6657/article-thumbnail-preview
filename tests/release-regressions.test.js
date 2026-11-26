@@ -7,7 +7,7 @@ const vm = require('vm');
 
 function loadShared(encoder) {
   const sandbox = { URL, TextEncoder: encoder, TextDecoder };
-  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'shared-utils.js'), 'utf8') +
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'shared-utils.js'), 'utf8') + '\n' + fs.readFileSync(path.join(__dirname, '..', 'html-extractors.js'), 'utf8') +
     '\nthis.SharedUtils = SharedUtils;', sandbox);
   return sandbox.SharedUtils;
 }

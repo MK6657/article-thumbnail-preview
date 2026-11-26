@@ -1,6 +1,8 @@
 (function () {
   'use strict';
 
+  var root = typeof window !== 'undefined' ? window : globalThis;
+
   function defaultValue(key, fallback) {
     return typeof ATP_DEFAULTS !== 'undefined' && ATP_DEFAULTS[key] !== undefined
       ? ATP_DEFAULTS[key]
@@ -26,7 +28,7 @@
   }
 
   function getBackgroundPresetDelay(settings) {
-    var speed = settings && settings.backgroundSpeed || defaultValue('backgroundSpeed', 'normal');
+    var speed = (settings && settings.backgroundSpeed) || defaultValue('backgroundSpeed', 'normal');
     if (speed === 'extreme') return 20;
     if (speed === 'veryfast') return 50;
     if (speed === 'fast') return 100;
@@ -35,87 +37,89 @@
   }
 
   var ATPLoadPolicy = {
-    getArticleFetchConcurrency: function(settings) {
+    getArticleFetchConcurrency: function (settings) {
       return positiveInteger(settings, 'articleFetchConcurrency', 3);
     },
 
-    getArticleQueueHighWatermark: function(settings) {
+    getArticleQueueHighWatermark: function (settings) {
       return positiveInteger(settings, 'articleQueueHighWatermark', 5);
     },
 
-    getArticleTimeout: function(settings) {
+    getArticleTimeout: function (settings) {
       return positiveInteger(settings, 'articleTimeout', 15000);
     },
 
-    getArticlePrefetchDistance: function(settings) {
+    getArticlePrefetchDistance: function (settings) {
       return nonNegativeInteger(settings, 'articlePrefetchDistance', 2000);
     },
 
-    getArticleCommitBatchSize: function(settings) {
+    getArticleCommitBatchSize: function (settings) {
       return positiveInteger(settings, 'articleCommitBatchSize', 2);
     },
 
-    getOrdinaryHostConcurrency: function(settings) {
+    getFirstScreenConcurrency: function (settings) {
+      return positiveInteger(settings, 'firstScreenConcurrency', 3);
+    },
+
+    getBackgroundConcurrency: function (settings) {
+      return positiveInteger(settings, 'backgroundConcurrency', 1);
+    },
+
+    getOrdinaryHostConcurrency: function (settings) {
       return positiveInteger(settings, 'ordinaryHostConcurrency', 6);
     },
 
-    isOrdinaryHostAdaptive: function(settings) {
+    isOrdinaryHostAdaptive: function (settings) {
       return !settings || settings.ordinaryHostAdaptive !== false;
     },
 
-    getOrdinaryHostSoftLimit: function(settings) {
+    getOrdinaryHostSoftLimit: function (settings) {
       return Math.min(
         ATPLoadPolicy.getOrdinaryHostConcurrency(settings),
         positiveInteger(settings, 'ordinaryHostSoftLimit', 2)
       );
     },
 
-    getOrdinaryHostHardLimit: function(settings) {
-      // 硬限制对应更严重的失败压力，不允许配置反转成比软限制更宽
+    getOrdinaryHostHardLimit: function (settings) {
       return Math.min(
         ATPLoadPolicy.getOrdinaryHostSoftLimit(settings),
         positiveInteger(settings, 'ordinaryHostHardLimit', 1)
       );
     },
 
-    getOrdinaryHostSoftFailures: function(settings) {
+    getOrdinaryHostSoftFailures: function (settings) {
       return positiveInteger(settings, 'ordinaryHostSoftFailures', 3);
     },
 
-    getOrdinaryHostHardFailures: function(settings) {
+    getOrdinaryHostHardFailures: function (settings) {
       return positiveInteger(settings, 'ordinaryHostHardFailures', 6);
     },
 
-    getOrdinaryHostCooldown: function(settings) {
+    getOrdinaryHostCooldown: function (settings) {
       return nonNegativeInteger(settings, 'ordinaryHostCooldownMs', 30000);
     },
 
-    getOrdinaryHostRecoverySuccesses: function(settings) {
+    getOrdinaryHostRecoverySuccesses: function (settings) {
       return positiveInteger(settings, 'ordinaryHostRecoverySuccesses', 3);
     },
 
-    getGlobalImageConcurrency: function(settings, ordinaryLimit, heavyLimit) {
+    getGlobalImageConcurrency: function (settings, ordinaryLimit, heavyLimit) {
       var configured = nonNegativeInteger(settings, 'globalImageConcurrency', 0);
       if (configured > 0) return configured;
       return Math.max(1, Number(ordinaryLimit) || 1) + Math.max(0, Number(heavyLimit) || 0);
     },
 
-    // Offscreen first rows share the ordinary pool with visible images. The
-    // visible reserve must hold inside that pool, not only in the global
-    // total, or offscreen loads can take every ordinary slot (3 of 3 with
-    // defaults). Capped at 3 lanes; at least 1 so offscreen work progresses.
-    getOffscreenFirstRowOrdinaryLimit: function(settings) {
+    getOffscreenFirstRowOrdinaryLimit: function (settings) {
       var pool = positiveInteger(settings, 'firstScreenConcurrency', 3);
       var reserve = Math.min(pool - 1, ATPLoadPolicy.getViewportPriorityReservedSlots(settings));
       return Math.max(1, Math.min(3, pool - Math.max(0, reserve)));
     },
 
-    // Heavy slots keep one for visible heavy threads the same way.
-    getOffscreenFirstRowHeavyLimit: function(settings) {
+    getOffscreenFirstRowHeavyLimit: function (settings) {
       return Math.max(1, positiveInteger(settings, 'heavyImageConcurrency', 2) - 1);
     },
 
-    getViewportPendingLimit: function(settings, backgroundLimit) {
+    getViewportPendingLimit: function (settings, backgroundLimit) {
       var configured = nonNegativeInteger(settings, 'viewportPendingLimit', 0);
       if (configured > 0) return configured;
       var cols = positiveInteger(settings, 'gridCols', 5);
@@ -123,134 +127,182 @@
       return Math.max(1, (Number(backgroundLimit) || 1) * 8, cols * rows * 3, 24);
     },
 
-    getBackgroundDelay: function(settings) {
+    getBackgroundDelay: function (settings) {
       var custom = integerValue(settings, 'backgroundDelayMs', -1);
       return custom >= 0 ? custom : getBackgroundPresetDelay(settings);
     },
 
-    getHeavySchedulingMode: function(settings) {
+    isHeavyImageOptimizationEnabled: function (settings) {
+      return !settings || settings.heavyImageOptimization !== false;
+    },
+
+    getHeavyThumbnailClarity: function (settings) {
+      if (!ATPLoadPolicy.isHeavyImageOptimizationEnabled(settings)) return 'balanced';
+      if (settings && (settings.heavyThumbnailClarity === 'lightweight' || settings.heavyThumbnailClarity === 'blurred')) {
+        return 'lightweight';
+      }
+      return 'balanced';
+    },
+
+    getHeavySchedulingMode: function (settings) {
       return settings && settings.heavySchedulingMode === 'fixed' ? 'fixed' : 'adaptive';
     },
 
-    isHeavyCircuitBreakerEnabled: function(settings) {
+    isHeavyCircuitBreakerEnabled: function (settings) {
       return !settings || settings.heavyCircuitBreaker !== false;
     },
 
-    getHeavyConcurrencyCeiling: function(settings) {
+    getHeavyConcurrencyCeiling: function (settings) {
       return positiveInteger(settings, 'heavyImageConcurrency', 2);
     },
 
-    getHeavyWarmupConcurrency: function(settings) {
+    getHeavyWarmupConcurrency: function (settings) {
       return Math.min(
         ATPLoadPolicy.getHeavyConcurrencyCeiling(settings),
         positiveInteger(settings, 'heavyWarmupConcurrency', 2)
       );
     },
 
-    getHeavyProbeConcurrency: function(settings) {
+    getHeavyProbeConcurrency: function (settings) {
       return Math.min(
         ATPLoadPolicy.getHeavyConcurrencyCeiling(settings),
         positiveInteger(settings, 'heavyProbeConcurrency', 1)
       );
     },
 
-    getOrdinaryReservedSlots: function(settings) {
+    getOrdinaryReservedSlots: function (settings) {
       return nonNegativeInteger(settings, 'ordinaryReservedSlots', 2);
     },
 
-    getViewportPriorityReservedSlots: function(settings) {
+    getViewportPriorityReservedSlots: function (settings) {
       return nonNegativeInteger(settings, 'viewportPriorityReservedSlots', 2);
     },
 
-    getOrdinaryFallbackLimit: function(settings) {
+    getOrdinaryFallbackLimit: function (settings) {
       return nonNegativeInteger(settings, 'ordinaryFallbackLimit', 2);
     },
 
-    getHeavyImageTimeout: function(settings) {
+    getHeavyImageTimeout: function (settings) {
       var configured = nonNegativeInteger(settings, 'heavyImageTimeout', 0);
       return configured > 0 ? configured : positiveInteger(settings, 'imageTimeout', 15000);
     },
 
-    getHeavyFailureThreshold: function(settings) {
+    getHeavyFailureThreshold: function (settings) {
       return positiveInteger(settings, 'heavyFailureThreshold', 6);
     },
 
-    getHeavyFailureWindow: function(settings) {
+    getHeavyFailureWindow: function (settings) {
       return positiveInteger(settings, 'heavyFailureWindowMs', 60000);
     },
 
-    getHeavyCooldownBase: function(settings) {
+    getHeavyCooldownBase: function (settings) {
       return nonNegativeInteger(settings, 'heavyCooldownBaseMs', 20000);
     },
 
-    getHeavyCooldownMax: function(settings) {
+    getHeavyCooldownMax: function (settings) {
       return Math.max(
         ATPLoadPolicy.getHeavyCooldownBase(settings),
         nonNegativeInteger(settings, 'heavyCooldownMaxMs', 60000)
       );
     },
 
-    getHeavyRampSuccesses: function(settings) {
+    getHeavyRampSuccesses: function (settings) {
       return positiveInteger(settings, 'heavyRampSuccesses', 2);
     },
 
-    getHeavyRecoverySuccesses: function(settings) {
+    getHeavyRecoverySuccesses: function (settings) {
       return positiveInteger(settings, 'heavyRecoverySuccesses', 2);
     },
 
-    getHeavyFallbackLimit: function(settings) {
+    getHeavyFallbackLimit: function (settings) {
       return nonNegativeInteger(settings, 'heavyFallbackLimit', 2);
     },
 
-    getImageTaskDeadline: function(settings) {
+    getImageTaskDeadline: function (settings) {
       return nonNegativeInteger(settings, 'imageTaskDeadline', 0);
     },
 
-    // 动图（几 MB 起）在限流的单独通道里下载，给更长的单次超时和任务截止，
-    // 免得下载到一大半就被判失败、字节白费。无任务截止时仍不设截止。
-    getLargeImageTimeout: function(settings) {
-      var base = nonNegativeInteger(settings, 'imageTimeout', 15000) || 15000;
+    getReadyImageAttemptTimeout: function (settings) {
+      var fallbackTimeout = Number(defaultValue('imageTimeout', 12000)) || 12000;
+      var timeout = nonNegativeInteger(settings, 'imageTimeout', fallbackTimeout) || fallbackTimeout;
+      var deadline = ATPLoadPolicy.getImageTaskDeadline(settings);
+      return deadline > 0 ? Math.min(timeout, deadline) : timeout;
+    },
+
+    getLargeImageTimeout: function (settings) {
+      var fallbackTimeout = Number(defaultValue('imageTimeout', 12000)) || 12000;
+      var base = nonNegativeInteger(settings, 'imageTimeout', fallbackTimeout) || fallbackTimeout;
       return Math.max(base * 3, 30000);
     },
 
-    getLargeImageTaskDeadline: function(settings) {
+    getLargeImageTaskDeadline: function (settings) {
       var base = nonNegativeInteger(settings, 'imageTaskDeadline', 0);
       return base > 0 ? Math.max(base * 3, 45000) : 0;
     },
 
-    // 同一普通图床同时下载动图的起始宽度；之后按动图实际完成速度自适应放宽或收窄。
-    getLargeImageHostConcurrency: function() {
+    getLargeImageHostConcurrency: function () {
       return 2;
     },
 
-    // 动图在此时间内完成算“快”，动图通道可放宽一条；超过“慢”阈值或超时则减半。
-    getLargeImageFastMs: function(settings) {
+    getLargeImageFastMs: function (settings) {
       var base = nonNegativeInteger(settings, 'imageTimeout', 15000) || 15000;
       return Math.max(2000, Math.min(5000, Math.round(base * 0.4)));
     },
 
-    getLargeImageSlowMs: function(settings) {
+    getLargeImageSlowMs: function (settings) {
       var base = nonNegativeInteger(settings, 'imageTimeout', 15000) || 15000;
       return Math.max(6000, Math.min(15000, base));
     },
 
-    getHeavyDecodedBudgetMP: function(settings) {
+    getHeavyDecodedBudgetMP: function (settings) {
       return nonNegativeInteger(settings, 'heavyDecodedBudgetMP', 160);
     },
 
-    getHeavyVisibleBudgetMP: function(settings) {
+    getHeavyVisibleBudgetMP: function (settings) {
       return nonNegativeInteger(settings, 'heavyVisibleBudgetMP', 180);
     },
 
-    getHeavyDecodedImageLimit: function(settings) {
+    getHeavyDecodedImageLimit: function (settings) {
       return nonNegativeInteger(settings, 'heavyDecodedImageLimit', 8);
     },
 
-    getHeavyLightweightPreviewEdge: function(settings) {
+    getHeavyLightweightPreviewEdge: function (settings) {
       return positiveInteger(settings, 'heavyLightweightPreviewEdge', 160);
     },
 
-    getPublicSnapshot: function(settings) {
+    getMaxRetryPerImage: function (settings) {
+      return nonNegativeInteger(settings, 'maxRetryPerImage', 0);
+    },
+
+    getAnimatedThumbnailMode: function (settings) {
+      return settings && settings.animatedThumbnailMode === 'play' ? 'play' : 'still';
+    },
+
+    isPauseWhenHiddenEnabled: function (settings) {
+      return !settings || settings.pauseWhenHidden !== false;
+    },
+
+    isAutoLoadOffscreenFirstRowsEnabled: function (settings) {
+      return !!(settings && (settings.autoLoadOffscreenFirstRowsEnabled === true || settings.autoLoadOffscreenFirstRows === true));
+    },
+
+    isDebugLoggingEnabled: function (settings) {
+      return !!(settings && settings.debugLogging === true);
+    },
+
+    getPreemptionMinAgeMs: function () {
+      return 250;
+    },
+
+    getViewportNearMarginPx: function () {
+      return 480;
+    },
+
+    getViewportPrefetchMarginPx: function () {
+      return 1500;
+    },
+
+    getPublicSnapshot: function (settings) {
       var ordinary = positiveInteger(settings, 'firstScreenConcurrency', 3);
       var heavy = ATPLoadPolicy.getHeavyConcurrencyCeiling(settings);
       var globalConfigured = nonNegativeInteger(settings, 'globalImageConcurrency', 0);
@@ -278,6 +330,7 @@
         heavyImageTimeout: ATPLoadPolicy.getHeavyImageTimeout(settings),
         heavyFallbackLimit: ATPLoadPolicy.getHeavyFallbackLimit(settings),
         imageTaskDeadline: ATPLoadPolicy.getImageTaskDeadline(settings),
+        readyImageAttemptTimeout: ATPLoadPolicy.getReadyImageAttemptTimeout(settings),
         largeImageTimeout: ATPLoadPolicy.getLargeImageTimeout(settings),
         largeImageTaskDeadline: ATPLoadPolicy.getLargeImageTaskDeadline(settings),
         largeImageHostConcurrency: ATPLoadPolicy.getLargeImageHostConcurrency(settings),
@@ -291,5 +344,6 @@
     }
   };
 
+  root.ATPLoadPolicy = ATPLoadPolicy;
   globalThis.ATPLoadPolicy = ATPLoadPolicy;
 })();

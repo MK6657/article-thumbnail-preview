@@ -41,7 +41,7 @@ function load(options = {}) {
   const failWrites = [];
   const listeners = [];
   const sandbox = {
-    URL, TextDecoder, TextEncoder, Uint8Array, AbortController, console,
+    URL, TextDecoder, TextEncoder, ArrayBuffer, Uint8Array, AbortController, console,
     Date: class extends Date { static now() { return clock; } },
     setTimeout(fn, delay) {
       const id = ++timerSequence;
@@ -70,6 +70,10 @@ function load(options = {}) {
         : response(url, 'https://pan.baidu.com/s/1yield' + requests.length);
     },
     chrome: { runtime: { lastError: null, sendMessage(message, callback) {
+      if (message.type === 'REPORT_FORUM_PACER_STATUS') {
+        callback({ ok: true });
+        return;
+      }
       messages.push({ message, callback });
       if (options.message) return options.message(message, callback);
       callback({ resources: sandbox.SharedUtils.emptyResources(), attemptedCount: message.attachments.length,
@@ -82,13 +86,16 @@ function load(options = {}) {
       const index = listeners.indexOf(listener);
       if (index >= 0) listeners.splice(index, 1);
     };
-    sandbox.postMessage = data => sandbox.setTimeout(() => listeners.slice().forEach(listener => listener({
-      source: contextWindow, origin, data
-    })), 0);
+    sandbox.postMessage = data => {
+      const delay = data.type === 'ATP_PAGE_TEXT_FETCH_REQUEST_V1' ? options.bridgeRequestDelay || 0 : 0;
+      return sandbox.setTimeout(() => listeners.slice().forEach(listener => listener({
+        source: contextWindow, origin, data
+      })), delay);
+    };
   }
   sandbox.window = sandbox;
   vm.createContext(sandbox);
-  vm.runInContext(read('shared-utils.js') + '\nthis.SharedUtils = SharedUtils;', sandbox);
+  vm.runInContext(read('shared-utils.js') + '\n' + read('html-extractors.js') + '\nthis.SharedUtils = SharedUtils;', sandbox);
   vm.runInContext(read('loading-policy.js'), sandbox);
   vm.runInContext(read('forum-pacer.js'), sandbox);
   if (options.bridge !== false) vm.runInContext(read('page-fetch-bridge.js'), sandbox);
@@ -135,6 +142,55 @@ function assertYield(status, unresolved) {
 function assertNoFailure(run) {
   assert.strictEqual(run.failWrites.length, 0, 'yield must not populate the failure cache');
   assert(!run.events.some(event => event.fields.outcome === 'failed'), 'yield must not log a request failure');
+}
+
+async function checkBridgeDeadlineAcrossWorlds() {
+  const expired = load({ bridgeRequestDelay: 100 });
+  let expiredStatus;
+  const expiredResult = expired.fetcher.fetchTextAttachmentResourcesWithStatus([attachment('expired-bridge')], {
+    deadline: expired.now() + 40
+  }).then(status => { expiredStatus = status; });
+  await expired.advance(40);
+  assert(expiredStatus, 'the content bridge waiter must settle at the shared deadline');
+  assert.strictEqual(expiredStatus.retryableCount, 1);
+  assert.strictEqual(expired.pacer.getState().active, 0, 'the expired bridge waiter must release its pace slot');
+  await expired.advance(60);
+  await expiredResult;
+  assert.strictEqual(expired.requests.length, 0, 'a bridge message delivered after the deadline must not start a fetch');
+  assert.strictEqual(expired.messages.length, 0, 'the expired bridge attempt must not send a background fallback');
+  assert.strictEqual(expired.failWrites.length, 0, 'a deadline must not record a persistent attachment failure');
+
+  const inflight = load({
+    bridgeRequestDelay: 30,
+    fetch(url, options) {
+      return new Promise((resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+      });
+    }
+  });
+  const inflightResult = inflight.fetcher.fetchTextAttachmentResourcesWithStatus([attachment('inflight-bridge')], {
+    deadline: inflight.now() + 40
+  });
+  await inflight.advance(30);
+  assert.strictEqual(inflight.requests.length, 1, 'a message received before the deadline may start its request');
+  const { signal } = inflight.requests[0].options;
+  await inflight.advance(9);
+  assert.strictEqual(signal.aborted, false, 'the request may run during the rest of the shared window');
+  await inflight.advance(1);
+  assert.strictEqual(signal.aborted, true, 'the page fetch must abort at the original deadline');
+  assert.strictEqual((await inflightResult).retryableCount, 1);
+  assert.strictEqual(inflight.messages.length, 0);
+
+  const attemptTimeout = load({ bridgeRequestDelay: 11000 });
+  let fallbackStatus;
+  const fallbackResult = attemptTimeout.fetcher.fetchTextAttachmentResourcesWithStatus([attachment('bridge-attempt-timeout')], {
+    deadline: attemptTimeout.now() + 20000
+  }).then(status => { fallbackStatus = status; });
+  await attemptTimeout.advance(11000);
+  assert(fallbackStatus, 'the fallback must settle within the remaining run time');
+  await fallbackResult;
+  assert.strictEqual(fallbackStatus.resolvedAttachments.length, 1, 'a single fallback may use the remaining run time');
+  assert.strictEqual(attemptTimeout.requests.length, 1, 'late bridge delivery must not duplicate a completed fallback');
 }
 
 async function checkBridgeWaitCancellation() {
@@ -379,6 +435,45 @@ async function checkFreshAndManual() {
   assert.strictEqual(manual.requests.length, 1, 'manual retry must retain its existing immediate request behavior');
 }
 
+async function checkManualRetryDoesNotWaitTwiceForForumAdmission() {
+  const run = load();
+  (await run.pacer.acquire({ manual: true })).done('flood');
+  await run.advance(run.pacer.getState().pausedMs + 1);
+  const pendingProbe = run.pacer.acquire({ manual: true });
+  await run.advance();
+  const probe = await pendingProbe;
+  assert(probe, 'the test must occupy the shared recovery probe');
+
+  let result;
+  const retry = run.fetcher.fetchTextAttachmentResourcesWithStatus([attachment('waiting-retry')], {
+    manualRetry: true
+  }).then(status => { result = status; });
+  await run.advance();
+  assert.strictEqual(run.pacer.getState().waiting, 1);
+  await run.advance(run.sandbox.SharedUtils.TEXT_ATTACHMENT_TIMEOUT + 500);
+  assert(result, 'a retry whose forum admission expired must settle after one wait');
+  assert.strictEqual(result.retryableCount, 1);
+  assert.strictEqual(run.pacer.getState().waiting, 0, 'the worker must not wait again for the same attachment');
+  assert.strictEqual(run.requests.length, 0);
+  assert.strictEqual(run.messages.length, 0);
+  assertNoFailure(run);
+  probe.done('ok');
+  await retry;
+
+  const direct = load({ bridge: false });
+  const acquire = direct.pacer.acquire;
+  let admissionCount = 0;
+  direct.pacer.acquire = options => ++admissionCount === 1 ? acquire(options) : Promise.resolve(null);
+  const resultAfterDirectWait = await direct.fetcher.fetchTextAttachmentResourcesWithStatus([attachment('direct-wait')], {
+    manualRetry: true
+  });
+  assert.strictEqual(resultAfterDirectWait.retryableCount, 1);
+  assert.strictEqual(admissionCount, 2, 'a refused direct handoff must not ask for a third turn in the worker');
+  assert.strictEqual(direct.requests.length, 0);
+  assert.strictEqual(direct.messages.length, 0);
+  assertNoFailure(direct);
+}
+
 async function checkGrantedTicketRefundAndLatch() {
   const run = load();
   const acquire = run.pacer.acquire;
@@ -414,6 +509,7 @@ async function checkGrantedTicketRefundAndLatch() {
 }
 
 async function run() {
+  await checkBridgeDeadlineAcrossWorlds();
   await checkBridgeWaitCancellation();
   await checkDynamicPriorityAndInflight();
   await checkPartialResultsAndResume();
@@ -421,8 +517,9 @@ async function run() {
   await checkVisibleFallbackAllowance();
   await checkDirectAndIntermediaryBoundaries();
   await checkFreshAndManual();
+  await checkManualRetryDoesNotWaitTwiceForForumAdmission();
   await checkGrantedTicketRefundAndLatch();
-  console.log('TXT yield tests ok: dynamic pace cancellation, priority, inflight retention, partial resources, resumption and fresh reads');
+  console.log('TXT yield tests ok: bridge deadlines, dynamic pace cancellation, priority, inflight retention, partial resources, resumption and fresh reads');
 }
 
 run().catch(error => { console.error(error && error.stack || error); process.exit(1); });

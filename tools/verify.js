@@ -24,8 +24,15 @@ function readIfExists(relPath) {
 function runtimeForVerify(file) {
   let source = read(file);
   if (file === 'loader.js') {
-    source = source.replace('  window.ATPLoader = ATPLoader;',
-      '  ATPLoader.getBgTasks = function() { return BG_TASKS; };\n  ATPLoader.getActive = function() { return GLOBAL_ACTIVE; };\n  ATPLoader._getQueueSnapshotForVerify = getQueueSnapshotFields;\n  window.ATPLoader = ATPLoader;');
+    const deps = read('host-health.js') + '\n' + read('image-runner.js') + '\n';
+    source = deps + source.replace('  window.ATPLoader = ATPLoader;',
+      '  if (!ATPLoader.getBgTasks) ATPLoader.getBgTasks = function() { return BG_TASKS; };\n' +
+      '  ATPLoader._getQueueSnapshotForVerify = getQueueSnapshotFields;\n' +
+      '  if (!ATPLoader.markTaskCurrentSourceStart) ATPLoader.markTaskCurrentSourceStart = function(task, url, noReferrer) {\n' +
+      '    if (window.ATPHostHealth) ATPHostHealth.stampTaskHostHealthEpoch(task, url);\n' +
+      '    if (task) { task.currentSrcStartedAt = Date.now(); task.currentSrcNoReferrerTried = !!noReferrer; }\n' +
+      '  };\n' +
+      '  window.ATPLoader = ATPLoader;');
   }
   if (file === 'resource-panel.js') {
     source = source.replace('  window.ATPResourcePanel = ATPResourcePanel;',
@@ -98,7 +105,8 @@ function checkJsSyntax() {
 }
 
 function checkExternalTestSuites() {
-  const suites = ['tests/resource-extraction.test.js', 'tests/loading-policy.test.js', 'tests/page-fetch-bridge.test.js', 'tests/release-regressions.test.js', 'tests/text-queue.test.js', 'tests/page-fixtures.test.js', 'tests/mirror-sites.test.js', 'tests/resource-marks.test.js', 'tests/txt-diagnostics.test.js', 'tests/article-queue.test.js', 'tests/image-lane.test.js', 'tests/txt-yield.test.js', 'tests/txt-visible-queue.test.js', 'tests/first-screen-timing.test.js'];
+  const suites = ['tests/resource-extraction.test.js', 'tests/loading-policy.test.js', 'tests/page-fetch-bridge.test.js', 'tests/release-regressions.test.js', 'tests/text-queue.test.js', 'tests/page-fixtures.test.js', 'tests/mirror-sites.test.js', 'tests/resource-marks.test.js', 'tests/txt-diagnostics.test.js', 'tests/article-queue.test.js', 'tests/image-lane.test.js', 'tests/txt-yield.test.js', 'tests/txt-visible-queue.test.js', 'tests/first-screen-timing.test.js',
+    'tests/article-image-extraction.test.js', 'tests/forum-pacer-resilience.test.js', 'tests/settings-input.test.js', 'tests/v119-architecture.test.js'];
   suites.forEach(function(file) {
     const result = spawnSync(process.execPath, [path.join(root, file)], {
       cwd: root,
@@ -198,19 +206,25 @@ function checkManifestContentScriptOrder(manifest) {
     'settings-schema.js',
     'defaults.js',
     'shared-utils.js',
+    'html-extractors.js',
     'resource-marks.js',
     'loading-policy.js',
     'logger.js',
     'cache.js',
     'config.js',
+    'forum-entry.js',
     'scanner.js',
     'forum-pacer.js',
     'fetcher.js',
+    'host-health.js',
     'viewport-observer.js',
+    'heavy-budget.js',
+    'image-runner.js',
     'loader.js',
     'resource-panel.js',
     'renderer.js',
     'previewer.js',
+    'settings-ui.js',
     'floating-panel.js',
     'content.js'
   ];
@@ -397,9 +411,10 @@ function getStagedReleaseFiles(manifest) {
 
 function loadSharedUtilsSandbox(options) {
   options = options || {};
-  const sandbox = { console: console, URL: URL, TextDecoder: TextDecoder };
+  const sandbox = { console: console, URL: URL, URLSearchParams: URLSearchParams, TextDecoder: TextDecoder, TextEncoder: TextEncoder };
+  sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
-  vm.runInContext(read('shared-utils.js') + '\nthis.SharedUtils = SharedUtils;', sandbox, {
+  vm.runInContext(read('shared-utils.js') + '\n' + read('html-extractors.js') + '\nthis.SharedUtils = SharedUtils;', sandbox, {
     filename: 'shared-utils.js'
   });
   if (options.backgroundOwner !== false) {
@@ -435,11 +450,17 @@ function loadLoggerSandbox(options) {
   options = options || {};
   const storage = options.storage || {};
   const storageGetKeys = [];
+  const storageReads = [];
+  const storageByteReads = [];
+  const storageRemovals = [];
   const failStorageGetKeys = options.failStorageGetKeys || [];
   const sandbox = {
     console: { log: function(){}, warn: function(){}, error: function(){} },
     URL: URL,
     Intl: options.Intl || Intl,
+    SharedUtils: options.logLimits && Object.assign({
+      utf8ByteLength: function(value) { return Buffer.byteLength(value, 'utf8'); }
+    }, options.logLimits),
     setInterval: setInterval,
     clearInterval: clearInterval,
     location: {
@@ -465,6 +486,7 @@ function loadLoggerSandbox(options) {
         },
         local: {
           get: function(keys, callback) {
+            storageReads.push(keys);
             const result = {};
             if (Array.isArray(keys)) {
               keys.forEach(function(key) { result[key] = storage[key]; });
@@ -489,6 +511,7 @@ function loadLoggerSandbox(options) {
           },
           remove: function(keys, callback) {
             const list = Array.isArray(keys) ? keys : [keys];
+            storageRemovals.push(list);
             const failed = list.some(function(key) {
               return (options.failStorageRemoveKeys || []).indexOf(key) !== -1;
             });
@@ -514,11 +537,24 @@ function loadLoggerSandbox(options) {
       return Promise.resolve(keys);
     };
   }
+  if (options.enableGetBytesInUse) {
+    sandbox.chrome.storage.local.getBytesInUse = function(key, callback) {
+      storageByteReads.push(key);
+      const failed = (options.failStorageByteKeys || []).includes(key);
+      sandbox.chrome.runtime.lastError = failed ? { message: 'byte usage read failed' } : null;
+      const value = storage[key];
+      callback(failed ? undefined : value === undefined ? 0 : Buffer.byteLength(key) + Buffer.byteLength(JSON.stringify(value)));
+      sandbox.chrome.runtime.lastError = null;
+    };
+  }
   vm.createContext(sandbox);
   vm.runInContext(read('logger.js') + '\nthis.Logger = Logger;', sandbox, { filename: 'logger.js' });
   if (options.enableDebug !== false && sandbox.Logger.setDebugEnabled) sandbox.Logger.setDebugEnabled(true);
   sandbox.__storage = storage;
   sandbox.__storageGetKeys = storageGetKeys;
+  sandbox.__storageReads = storageReads;
+  sandbox.__storageByteReads = storageByteReads;
+  sandbox.__storageRemovals = storageRemovals;
   return sandbox;
 }
 
@@ -599,13 +635,15 @@ function loadBackgroundSandbox(options) {
       }
     }
   };
+  sandbox.globalThis = sandbox;
+  sandbox.self = sandbox;
   vm.createContext(sandbox);
   sandbox.importScripts = function() {
     Array.prototype.slice.call(arguments).forEach(function(file) {
       vm.runInContext(read(file), sandbox, { filename: file });
     });
   };
-  vm.runInContext(read('background.js') + '\nthis.BGLOG = BGLOG;\nthis.SharedUtils = SharedUtils;\nthis.__updateIndexForWrite = updateIndexForWrite;', sandbox, { filename: 'background.js' });
+  vm.runInContext(read('background.js') + '\nthis.BGLOG = BGLOG;\nthis.SharedUtils = SharedUtils;\nthis.__updateIndexForWrite = typeof updateIndexForWrite !== "undefined" ? updateIndexForWrite : function(k, v) { SharedUtils.cacheIndex.updateForValue(k, v); };', sandbox, { filename: 'background.js' });
   if (options.enableDebug !== false && sandbox.BGLOG.setDebugEnabled) sandbox.BGLOG.setDebugEnabled(true);
   sandbox.__storage = storage;
   return sandbox;
@@ -618,6 +656,7 @@ function loadPopupSandbox(initialStorage, options) {
   const timers = [];
   const storageGets = [];
   const storageSets = [];
+  const storageListeners = [];
   const storageGetKeys = [];
   const delayedStorageGets = [];
   const tabQueries = [];
@@ -768,6 +807,7 @@ function loadPopupSandbox(initialStorage, options) {
   const sandbox = {
     console: { log: function(){}, warn: function(){}, error: function(){} },
     URL: options.URL || URL,
+    Date: options.now ? class extends Date { static now() { return options.now(); } } : Date,
     Intl: Intl,
     Blob: Blob,
     setTimeout: function(callback, delay) {
@@ -849,6 +889,7 @@ function loadPopupSandbox(initialStorage, options) {
         }
       },
       storage: {
+        onChanged: { addListener: function(listener) { storageListeners.push(listener); } },
         local: {
           get: function(keys, callback) {
             storageGetCount++;
@@ -935,8 +976,6 @@ function loadPopupSandbox(initialStorage, options) {
   vm.runInContext(read('settings-schema.js') + '\nthis.SETTINGS_SCHEMA = SETTINGS_SCHEMA;', sandbox, { filename: 'settings-schema.js' });
   vm.runInContext(read('defaults.js'), sandbox, { filename: 'defaults.js' });
   if (options.withMarks) {
-    sandbox.__marksStorageListeners = [];
-    sandbox.chrome.storage.onChanged = { addListener: function(listener) { sandbox.__marksStorageListeners.push(listener); } };
     // The real resource helpers behind the popup's stubbed ones, and the
     // marks module the popup builds its files with.
     const realSharedUtils = loadSharedUtils();
@@ -959,12 +998,16 @@ function loadPopupSandbox(initialStorage, options) {
       return Promise.resolve(keys);
     };
   }
+  sandbox.globalThis = sandbox;
+  vm.runInContext(read('settings-ui.js'), sandbox, { filename: 'settings-ui.js' });
+  vm.runInContext(read('popup-logs.js'), sandbox, { filename: 'popup-logs.js' });
   vm.runInContext(read('popup.js'), sandbox, { filename: 'popup.js' });
   sandbox.__elements = elements;
   sandbox.__storage = storage;
   sandbox.__timers = timers;
   sandbox.__storageGets = storageGets;
   sandbox.__storageSets = storageSets;
+  sandbox.__storageListeners = storageListeners;
   sandbox.__storageGetKeys = storageGetKeys;
   sandbox.__tabQueries = tabQueries;
   sandbox.__tabReloads = tabReloads;
@@ -1203,13 +1246,16 @@ function checkRendererImageOrder() {
     'GIF and static thumbnails must keep post order in the ordinary image queue');
   assert(srcs(ordinary.sourceCandidates) === srcs(ordinary.allCandidates),
     'source and displayed candidate indexes must line up');
+  assert(ordinary.allCandidates !== ordinary.sourceCandidates,
+    'even a gallery that displays every image must give the loader its own mutable array');
   const unordered = renderWith({}, [j1, j3]);
   assert(unordered.state.cacheImages !== unordered.sourceCandidates && srcs(unordered.state.cacheImages) === 'j1.jpg,j3.jpg',
     'the cached image list must be its own copy, so a host swap of a rendered slot never reaches the cache');
   assert(srcs(ordinary.state.cacheImages) === 'g0.gif,j1.jpg,g2.gif,j3.jpg,j4.png',
     'cache write-backs must keep post order');
   const rendererSource = read('renderer.js');
-  assert(rendererSource.split('images: threadState.cacheImages || threadState.sourceCandidates || threadState.candidates || [],').length === 3,
+  assert(rendererSource.includes('images: thread.cacheImages || thread.sourceCandidates || thread.candidates || [],') &&
+    rendererSource.split("cacheThreadArticle(threadState, imageDone, writeStartedAt, 'text')").length === 3,
     'both TXT cache write-backs must persist the post-order images');
 
   const clamped = renderWith({ maxDisplayPerPost: 3 }, [g0, j1, g2, j3, j4]);
@@ -1227,6 +1273,101 @@ function checkRendererImageOrder() {
     'heavy threads must keep their own ordering');
 }
 
+async function checkPreparedGalleryFrames() {
+  const run = createLoaderCompletedRecoverySandbox();
+  const sandbox = run.sandbox;
+  const state = sandbox.ATPState;
+  Object.assign(state.settings, {
+    maxImagesPerPost: 5000, maxDisplayPerPost: 5000, heavyImageOptimization: true, heavyThumbnailClarity: 'lightweight'
+  });
+  const frames = [];
+  let clock = 0;
+  const cache = loadCacheSandbox({
+    state,
+    requestAnimationFrame: callback => frames.push(callback),
+    performance: { now: () => clock += 0.05 }
+  });
+  sandbox.ATPCache = cache;
+  sandbox.SharedUtils = cache.__SharedUtils;
+  const makeElement = sandbox.document.createElement;
+  sandbox.document.createElement = tag => Object.assign(makeElement(tag), {
+    tagName: tag.toUpperCase(), addEventListener() {}
+  });
+  sandbox.ATPLoader.globalSchedule = function() {};
+  vm.runInContext(read('renderer.js'), sandbox, { filename: 'renderer.js' });
+  const renderer = sandbox.ATPRenderer;
+  let checkedHeavy = 0;
+  const isHeavy = renderer.isHeavyImage;
+  renderer.isHeavyImage = image => { checkedHeavy++; return isHeavy(image); };
+
+  function finishFrames(pending) {
+    let frameCount = 0;
+    while (frames.length) {
+      assert(frameCount++ < 1000, 'gallery preparation must finish its bounded sequence of frames');
+      frames.shift()();
+    }
+    return pending;
+  }
+  const single = await cache.prepareArticleData({ images: [{ src: 'https://img.example/small.jpg' }] });
+  assert(renderer.prepareArticleGallery(single) === null && !frames.length,
+    'a small gallery must stay on the synchronous render path');
+  const raw = Array.from({ length: 5000 }, (_, i) => ({
+    src: 'https://image.imx.to/prepared/' + i + '.jpg',
+    displaySrc: 'https://thumb.example/prepared/' + i + '.jpg'
+  }));
+  const data = await finishFrames(cache.prepareArticleData({
+    images: raw, loadedUrls: [raw[4999].displaySrc, raw[42].src, raw[4999].src]
+  }));
+
+  const pending = renderer.prepareArticleGallery(data, () => true);
+  assert(pending && !checkedHeavy && frames.length === 1,
+    'a prepared long gallery must join the shared frame queue before scanning any images');
+  frames.shift()();
+  assert(checkedHeavy > 0 && checkedHeavy < raw.length && frames.length === 1,
+    'the first gallery frame must yield before finishing heavy classification');
+  const prepared = await finishFrames(pending);
+  assert(checkedHeavy === raw.length, 'a long gallery must classify each candidate once');
+  const row = sandbox.document.createElement('tbody');
+  const link = { href: 'https://www.sehuatang.org/thread-prepared-1-1.html' };
+  let commitUrlReads = 0;
+  const normalizeUrl = sandbox.SharedUtils.normalizeImageUrl;
+  sandbox.SharedUtils.normalizeImageUrl = function(url) { commitUrlReads++; return normalizeUrl(url); };
+  sandbox.URL = class extends URL {
+    constructor(...args) { super(...args); commitUrlReads++; }
+  };
+  renderer.injectThumbnails(row, data, link, 100000, true, prepared);
+  const thread = Object.values(state.threads)[0];
+  assert(thread.lightweightHeavyMode && thread.candidates.length === 5000 && thread.firstTasks.length === 5 &&
+    checkedHeavy === raw.length && commitUrlReads === 0,
+    'prepared gallery registration must avoid rerunning heavy classification, URL ordering and DEBUG host parsing');
+  assert(thread.candidates.slice(0, 3).map(image => image.src).join(',') ===
+    [raw[4999].src, raw[42].src, raw[0].src].join(','),
+    'the staged plan must prioritize loaded display and preview URLs exactly once and preserve the remaining source order');
+  assert(run.events.find(event => event.type === 'thread_registered')?.fields.hostMix.join(',') ===
+    'image.imx.to:5000,image.imx.to-heavy:5000',
+    'the prepared plan must carry the same DEBUG host histogram into registration');
+  const original = thread.sourceCandidates[0];
+  thread.candidates[0] = Object.assign({}, original, { src: 'https://thumb.example/mirror.jpg' });
+  assert(thread.sourceCandidates[0] === original && thread.cacheImages[0] === original && data.images[4999] === original,
+    'a replaced slot must preserve its source index and cache entry when the display and fetch caps match');
+
+  let live = true;
+  const detached = renderer.prepareArticleGallery(data, () => live);
+  frames.shift()();
+  const beforeCancel = checkedHeavy;
+  live = false;
+  assert(await finishFrames(detached) === null && checkedHeavy === beforeCancel,
+    'detaching a row during gallery preparation must cancel its remaining work');
+  const staleSettings = renderer.prepareArticleGallery(data);
+  frames.shift()();
+  state.settings.maxDisplayPerPost = 10;
+  assert(await finishFrames(staleSettings) === null, 'changing a gallery cap must cancel the old preparation');
+  const staleRow = sandbox.document.createElement('tbody');
+  renderer.injectThumbnails(staleRow, data, link, 100000, true, prepared);
+  assert(staleRow.children.length === 0 && Object.keys(state.threads).length === 1,
+    'a completed but outdated plan must not inject with obsolete display settings');
+}
+
 function loadPreviewerSandbox() {
   let documentRef = null;
 
@@ -1235,6 +1376,7 @@ function loadPreviewerSandbox() {
   }
 
   function matchesSelector(el, selector) {
+    if (selector.includes(',')) return selector.split(',').some(part => matchesSelector(el, part.trim()));
     if (selector === 'button:not([disabled])') return el.tagName === 'BUTTON' && !el.disabled;
     if (selector.charAt(0) === '.') return hasClass(el, selector.substring(1));
     return false;
@@ -1266,6 +1408,7 @@ function loadPreviewerSandbox() {
         if (name === 'id') this.id = '';
         if (name === 'class') this.className = '';
         if (name === 'src') delete this.src;
+        if (name === 'referrerpolicy') this.referrerPolicy = '';
       },
       appendChild: function(child) {
         if (child.parentNode) child.remove();
@@ -1387,6 +1530,49 @@ function checkPreviewerFocusBehavior() {
   assert(previewToolbar && previewToolbar.style.cssText.indexOf('flex:0 0 auto') !== -1, 'preview toolbar must keep a fixed flex height');
   assert(previewImgWrapper && previewImgWrapper.style.cssText.indexOf('min-height:0') !== -1, 'preview image wrapper must be shrinkable in short viewports');
   assert(previewImg && previewImg.style.cssText.indexOf('max-height:100%') !== -1, 'preview image must fit inside the shrinkable wrapper');
+  const retry = body.querySelector('.atp-preview-retry');
+  const counter = body.querySelector('.atp-preview-counter');
+  assert(retry.hidden && retry.disabled, 'a loading preview must exclude the retry button from its tab order');
+  const firstLoad = previewImg.onload;
+  const firstError = previewImg.onerror;
+  sandbox.__timers.at(-1).callback();
+  const fallbackImg = body.querySelector('.atp-preview-img');
+  firstLoad();
+  firstError();
+  assert(fallbackImg !== previewImg && !previewImg.src && !previewImg.parentNode && counter.textContent === '重试中 (1 / 1)',
+    'automatic fallback must be independent of queued events for the original element');
+  const staleLoad = fallbackImg.onload;
+  const staleError = fallbackImg.onerror;
+  const lateSourceAssignment = sandbox.__timers.at(-1);
+  // The no-referrer assignment runs on the next tick. The second timeout
+  // can win that race in a suspended tab.
+  sandbox.__timers.filter(timer => !timer.cleared && timer.delay === 15000).at(-1).callback();
+  lateSourceAssignment.callback();
+  staleLoad();
+  staleError();
+  assert(!fallbackImg.src && !fallbackImg.onload && !fallbackImg.onerror && counter.textContent === '加载失败 (1 / 1)',
+    'an expired preview must cancel its source and ignore late image events and queued source assignments');
+  assert(!retry.disabled && !retry.hidden && retry.tagName === 'BUTTON', 'failed previews must offer a native retry button');
+  retry.focus();
+  retry.onclick();
+  const manualImg = body.querySelector('.atp-preview-img');
+  assert(manualImg.src === 'https://img.example/a.jpg' && !retry.hidden && !retry.disabled &&
+    retry.getAttribute('aria-disabled') === 'true' && document.activeElement === retry,
+    'single-image keyboard retries must start a fresh load without taking focus away from retry');
+  retry.onclick();
+  assert(body.querySelector('.atp-preview-img') === manualImg, 'repeat activation while retrying must keep the pending image request');
+  staleLoad();
+  assert(counter.textContent === '重试中 (1 / 1)', 'the previous attempt cannot complete a manual retry');
+  manualImg.onerror();
+  body.querySelector('.atp-preview-img').onerror();
+  assert(!retry.hidden && retry.getAttribute('aria-disabled') === null && document.activeElement === retry,
+    'a failed manual retry must allow another retry from the same focus target');
+  retry.onclick();
+  const recoveredImg = body.querySelector('.atp-preview-img');
+  recoveredImg.onload();
+  assert(counter.textContent === '1 / 1' && recoveredImg.style.display !== 'none', 'a successful retry must display the image');
+  assert(retry.hidden && previewContainer.parentNode.contains(document.activeElement),
+    'a successful retry must keep focus inside the dialog when the retry button disappears');
   sandbox.ATPPreviewer.close();
   assert(document.activeElement === mouseOpener, 'mouse-opened preview close must restore focus to the opener');
 
@@ -1511,7 +1697,13 @@ function loadCacheSandbox(options) {
   const sharedSandbox = loadSharedUtilsSandbox();
   const SharedUtils = sharedSandbox.SharedUtils;
   const silentConsole = { warn: function(){}, log: function(){}, error: function(){} };
-  const storage = {};
+  const storage = options.storage || {};
+  let background;
+  function getBackground() {
+    if (options.getBackground) return options.getBackground();
+    if (!background) background = loadBackgroundSandbox(Object.assign({}, options, { storage: storage }));
+    return background;
+  }
   function selectStorage(keys) {
     if (keys === null || keys === undefined) return Object.assign({}, storage);
     const out = {};
@@ -1533,14 +1725,19 @@ function loadCacheSandbox(options) {
   const sandbox = {
     console: silentConsole,
     SharedUtils: SharedUtils,
-    window: { ATPState: { settings: {} } },
+    window: { ATPState: options.state || { settings: {} } },
     chrome: {
-      runtime: { lastError: null },
+      runtime: { lastError: null, sendMessage: function(message, callback) {
+        getBackground().__onMessage(message, { url: options.senderUrl || 'https://www.sehuatang.org/forum-1-1.html' }, callback);
+      } },
       storage: {
         local: {
           get: function(keys, callback) {
             if (options.beforeStorageGet) options.beforeStorageGet(keys, storage);
-            if (callback) callback(selectStorage(keys));
+            if (!callback) return;
+            const snapshot = selectStorage(keys);
+            if (options.deliverStorageGet) options.deliverStorageGet(keys, () => callback(snapshot));
+            else callback(snapshot);
           },
           set: function(items, callback) {
             Object.assign(storage, items || {});
@@ -1555,20 +1752,25 @@ function loadCacheSandbox(options) {
         }
       }
     },
-    setTimeout: function() { return 0; },
-    clearTimeout: function(){}
+    setTimeout: options.setTimeout || function() { return 0; },
+    clearTimeout: options.clearTimeout || function(){}
   };
+  if (options.requestAnimationFrame) sandbox.requestAnimationFrame = options.requestAnimationFrame;
+  if (options.performance) sandbox.performance = options.performance;
+  if (options.onStorageChanged) sandbox.chrome.storage.onChanged = { addListener: options.onStorageChanged };
   sharedSandbox.chrome = sandbox.chrome;
   sharedSandbox.console = silentConsole;
   vm.createContext(sandbox);
   vm.runInContext(read('cache.js'), sandbox, { filename: 'cache.js' });
   sandbox.window.ATPCache.__storage = storage;
   sandbox.window.ATPCache.__SharedUtils = SharedUtils;
+  sandbox.window.ATPCache.__getBackground = getBackground;
   return sandbox.window.ATPCache;
 }
 
 function loadFetcherSandbox() {
   const SharedUtils = loadSharedUtils();
+  const normalizeArticleData = loadCacheSandbox().normalizeArticleData;
   const cachedTextResources = {};
   const textFailCache = {};
   const cacheReads = [];
@@ -1589,12 +1791,18 @@ function loadFetcherSandbox() {
     Logger: {
       debug: function(){},
       warn: function(){},
+      isEnabled: function() { return false; },
       sanitizeUrl: function(url) { return String(url || '').replace(/[?#].*$/, ''); }
     },
     ATPCache: {
       getSettings: function() { return { cacheTTL: 30 }; },
-      normalizeArticleData: function(data) { return data || {}; },
+      normalizeArticleData: normalizeArticleData,
+      prepareArticleData: async function(data, isCurrent) {
+        return !isCurrent || isCurrent() ? normalizeArticleData(data) : null;
+      },
+      isArticleCacheReadCurrent: function() { return true; },
       getArticleCacheState: function() { return Promise.resolve({ cached: null, negative: false }); },
+      setCachedArticleData: function() {},
       getCachedTextResources: function(url) {
         cacheReads.push('resource:' + url);
         return Promise.resolve(cachedTextResources[url] || null);
@@ -1665,6 +1873,8 @@ function checkSettingsNormalization() {
     pauseWhenHidden: 'false'
   });
   assert(settings.enabled === false, 'settings normalization must preserve disabled string values');
+  assert(settings.autoEnterAgeGate === true && normalize({ autoEnterAgeGate: false }).autoEnterAgeGate === false,
+    'existing settings must pick up automatic forum entry and preserve an explicit opt-out');
   assert(settings.siteConfigs && typeof settings.siteConfigs === 'object' && !Array.isArray(settings.siteConfigs), 'settings normalization must repair invalid siteConfigs');
   assert(settings.gridCols === 32, 'settings normalization must clamp numeric settings to the public schema max');
   assert(settings.autoLoadOffscreenFirstRowsEnabled === false &&
@@ -1672,15 +1882,16 @@ function checkSettingsNormalization() {
     normalize({ autoLoadOffscreenFirstRows: true }).autoLoadOffscreenFirstRowsEnabled === false,
     'offscreen first-row loading must default off, ignore the old default-on key, and remain user-configurable');
   assert(settings.debugLogging === false, 'legacy settings must normalize to DEBUG logging disabled without changing existing fields');
-  assert(sandbox.ATPGetSettingApplyMode('gridCols') === 'hotReload', 'schema non-immediate settings must map to hot reload');
+  assert(sandbox.ATPGetSettingApplyMode('gridCols') === 'live', 'grid column changes must apply live via CSS variables without destroying thumbnails');
+  assert(sandbox.ATPGetSettingApplyMode('visibleRows') === 'hotReload', 'schema non-immediate settings must map to hot reload');
   assert(sandbox.ATPGetSettingApplyMode('autoLoadOffscreenFirstRowsEnabled') === 'hotReload', 'offscreen loading toggle must rebuild article and image queues');
   assert(sandbox.ATPGetSettingApplyMode('firstScreenConcurrency') === 'live', 'image concurrency settings must support live scheduler reconfiguration');
   assert(sandbox.ATPGetSettingApplyMode('imageTimeout') === 'live', 'image timeout must apply live to new attempts');
   assert(sandbox.ATPGetSettingApplyMode('heavyPreviewStarvationWait') === 'live', 'schema immediate settings must map to live apply');
-  assert(sandbox.ATPGetSettingsApplyMode(['heavyPreviewStarvationWait', 'gridCols']) === 'hotReload', 'settings apply mode aggregation must prefer hot reload over live');
-  assert(sandbox.ATPGetSettingsApplyMode(['gridCols', 'enabled']) === 'pageReload', 'settings apply mode aggregation must prefer page reload for extension state changes');
+  assert(sandbox.ATPGetSettingsApplyMode(['heavyPreviewStarvationWait', 'visibleRows']) === 'hotReload', 'settings apply mode aggregation must prefer hot reload over live');
+  assert(sandbox.ATPGetSettingsApplyMode(['visibleRows', 'enabled']) === 'pageReload', 'settings apply mode aggregation must prefer page reload for extension state changes');
   assert(settings.visibleRows === 2, 'settings normalization must fall back invalid numeric settings to defaults');
-  assert(settings.backgroundSpeed === 'normal', 'settings normalization must fall back invalid select values to defaults');
+  assert(settings.backgroundSpeed === 'fast', 'settings normalization must fall back invalid select values to defaults');
   assert(settings.pauseWhenHidden === false, 'settings normalization must preserve false boolean string values');
   assert(!Object.prototype.hasOwnProperty.call(settings, 'unknownTopLevel'), 'settings normalization must drop unknown top-level fields');
 
@@ -1750,6 +1961,8 @@ function checkSettingsNormalization() {
 function createScannerSandbox(rowCount, options) {
   options = options || {};
   const queryCounts = {};
+  const selectorForRows = options.rowsAsTr ? 'tr[id^="thread"]' : 'tbody[id^="normalthread"]';
+  const table = { querySelector: function() { return null; } };
   const rows = [];
   for (let i = 0; i < rowCount; i++) {
     const invalidIconLink = {
@@ -1763,8 +1976,8 @@ function createScannerSandbox(rowCount, options) {
       textContent: 'thread ' + i
     };
     rows.push({
-      id: 'normalthread_' + i,
-      tagName: 'TBODY',
+      id: (options.rowsAsTr ? 'thread_' : 'normalthread_') + i,
+      tagName: options.rowsAsTr ? 'TR' : 'TBODY',
       classList: { contains: function() { return false; } },
       querySelector: function(selector) {
         if (selector.indexOf('atp-thumbnail-container') !== -1 || selector.indexOf('atp-thumb-row') !== -1) return null;
@@ -1772,23 +1985,25 @@ function createScannerSandbox(rowCount, options) {
         if (options.invalidIconLink && selector === 'a.xst[href]') return link;
         return selector.indexOf('a[href') !== -1 ? link : null;
       },
-      closest: function() { return null; },
+      closest: function(selector) { return selector === 'table' ? (options.tableAt ? options.tableAt(i) : table) : null; },
       textContent: 'thread ' + i,
       getBoundingClientRect: function() {
         return typeof options.rowRect === 'function' ? options.rowRect(i) : { top: 10, bottom: 80 };
       }
     });
   }
+  const pinned = rows.slice(0, options.pinnedCount || 0).map((row, i) => Object.assign({}, row, { id: 'stickthread_' + i, tagName: 'TBODY' }));
   const root = {
     matches: function() { return false; },
     querySelectorAll: function(selector) {
       queryCounts[selector] = (queryCounts[selector] || 0) + 1;
-      return selector === 'tbody[id^="normalthread"]' ? rows : [];
+      if (selector === 'tbody[id^="stickthread"]') return pinned;
+      return selector === selectorForRows ? rows : [];
     }
   };
   const sandbox = {
     console: console,
-    window: {},
+    window: { getComputedStyle: () => ({ display: options.tableDisplay || 'table' }) },
     document: {
       querySelector: function() { return rows[0] || null; },
       querySelectorAll: function(selector) {
@@ -2075,6 +2290,47 @@ function checkScannerCursorState() {
   assert(seekSecond.length === 5 && seekSecondIndex === seekFirstIndex + 5, 'scanner viewport seek must not restart from the viewport on cursor continuation');
   assert(sandbox.queryCounts['tbody[id^="normalthread"]'] === selectorQueriesAfterSeekFirst, 'scanner viewport seek continuation must reuse the active selector node list');
 
+  for (const count of [40, 250, 5000]) {
+    let reads = 0;
+    const nearEnd = createScannerSandbox(count, {
+      rowsAsTr: count === 5000,
+      rowRect(index) { reads++; return { bottom: (index - count + 2) * 20 }; }
+    });
+    const options = { limit: 4, nodeBudget: 8, scanState: {}, seekViewportStart: true, viewportTop: 0, skipServiceThreads: false };
+    const batch = nearEnd.scanner.detectArticleContainers(options);
+    assert(batch[0].link.href.includes('thread-' + (count - 10) + '-') && reads <= Math.ceil(Math.log2(count)) + 2,
+      'deep scrolling must locate the visible rows within a logarithmic number of layout reads, including TR-only lists');
+    const firstReads = reads;
+    const next = nearEnd.scanner.detectArticleContainers(options);
+    assert(next[0].link.href.includes('thread-' + (count - 6) + '-') && reads === firstReads,
+      'the next scan must continue from its previous row without searching again');
+  }
+  const tableA = {}, tableB = {};
+  for (const irregular of [
+    { rowRect: index => ({ bottom: index - 90 }), tableAt: index => index < 50 ? tableA : tableB },
+    { rowRect: index => ({ bottom: index - 90 }), tableAt: index => index === 49 ? tableB : tableA },
+    { rowRect: index => ({ bottom: index - 90 }), tableAt: () => null },
+    { rowRect: index => ({ bottom: index - 90 }), tableDisplay: 'grid' },
+    { rowRect: index => index === 49 ? { bottom: 0, width: 0, height: 0 } : { bottom: index - 90 } },
+    { rowRect: index => ({ bottom: index === 49 ? NaN : index - 90 }) },
+    { rowRect: index => ({ bottom: index === 49 ? 30 : index - 90 }) }
+  ]) {
+    const rows = createScannerSandbox(100, irregular).scanner.detectArticleContainers({
+      limit: 3, nodeBudget: 8, scanState: {}, seekViewportStart: true, viewportTop: 0, skipServiceThreads: false
+    });
+    assert(rows[0].link.href.includes('thread-0-'), 'mixed tables or uncertain row geometry must keep the forward scan');
+  }
+  for (const pinnedCount of [1, 18]) {
+    const mixedRows = createScannerSandbox(5000, {
+      rowsAsTr: true, pinnedCount, rowRect: index => ({ bottom: (index - 4998) * 20 })
+    });
+    const options = { limit: 2, nodeBudget: 12, scanState: {}, seekViewportStart: true, viewportTop: 0,
+      accept: entry => entry.container.id === 'thread_4998' || entry.container.id === 'thread_4999' };
+    let found = mixedRows.scanner.detectArticleContainers(options);
+    if (pinnedCount === 18 && !found.length) found = mixedRows.scanner.detectArticleContainers(options);
+    assert(found[0]?.container.id === 'thread_4998', 'a pinned section must not consume the viewport seek for a later TR group');
+  }
+
   sandbox = createScannerSandbox(1, { invalidIconLink: true });
   const fallbackLink = sandbox.scanner.detectArticleContainers({
     limit: 1,
@@ -2163,6 +2419,7 @@ async function checkFloatingPanelPartialSettingsSave() {
   vm.createContext(sandbox);
   vm.runInContext(read('settings-schema.js') + '\nthis.SETTINGS_SCHEMA = SETTINGS_SCHEMA;', sandbox, { filename: 'settings-schema.js' });
   vm.runInContext(read('defaults.js'), sandbox, { filename: 'defaults.js' });
+  vm.runInContext(read('settings-ui.js'), sandbox, { filename: 'settings-ui.js' });
   vm.runInContext(read('floating-panel.js') + '\nthis.FloatingPanel = FloatingPanel;', sandbox, {
     filename: 'floating-panel.js'
   });
@@ -2388,7 +2645,7 @@ async function checkFloatingPanelPartialSettingsSave() {
   const messagePanel = Object.create(sandbox.FloatingPanel.prototype);
   messagePanel.schema = sandbox.SETTINGS_SCHEMA;
   messagePanel.settings = sandbox.ATPNormalizeSettings({
-    gridCols: 6,
+    visibleRows: 3,
     heavyPreviewStarvationWait: 8
   });
   messagePanel._saveStatusSeq = 0;
@@ -2397,12 +2654,12 @@ async function checkFloatingPanelPartialSettingsSave() {
   messagePanel._queueSettingsSave = async function() { return null; };
   const saveMessages = [];
   messagePanel.showMessage = function(text, type) { saveMessages.push({ text: text, type: type }); };
-  await messagePanel._saveSettings('reset grid', 'gridCols', ['gridCols']);
+  await messagePanel._saveSettings('reset rows', 'visibleRows', ['visibleRows']);
   await messagePanel._saveSettings('live reset', 'heavyPreviewStarvationWait', ['heavyPreviewStarvationWait']);
-  await messagePanel._saveSettings('preset reset', 'heavyPreviewStarvationWait', ['heavyPreviewStarvationWait', 'gridCols']);
+  await messagePanel._saveSettings('preset reset', 'heavyPreviewStarvationWait', ['heavyPreviewStarvationWait', 'visibleRows']);
   const finalSaveMessages = saveMessages.filter(function(message) { return message.type === 'ok'; });
   assert(saveMessages.filter(function(message) { return message.text === '保存中...' && message.type === 'warn'; }).length === 3, 'floating panel saves must announce progress before queued storage writes finish');
-  assert(finalSaveMessages[0].text === 'reset grid，缩略图已自动重新加载' && finalSaveMessages[0].type === 'ok', 'floating panel custom reset messages must report automatic thumbnail reloads for hot-reload settings');
+  assert(finalSaveMessages[0].text === 'reset rows，缩略图已自动重新加载' && finalSaveMessages[0].type === 'ok', 'floating panel custom reset messages must report automatic thumbnail reloads for hot-reload settings');
   assert(finalSaveMessages[1].text === 'live reset', 'floating panel custom reset messages must not add refresh guidance for immediate settings');
   assert(finalSaveMessages[2].text === 'preset reset，缩略图已自动重新加载', 'floating panel multi-field preset messages must report the highest hot-reload apply mode');
 
@@ -2448,6 +2705,57 @@ async function checkFloatingPanelPartialSettingsSave() {
   assert(ordinaryPresetPanel.settings.globalImageConcurrency === 0 && ordinaryPresetPanel.settings.viewportPendingLimit === 24, 'floating panel fast ordinary preset must reset stale global ceilings and bound pending work');
   assert(ordinaryPresetPanel.settings.imageTimeout === 8000 && ordinaryPresetPanel.settings.imageTaskDeadline === 16000, 'floating panel fast ordinary preset must bound per-attempt and whole-task waits');
   assert(ordinaryPresetButton.__bfpBusy === false && !ordinaryPresetButton.attrs['aria-disabled'], 'floating panel ordinary preset must clear focus-safe busy state after save');
+
+  // Drive the same per-field, reset and preset handlers used by the UI through
+  // the real serialized save queue, including an intervening storage broadcast.
+  const confirmed = { firstScreenConcurrency: 3, ordinaryHostConcurrency: 4, gridCols: 5 };
+  ordinaryPresetPanel.setSettings(confirmed);
+  const firstField = ordinaryPresetPanel._settingsViewEl.querySelector('[data-key="firstScreenConcurrency"]');
+  const hostField = ordinaryPresetPanel._settingsViewEl.querySelector('[data-key="ordinaryHostConcurrency"]');
+  firstField.dataset = { key: 'firstScreenConcurrency' };
+  ordinaryPresetPanel._saveChain = Promise.resolve();
+  delete ordinaryPresetPanel._queueSettingsSave;
+  ordinaryPresetPanel.flashError = function() {};
+  const writes = [];
+  ordinaryPresetPanel.storage = { setSettings(patch) {
+    return new Promise((resolve, reject) => writes.push({ patch, resolve, reject }));
+  } };
+  const presetSave = ordinaryPresetPanel._onOrdinaryPreset(ordinaryPresetButton);
+  firstField.value = '9';
+  const editSave = ordinaryPresetPanel._onFieldChange(firstField);
+  confirmed.ordinaryHostConcurrency = 5;
+  confirmed.gridCols = 7;
+  ordinaryPresetPanel.setSettings(confirmed);
+  await new Promise(resolve => setImmediate(resolve));
+  assert(writes.length === 1 && writes[0].patch.ordinaryHostConcurrency === 10 && Number(hostField.value) === 10,
+    'a pending preset must stay visible while a later edit waits in the storage queue');
+  writes[0].reject(new Error('preset rejected'));
+  await presetSave;
+  assert(ordinaryPresetPanel.settings.ordinaryHostConcurrency === 5 && Number(hostField.value) === 5 && ordinaryPresetPanel.settings.gridCols === 7,
+    'a failed preset must restore each untouched field from the latest confirmed settings and preserve external edits');
+  assert(firstField.value === '9' && Object.keys(ordinaryPresetPanel._pendingSaveByKey).join() === 'firstScreenConcurrency',
+    'a failed preset must leave only the later field edit pending');
+  await new Promise(resolve => setImmediate(resolve));
+  assert(writes.length === 2 && Object.keys(writes[1].patch).join() === 'firstScreenConcurrency', 'the later change must save only its own field');
+  confirmed.firstScreenConcurrency = 9;
+  writes[1].resolve(confirmed);
+  await editSave;
+  ordinaryPresetPanel.setSettings(Object.assign({}, confirmed, { ordinaryHostConcurrency: 6 }));
+  assert(!Object.keys(ordinaryPresetPanel._pendingSaveByKey).length && Number(firstField.value) === 9 && Number(hostField.value) === 6,
+    'after a failed preset and a successful edit the panel must accept all future storage updates');
+
+  firstField.value = '12';
+  const failingEdit = ordinaryPresetPanel._onFieldChange(firstField);
+  const failingReset = ordinaryPresetPanel._onReset({ dataset: firstField.dataset });
+  await new Promise(resolve => setImmediate(resolve));
+  writes[2].reject(new Error('field rejected'));
+  await failingEdit;
+  await new Promise(resolve => setImmediate(resolve));
+  sandbox.console = { warn() {} };
+  writes[3].reject(new Error('reset rejected'));
+  await failingReset;
+  assert(ordinaryPresetPanel.settings.firstScreenConcurrency === 9 && Number(firstField.value) === 9 &&
+    !Object.keys(ordinaryPresetPanel._pendingSaveByKey).length, 'overlapping failed edits must roll back to the last confirmed value');
 }
 
 function loadFloatingPanelClassSandbox() {
@@ -3449,7 +3757,14 @@ function checkCacheNormalization() {
 }
 
 async function checkArticleNegativeCacheState() {
-  const cache = loadCacheSandbox();
+  let deferReply = false;
+  let deliverReply;
+  const cache = loadCacheSandbox({
+    deliverStorageGet(keys, deliver) {
+      if (deferReply && Array.isArray(keys) && keys.includes(key)) deliverReply = deliver;
+      else deliver();
+    }
+  });
   const url = 'https://www.sehuatang.org/thread-444-1-1.html';
   const key = cache.NEGATIVE_CACHE_KEY + url;
   const negativeTtlMs = 5 * 60 * 1000;
@@ -3463,9 +3778,17 @@ async function checkArticleNegativeCacheState() {
   assert(state.negativeRemainingMs > 0 && state.negativeRemainingMs <= negativeTtlMs, 'article cache state must expose bounded negative cache remaining time');
 
   cache.__storage[key] = Date.now() - negativeTtlMs - 1;
-  const expiredState = await cache.getArticleCacheState(url);
+  deferReply = true;
+  const oldRead = cache.getArticleCacheState(url);
+  const refreshedAt = Date.now();
+  cache.__storage[key] = refreshedAt;
+  deferReply = false;
+  deliverReply();
+  const expiredState = await oldRead;
   assert(expiredState.cached === null && expiredState.negative === false, 'article cache state must ignore expired negative cache entries');
-  assert(!Object.prototype.hasOwnProperty.call(cache.__storage, key), 'expired negative cache entries must be removed during state reads');
+  const refreshed = await cache.getArticleCacheState(url);
+  assert(cache.__storage[key] === refreshedAt && refreshed.negative && refreshed.negativeTs === refreshedAt,
+    'an old negative-cache snapshot must not remove a newer tab’s failure record');
 }
 
 async function checkArticleCachePartialWriteSafety() {
@@ -3547,6 +3870,336 @@ async function checkArticleCachePartialWriteSafety() {
   });
   assert(markerState.cached && markerState.cached.images.length === 1, 'marker-only partial writes must not downgrade fresh complete article images');
   assert(markerState.cached.hasTextAttachments === true && markerState.cached.textAttachmentCount === 4, 'marker-only partial writes must preserve Discuz TXT attachment markers');
+}
+
+async function checkLoadedUrlBatches() {
+  const startedAt = Date.now() - 5000;
+  const url = 'https://www.sehuatang.org/thread-9380-1-1.html';
+  const state = { threads: { post: { link: url, cacheWriteStartedAt: startedAt, loadedUrls: [] } } };
+  const timers = new Map();
+  let timerId = 0;
+  const cache = loadCacheSandbox({ state: state, setTimeout(fn, delay) {
+    timers.set(++timerId, { fn, delay });
+    return timerId;
+  } });
+  const batches = [];
+  cache.updateArticleLoadedUrls = (article, urls, complete, timestamp) => {
+    batches.push({ article, urls: Array.from(urls), complete, timestamp });
+    return Promise.resolve(batches.length !== 1);
+  };
+  const loaded = state.threads.post.loadedUrls;
+  const image = id => 'https://img.example/' + id + '.jpg';
+  for (let i = 0; i < 5000; i += 100) {
+    for (let j = i; j < i + 100; j++) loaded.push(image(j));
+    cache.scheduleCacheFlush('post', startedAt);
+    cache.flushCacheNow('post', i + 100 === 5000);
+  }
+  cache.flushCacheNow('post', true);
+  assert(batches.length === 50, 'each 100-image batch must be sent once before a retry');
+  assert(JSON.stringify(batches.flatMap(batch => batch.urls)) === JSON.stringify(loaded),
+    'image progress messages must carry only newly settled URLs');
+  assert(batches.every(batch => batch.timestamp === startedAt) &&
+    batches.filter(batch => batch.complete).length === 1 && batches[49].complete,
+    'all batches share the original cache generation, with one completion update');
+  await Promise.resolve();
+  const retry = Array.from(timers.values()).find(timer => timer.delay === 500);
+  assert(retry, 'failed delivery must schedule a replay');
+  delete state.threads.post;
+  retry.fn();
+  assert(JSON.stringify(batches[50]) === JSON.stringify(batches[0]), 'replaying a detached row must keep the original URL delta and generation');
+}
+
+async function checkLegacyArticleImageRevalidation() {
+  const cache = loadCacheSandbox();
+  const shared = cache.__SharedUtils;
+  const url = 'https://www.sehuatang.org/thread-9384-1-1.html';
+  const key = shared.CACHE_PREFIXES.ARTICLE + url;
+  const data = { images: ['https://img.example/legacy.jpg'] };
+  const older = Date.now() - 16 * 60 * 1000;
+  const fresh = Date.now() - 2 * 60 * 1000;
+  cache.__storage[key] = { data, ts: fresh, complete: true };
+  assert((await cache.getCachedArticleData(url)).images.length === 1, 'fresh old image records must remain cache hits');
+  cache.__storage[key].ts = older;
+  assert(!(await cache.getArticleCacheState(url)).cached, 'old image records must revalidate after their shorter upgrade TTL');
+  cache.__storage[key].data = { resources: { groups: { other: ['https://downloads.example/import.zip'] } } };
+  assert(await cache.getCachedArticleData(url), 'resource-only entries without image extraction must retain their normal expiry');
+  cache.__storage[key].data.imageExtractionVersion = 1;
+  assert(!(await cache.getCachedArticleData(url)), 'a previous image filter can leave a complete cache with resources and zero images');
+  cache.__storage[key].ts = fresh;
+  assert(await cache.setCachedArticleData(url, Object.assign({}, data, {
+    imageExtractionVersion: shared.ARTICLE_IMAGE_EXTRACTION_VERSION
+  }), true, Date.now()));
+  cache.__storage[key].ts = older;
+  const current = await cache.getCachedArticleData(url);
+  assert(current && current.imageExtractionVersion === shared.ARTICLE_IMAGE_EXTRACTION_VERSION,
+    'freshly verified image extraction must retain its provenance and normal cache expiry');
+}
+
+async function checkSlicedArticleCacheRead() {
+  const frames = [];
+  const timers = new Map();
+  let nextTimer = 0;
+  let clock = 0;
+  let storageReads = 0;
+  let storageChanged;
+  let holdGenerationReply = false;
+  let pendingGenerationReply;
+  const url = 'https://www.sehuatang.org/thread-9386-1-1.html';
+  const cache = loadCacheSandbox({
+    requestAnimationFrame: callback => frames.push(callback),
+    performance: { now: () => clock },
+    setTimeout(callback) { timers.set(++nextTimer, callback); return nextTimer; },
+    clearTimeout: id => timers.delete(id),
+    beforeStorageGet(keys) {
+      if (Array.isArray(keys) && keys.includes(cache.ARTICLE_CACHE_PREFIX + url)) storageReads++;
+    },
+    deliverStorageGet(keys, deliver) {
+      if (holdGenerationReply && keys === cache.__SharedUtils.CACHE_GENERATION_KEY) pendingGenerationReply = deliver;
+      else deliver();
+    },
+    onStorageChanged(listener) { storageChanged = listener; }
+  });
+  const shared = cache.__SharedUtils;
+  let validatedImages = 0;
+  const validateImage = shared.isMeaningfulImage;
+  shared.isMeaningfulImage = function(src) {
+    clock += 0.08;
+    validatedImages++;
+    return validateImage.call(this, src);
+  };
+  const images = Array.from({ length: 5000 }, (_, index) => 'https://img.example/slice/' + index + '.jpg');
+  const before = Date.now() - 2000;
+  const key = cache.ARTICLE_CACHE_PREFIX + url;
+  const raw = {
+    images: ['javascript:invalid', ...images.slice(0, 2048), images[10], ...images.slice(2048)],
+    loadedUrls: [images[10], ' ' + images[12] + ' ', images[10]],
+    textAttachments: [
+      'https://dl.ldkms.la/real.txt',
+      { url: 'https://www.sehuatang.org/forum.php?mod=attachment&aid=transient-sliced-test',
+        pageUrl: url, name: 'fresh.txt' }
+    ],
+    imageExtractionVersion: shared.ARTICLE_IMAGE_EXTRACTION_VERSION
+  };
+  cache.__storage[key] = { data: raw, complete: true, ts: before };
+  const flushMicrotasks = () => new Promise(resolve => setImmediate(resolve));
+  const first = cache.getCachedArticleData(url + '?from=list#post');
+  const second = cache.getArticleCacheState(url);
+  await flushMicrotasks();
+  assert(storageReads === 1 && validatedImages === 0 && frames.length === 1,
+    'concurrent cache lookups for one post must share the snapshot and defer the large validation');
+  let slices = 0;
+  while (frames.length) {
+    assert(++slices < 120, 'the scheduled normalization must finish');
+    const start = clock;
+    frames.shift()();
+    assert(clock - start <= 6.09, 'normalization must yield once the shared time budget is spent');
+  }
+  const [data, state] = await Promise.all([first, second]);
+  assert(slices > 1 && validatedImages === raw.images.length && state.cached === data &&
+    data.images.length === 5000 && data.images[2048].src === images[2048] && data.readAt === before &&
+    JSON.stringify(data.loadedUrls) === JSON.stringify([images[10], images[12]]),
+    'the complete result must be canonicalized once, preserving order, deduplication and the original read time');
+  assert(data.textAttachments.length === 1 && data.textAttachmentCount === 2 && data.textAttachmentHints.length === 2 &&
+    cache.isArticleCacheReadCurrent(data) && cache.isArticleCacheReadCurrent(state),
+    'the shared cache snapshot must retain safe attachment progress and the current generation');
+  assert(cache.normalizeArticleData(data) === data && (await cache.prepareArticleData(data)) === data &&
+    validatedImages === raw.images.length, 'prepared content and renderer handoffs must do no repeated URL validation');
+
+  data.freshTextAttachments = [{ url: 'https://www.sehuatang.org/forum.php?mod=attachment&aid=live-only-sliced-test' }];
+  data.freshTextAttachmentsAt = Date.now();
+  const worker = cache.__getBackground();
+  const receive = worker.__onMessage;
+  let snapshot;
+  worker.__onMessage = function(message, sender, respond) {
+    if (message.type === shared.MESSAGE_TYPES.ARTICLE_CACHE_MUTATION) snapshot = JSON.stringify(message.data);
+    return receive(message, sender, respond);
+  };
+  assert(await cache.setCachedArticleData(url, data, true, Date.now()));
+  assert(snapshot && !snapshot.includes('live-only-sliced-test') && !snapshot.includes('freshTextAttachments') &&
+    validatedImages === raw.images.length && data.freshTextAttachments.length === 1,
+    'a prepared article write must reuse validated images and keep short-lived TXT URLs in memory');
+
+  const pending = cache.getCachedArticleData(url);
+  await flushMicrotasks();
+  assert(storageReads === 2 && frames.length === 1, 'a later read must consult storage again');
+  frames.shift()();
+  const beforeClear = validatedImages;
+  holdGenerationReply = true;
+  const negativeUrl = 'https://www.sehuatang.org/thread-9387-1-1.html';
+  const negativeKey = cache.NEGATIVE_CACHE_KEY + negativeUrl;
+  cache.setNegativeCache(negativeUrl);
+  assert(typeof pendingGenerationReply === 'function' && cache.__storage[negativeKey],
+    'the delayed generation reply must capture the just-written failure entry');
+  const clearedAt = Date.now() + 1;
+  cache.__storage[shared.CACHE_GENERATION_KEY] = clearedAt;
+  delete cache.__storage[key];
+  storageChanged({ [shared.CACHE_GENERATION_KEY]: { newValue: clearedAt } }, 'local');
+  holdGenerationReply = false;
+  pendingGenerationReply();
+  frames.shift()();
+  assert(await pending === null && !frames.length && !cache.__storage[negativeKey] && validatedImages === beforeClear &&
+    !cache.isArticleCacheReadCurrent(data) && !cache.isArticleCacheReadCurrent(state),
+    'the pre-clear generation response must not reinstate stale storage or pending and already delivered snapshots');
+
+  const exerciseTimer = cache.runArticlePreparation((function*() {
+    yield;
+    return 7;
+  })());
+  assert(timers.size === 1 && frames.length === 1, 'visible frame scheduling must also arm its fallback');
+  const fallback = timers.values().next().value;
+  fallback();
+  frames.shift()();
+  assert(await exerciseTimer === 7 && !timers.size && !frames.length,
+    'the fallback must finish a stalled frame exactly once');
+
+  let cancelled = false;
+  let processed = 0;
+  const long = cache.runArticlePreparation((function*() {
+    while (processed < 1300) {
+      processed++;
+      clock += 0.08;
+      yield;
+    }
+  })());
+  const obsolete = cache.runArticlePreparation((function*() {
+    throw new Error('an obsolete job must not prepare its data');
+  })(), () => false).then(value => { cancelled = value === null; });
+  frames.shift()();
+  frames.shift()();
+  await flushMicrotasks();
+  assert(cancelled && processed < 1300, 'a cancelled gallery must release its waiter while another long gallery is still preparing');
+  while (frames.length) frames.shift()();
+  await Promise.all([long, obsolete]);
+}
+
+async function checkArticleWritesAcrossTabs() {
+  const storage = {};
+  let worker = loadBackgroundSandbox({ storage: storage });
+  const connection = { storage: storage, getBackground: () => worker };
+  const tabA = loadCacheSandbox(connection), tabB = loadCacheSandbox(connection);
+  const shared = tabA.__SharedUtils;
+  const url = 'https://www.sehuatang.org/thread-9381-1-1.html';
+  const key = shared.CACHE_PREFIXES.ARTICLE + url;
+  const readAt = Date.now() - 5000;
+  const attachments = ['a', 'b'].map(name => ({ url: 'https://dl.ldkms.la/' + name + '.txt', name: name + '.txt' }));
+  const snapshot = { images: [{ src: 'https://img.example/new-body.jpg' }], textAttachments: attachments, readAt: readAt };
+  function imported(index) {
+    const resources = shared.emptyResources();
+    resources.groups.other.push({ type: 'other', url: 'https://downloads.example/' + index + '.zip', source: 'import' });
+    return Object.assign({}, snapshot, {
+      resources: resources, textResourcesImported: true, textResourcesComplete: false,
+      textResourcesAttemptedCount: 1, textResourcesUnresolvedCount: 1, textResourcesRetryableCount: 1,
+      textResolvedAttachmentIds: [shared.getTextAttachmentCacheKeySuffix(attachments[index].url)]
+    });
+  }
+  assert(await tabA.setCachedArticleData(url, snapshot, true, readAt), 'the background must acknowledge the initial article write');
+  const ts = storage[key].ts;
+  async function interleave(articleKey, startFirst, startSecond) {
+    const local = worker.chrome.storage.local, originalGet = local.get, held = [];
+    local.get = function(keys, callback) {
+      if (keys === articleKey) originalGet(keys, value => held.push(() => callback(value)));
+      else originalGet(keys, callback);
+    };
+    const pending = Promise.all([startFirst(), startSecond()]);
+    await Promise.resolve();
+    await Promise.resolve();
+    assert(held.length === 1, 'two content contexts must have only one authoritative read in flight for aliases of one article');
+    local.get = originalGet;
+    held[0]();
+    assert((await pending).every(Boolean), 'both interleaved mutations must settle successfully');
+  }
+  await interleave(key, () => tabA.setCachedArticleData(url, imported(0), true, readAt + 10, 'text'),
+    () => tabB.updateArticleLoadedUrls(url + '?from=retry#page', ['https://img.example/progress.jpg'], true, readAt + 11));
+  assert(storage[key].ts === ts && storage[key].data.readAt === readAt && storage[key].data.textResourcesImported &&
+    storage[key].data.resources.groups.other.length === 1 && storage[key].data.loadedUrls.length === 1,
+    'an image flush must preserve the TXT import, read time and original article TTL');
+  const committedEntry = storage[key];
+  assert(await tabB.updateArticleLoadedUrls(url, ['https://img.example/progress.jpg'], true, readAt + 11));
+  assert(storage[key] === committedEntry, 'a replayed loaded-URL delta must acknowledge success without writing the entry');
+
+  const reverse = url.replace('9381', '9382');
+  await tabB.setCachedArticleData(reverse, snapshot, true, readAt);
+  await interleave(shared.CACHE_PREFIXES.ARTICLE + reverse,
+    () => tabB.updateArticleLoadedUrls(reverse, ['https://img.example/progress.jpg'], true, readAt + 11),
+    () => tabA.setCachedArticleData(reverse + '#post', imported(0), true, readAt + 10, 'text'));
+  const opposite = await tabB.getCachedArticleData(reverse);
+  assert(opposite.textResolvedAttachmentIds.length === 1 && opposite.resources.groups.other.length === 1 && opposite.loadedUrls.length === 1,
+    'interleaving the image flush before the TXT write must preserve the same union in reverse order');
+
+  // A new service worker has no in-memory queue. Merge with the committed
+  // article again, including on replay and when a stale tab writes its body.
+  worker = loadBackgroundSandbox({ storage: storage });
+  assert(await tabB.setCachedArticleData(url, imported(1), true, readAt + 20, 'text'), 'the new worker must persist the second import');
+  await tabA.setCachedArticleData(url, imported(0), true, readAt + 10, 'text');
+  const stale = { images: ['https://img.example/stale.jpg'], textResourcesComplete: false, readAt: readAt - 50 };
+  await tabA.setCachedArticleData(url, stale, true, readAt - 50);
+  await tabB.setCachedArticleData(url, stale, true, readAt + 30, 'preview');
+  const data = await tabA.getCachedArticleData(url);
+  assert(data.textResourcesComplete && data.textResourcesUnresolvedCount === 0 && data.textResolvedAttachmentIds.length === 2 &&
+    data.resources.groups.other.length === 2 && data.images[0].src === snapshot.images[0].src && data.loadedUrls.length === 1 && storage[key].ts === ts,
+    'restarting, replaying a partial import and writing late snapshots must preserve independently completed TXT and image progress');
+
+  const originalSet = worker.chrome.storage.local.set, originalBytes = worker.chrome.storage.local.getBytesInUse;
+  let failedSets = 0;
+  worker.chrome.storage.local.getBytesInUse = (keys, callback) => queueMicrotask(() => originalBytes(keys, callback));
+  worker.chrome.storage.local.set = function(items, callback) {
+    if (!items[key]) { originalSet(items, callback); return; }
+    failedSets++;
+    worker.chrome.runtime.lastError = { message: 'simulated storage quota failure' };
+    callback();
+    worker.chrome.runtime.lastError = null;
+  };
+  assert(await tabA.updateArticleLoadedUrls(url, ['https://img.example/retry.jpg'], true) === false && failedSets === 2, 'a failed storage retry must acknowledge failure');
+  worker.chrome.storage.local.set = originalSet;
+  worker.chrome.storage.local.getBytesInUse = originalBytes;
+  assert(await tabB.updateArticleLoadedUrls(url, ['https://img.example/retry.jpg'], true), 'subsequent messages for a failed key must still settle');
+
+  storage[key].ts = Date.now() - 60 * 60 * 1000;
+  await tabB.setCachedArticleData(url, { images: ['https://img.example/next-read.jpg'] }, true, Date.now());
+  assert(storage[key].data.images[0].src.endsWith('/next-read.jpg') && storage[key].data.resources.groups.other.length === 0,
+    'a newer complete read after expiry must replace stale article content and its attachment set');
+
+  const transientPost = url.replace('9381', '9383');
+  const ephemeral = [
+    { url: 'https://www.sehuatang.org/forum.php?mod=attachment&aid=private-discuz-probe', name: 'first.txt' },
+    { url: 'https://xia.ewrewej.la/download?token=private-signed-probe', name: 'second.txt' }
+  ];
+  await tabA.setCachedArticleData(transientPost, { textAttachments: ephemeral }, true, readAt);
+  const markers = await tabB.getCachedArticleData(transientPost);
+  assert(markers.textAttachments.length === 0 && markers.textAttachmentCount === 2 && markers.textAttachmentHints.length === 2 &&
+    !JSON.stringify(storage).includes('private-discuz-probe') && !JSON.stringify(storage).includes('private-signed-probe'),
+    'the complete stored article and index must contain no signed or Discuz URL while retaining matching information for both attachments');
+
+  const largePost = url.replace('9381', '9385');
+  const largeKey = shared.CACHE_PREFIXES.ARTICLE + largePost;
+  const images = Array.from({ length: 5000 }, (_, index) => ({
+    src: 'https://img.example/small/' + index + '.jpg',
+    previewSrc: 'https://img.example/original/' + index + '.jpg'
+  }));
+  const largeUpdate = Object.assign(imported(0), { images, imageExtractionVersion: shared.ARTICLE_IMAGE_EXTRACTION_VERSION });
+  assert(await tabA.setCachedArticleData(largePost, Object.assign({}, snapshot, { images, imageExtractionVersion: largeUpdate.imageExtractionVersion }), true, readAt));
+  const wire = [];
+  const receive = worker.__onMessage;
+  worker.__onMessage = function(message, sender, respond) {
+    if (message.url === largePost && message.type === shared.MESSAGE_TYPES.ARTICLE_CACHE_MUTATION) {
+      wire.push([message.operation, message.data.images.length, message.writeStartedAt]);
+    }
+    return receive(message, sender, respond);
+  };
+  const largeTs = storage[largeKey].ts;
+  assert(await tabA.setCachedArticleData(largePost, largeUpdate, true, readAt + 50, 'text'));
+  assert(JSON.stringify(wire) === JSON.stringify([['textProgress', 0, readAt + 50]]) &&
+    storage[largeKey].data.images.length === 5000 && storage[largeKey].ts === largeTs &&
+    storage[largeKey].data.resources.groups.other.length === 1,
+    'an existing long post must accept the TXT update without receiving or replacing its image candidates');
+  delete storage[largeKey];
+  wire.length = 0;
+  assert(await tabA.setCachedArticleData(largePost, largeUpdate, true, readAt + 60, 'text'));
+  assert(JSON.stringify(wire) === JSON.stringify([['textProgress', 0, readAt + 60], ['text', 5000, readAt + 60]]) &&
+    storage[largeKey].data.images.length === 5000 && storage[largeKey].ts === readAt &&
+    storage[largeKey].data.imageExtractionVersion === shared.ARTICLE_IMAGE_EXTRACTION_VERSION &&
+    storage[largeKey].data.resources.groups.other.length === 1,
+    'an evicted long post must be restored with the full snapshot and the original read time and image extraction version');
 }
 
 async function checkContentCacheClearGenerationBoundary() {
@@ -3772,7 +4425,7 @@ async function checkContentCacheIndexRemoveFailureRebuildsAfterStorageRemove() {
     }
   };
   let removeCalls = 0;
-  SharedUtils.cacheIndex.removeEntries = function(keys, callback) {
+  cache.__getBackground().SharedUtils.cacheIndex.removeEntries = function(keys, callback) {
     removeCalls++;
     if (callback) callback(false);
   };
@@ -4115,6 +4768,73 @@ function checkContentLoggerIndexDiscovery() {
   assert(contentIndex.indexOf(currentLogKey) !== -1, 'content logger index discovery must keep the current content log shard');
 }
 
+function checkContentLoggerMeasuresShardsWithoutReadingValues() {
+  const newer = Date.now() + 60000;
+  const newestOversized = 'atp_logs_content_' + (newer + 3) + '_oversized';
+  const newestSmall = 'atp_logs_content_' + (newer + 2) + '_small';
+  const unmeasured = 'atp_logs_content_' + (newer + 1) + '_older';
+  const storage = {
+    atp_logs_content_keys: [newestSmall, unmeasured],
+    [newestOversized]: [{ msg: '界'.repeat(2000) }],
+    [newestSmall]: [{ msg: 'small retained entry' }],
+    [unmeasured]: [{ msg: 'older than the size read window' }]
+  };
+  const sandbox = loadLoggerSandbox({
+    storage: storage,
+    enableGetKeys: true,
+    enableGetBytesInUse: true,
+    logLimits: { MAX_CONTENT_LOG_KEYS: 3, CONTENT_LOG_TOTAL_BYTES: 4096 }
+  });
+  sandbox.Logger.info('reserve the active log shard');
+  sandbox.Logger.flush();
+
+  const contentIndex = storage.atp_logs_content_keys;
+  const active = sandbox.__storageByteReads[0];
+  assert(sandbox.__storageByteReads.join(',') === [active, newestOversized, newestSmall].join(','),
+    'index maintenance must reserve the active shard and bound byte queries to the newest candidates');
+  assert(contentIndex.join(',') === [newestSmall, active].join(',') && Array.isArray(storage[active]),
+    'UTF-8 byte accounting must drop the oversized log and keep the active shard even when sibling shards are newer');
+  assert(!sandbox.__storageReads.some(function(keys) {
+    return Array.isArray(keys) || keys === newestOversized || keys === newestSmall || keys === unmeasured;
+  }), 'byte accounting must not fetch the values of older shards when size queries are available');
+  assert(!storage[newestOversized] && !storage[unmeasured] &&
+    sandbox.__storageRemovals.length === 2 && sandbox.__storageRemovals.every(function(keys) { return keys.length === 1; }),
+    'pruning must delete stale shards individually so each storage event carries at most one old value');
+}
+
+function checkContentLoggerFallsBackSafelyForFailedSizeReads() {
+  const newest = 'atp_logs_content_2000_newest';
+  const oldest = 'atp_logs_content_1000_oldest';
+  for (const mode of ['no-byte-api', 'byte-error', 'both-errors']) {
+    const failedValueReads = mode === 'both-errors' ? [newest] : [];
+    const storage = {
+      atp_logs_content_keys: [newest, oldest],
+      [newest]: [{ msg: 'newer record' }],
+      [oldest]: [{ msg: 'older record' }]
+    };
+    const sandbox = loadLoggerSandbox({
+      storage: storage,
+      enableGetBytesInUse: mode !== 'no-byte-api',
+      failStorageByteKeys: [newest],
+      failStorageGetKeys: failedValueReads,
+      logLimits: { MAX_CONTENT_LOG_KEYS: 2 }
+    });
+    sandbox.Logger.info('first size measurement');
+    sandbox.Logger.flush();
+    assert(sandbox.__storageReads.includes(newest) && !sandbox.__storageReads.some(Array.isArray),
+      'an unavailable or failed size query must fall back to one shard at a time');
+    if (mode === 'both-errors') {
+      assert(sandbox.__storageRemovals.length === 0 && storage.atp_logs_content_keys.join(',') === [newest, oldest].join(','),
+        'unreadable shard sizes must leave stored logs and their index intact');
+      failedValueReads.length = 0;
+      sandbox.Logger.info('retry size measurement');
+      sandbox.Logger.flush();
+    }
+    assert(Array.isArray(storage[newest]) && !storage[oldest] && storage.atp_logs_content_keys.length === 2 &&
+      storage.atp_logs_content_keys.includes(newest), 'fallback or retry must keep the newest sibling and the current writer');
+  }
+}
+
 function checkContentLoggerPruneRemoveFailureKeepsRetryIndex() {
   const storage = {
     atp_logs_content_keys: [],
@@ -4140,6 +4860,41 @@ function checkContentLoggerPruneRemoveFailureKeepsRetryIndex() {
     contentIndex.indexOf('atp_logs_content_1000_stale') !== -1,
     'content logger prune remove failure must keep stale shards indexed so later flushes can retry cleanup'
   );
+  assert(!sandbox.__storage.atp_logs_content_2000 && contentIndex.indexOf('atp_logs_content_2000') === -1,
+    'a failed shard deletion must not put a successfully deleted sibling back into the index');
+}
+
+function checkContentLoggerQuotaRetryUsesShardSizes() {
+  const newest = 'atp_logs_content_2000_newest';
+  const oldest = 'atp_logs_content_1000_oldest';
+  const storage = {
+    atp_logs_content_keys: [newest, oldest],
+    [newest]: [{ msg: 'newer record' }],
+    [oldest]: [{ msg: 'older record' }]
+  };
+  const sandbox = loadLoggerSandbox({ storage: storage, enableGetKeys: true, enableGetBytesInUse: true });
+  const local = sandbox.chrome.storage.local;
+  const set = local.set;
+  let active;
+  local.set = function(items, callback) {
+    const key = Object.keys(items)[0];
+    if (!active && key !== 'atp_logs_content_keys') {
+      active = key;
+      sandbox.chrome.runtime.lastError = { message: 'quota exceeded' };
+      callback();
+      sandbox.chrome.runtime.lastError = null;
+      return;
+    }
+    set(items, callback);
+  };
+  sandbox.Logger.info('quota recovery event');
+  sandbox.Logger.flush();
+  assert(active && storage[active].some(function(entry) { return entry.msg === 'quota recovery event'; }),
+    'the logger must persist the current entries after a quota recovery retry');
+  assert(!storage[oldest] && storage[newest] && storage.atp_logs_content_keys.join(',') === [active, newest].join(','),
+    'quota recovery must clear the oldest eligible sibling and keep the active and newer log shards');
+  assert(sandbox.__storageByteReads.includes(oldest) && !sandbox.__storageReads.some(Array.isArray),
+    'quota recovery must measure per-key usage without loading the old shards together');
 }
 
 function checkBackgroundLogSanitization() {
@@ -4603,6 +5358,7 @@ async function checkBackgroundFetchWorkerPoolProgress() {
       urls: urls,
       maxImages: 100,
       displayImages: 100,
+      articleFetchConcurrency: 3,
       deadline: Date.now() + 30000
     }, { url: 'https://www.sehuatang.org/forum.php?mod=forumdisplay&fid=1' }, resolve);
     assert(asyncResult === true, 'background worker-pool test must preserve async response semantics');
@@ -4701,7 +5457,7 @@ async function checkBackgroundFetchInflightDeadline() {
     const asyncResult = sandbox.__onMessage(request, sender, resolve);
     assert(asyncResult === true, 'background in-flight fetch test must preserve async response semantics for the second request');
   });
-  await Promise.resolve();
+  await new Promise(resolve => setImmediate(resolve));
   assert(fetchCount === 1, 'background concurrent FETCH_IMAGES requests for the same article must share one in-flight fetch');
   releaseFetch();
   const responses = await Promise.all([first, second]);
@@ -4711,6 +5467,8 @@ async function checkBackgroundFetchInflightDeadline() {
   );
 
   const mixedSandbox = loadBackgroundSandbox();
+  const mixedNow = Date.now();
+  mixedSandbox.Date = class extends Date { static now() { return mixedNow; } };
   let mixedFetchCount = 0;
   let releaseMixedFetch;
   const mixedTimers = [];
@@ -4738,14 +5496,14 @@ async function checkBackgroundFetchInflightDeadline() {
     urls: [mixedUrl],
     maxImages: 10,
     displayImages: 10,
-    deadline: Date.now() + 5
+    deadline: mixedNow + 5
   };
   const longDeadlineRequest = {
     type: 'FETCH_IMAGES',
     urls: [mixedUrl],
     maxImages: 10,
     displayImages: 10,
-    deadline: Date.now() + 10000
+    deadline: mixedNow + 10000
   };
   const shortResponsePromise = new Promise(function(resolve) {
     const asyncResult = mixedSandbox.__onMessage(shortDeadlineRequest, sender, resolve);
@@ -4755,7 +5513,7 @@ async function checkBackgroundFetchInflightDeadline() {
     const asyncResult = mixedSandbox.__onMessage(longDeadlineRequest, sender, resolve);
     assert(asyncResult === true, 'background mixed deadline long request must preserve async response semantics');
   });
-  await Promise.resolve();
+  await new Promise(resolve => setImmediate(resolve));
   assert(mixedFetchCount === 1, 'background mixed deadline requests for the same article must share one in-flight fetch');
   assert(mixedTimers.length >= 4, 'background mixed deadline test must create separate caller and fetch timers');
   assert(
@@ -4782,6 +5540,8 @@ async function checkBackgroundFetchInflightDeadline() {
   );
 
   const abortedSandbox = loadBackgroundSandbox();
+  const abortedNow = Date.now();
+  abortedSandbox.Date = class extends Date { static now() { return abortedNow; } };
   let abortedFetchCount = 0;
   const abortedTimers = [];
   abortedSandbox.setTimeout = function(callback, delay) {
@@ -4807,20 +5567,20 @@ async function checkBackgroundFetchInflightDeadline() {
     urls: [abortedUrl],
     maxImages: 10,
     displayImages: 10,
-    deadline: Date.now() + 5
+    deadline: abortedNow + 5
   };
   const abortedLongRequest = {
     type: 'FETCH_IMAGES',
     urls: [abortedUrl],
     maxImages: 10,
     displayImages: 10,
-    deadline: Date.now() + 10000
+    deadline: abortedNow + 10000
   };
   const ignoredShortResponse = new Promise(function(resolve) {
     const asyncResult = abortedSandbox.__onMessage(abortedShortRequest, sender, resolve);
     assert(asyncResult === true, 'background aborted in-flight short request must preserve async response semantics');
   });
-  await Promise.resolve();
+  await new Promise(resolve => setImmediate(resolve));
   assert(abortedFetchCount === 1, 'background aborted in-flight regression must start with one pending fetch');
   assert(abortedTimers[0] && abortedTimers[0].delay < 1000, 'background aborted in-flight regression must start with a short fetch abort timer');
   abortedTimers[0].callback();
@@ -5509,13 +6269,11 @@ async function checkContentTextCachePrecedence() {
     { url: 'https://dl.ldkms.la/dupe.txt?a=1&b=2#frag', name: 'dupe-b.txt' },
     { url: 'https://dl.ldkms.la/other.txt', name: 'other.txt' }
   ], {});
-  assert(dedupeSandbox.__backgroundCalls.length === 1, 'content TXT cross-origin dedupe must keep one background handoff');
-  assert(
-    dedupeSandbox.__backgroundCalls[0].attachments.length === 2 &&
-      dedupeSandbox.__backgroundCalls[0].attachments[0].url === 'https://dl.ldkms.la/dupe.txt?b=2&a=1' &&
-      dedupeSandbox.__backgroundCalls[0].attachments[1].url === 'https://dl.ldkms.la/other.txt',
-    'content TXT fetch must dedupe equivalent attachment URLs before background handoff'
-  );
+  const handoffs = dedupeSandbox.__backgroundCalls;
+  assert(handoffs.every(call => call.attachments.length === 1), 'cross-origin TXT must hand over one attachment at a time');
+  assertExactStringArray(handoffs.map(call => call.attachments[0].url),
+    ['https://dl.ldkms.la/dupe.txt?b=2&a=1', 'https://dl.ldkms.la/other.txt'],
+    'content TXT handoffs after equivalent attachment URLs were deduplicated');
 
   const retrySandbox = loadFetcherSandbox();
   const retryUrl = 'https://dl.ldkms.la/manual-retry.txt';
@@ -5669,7 +6427,10 @@ async function checkFetcherFreshTextAttachmentMessage() {
 async function checkContentTextAttachmentSharedDeadline() {
   const sandbox = loadFetcherSandbox();
   const timers = [];
-  const deadline = Date.now() + 40;
+  let clock = Date.now();
+  sandbox.Date = class extends Date { static now() { return clock; } };
+  const directTimeout = sandbox.SharedUtils.TEXT_ATTACHMENT_TIMEOUT;
+  const deadline = clock + directTimeout + 40;
   let directAbortListener = null;
   let directFetchStarted = false;
   sandbox.setTimeout = function(callback, delay) {
@@ -5705,15 +6466,16 @@ async function checkContentTextAttachmentSharedDeadline() {
   const statusPromise = sandbox.ATPFetcher.fetchTextAttachmentResourcesWithStatus([
     { url: 'https://www.sehuatang.org/attachment/slow.txt', name: 'slow.txt' }
   ], { deadline: deadline });
-  for (let i = 0; i < 12; i++) await Promise.resolve();
+  for (let i = 0; i < 30 && !directFetchStarted; i++) await Promise.resolve();
   assert(directFetchStarted && directAbortListener, 'content same-origin TXT shared deadline test must start a direct abortable fetch');
-  assert(timers.length >= 1 && timers[0].delay <= 40, 'content same-origin TXT direct fetch must clamp its timeout to the shared deadline');
+  assert(timers.length >= 1 && timers[0].delay === directTimeout, 'content same-origin TXT direct fetch must obey its per-request timeout');
+  clock += timers[0].delay;
   timers[0].callback();
   const status = await statusPromise;
   assert(status.retryableCount === 1, 'content same-origin TXT shared deadline test must return retryable unresolved status after timeout fallback');
   assert(sandbox.__backgroundCalls.length === 1, 'content same-origin TXT timeout must still attempt one background fallback within the shared deadline');
   assert(sandbox.__backgroundCalls[0].deadline === deadline, 'content same-origin TXT background fallback must reuse the original shared deadline');
-  assert(timers.length >= 2 && timers[1].delay < sandbox.SharedUtils.getTextAttachmentBackgroundTimeout(1), 'content same-origin TXT background fallback must not restart a full background timeout after direct timeout');
+  assert(timers.length >= 2 && timers[1].delay === 40, 'content same-origin TXT background fallback must use the remaining shared time after a direct timeout');
 
   const expiredSandbox = loadFetcherSandbox();
   let expiredFetchCount = 0;
@@ -5758,11 +6520,12 @@ async function checkTextResourcePartialSuccessStatus() {
   contentSandbox.clearTimeout = function(){};
   contentSandbox.chrome.runtime.sendMessage = function(message, callback) {
     contentSandbox.__backgroundCalls.push(message);
+    const resolved = /-a\.txt$/.test(message.attachments[0].url);
     callback({
-      resources: partialResources,
-      attemptedCount: message.attachments.length,
-      unresolvedCount: 1,
-      retryableCount: 1
+      resources: resolved ? partialResources : SharedUtils.emptyResources(),
+      attemptedCount: 1,
+      unresolvedCount: resolved ? 0 : 1,
+      retryableCount: resolved ? 0 : 1
     });
   };
   const contentStatus = await contentSandbox.ATPFetcher.fetchTextAttachmentResourcesWithStatus([
@@ -5833,11 +6596,11 @@ async function checkTextResourcePartialSuccessStatus() {
       assert(asyncResult === true, 'background queued TXT messages must preserve async response semantics');
     }));
   }
-  for (let bqf = 0; bqf < 8; bqf++) await Promise.resolve();
+  await new Promise(resolve => setImmediate(resolve));
   assert(backgroundTxtDeferred.length === 2 && backgroundTxtActive === 2, 'background TXT message queue must start only two extension-wide requests');
   backgroundTxtDeferred[0]();
   backgroundTxtDeferred[1]();
-  for (let bqf2 = 0; bqf2 < 12; bqf2++) await Promise.resolve();
+  await new Promise(resolve => setImmediate(resolve));
   assert(backgroundTxtDeferred.length === 4 && backgroundTxtMax === 2, 'background TXT message queue must start later messages only after a slot is released');
   backgroundTxtDeferred[2]();
   backgroundTxtDeferred[3]();
@@ -5986,6 +6749,7 @@ async function checkTextResourcePartialSuccessStatus() {
     link: 'https://www.sehuatang.org/thread-empty-1-1.html',
     statusEl: { textContent: '' }
   };
+  const emptyThreadFixture = Object.assign({}, emptyThreadState);
   assert(rendererSandbox.ATPRenderer.scheduleTextResourceLoad(emptyThreadState, false) === true, 'renderer TXT scheduling must return true after accepting empty-status work');
   await flushAutomaticTextPromises();
   assert(rendererSandbox.__emptyFetchAttachmentCount === 1, 'renderer TXT empty-status test must pass attachments to the fetcher');
@@ -6015,7 +6779,7 @@ async function checkTextResourcePartialSuccessStatus() {
       retryableCount: 0
     });
   };
-  const mixedThreadState = Object.assign({}, emptyThreadState, {
+  const mixedThreadState = Object.assign({}, emptyThreadFixture, {
     resources: SharedUtils.emptyResources(),
     textAttachments: [
       { url: 'https://dl.ldkms.la/mixed.txt?b=2&a=1', name: 'mixed.txt' }
@@ -6065,7 +6829,7 @@ async function checkTextResourcePartialSuccessStatus() {
       retryableCount: 0
     });
   };
-  const freshFailureFallbackState = Object.assign({}, emptyThreadState, {
+  const freshFailureFallbackState = Object.assign({}, emptyThreadFixture, {
     resources: SharedUtils.emptyResources(),
     textAttachments: [
       { url: 'https://dl.ldkms.la/cached-after-fresh-fail.txt', name: 'cached-after-fresh-fail.txt' }
@@ -6100,7 +6864,7 @@ async function checkTextResourcePartialSuccessStatus() {
     nullFreshFetchUrls = attachments.map(function(attachment) { return attachment.url; });
     return Promise.resolve({ resources: partialResources, attemptedCount: attachments.length, unresolvedCount: 0, retryableCount: 0 });
   };
-  const nullFreshState = Object.assign({}, emptyThreadState, {
+  const nullFreshState = Object.assign({}, emptyThreadFixture, {
     resources: SharedUtils.emptyResources(),
     textAttachments: [{ url: 'https://dl.ldkms.la/cached-null-fresh.txt', name: 'cached-null-fresh.txt' }],
     hasTextAttachments: true,
@@ -6121,7 +6885,7 @@ async function checkTextResourcePartialSuccessStatus() {
   // A fresh result may be incomplete even though the cached attachment is
   // readable. Do not turn one successful file into a complete two-file run.
   rendererSandbox.ATPFetcher.fetchTextAttachmentsFresh = function() { return Promise.resolve([]); };
-  const missingFreshState = Object.assign({}, emptyThreadState, {
+  const missingFreshState = Object.assign({}, emptyThreadFixture, {
     resources: SharedUtils.emptyResources(),
     textAttachments: [{ url: 'https://dl.ldkms.la/cached-missing-fresh.txt', name: 'cached.txt' }],
     hasTextAttachments: true,
@@ -6336,7 +7100,10 @@ async function checkTextResourcePartialSuccessStatus() {
     lateFreshAttachmentFetches++;
     return Promise.resolve({ resources: lateAutomaticResources, attemptedCount: 1, unresolvedCount: 0, retryableCount: 0 });
   };
-  const importedDuringFresh = makeAutomaticThread('import-during-fresh', { textAttachments: [], hasTextAttachments: true });
+  const importedDuringFresh = makeAutomaticThread('import-during-fresh', {
+    textAttachments: [], hasTextAttachments: true,
+    textAttachmentHints: SharedUtils.getTextAttachmentHints([{ url: 'https://www.sehuatang.org/forum.php?mod=attachment&aid=expiring', name: 'import-during-fresh.txt' }])
+  });
   rendererSandbox.ATPRenderer.queueAutomaticTextResourceLoad(importedDuringFresh);
   assert(rendererSandbox.ATPRenderer.importTextResources(importedDuringFresh, [{ name: 'import-during-fresh.txt', resources: partialResources }]) === true, 'local TXT import must invalidate a pending fresh-attachment extraction run');
   const importedFreshMessage = importedDuringFresh.textResourceMessage;
@@ -6355,6 +7122,53 @@ async function checkTextResourcePartialSuccessStatus() {
   assert(rendererSandbox.ATPRenderer.importTextResources(partialLocalImport, [{ name: 'partial-local-a.txt', resources: partialResources }]) === true, 'local TXT import must accept a valid subset of a multi-attachment thread');
   assert(partialLocalImport.textResourcesDone === false && partialLocalImport.textResourcesRetryable === true && partialLocalImport.textResourcesUnresolvedCount === 1, 'a partial local TXT import must keep the remaining attachment retryable instead of completing the whole thread');
   assert(cacheWrites[cacheWrites.length - 1].data.textResourcesComplete === false, 'a partial local TXT import must persist an incomplete article TXT cache contract');
+
+  const importFile = (thread, name, resources) => rendererSandbox.ATPRenderer.importTextResources(thread, [{ name: name, resources: resources || lateAutomaticResources }]);
+  const firstFile = partialLocalImport.textAttachments[0].name, secondFile = partialLocalImport.textAttachments[1].name;
+  assert(importFile(partialLocalImport, firstFile, partialResources) && partialLocalImport.textResourcesUnresolvedCount === 1 &&
+    partialLocalImport.textResolvedAttachmentIds.length === 1 && partialLocalImport.textResourcesAttemptedCount === 1,
+    're-importing the same file must not complete two attachments');
+  const savedImport = loadCacheSandbox().normalizeArticleData(JSON.parse(JSON.stringify(cacheWrites[cacheWrites.length - 1].data)));
+  const restoredImport = rendererSandbox.ATPRenderer.registerThread([], savedImport.resources, null, { textContent: '' },
+    { classList: { add() {} } }, partialLocalImport.link, null, {}, savedImport.textAttachments, [], { enabled: false }, true, 2, false,
+    Date.now(), savedImport.textResourcesComplete, savedImport.textResourcesAttemptedCount, savedImport.textResourcesUnresolvedCount,
+    savedImport.textResourcesRetryableCount, savedImport);
+  assert(importFile(restoredImport, secondFile) && restoredImport.textResourcesDone && !restoredImport.textResourcesRetryable &&
+    restoredImport.textResolvedAttachmentIds.length === 2 && restoredImport.textResourcesAttemptedCount === 2 &&
+    cacheWrites[cacheWrites.length - 1].data.textResourcesComplete && SharedUtils.countResources(restoredImport.resources) === 2,
+    'a second file after a cache round-trip must finish the two attachments and preserve resources from both batches');
+
+  const attachmentWrites = [];
+  rendererSandbox.ATPCache.setCachedTextResources = url => attachmentWrites.push(url);
+  const sameName = makeAutomaticThread('same-name', { textAttachments: [
+    { url: 'https://dl.ldkms.la/a/resources.txt', name: 'resources.txt' },
+    { url: 'https://dl.ldkms.la/b/resources.txt', name: 'resources.txt' }
+  ], textAttachmentCount: 2 });
+  assert(importFile(sameName, 'resources.txt') && importFile(sameName, 'unrelated.txt') &&
+    sameName.textResourcesUnresolvedCount === 2 && !sameName.textResourcesDone && attachmentWrites.length === 0 && SharedUtils.hasResourcePayload(sameName.resources),
+    'ambiguous and unmatched files must merge their resources without crediting or seeding other attachments');
+
+  const legacyMarker = makeAutomaticThread('legacy-marker', { textAttachments: [], textResourcesAttemptedCount: 2, textResourcesUnresolvedCount: 1, textAttachmentCount: 2 });
+  assert(importFile(legacyMarker, 'unknown.txt') && !legacyMarker.textResourcesDone && legacyMarker.textResourcesUnresolvedCount === 1,
+    'old count-only posts must retain known progress without guessing which attachment an unmatched file belongs to');
+
+  const transient = { url: 'https://www.sehuatang.org/forum.php?mod=attachment&aid=private-test-token', name: 'signed-A.txt' };
+  const stable = { url: 'https://dl.ldkms.la/mixed-B.txt', name: 'mixed-B.txt' };
+  const raw = loadCacheSandbox().normalizeArticleData({ textAttachments: [transient, stable], textAttachmentCount: 2 });
+  assert(!JSON.stringify(raw).includes('private-test-token') && raw.textAttachmentHints.length === 2 && raw.textAttachments.length === 1,
+    'attachment matching hints must survive a signed URL without persisting its token');
+  const automaticThenLocal = makeAutomaticThread('automatic-then-local', { textAttachments: [transient, stable], textAttachmentCount: 2, freshTextAttachmentsAt: Date.now() });
+  rendererSandbox.ATPFetcher.fetchTextAttachmentResourcesWithStatus = function() {
+    return Promise.resolve({ resources: partialResources, resolvedAttachments: [transient], attemptedCount: 2, unresolvedCount: 1, retryableCount: 1 });
+  };
+  rendererSandbox.ATPRenderer.scheduleTextResourceLoad(automaticThenLocal, false);
+  await flushAutomaticTextPromises();
+  assert(automaticThenLocal.textResourcesUnresolvedCount === 1 && automaticThenLocal.textResolvedAttachmentIds.length === 1,
+    'partial automatic results must preserve the identity of each confirmed attachment');
+  assert(importFile(automaticThenLocal, transient.name, partialResources) && !automaticThenLocal.textResourcesDone &&
+    importFile(automaticThenLocal, stable.name) && automaticThenLocal.textResourcesDone &&
+    attachmentWrites.length === 1 && attachmentWrites[0] === stable.url,
+    'reimporting an automatic success must be idempotent and a local match for the other file must finish the thread');
 
   const detachedDeferred = [];
   const detachedStarts = [];
@@ -6585,7 +7399,8 @@ async function checkArticleRetryableEmptyBehavior() {
     return makeHtmlResponse(unavailableSamples[1].html);
   };
   const unavailableData = await unavailableSandbox.ATPFetcher.fetchArticleData('https://www.sehuatang.org/thread-200-permission-1-1.html');
-  assert(unavailableData.retryableEmpty === true && unavailableData.emptyReason === 'blocked', 'HTTP 200 unavailable article pages must be retryable');
+  assert(unavailableData.retryableEmpty === true && unavailableData.emptyReason === 'permission_page',
+    'HTTP 200 permission notices must remain retryable and identify the permission requirement');
   assert(unavailableSandbox.__negativeWrites.length === 0, 'HTTP 200 unavailable article pages must not write negative article cache entries');
 
   const deniedSandbox = loadFetcherSandbox();
@@ -6622,6 +7437,7 @@ async function checkSameOriginArticleParseQueue() {
       TEXT_ATTACHMENT_MAX_COUNT: 8,
       TEXT_ATTACHMENT_MAX_BYTES: 1024,
       TEXT_ATTACHMENT_TIMEOUT: 1000,
+      emptyResources: function() { return { links: [] }; },
       extractResources: function(html) {
         parseClock += 13;
         stages.push(html + ':resources');
@@ -6629,7 +7445,11 @@ async function checkSameOriginArticleParseQueue() {
         return { links: [html] };
       },
       extractTextAttachments: function(html) { parseClock += 13; stages.push(html + ':text'); return [{ url: html + '.txt' }]; },
-      extractImagesForSettings: function(html) { parseClock += 13; stages.push(html + ':images'); return [{ src: html + '.jpg' }]; },
+      extractImagesForSettingsInSlices: async function(html) {
+        parseClock += 13;
+        stages.push(html + ':images');
+        return { images: [{ src: html + '.jpg' }], partial: false };
+      },
       countResources: function(resources) { return resources && resources.links ? resources.links.length : 0; }
     },
     Logger: {
@@ -6656,7 +7476,7 @@ async function checkSameOriginArticleParseQueue() {
     assert(rafQueue.length > 0, message);
     const callback = rafQueue.shift();
     callback();
-    for (let i = 0; i < 5; i++) await Promise.resolve();
+    for (let i = 0; i < 10; i++) await Promise.resolve();
   }
 
   const queue = sandbox.__ATP_VERIFY_PARSE_QUEUE;
@@ -6684,6 +7504,74 @@ async function checkSameOriginArticleParseQueue() {
   assert((await afterBad).images[0].src === 'after.jpg', 'article parse queue must continue draining after a failed job');
 }
 
+async function checkFetcherPreparedArticleHandoff() {
+  const sandbox = loadFetcherSandbox();
+  const url = 'https://www.sehuatang.org/thread-157-1-1.html';
+  let cacheReads = 0, networkReads = 0, firstLive = true, written;
+  let preparationStarted, releasePreparation;
+  const preparing = new Promise(resolve => { preparationStarted = resolve; });
+  const pause = new Promise(resolve => { releasePreparation = resolve; });
+  const prepare = sandbox.ATPCache.prepareArticleData;
+  sandbox.ATPCache.getArticleCacheState = async function() {
+    cacheReads++;
+    return { cached: null, negative: false };
+  };
+  sandbox.ATPCache.prepareArticleData = async function(data, isCurrent) {
+    preparationStarted(isCurrent);
+    await pause;
+    return prepare(data, isCurrent);
+  };
+  sandbox.ATPCache.setCachedArticleData = (key, data) => { written = JSON.stringify(data); };
+  sandbox.fetch = async function(target) {
+    networkReads++;
+    return makeHtmlResponse('<div id="postlist"><img src="https://img.example/prepared.jpg">' +
+      '<a href="/forum.php?mod=attachment&amp;aid=ephemeral-157">ephemeral.txt</a>' +
+      '<a href="https://dl.ldkms.la/stable.txt">stable.txt</a></div>', { url: target });
+  };
+  const first = sandbox.ATPFetcher.fetchArticleData(url, null, { isCurrent: () => firstLive });
+  const isCurrent = await preparing;
+  const second = sandbox.ATPFetcher.fetchArticleData(url, null, { isCurrent: () => true });
+  firstLive = false;
+  assert(isCurrent(), 'a live reader sharing the same article must retain its pending preparation');
+  releasePreparation();
+  const [oldReader, liveReader] = await Promise.all([first, second]);
+  assert(cacheReads === 1 && networkReads === 1 && oldReader === liveReader && liveReader.images[0].src === 'https://img.example/prepared.jpg',
+    'concurrent readers must share one article lookup, request, and prepared result');
+  assert(written && !written.includes('ephemeral-157') && !written.includes('freshTextAttachments') &&
+    liveReader.textAttachments.length === 1 && liveReader.textAttachmentCount === 2 &&
+    liveReader.freshTextAttachments.some(item => item.url.includes('ephemeral-157')) && liveReader.freshTextAttachmentsAt > 0,
+    'a prepared same-origin article must retain fresh TXT links only for its tab while caching persistent links and markers');
+
+  const abandoned = loadFetcherSandbox();
+  let lookingAtRow = true, forumOutcome;
+  abandoned.ATPForumPacer = { acquire: async () => ({ done: outcome => { forumOutcome = outcome; } }) };
+  abandoned.fetch = async function(target) {
+    lookingAtRow = false;
+    return makeHtmlResponse('<div id="messagetext">您的请求过于频繁，请稍后再试。</div>', { url: target });
+  };
+  const limited = await abandoned.ATPFetcher.fetchArticleData(url, null, { isCurrent: () => lookingAtRow });
+  assert(limited.emptyReason === 'rate_limited' && forumOutcome === 'flood' && abandoned.__negativeWrites.length === 0,
+    'a dispatched request must preserve a real HTML rate limit even if its row disappears before preparation');
+
+  const bridge = loadFetcherSandbox();
+  const remoteUrl = 'https://www.sehuatang.net/thread-158-1-1.html';
+  let settled = false, releaseBackgroundPreparation;
+  const enteringPreparation = new Promise(resolve => {
+    bridge.ATPCache.prepareArticleData = function(data) {
+      resolve();
+      return new Promise(finish => { releaseBackgroundPreparation = () => finish(prepare(data)); });
+    };
+  });
+  bridge.ATPForumPacer = { acquire: async () => ({ done: () => { settled = true; } }) };
+  bridge.setTimeout = () => 1;
+  bridge.chrome.runtime.sendMessage = (message, respond) => respond({ [remoteUrl]: { images: ['https://img.example/remote.jpg'] } });
+  const pending = bridge.ATPFetcher.fetchArticleDataByBackground(remoteUrl);
+  await enteringPreparation;
+  assert(settled, 'a completed background request must release the forum ticket before client-side preparation');
+  releaseBackgroundPreparation();
+  assert((await pending).images[0].src === 'https://img.example/remote.jpg', 'background responses must yield the canonical article shape');
+}
+
 async function checkArticleRetryAfterBehavior() {
   const sameOriginSandbox = loadFetcherSandbox();
   sameOriginSandbox.fetch = async function() {
@@ -6698,12 +7586,24 @@ async function checkArticleRetryAfterBehavior() {
     'same-origin HTTP 429 Retry-After seconds must be converted to an absolute retry timestamp'
   );
   assert(sameOriginSandbox.__negativeWrites.length === 0, 'same-origin HTTP 429 retry-after responses must not write negative article cache entries');
+  sameOriginSandbox.navigator.onLine = false;
+  sameOriginSandbox.fetch = async function() { throw new TypeError('fixture network failure'); };
+  const disconnected = await sameOriginSandbox.ATPFetcher.fetchArticleData('https://www.sehuatang.org/thread-17-1-1.html');
+  sameOriginSandbox.navigator.onLine = true;
+  const connected = await sameOriginSandbox.ATPFetcher.fetchArticleData('https://www.sehuatang.org/thread-17-1-1.html');
+  assert(disconnected.emptyReason === 'offline' && connected.emptyReason === 'transient_exception' &&
+      sameOriginSandbox.__negativeWrites.length === 0,
+    'only a confirmed disconnection must use the online-event retry path');
 
   const backgroundSandbox = loadBackgroundSandbox();
+  let workerNow = Date.now();
+  backgroundSandbox.Date = class extends Date { static now() { return workerNow; } };
   const retryDate = new Date(Date.now() + 180000).toUTCString();
   const retryDateAt = Date.parse(retryDate);
   const retryUrl = 'https://www.sehuatang.org/thread-16-1-1.html';
+  let networkRequests = 0;
   backgroundSandbox.fetch = async function(url) {
+    networkRequests++;
     return makeHtmlResponse('', { ok: false, status: 503, retryAfter: retryDate, url: url });
   };
   const response = await new Promise(function(resolve) {
@@ -6719,9 +7619,315 @@ async function checkArticleRetryAfterBehavior() {
     response[retryUrl] &&
       response[retryUrl].retryableEmpty === true &&
       response[retryUrl].reason === 'http_503' &&
+      response[retryUrl].forumOrigin === new URL(retryUrl).origin &&
       response[retryUrl].retryAfter === retryDateAt,
     'background HTTP 5xx Retry-After dates must be returned to content as absolute retry timestamps'
   );
+  const send = (type, fields, source) => new Promise(resolve => {
+    backgroundSandbox.__onMessage(Object.assign({ type: type }, fields), { url: source + '/forum-1-1.html' }, resolve);
+  });
+  const targetOrigin = new URL(retryUrl).origin;
+  const otherOrigin = 'https://www.sehuatang.net';
+  for (const source of [targetOrigin, otherOrigin]) {
+    const article = await send('FETCH_IMAGES', { urls: [retryUrl] }, source);
+    const fresh = await send('FETCH_TEXT_ATTACHMENTS_FRESH', { url: retryUrl }, source);
+    assert(networkRequests === 1 && article[retryUrl].emptyReason === 'forum_cooldown' &&
+        article[retryUrl].retryableEmpty && article[retryUrl].retryAfter === retryDateAt &&
+        fresh.reason === 'forum_cooldown' && !fresh.ok && fresh.retryAfter === retryDateAt,
+      'stored target cooldown must prevent both article and fresh TXT requests from either source');
+  }
+  workerNow = retryDateAt + 1;
+  let resolveProbe;
+  let probeStarted;
+  const probeReady = new Promise(resolve => { probeStarted = resolve; });
+  backgroundSandbox.fetch = function() {
+    networkRequests++;
+    return new Promise(resolve => {
+      resolveProbe = resolve;
+      probeStarted();
+    });
+  };
+  const probe = send('FETCH_TEXT_ATTACHMENTS_FRESH', { url: retryUrl }, otherOrigin);
+  await probeReady;
+  const anotherUrl = targetOrigin + '/thread-18-1-1.html';
+  const whileProbing = await send('FETCH_IMAGES', { urls: [anotherUrl] }, targetOrigin);
+  const textWhileProbing = await send('FETCH_TEXT_RESOURCES', {
+    attachments: [{ url: targetOrigin + '/fixture.txt', name: 'fixture.txt' }],
+    manualRetry: true
+  }, otherOrigin);
+  assert(networkRequests === 2 && whileProbing[anotherUrl].emptyReason === 'forum_cooldown' &&
+      whileProbing[anotherUrl].retryAfter > workerNow && textWhileProbing.forumCooldown.deferredWithoutRequest,
+    'expired cooldown must admit one real probe across all background routes for the origin');
+  const html = '<html><head><title>Fixture thread</title></head><body><div id="postlist"><td id="postmessage_1">' +
+    '<a href="https://www.sehuatang.org/fixture.txt">fixture.txt</a></td></div></body></html>';
+  resolveProbe(makeHtmlResponse(html, { url: retryUrl }));
+  assert((await probe).ok, 'the recovery probe must return its real TXT result');
+  backgroundSandbox.fetch = async function(url) {
+    networkRequests++;
+    return makeHtmlResponse(html, { url: url });
+  };
+  const afterProbe = await send('FETCH_IMAGES', { urls: [anotherUrl] }, targetOrigin);
+  assert(networkRequests === 3 && !afterProbe[anotherUrl].retryableEmpty, 'a successful real probe must release the target restriction');
+
+  const reportedUntil = workerNow + 120000;
+  const report = await send('REPORT_FORUM_PACER_STATUS', { entry: { at: workerNow, retryAfterUntil: reportedUntil } }, otherOrigin);
+  const reportedUrl = otherOrigin + '/thread-19-1-1.html';
+  const blockedByTab = await send('FETCH_IMAGES', { urls: [reportedUrl] }, targetOrigin);
+  const unrelated = await send('FETCH_IMAGES', { urls: [anotherUrl] }, targetOrigin);
+  assert(report.ok && networkRequests === 4 && blockedByTab[reportedUrl].retryAfter === reportedUntil &&
+      !unrelated[anotherUrl].retryableEmpty,
+    'a direct page Retry-After must protect its target through the worker while leaving other origins available');
+
+  const attachmentArrivals = [];
+  const localText = targetOrigin + '/healthy.txt';
+  const limitedText = otherOrigin + '/limited.txt';
+  backgroundSandbox.fetch = async function(url) {
+    attachmentArrivals.push(url);
+    if (url === limitedText) {
+      return makeHtmlResponse('', { ok: false, status: 429, retryAfter: '30', url: url });
+    }
+    return makeHtmlResponse('https://pan.quark.cn/s/healthyfixture', { url: url, contentType: 'text/plain' });
+  };
+  const mixedText = {
+    attachments: [localText, limitedText].map(url => ({ url: url, name: 'fixture.txt' })),
+    manualRetry: true
+  };
+  const skipped = await send('FETCH_TEXT_RESOURCES', mixedText, targetOrigin);
+  assert(attachmentArrivals.length === 1 && attachmentArrivals[0] === localText &&
+      skipped.forumCooldown.origin === otherOrigin && !skipped.forumCooldown.deferredWithoutRequest &&
+      skipped.observedForumCooldowns.length === 0,
+    'mixed batches must distinguish a deferred origin from successful network requests to another origin');
+  workerNow = reportedUntil + 1;
+  const refused = await send('FETCH_TEXT_RESOURCES', mixedText, targetOrigin);
+  assert(attachmentArrivals.length === 2 && attachmentArrivals[1] === limitedText &&
+      refused.observedForumCooldowns.length === 1 && refused.observedForumCooldowns[0].origin === otherOrigin,
+    'only the origin that newly refused a real network request belongs in the list of observed cooldowns');
+}
+
+async function checkForumServerWaitPublication() {
+  const org = 'https://www.sehuatang.org';
+  const net = 'https://www.sehuatang.net';
+  const waitKey = 'atp_forum_server_wait_v1';
+  const statusKey = 'atp_forum_pacer_status_v1';
+  const resetKey = 'atp_forum_pacer_reset_at';
+  const storage = {};
+  const listeners = [];
+  const reports = [];
+  const arrivals = [];
+  let waitWrites = 0;
+  function emit(items) {
+    const changes = Object.fromEntries(Object.entries(items).map(([key, value]) => [key, { newValue: structuredClone(value) }]));
+    listeners.forEach(listener => listener(changes, 'local'));
+  }
+  const worker = loadBackgroundSandbox({ storage, afterStorageSet(items) {
+    if (Object.hasOwn(items, waitKey)) waitWrites++;
+    emit(items);
+  } });
+  listeners.push(worker.__storageChangeListener);
+  function openPage(origin, delayStartup) {
+    const page = loadFetcherSandbox();
+    page.location = new URL(origin + '/forum-1-1.html');
+    page.setTimeout = setTimeout;
+    page.clearTimeout = clearTimeout;
+    page.Logger.info = function() {};
+    page.chrome.runtime.sendMessage = function(message, callback) {
+      if (message.type === 'REPORT_FORUM_PACER_STATUS') reports.push({ origin, entry: message.entry });
+      return worker.__onMessage(message, { url: page.location.href }, callback);
+    };
+    page.chrome.storage = {
+      local: { get(keys, callback) {
+        const snapshot = structuredClone(Object.fromEntries(keys.map(key => [key, storage[key]])));
+        if (delayStartup) page.finishStartup = () => callback(snapshot);
+        else callback(snapshot);
+      } },
+      onChanged: { addListener: listener => listeners.push(listener) }
+    };
+    page.fetch = async url => {
+      arrivals.push(url);
+      return makeHtmlResponse('https://pan.quark.cn/s/healthyfixture', { url, contentType: 'text/plain' });
+    };
+    vm.runInContext(read('forum-pacer.js'), page, { filename: 'forum-pacer.js' });
+    return page;
+  }
+  function readText(page, suffix) {
+    return page.ATPFetcher.fetchTextAttachmentResourcesWithStatus(
+      [{ url: page.location.origin + '/' + suffix + '.txt' }], { manualRetry: true });
+  }
+
+  const live = openPage(net, false);
+  const healthy = openPage(org, false);
+  const otherPort = openPage(net + ':8443', false);
+  const header = new Date(Date.now() + 120000).toUTCString();
+  const deadline = Date.parse(header);
+  worker.fetch = async url => makeHtmlResponse('', { url, status: 429, ok: false, retryAfter: header });
+  const attachment = { url: net + '/busy.txt' };
+  const refusal = await new Promise(resolve => worker.__onMessage(
+    { type: 'FETCH_TEXT_RESOURCES', attachments: [attachment], manualRetry: true },
+    { url: healthy.location.href }, resolve));
+  assert(refusal.forumCooldown.retryAfter === deadline && storage[waitKey][net].until === deadline &&
+      live.ATPForumPacer.getState().retryAfterUntil === deadline,
+    'a background-only network refusal must reach tabs on the exact target origin');
+  let guarded = false;
+  const guardedArticle = await live.ATPFetcher.fetchArticleData(net + '/thread-801-1-1.html', null, {
+    onHeld: () => { guarded = true; },
+    isCancelled: () => guarded
+  });
+  assert(guardedArticle.emptyReason === 'pace_cancelled' && arrivals.length === 0,
+    'a live target page must hold the next direct article request');
+
+  const fresh = openPage(net, true);
+  let freshSettled = false;
+  const pending = readText(fresh, 'direct-after-startup').then(result => { freshSettled = true; return result; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert(!freshSettled && !fresh.ATPForumPacer.canStartNow(0) && arrivals.length === 0,
+    'a new tab must wait for its initial server deadline before granting a request');
+  fresh.finishStartup();
+  assert((await pending).retryableCount === 1 && fresh.ATPForumPacer.getState().level === 1 &&
+      arrivals.length === 0 && (await readText(live, 'direct-live')).retryableCount === 1 && arrivals.length === 0,
+    'both startup and live manual TXT must be held by the worker-observed deadline');
+  assert((await readText(healthy, 'direct-healthy')).resources.groups.quark.length === 1 &&
+      (await readText(otherPort, 'direct-other-port')).resources.groups.quark.length === 1 &&
+      arrivals.length === 2,
+    'another host and another port must keep their direct allowance');
+
+  const popup = loadPopupSandbox({}, { sharedStorage: storage, activeTabs: [{ id: 51, url: live.location.href }] });
+  listeners.push(...popup.__storageListeners);
+  await popup.window.__ATPPopupTest.loadUI();
+  await popup.__flushPromises(20);
+  const info = popup.document.getElementById('forumPacerInfo');
+  assert(/www\.sehuatang\.net：.*论坛要求等待/.test(info.textContent) && !/www\.sehuatang\.org：/.test(info.textContent),
+    'the popup must display the background-observed server period for the limited host: ' + info.textContent);
+  popup.document.getElementById('resetForumPacer').click();
+  await popup.__flushPromises(20);
+  emit({ [resetKey]: storage[resetKey] });
+  await worker.forumPacerStatusWrites;
+  assert(live.ATPForumPacer.getState().retryAfterUntil === deadline &&
+      storage[statusKey][new URL(net).hostname].retryAfterUntil === deadline && /论坛要求等待/.test(info.textContent),
+    'resetting the learned allowance must keep the imported deadline in both the pacer and the popup');
+  assert(waitWrites === 1 && reports.filter(report => report.origin === net).every(report => report.entry.retryAfterUntil === 0),
+    'importing a worker deadline must not emit another server-wait write or report');
+
+  const restarted = loadBackgroundSandbox({ storage });
+  let sendsAfterRestart = 0;
+  restarted.fetch = async url => {
+    sendsAfterRestart++;
+    return makeHtmlResponse('', { url, status: 429, ok: false, retryAfter: header });
+  };
+  const persisted = await new Promise(resolve => restarted.__onMessage(
+    { type: 'FETCH_TEXT_RESOURCES', attachments: [attachment], manualRetry: true },
+    { url: healthy.location.href }, resolve));
+  assert(sendsAfterRestart === 0 && persisted.forumCooldown.retryAfter === deadline &&
+      persisted.forumCooldown.deferredWithoutRequest, 'an active server deadline must also survive a worker with empty session storage');
+}
+
+async function checkBackgroundRedirectRecovery() {
+  const org = 'https://www.sehuatang.org';
+  const net = 'https://www.sehuatang.net';
+  for (const readTxt of [false, true]) {
+    let now = Date.now();
+    const worker = loadBackgroundSandbox();
+    worker.Date = class extends Date { static now() { return now; } };
+    const arrivals = [];
+    const retryUntil = Date.parse(new Date(now + 120000).toUTCString());
+    function read(origin, id) {
+      const url = origin + (readTxt ? '/fixture-' + id + '.txt' : '/thread-' + id + '-1-1.html');
+      const message = readTxt
+        ? { type: 'FETCH_TEXT_RESOURCES', attachments: [{ url }], manualRetry: true }
+        : { type: 'FETCH_IMAGES', urls: [url] };
+      return new Promise(resolve => worker.__onMessage(message, { url: net + '/forum-1-1.html' },
+        result => resolve(readTxt ? result : result[url])));
+    }
+    function usable(url) {
+      const body = readTxt ? 'https://pan.quark.cn/s/healthyfixture' : '<html><body id="postmessage_12"><img src="/fixture.jpg"></body></html>';
+      return makeHtmlResponse(body, { url, contentType: readTxt ? 'text/plain' : 'text/html' });
+    }
+    function succeeded(result) {
+      return readTxt ? result.resources.groups.quark.length === 1 : result.images.length === 1;
+    }
+    worker.fetch = async url => {
+      arrivals.push(url);
+      return makeHtmlResponse('', { url, ok: false, status: 429, retryAfter: new Date(retryUntil).toUTCString() });
+    };
+    await read(org, 804);
+    now = retryUntil + 1;
+    worker.fetch = async url => {
+      arrivals.push(url);
+      return usable(url.replace(org, net));
+    };
+    assert(succeeded(await read(org, 805)), 'a supported cross-origin redirect must still return its usable content');
+
+    let finishProbe;
+    const probeStarted = new Promise(resolve => {
+      worker.fetch = url => {
+        arrivals.push(url);
+        if (finishProbe) return Promise.resolve(usable(url));
+        return new Promise(finish => { finishProbe = () => finish(usable(url)); resolve(); });
+      };
+    });
+    const probe = read(org, 806);
+    await probeStarted;
+    const deferred = await read(org, 807);
+    assert(arrivals.length === 3 && (readTxt ? deferred.forumCooldown.deferredWithoutRequest : deferred.emptyReason === 'forum_cooldown'),
+      'a successful redirect must leave only one recovery probe for the original origin');
+    finishProbe();
+    assert(succeeded(await probe), 'a probe returning real content from the original origin must succeed');
+    worker.fetch = async url => { arrivals.push(url); return usable(url); };
+    assert((await Promise.all([read(org, 808), read(org, 809)])).every(succeeded) && arrivals.length === 5,
+      'a usable probe from the correct origin must release ordinary parallel work');
+  }
+}
+
+async function checkCrossOriginTextYield() {
+  const worker = loadBackgroundSandbox();
+  const page = loadFetcherSandbox();
+  page.setTimeout = setTimeout;
+  page.clearTimeout = clearTimeout;
+  page.ATPCache.getCachedTextResources = worker.getCachedTextResources;
+  const handoffs = [];
+  page.chrome.runtime.sendMessage = function(message, callback) {
+    handoffs.push(message);
+    return worker.__onMessage(message, { url: page.location.href, tab: { id: 51 } }, callback);
+  };
+  const files = ['first', 'second'].map(name => ({ url: 'https://www.sehuatang.net/' + name + '-yield.txt', name }));
+  const arrivals = [];
+  function usable(url) {
+    return makeHtmlResponse('https://pan.quark.cn/s/' + (url === files[0].url ? 'firstfixture' : 'secondfixture'),
+      { url, contentType: 'text/plain' });
+  }
+  let finishFirst;
+  const started = new Promise(resolve => {
+    worker.fetch = url => {
+      arrivals.push(url);
+      if (url !== files[0].url) return Promise.resolve(usable(url));
+      return new Promise(finish => { finishFirst = () => finish(usable(url)); resolve(); });
+    };
+  });
+  let stale = false;
+  const partial = [];
+  const deadline = Date.now() + 20000;
+  const pending = page.ATPFetcher.fetchTextAttachmentResourcesWithStatus(files, {
+    manualRetry: true, deadline,
+    isStale: () => stale,
+    onResources: (resources, confirmed) => { partial.push({ resources, confirmed }); }
+  });
+  await started;
+  stale = true;
+  finishFirst();
+  const yielded = await pending;
+  assertExactStringArray(arrivals, [files[0].url], 'network requests after the original thread was replaced');
+  assert(yielded.yielded && yielded.attemptedCount === 2 && yielded.retryableCount === 1 && yielded.unresolvedCount === 1 &&
+      yielded.resources.groups.quark.length === 1 && partial.length === 1 && partial[0].confirmed[0].url === files[0].url,
+    'the completed cross-origin attachment must be published while the unsent attachment stays retryable');
+  assert(handoffs.length === 1 && handoffs[0].attachments.length === 1 && handoffs[0].deadline === deadline,
+    'the first attachment must be the only worker handoff before a replacement');
+
+  await new Promise(resolve => setImmediate(resolve));
+  stale = false;
+  const completed = await page.ATPFetcher.fetchTextAttachmentResourcesWithStatus(files, { manualRetry: true, deadline });
+  assertExactStringArray(arrivals, files.map(file => file.url), 'network requests after the unsent attachment was retried');
+  assert(handoffs.length === 2 && handoffs[1].deadline === deadline && completed.unresolvedCount === 0 &&
+      completed.resources.groups.quark.length === 2,
+    'the retry must reuse the completed result and use the shared deadline for the remaining attachment');
 }
 
 const verifyNoteElements = [];
@@ -6770,9 +7976,12 @@ function loadContentRetryableEmptySandbox(options) {
   const timers = [];
   const scanCalls = [];
   const injected = [];
+  const windowEvents = {};
+  const prepared = new WeakSet();
   function normalizeArticleData(data) {
+    if (prepared.has(data)) return data;
     data = data || {};
-    return {
+    const result = {
       images: Array.isArray(data.images) ? data.images : [],
       resources: data.resources || {},
       textAttachments: Array.isArray(data.textAttachments) ? data.textAttachments : [],
@@ -6784,6 +7993,8 @@ function loadContentRetryableEmptySandbox(options) {
       emptyReason: data.emptyReason || '',
       retryAfter: Number(data.retryAfter) || 0
     };
+    prepared.add(result);
+    return result;
   }
   const sandbox = {
     console: console,
@@ -6802,6 +8013,7 @@ function loadContentRetryableEmptySandbox(options) {
       warn: function() {},
       info: function() {},
       error: function() {},
+      flush: function() {},
       event: function() {},
       sanitizeUrl: function(url) {
         return String(url || '').replace(/[?#].*$/, '');
@@ -6836,7 +8048,10 @@ function loadContentRetryableEmptySandbox(options) {
     },
     ATPCache: {
       normalizeArticleData: normalizeArticleData,
+      isArticleCacheReadCurrent: function() { return true; },
       getArticleCacheState: function() { return Promise.resolve({ cached: null, negative: false }); },
+      clearFlushTimer: function() {},
+      flushCacheNow: function() {},
       setCachedArticleData: function() {},
       setNegativeCache: function() {}
     },
@@ -6847,11 +8062,12 @@ function loadContentRetryableEmptySandbox(options) {
       }
     },
     ATPFetcher: {
-      fetchArticleData: options.fetchArticleData || function() {
-        return Promise.resolve({ images: [], resources: {}, textAttachments: [] });
+      fetchArticleData: async function(url, pageUrl, paceOptions) {
+        const result = options.fetchArticleData ? await options.fetchArticleData(url, pageUrl, paceOptions) : {};
+        return result && normalizeArticleData(result);
       },
-      fetchArticleDataByBackground: function(url) {
-        return sandbox.ATPFetcher.fetchArticleData(url);
+      fetchArticleDataByBackground: function(url, paceOptions) {
+        return sandbox.ATPFetcher.fetchArticleData(url, sandbox.location.href, paceOptions);
       }
     },
     MutationObserver: function() {
@@ -6871,8 +8087,8 @@ function loadContentRetryableEmptySandbox(options) {
   sandbox.window = {
     ATPState: { settings: sandbox.ATPConfig.settings, threads: {} },
     innerHeight: 800,
-    addEventListener: function() {},
-    removeEventListener: function() {}
+    addEventListener: function(type, callback) { windowEvents[type] = callback; },
+    removeEventListener: function(type, callback) { if (windowEvents[type] === callback) delete windowEvents[type]; }
   };
   sandbox.document = {
     readyState: 'loading',
@@ -6890,7 +8106,10 @@ function loadContentRetryableEmptySandbox(options) {
   }
   vm.createContext(sandbox);
   vm.runInContext(read('loading-policy.js'), sandbox, { filename: 'loading-policy.js' });
-  if (options.withPacer) vm.runInContext(read('forum-pacer.js'), sandbox, { filename: 'forum-pacer.js' });
+  if (options.withPacer) {
+    sandbox.SharedUtils.FORUM_BASE_PAUSE_MS = loadSharedUtils().FORUM_BASE_PAUSE_MS;
+    vm.runInContext(read('forum-pacer.js'), sandbox, { filename: 'forum-pacer.js' });
+  }
   const source = read('content.js').replace(
     /\}\)\(\);\s*$/,
     '\n  window.__ATP_VERIFY_CONTENT_INTERNALS = {' +
@@ -6899,6 +8118,7 @@ function loadContentRetryableEmptySandbox(options) {
       '\n    isProcessCandidate: isProcessCandidate,' +
       '\n    isLiveProcessCandidate: isLiveProcessCandidate,' +
       '\n    detectProcessCandidates: detectProcessCandidates,' +
+      '\n    detectAndProcess: detectAndProcess,' +
       '\n    processContainers: processContainers,' +
       '\n    requestArticleVisibleBoost: requestArticleVisibleBoost,' +
       '\n    clearQueuedProcessCandidates: clearQueuedProcessCandidates,' +
@@ -6916,6 +8136,8 @@ function loadContentRetryableEmptySandbox(options) {
       '\n    handleForumPacerStorage: handleForumPacerStorage,' +
       '\n    clearThumbnailDom: clearThumbnailDom,' +
       '\n    getScanGeneration: function() { return scanGeneration; },' +
+      '\n    setInitialized: function() { initialized = true; },' +
+      '\n    handleVisibilityChange: handleVisibilityChange,' +
       '\n    getRetryableEmptyState: function() {' +
       '\n      return {' +
       '\n        retryAfter: emptyRetryAfterByUrl,' +
@@ -6930,6 +8152,7 @@ function loadContentRetryableEmptySandbox(options) {
   sandbox.__timers = timers;
   sandbox.__scanCalls = scanCalls;
   sandbox.__injected = injected;
+  sandbox.__windowEvents = windowEvents;
   return sandbox;
 }
 
@@ -7203,6 +8426,19 @@ function checkContentProcessCandidateCursorInvalidationBehavior() {
   assert(belowBatch.length === 0, 'content below-viewport scan test must return no near candidates');
   assert(belowScans === 2 && belowAcceptCalls === belowEntries.length * 2, 'content below-viewport scan test must inspect the offscreen candidates once per near pass');
   assert(belowQueueState.mayHaveMore === false, 'content below-viewport scans must stop after the band-above pass instead of chaining 250ms empty scans');
+
+  const unordered = loadContentRetryableEmptySandbox();
+  unordered.ATPScanner = createScannerSandbox(300, { rowsAsTr: true, tableDisplay: 'grid', rowRect: index => {
+    const top = index === 270 ? 10 : 5000 + index * 20;
+    return { top, bottom: top + 15 };
+  } }).scanner;
+  const unorderedScan = unordered.window.__ATP_VERIFY_CONTENT_INTERNALS;
+  for (let pass = 0; pass < 2; pass++) {
+    assert(unorderedScan.detectProcessCandidates(3).length === 0 && unorderedScan.getProcessCandidateQueueState().mayHaveMore,
+      'a row below the viewport must not stop the forward scan on a visually reordered table');
+  }
+  assert(unorderedScan.detectProcessCandidates(3)[0]?.container.id === 'thread_270',
+    'the content queue must reach a visible row after two full scanner budgets on an irregular list');
 
   internals.clearProcessCandidateQueue();
   assert(internals.getProcessCandidateScanState() === null, 'content structural queue invalidation must clear the scanner cursor');
@@ -7546,10 +8782,7 @@ async function checkContentMutationFilteringBehavior() {
   let currentContainer = firstContainer;
   const sandbox = loadContentLifecycleSandbox({
     initialSettings: { enabled: true },
-    findThreadContainer: function() { return currentContainer; },
-    documentContains: function(node) {
-      return node !== firstContainer || firstContainer.__detached !== true;
-    }
+    findThreadContainer: function() { return currentContainer; }
   });
   const lifecycle = sandbox.window.__ATP_VERIFY_CONTENT_LIFECYCLE;
   function runNextTimer(delay, message) {
@@ -7566,7 +8799,7 @@ async function checkContentMutationFilteringBehavior() {
       classList: { contains: function() { return false; } },
       closest: function() { return null; },
       matches: function(selector) {
-        return !!articleLike && selector.indexOf('tbody[id^="normalthread"]') !== -1;
+        return articleLike === true && (selector.includes('tbody[id^="normalthread"]') || selector.split(',').includes('tbody'));
       },
       querySelector: function(selector) {
         return articleLike === 'link' && selector.indexOf('a.xst[href]') !== -1 ? {} : null;
@@ -7591,9 +8824,123 @@ async function checkContentMutationFilteringBehavior() {
   );
   runNextTimer(16, 'content mutation filter test must flush the immediate startup scan before checking later mutations');
 
+  const images = createLoaderCompletedRecoverySandbox();
+  sandbox.ATPState = images.sandbox.ATPState;
+  const loader = images.sandbox.ATPLoader;
+  sandbox.ATPLoader.discardThreadImages = loader.discardThreadImages;
+  const state = sandbox.ATPState;
+  const cache = loadCacheSandbox({ state: state });
+  sandbox.ATPCache = cache;
+  const flushedUrls = new Map();
+  cache.updateArticleLoadedUrls = (url, urls) => {
+    flushedUrls.set(url, Array.from(urls));
+    return Promise.resolve(true);
+  };
+  const opened = [];
+  images.sandbox.ATPPreviewer.open = function(urls) { opened.push(urls[0]); };
+  function addThreadImage(id, pending) {
+    const src = 'https://img.example/' + id + '.jpg';
+    const thread = images.addThread(id, src, 0);
+    thread.link = 'https://forum.example/thread-' + id + '-1-1.html';
+    thread.generation = state.generation;
+    const row = Object.assign(createVerifyElement('atp-processed'), makeAddedNode(true));
+    row.tagName = 'TBODY';
+    row.classList = createVerifyClassList(['atp-processed']);
+    thread.container = row;
+    thread.outerRow = createVerifyElement('atp-thumb-row');
+    thread.panel = createVerifyElement('atp-thread-panel');
+    row.appendChild(thread.outerRow);
+    thread.outerRow.appendChild(thread.panel);
+    const wrapper = createVerifyElement('atp-thumbnail-wrapper');
+    const loading = createVerifyElement('atp-thumbnail-loading');
+    wrapper.appendChild(loading);
+    thread.panel.appendChild(wrapper);
+    const task = createVerifyLaneTask(src, id, { generation: state.generation });
+    loader.loadImageDirect(wrapper, loading, task, task.candidates[0]);
+    const img = images.images[images.images.length - 1];
+    if (!pending) {
+      Object.assign(img, { complete: true, naturalWidth: 240, naturalHeight: 180 });
+      img.onload();
+      cache.scheduleCacheFlush(id);
+    }
+    return { thread, img, row, src };
+  }
+  const oldGeneration = state.generation;
+  const first = addThreadImage('301');
+  first.img.onclick({});
+  initialParentObserver.callback([{ addedNodes: [makeAddedNode('link')] }]);
+  assert(!initialParentObserver.disconnected && state.generation === oldGeneration && state.threads['301'] === first.thread,
+    'adding a thread link beside a still-selected list must keep its observer, image tasks and registered threads');
+  first.img.onclick({});
+  assert(opened.length === 2 && opened[1] === first.src, 'clicking an already rendered thumbnail must still open its preview after a sibling is appended');
+  runNextTimer(150, 'appending a relevant sibling to the same list root must schedule an incremental scan');
+
+  initialContainerObserver.callback([{ removedNodes: [first.row], addedNodes: [] }, { removedNodes: [], addedNodes: [first.row] }]);
+  assert(state.threads['301'] === first.thread && !first.thread.panel.removed && cache.getPendingFlush()['301'],
+    'moving a live row within one observer batch must preserve its panel, registration and pending cache write');
+
+  const removed = addThreadImage('302');
+  const oldGroup = createVerifyElement('');
+  const newGroup = createVerifyElement('');
+  removed.row.tagName = 'TR';
+  removed.row.removeChild(removed.thread.outerRow);
+  oldGroup.appendChild(removed.thread.outerRow);
+  newGroup.appendChild(removed.row);
+  removed.row.insertAdjacentElement = function(position, sibling) {
+    assert(position === 'afterend', 'the detached thumbnail sibling must follow its source');
+    sibling.parentNode.removeChild(sibling);
+    newGroup.appendChild(sibling);
+    this.nextElementSibling = sibling;
+  };
+  initialContainerObserver.callback([{ removedNodes: [removed.row], addedNodes: [] }, { removedNodes: [], addedNodes: [removed.row] }]);
+  assert(newGroup.children[1] === removed.thread.outerRow && state.threads['302'] === removed.thread,
+    'moving the source TR without its thumbnail must move the existing thumbnail alongside it');
+  newGroup.removeChild(removed.row);
+  removed.row.__detached = true;
+  initialContainerObserver.callback([{ removedNodes: [removed.row], addedNodes: [] }]);
+  assert(!state.threads['302'] && state.threads['301'] === first.thread && state.generation === oldGeneration,
+    'removing the source row must release only that registration even if its thumbnail sibling remains attached');
+  assert(removed.thread.outerRow.removed && removed.thread.panel.removed && !removed.row.classList.contains('atp-processed'),
+    'removing a row must dispose of its decorations so reinserting that row can register it again');
+  assert(flushedUrls.get(removed.thread.link).includes(removed.src) && cache.getPendingFlush()['301'],
+    'removing a row must flush its loaded URL before releasing the state and leave unrelated writes pending');
+
+  const pending = addThreadImage('304', true);
+  const activeMove = addThreadImage('305', true);
+  const staleLoad = pending.img.onload;
+  const staleError = pending.img.onerror;
+  activeMove.row.tagName = 'TR';
+  activeMove.row.removeChild(activeMove.thread.outerRow);
+  oldGroup.appendChild(activeMove.thread.outerRow);
+  activeMove.thread.panel.__detached = true;
+  activeMove.row.insertAdjacentElement = function(position, sibling) {
+    assert(position === 'afterend', 'an active thumbnail row must follow its moved source');
+    sibling.parentNode.removeChild(sibling);
+    newGroup.appendChild(sibling);
+    activeMove.thread.panel.__detached = false;
+    this.nextElementSibling = sibling;
+  };
+  newGroup.appendChild(activeMove.row);
+  pending.row.__detached = true;
+  initialContainerObserver.callback([{ removedNodes: [pending.row, activeMove.row], addedNodes: [activeMove.row] }]);
+  assert(!state.threads['304'] && pending.img.src === undefined && !pending.img.onload && !pending.img.onerror,
+    'removing a row must cancel its actual image request and detach completion handlers immediately');
+  assert(state.threads['305'] === activeMove.thread && activeMove.img.src === activeMove.src && loader.getActive() === 1,
+    'a source moved away from a detached thumbnail sibling must keep that sibling and its active slot');
+  staleLoad();
+  staleError();
+  assert(loader.getActive() === 1 && pending.thread.loaded === 0 && pending.thread.failedCount === 0 &&
+    !images.sandbox.__ATP_VERIFY_GET_ORDINARY_HOST_STATS('img.example')?.failures,
+    'late callbacks for a removed image must neither release a surviving slot nor count as host failures');
+
   firstContainer.__detached = true;
+  first.row.__detached = true;
+  first.thread.panel.__detached = true;
+  activeMove.row.__detached = true;
   currentContainer = secondContainer;
   initialParentObserver.callback([{ addedNodes: [] }]);
+  assert(!state.threads['301'] && state.generation !== oldGeneration, 'replacing the whole root must release its detached rows and invalidate old work');
+  assert(flushedUrls.get(first.thread.link).includes(first.src), 'replacing the root must flush the old list before losing its cache data');
   assert(initialContainerObserver.disconnected, 'content parent replacement must disconnect the stale container observer');
   assert(initialParentObserver.disconnected, 'content parent replacement must disconnect the stale parent observer');
   assert(sandbox.__mutationObservers.length === 4, 'content parent replacement must bind a fresh observer pair');
@@ -7617,6 +8964,23 @@ async function checkContentMutationFilteringBehavior() {
       sandbox.__timers[sandbox.__timers.length - 1].delay === 150,
     'content thread-like mutations must still schedule a fast mutation scan'
   );
+
+  const moved = addThreadImage('303');
+  const movedGeneration = state.generation;
+  secondContainer.__detached = true;
+  currentContainer = { nodeType: 1, parentNode: threadParent };
+  reboundParentObserver.callback([{ addedNodes: [makeAddedNode(true)], removedNodes: [secondContainer] }]);
+  moved.img.onclick({});
+  assert(state.generation === movedGeneration && state.threads['303'] === moved.thread && opened[opened.length - 1] === moved.src,
+    'a replacement root that adopts an already-rendered row must preserve its generation and working preview');
+  runNextTimer(150, 'a replacement root must get its own scan even when an older scan timer was already pending');
+  const visibleObserver = sandbox.__mutationObservers[sandbox.__mutationObservers.length - 2];
+  sandbox.document.visibilityState = 'hidden';
+  moved.row.__detached = true;
+  visibleObserver.callback([{ removedNodes: [moved.row], addedNodes: [] }]);
+  sandbox.document.visibilityState = 'visible';
+  lifecycle.handleVisibilityChange();
+  assert(!state.threads['303'], 'resuming a hidden list must release rows removed while scanning was paused');
 }
 
 async function checkContentDormantActivationBehavior() {
@@ -7741,6 +9105,26 @@ function checkContentBfcachePagehideSlotReset() {
   assert(followupTimer, 'content scan completion must track requested follow-up scans');
   followupLifecycle.handlePageHide({ persisted: true });
   assert(followupTimer.cleared, 'content BFCache pagehide must clear pending follow-up scan timers');
+
+  const entry = loadContentLifecycleSandbox({ initialSettings: { enabled: false, pauseWhenHidden: true } });
+  const entryEvents = [];
+  entry.window.ATPForumEntry = {
+    handlePage: enabled => { entryEvents.push(enabled); return true; },
+    stopWatching: () => entryEvents.push('stop')
+  };
+  const entryLife = entry.window.__ATP_VERIFY_CONTENT_LIFECYCLE;
+  entryLife.setInitialized(true);
+  entryLife.handleSettingsChanged({ settings: { newValue: { enabled: true, autoEnterAgeGate: true } } }, 'local');
+  entry.document.visibilityState = 'hidden';
+  entryLife.handleVisibilityChange();
+  entry.document.visibilityState = 'visible';
+  entryLife.handleVisibilityChange();
+  entryLife.handlePageHide({ persisted: true });
+  entryLife.handlePageShow({ persisted: true });
+  assert(JSON.stringify(entryEvents) === JSON.stringify([true, 'stop']), 'returning through browser history must not re-activate a restored age notice');
+  assert(!entryLife.getBfcacheRecoveryPending() && !entryLife.getRescanRequested() &&
+    !entry.__calls.some(call => ['find_thread_container', 'init_float_panel', 'suspend:bfcache_pagehide', 'recover:bfcache_pageshow'].includes(call)),
+    'age notices must stay out of the article pipeline across tab and BFCache visibility changes');
 }
 
 function assertCallOrder(calls, expected, message) {
@@ -8123,7 +9507,7 @@ function createLoaderCompletedRecoverySandbox() {
   vm.runInContext(read('loading-policy.js'), sandbox, { filename: 'loading-policy.js' });
   const loaderWithInternals = runtimeForVerify('loader.js').replace(
     /\s*window\.ATPLoader = ATPLoader;\s*\}\)\(\);/,
-    '\n  window.__ATP_VERIFY_ACTIVE_IMAGE_LOAD_COUNT = function() { return ACTIVE_IMAGE_LOADS.length; };\n  window.__ATP_VERIFY_GET_HEAVY_HOST_STATS = function(host) { return getHeavyHostStats(host, false); };\n  window.__ATP_VERIFY_GET_ORDINARY_HOST_STATS = function(host) { return getOrdinaryHostStats(host, false); };\n  window.ATPLoader = ATPLoader;\n})();'
+    '\n  window.__ATP_VERIFY_ACTIVE_IMAGE_LOAD_COUNT = function() { return window.ATPImageRunner ? ATPImageRunner.getActiveCount() : 0; };\n  window.__ATP_VERIFY_GET_HEAVY_HOST_STATS = function(host) { return window.ATPHostHealth ? ATPHostHealth.getHeavyHostStats(host, false) : null; };\n  window.__ATP_VERIFY_GET_ORDINARY_HOST_STATS = function(host) { return window.ATPHostHealth ? ATPHostHealth.getOrdinaryHostStats(host, false) : null; };\n  window.ATPLoader = ATPLoader;\n})();'
   );
   vm.runInContext(loaderWithInternals, sandbox, { filename: 'loader.js' });
 
@@ -8691,8 +10075,8 @@ async function checkLoaderAnimatedThumbnailStill() {
 // sibling host of the same attachment store that already served this page;
 // a host that failed like that three times with no success is skipped.
 function checkLoaderSiblingAttachmentHost() {
-  const live = 'https://tu.live.example';
-  const dead = 'https://tu.dead.example';
+  const live = 'https://tu.djhdhs.us';
+  const dead = 'https://tu.w4kmzkm.com';
   function attachmentPath(i) { return '/tupian/forum/202609/25/2302' + String(10 + i) + 'lco62asacdsxoz5' + String.fromCharCode(97 + i) + '.jpg'; }
   function createRun(liveSuccesses) {
     const run = createLoaderCompletedRecoverySandbox();
@@ -8710,17 +10094,120 @@ function checkLoaderSiblingAttachmentHost() {
     const img = run.images[run.images.length - 1];
     img.onerror();
     img.onerror();
-    return { task: task, img: img, thread: thread };
+    return { task: task, img: run.images.at(-1), thread: thread };
   }
   function retries(run, reason) {
     return run.events.filter(function(event) { return event.type === 'image_retry' && event.fields.reason === reason; });
   }
 
+  for (const viaViewport of [false, true]) {
+    for (const gif of [false, true]) {
+      const run = createRun(2);
+      const sandbox = run.sandbox;
+      const loader = sandbox.ATPLoader;
+      let now = Date.now();
+      sandbox.Date = class extends Date { static now() { return now; } };
+      Object.assign(sandbox.ATPState.settings, { ordinaryHostConcurrency: gif ? 8 : 1,
+        globalImageConcurrency: 8, ordinaryHostAdaptive: false, heavyImageOptimization: true, pauseWhenHidden: true });
+      sandbox.innerWidth = 1000;
+      sandbox.innerHeight = 800;
+      sandbox.IntersectionObserver = class { observe() {} unobserve() {} };
+      if (viaViewport) vm.runInContext(read('viewport-observer.js'), sandbox, { filename: 'viewport-observer.js' });
+      const file = i => gif ? attachmentPath(i).replace('.jpg', '.gif') : attachmentPath(i);
+      const blockers = [];
+      for (let i = 0; i < (gif ? 2 : 1); i++) {
+        const src = live + file(i);
+        const id = 'busy-sibling-' + i;
+        run.addThread(id, src, 0);
+        const holder = createVerifyLaneTask(src, id, { isFirstScreen: false, currentlyVisible: true });
+        loader.loadImageDirect(createVerifyElement(''), createVerifyElement(''), holder, holder.candidates[0]);
+        blockers.push(run.images.at(-1));
+      }
+      const id = 'mixed-sibling';
+      const original = dead + file(4);
+      const thread = run.addThread(id, original, 0);
+      const candidates = [0, 1, 2].map(i => ({ src: 'https://image.imx.to/u/i/heavy-' + i + '.jpg' })).concat({ src: original });
+      const grid = createVerifyElement('atp-thumbnail-container');
+      Object.assign(thread, { heavyMode: true, candidates, cacheImages: candidates, grid,
+        nextIdx: 4, total: 4, firstScreenTotal: 4, loaded: 3, firstScreenOk: 3 });
+      const task = createVerifyLaneTask(original, id, { candidates, idx: 3, grid, viewportPriority: true });
+      const cell = createVerifyElement('atp-thumbnail-wrapper');
+      cell.getBoundingClientRect = () => ({ top: 10, bottom: 90, left: 10, right: 120 });
+      const loading = createVerifyElement('atp-thumbnail-loading');
+      grid.appendChild(cell);
+      cell.appendChild(loading);
+      if (viaViewport) {
+        assert(sandbox.ATPViewport.loadWrapper(cell, { task, imgData: candidates[3], inViewport: true, actualInViewport: true }, false),
+          'the original mixed-gallery request must start through the actual viewport loader');
+      } else {
+        loader.loadImageDirect(cell, loading, task, candidates[3]);
+      }
+      const old = run.images.at(-1);
+      const oldLoad = old.onload;
+      const oldError = old.onerror;
+      now += 100;
+      const firstTimer = run.timers.length;
+      old.onerror();
+      run.timers.slice(firstTimer).filter(t => !t.cleared && t.delay === 0).forEach(t => t.callback());
+      now += 100;
+      old.onerror();
+      oldLoad();
+      oldError();
+      assert(!old.src && !old.onload && !old.onerror && run.images.length === blockers.length + 1 &&
+        loader.getActive() === blockers.length && thread.failedCount === 0 && thread.firstScreenOk === 3,
+        'mixed-gallery failover must release its old slot and wait behind the destination host and GIF limits');
+      if (viaViewport && !gif) {
+        for (let i = 10; i < 13; i++) {
+          const url = live + file(i);
+          loader.recordTaskImageFailure(createVerifyLaneTask(url, id), url, 'direct_fail', true);
+        }
+        loader.globalSchedule();
+        assert(thread.failedCount === 1 && thread.firstScreenFailed === 1 && cell.classList.contains('atp-thumbnail-failed') &&
+          loader.getActive() === blockers.length, 'disappearing mixed-gallery mirrors must settle without another network request');
+        cell.onclick();
+        assert(run.images.at(-1).src === original && grid.children.length === 1 && thread.cacheImages[3].src === original,
+          'manual retry after a lost mirror must start the original attachment in the same cell');
+        run.images.at(-1).onload();
+        oldLoad();
+        assert(thread.loaded === 4 && thread.failedCount === 0 && thread.firstScreenFailed === 1,
+          'a successful manual retry must repair the thumbnail without counting a second first-screen settlement');
+        continue;
+      }
+      now += 33000;
+      blockers[0].onload();
+      const budget = (gif ? 30000 : 8000) - 200;
+      assert(run.images.at(-1).src === live + file(4) && task.taskDeadlineAt === now + budget &&
+        grid.children.length === 1 && thread.cacheImages[3].src === original,
+        'a mixed retry must start in the existing cell with the original cache URL and the remaining network budget');
+      if (!gif && !viaViewport) {
+        const staleMirror = run.images.at(-1).onload;
+        now += 150;
+        sandbox.document.visibilityState = 'hidden';
+        loader.syncVisibilityPauseState();
+        const beforeResume = run.images.length;
+        staleMirror();
+        now += 15000;
+        loader.globalSchedule();
+        assert(loader.getActive() === 0 && run.images.length === beforeResume && thread.firstScreenOk === 3,
+          'hiding must pause a mixed mirror without spending a slot or settling the cell');
+        sandbox.document.visibilityState = 'visible';
+        loader.syncVisibilityPauseState();
+        assert(run.images.length === beforeResume + 1 && task.taskDeadlineAt === now + budget - 150,
+          'resuming a mirror must preserve the unspent network time and exclude the hidden interval');
+      }
+      run.images.at(-1).onload();
+      oldLoad();
+      assert(thread.loaded === 4 && thread.firstScreenOk === 4 && thread.firstScreenDone &&
+        !thread.failedCount && loader.getActive() === blockers.length - 1 && grid.children[0] === cell,
+        'each mixed-gallery retry must settle once in the original first-screen cell');
+    }
+  }
+
   const rescue = createRun(2);
   const rescued = failTwice(rescue, dead + attachmentPath(0), 'sibling-0');
-  assert(retries(rescue, 'no_referrer').length === 1 && retries(rescue, 'sibling_host').length === 1,
+  assert(retries(rescue, 'no_referrer').length === 1 && retries(rescue, 'sibling_host_queue').length === 1,
     'an attachment failing with and without a Referer must be tried once on a sibling host');
-  assert(rescued.task.candidates[0].src === live + attachmentPath(0) && rescued.task.candidates[0].siblingHostFrom === 'tu.dead.example',
+  assert(rescued.task.candidates[0].src === live + attachmentPath(0) && rescued.task.candidates[0].siblingHostFrom === new URL(dead).hostname,
     'the sibling retry must keep the path and only swap the host');
   rescued.img.complete = true;
   rescued.img.naturalWidth = 120;
@@ -8730,7 +10217,7 @@ function checkLoaderSiblingAttachmentHost() {
 
   const failing = failTwice(rescue, dead + attachmentPath(1), 'sibling-1');
   failing.img.onerror();
-  assert(retries(rescue, 'sibling_host').length === 2 && failing.thread.failedCount === 1,
+  assert(retries(rescue, 'sibling_host_queue').length === 2 && failing.thread.failedCount === 1,
     'the sibling host gets exactly one try; a second failure ends the task');
   failTwice(rescue, dead + attachmentPath(2), 'sibling-2');
   const skipTask = createVerifyLaneTask(dead + attachmentPath(3), 'sibling-3', { isFirstScreen: false, viewportPriority: true });
@@ -8767,7 +10254,7 @@ function checkLoaderSiblingAttachmentHost() {
   const marksImg = marks.images[marks.images.length - 1];
   marksImg.onerror();
   marksImg.onerror();
-  assert(Object.keys(marksThread.fallbackUsedUrls || {}).some(function(key) { return key.indexOf('tu.dead.example') !== -1; }),
+  assert(Object.keys(marksThread.fallbackUsedUrls || {}).some(function(key) { return key.indexOf(new URL(dead).hostname) !== -1; }),
     'the forum\'s own URL must be marked used so the fallback does not show the same picture twice');
   assert(marksThread.cacheImages !== marksTask.candidates && marksThread.cacheImages[0].src === marksSrc,
     'the list the cache is written from must keep the forum\'s URL');
@@ -8777,13 +10264,50 @@ function checkLoaderSiblingAttachmentHost() {
 
   const noSibling = createRun(1);
   failTwice(noSibling, dead + attachmentPath(4), 'sibling-4');
-  assert(retries(noSibling, 'sibling_host').length === 0, 'a host with fewer than two recent successes must not be used as a sibling');
+  assert(retries(noSibling, 'sibling_host_queue').length === 0, 'a host with fewer than two recent successes must not be used as a sibling');
   const notAttachment = createRun(2);
-  failTwice(notAttachment, 'https://tu.dead.example/img/photo.jpg', 'sibling-5');
-  assert(retries(notAttachment, 'sibling_host').length === 0, 'only attachment-store paths may be tried on a sibling host');
+  failTwice(notAttachment, dead + '/img/photo.jpg', 'sibling-5');
+  assert(retries(notAttachment, 'sibling_host_queue').length === 0, 'only attachment-store paths may be tried on a sibling host');
   const otherFamily = createRun(2);
   failTwice(otherFamily, 'https://img.dead.example' + attachmentPath(5), 'sibling-6');
-  assert(retries(otherFamily, 'sibling_host').length === 0, 'only hosts of the same attachment family may be siblings');
+  assert(retries(otherFamily, 'sibling_host_queue').length === 0, 'only hosts of the same attachment family may be siblings');
+  const unrelated = createRun(2);
+  failTwice(unrelated, 'https://tu.unrelated.example' + attachmentPath(5), 'unrelated-attachment-host');
+  assert(retries(unrelated, 'sibling_host_queue').length === 0,
+    'matching subdomains and attachment paths on unrelated sites must not qualify as mirrors');
+
+  const nested = createRun(0);
+  const shared = loadSharedUtils();
+  Object.assign(nested.sandbox.SharedUtils, {
+    getForumSiteZone: shared.getForumSiteZone, getSupportedForumRoot: shared.getSupportedForumRoot
+  });
+  const nestedMirror = 'https://img.east.sehuatang.net';
+  nested.sandbox.ATPLoader.recordDomainSuccess(nestedMirror + attachmentPath(0));
+  nested.sandbox.ATPLoader.recordDomainSuccess(nestedMirror + attachmentPath(1));
+  const west = failTwice(nested, 'https://img.west.sehuatang.org' + attachmentPath(2), 'nested-other-store');
+  assert(west.thread.failedCount === 1 && !west.task.candidates[0].siblingHostFrom,
+    'matching only the first DNS label must not join distinct forum attachment stores');
+  const east = failTwice(nested, 'https://img.east.sehuatang.org' + attachmentPath(3), 'nested-same-store');
+  assert(east.task.candidates[0].src === nestedMirror + attachmentPath(3), 'the same subdomain across built-in forum roots can still recover');
+
+  for (const previewUrl of [dead + '/gallery/original.jpg', dead + ':8443' + attachmentPath(0)]) {
+    const separatePreview = createRun(2);
+    const displayUrl = dead + attachmentPath(0);
+    const candidate = { src: previewUrl, previewSrc: previewUrl, displaySrc: displayUrl };
+    const thread = separatePreview.addThread('separate-preview', displayUrl, 0);
+    const task = createVerifyLaneTask(displayUrl, 'separate-preview', { candidates: [candidate] });
+    thread.candidates = task.candidates;
+    const wrapper = createVerifyElement('atp-thumbnail-wrapper');
+    const loading = createVerifyElement('atp-thumbnail-loading');
+    wrapper.appendChild(loading);
+    separatePreview.sandbox.ATPLoader.loadImageDirect(wrapper, loading, task, candidate);
+    const image = separatePreview.images[0];
+    image.onerror();
+    image.onerror();
+    const result = task.candidates[0];
+    assert(result.displaySrc === live + attachmentPath(0) && result.src === previewUrl && result.previewSrc === previewUrl,
+      'recovering the thumbnail must preserve a full image served by another store or port');
+  }
 
   function failReady(run, src) {
     run.sandbox.ATPLoader.recordTaskImageFailure({ candidates: [{ src: src }], idx: 0, readyImageQueue: true },
@@ -8819,6 +10343,21 @@ function checkLoaderSiblingAttachmentHost() {
   }
   assert(nextHost(scattered, dead + attachmentPath(4), 'scattered-failures') === dead + attachmentPath(4),
     'failures spread beyond one observation window must not accumulate into an unavailable host');
+
+  const rolling = createRun(2);
+  const start = Date.now();
+  let rollingNow = start;
+  rolling.sandbox.Date = class extends Date { static now() { return rollingNow; } };
+  [0, 44000, 46000, 48000].forEach(function(offset, index) {
+    rollingNow = start + offset;
+    failReady(rolling, dead + attachmentPath(index));
+  });
+  assert(nextHost(rolling, dead + attachmentPath(4), 'rolling-window') === live + attachmentPath(4),
+    'the last three distinct failures must count across the start of an older observation window');
+  rollingNow += 46000;
+  failReady(rolling, dead + attachmentPath(5));
+  assert(nextHost(rolling, dead + attachmentPath(6), 'cooldown-late-failure') === live + attachmentPath(6),
+    'a failure from an in-flight request must not reset an active attachment-host cooldown');
 
   const expired = createRun(2);
   let now = Date.now();
@@ -9869,121 +11408,59 @@ function checkLoaderFallbackUsesDisplaySrc() {
   assert(thread.candidates[0].previewSrc === replacement.previewSrc, 'loader fallback must preserve the replacement previewSrc for click preview');
 }
 
-function checkViewportCompletedImageRecoverBehavior() {
-  let active = false;
-  let token = 0;
-  let releaseCount = 0;
-  let failureCount = 0;
-  let successCount = 0;
-  let threadDoneOk = 0;
-  let registeredRecover = null;
-  let activeLoadCount = 0;
-  let noReferrerCalls = 0;
-  const successTasks = [];
-  const images = [];
-  const timers = [];
-  const sandbox = {
-    console: console,
-    Date: Date,
-    Map: Map,
-    Math: Math,
-    setTimeout: function(callback, delay) {
-      timers.push({ callback: callback, delay: delay, cleared: false });
-      return timers.length;
-    },
-    clearTimeout: function(id) {
-      if (timers[id - 1]) timers[id - 1].cleared = true;
-    },
-    document: {
-      visibilityState: 'visible',
-      documentElement: { clientHeight: 1000 },
-      contains: function() { return true; },
-      createElement: function(tagName) {
-        const el = String(tagName || '').toLowerCase() === 'img'
-          ? createVerifyImageElement()
-          : createVerifyElement('');
-        if (String(tagName || '').toLowerCase() === 'img') images.push(el);
-        return el;
-      }
-    },
-    IntersectionObserver: function() {
-      this.observe = function() {};
-      this.unobserve = function() {};
-      this.disconnect = function() {};
-    },
-    ATPLoader: {
-      isPaused: function() { return false; },
-      isTaskCurrent: function() { return true; },
-      shouldSkipDomain: function() { return false; },
-      acquireSlot: function(task) {
-        active = true;
-        token++;
-        task.activeSlotToken = token;
-        return true;
-      },
-      releaseSlot: function(task, slotToken) {
-        if (active && slotToken === token) {
-          active = false;
-          releaseCount++;
-        }
-      },
-      getActiveSlotToken: function() { return token; },
-      isImageSlotCurrent: function(task, slotToken) { return active && slotToken === token; },
-      registerActiveImageLoad: function(control) {
-        activeLoadCount++;
-        registeredRecover = control.recover;
-        return function() {
-          if (activeLoadCount > 0) activeLoadCount--;
-          if (registeredRecover === control.recover) registeredRecover = null;
-        };
-      },
-      getTaskImageSrc: function(task) { return task.candidates[task.idx].src; },
-      getImageLoadTimeout: function(settings) { return (settings && settings.imageTimeout) || 15000; },
-      getImageMetrics: function(img) { return { naturalWidth: img.naturalWidth, naturalHeight: img.naturalHeight }; },
-      recordTaskImageFailure: function() { failureCount++; },
-      tryNoReferrerFallback: function() { noReferrerCalls++; return false; },
-      isLargeImageTask: function(task) { return /\.gif$/i.test(task.candidates[task.idx].src); },
-      tryHeavyCandidateFallback: function() { return false; },
-      logImageDone: function(task, ok) { if (ok) successCount++; },
-      recordDomainSuccess: function(url, task) { successTasks.push(task); },
-      isHeavyChannelTask: function() { return false; },
-      prepareThumbnailImage: function(img) { img.className = 'atp-thumbnail-img'; },
-      bindPreviewActivation: function(wrapper) { wrapper.previewBound = true; },
-      buildPreviewUrls: function(candidates) { return candidates.map(function(candidate) { return candidate.src; }); },
-      getTaskPreviewIndex: function() { return 0; },
-      getCandidatePreviewSrc: function(candidate) { return candidate.src; },
-      setImageSource: function(img, src) { img.src = src; },
-      cancelImageLoadElement: function(img) {
-        img.canceled = true;
-        img.onload = null;
-        img.onerror = null;
-        img.removeAttribute('src');
-        img.removeAttribute('srcset');
-      },
-      handleFail: function() { return false; },
-      showFailedPlaceholder: function() { failureCount++; },
-      threadImageDone: function(task, ok) { if (ok) threadDoneOk++; },
-      globalSchedule: function() {}
-    },
-    ATPPreviewer: { open: function() {} },
-    ATPState: {
-      settings: { pauseWhenHidden: true, thumbWidth: 110, thumbHeight: 82 },
-      threads: {
-        viewport: { heavyMode: false, candidates: [{ src: 'https://img.example/viewport-complete.jpg' }] }
-      }
-    }
-  };
-  sandbox.window = sandbox;
+function checkLoaderPreviewLabelGalleryCost() {
+  const run = createLoaderCompletedRecoverySandbox();
+  const sandbox = run.sandbox;
+  const src = 'https://thumb.example/prepared-mirror.jpg';
+  const previewSrc = 'https://original.example/prepared-mirror.jpg';
+  const thread = run.addThread('long-preview-label', src, 0);
+  const previewIndex = 4977;
+  thread.heavyMode = true;
+  thread.total = 5000;
+  thread.sourceCandidates = Array.from({ length: thread.total }, (_, i) => ({
+    src: 'https://image.imx.to/prepared/' + i + '.jpg'
+  }));
+  let mirrorChecks = 0;
+  thread.candidates = thread.sourceCandidates.map(candidate => Object.defineProperty({ src: candidate.src }, 'siblingHostFrom', {
+    get() { mirrorChecks++; return ''; }
+  }));
+  thread.candidates[0] = { src, previewSrc, previewIndex, siblingHostFrom: 'image.imx.to' };
+  const task = { candidates: thread.candidates, idx: 0, threadId: 'long-preview-label', generation: 0 };
+  const wrapper = createVerifyElement('atp-thumbnail-wrapper');
+  const loading = createVerifyElement('atp-thumbnail-loading');
+  wrapper.appendChild(loading);
+  sandbox.ATPLoader.loadImageDirect(wrapper, loading, task, task.candidates[0]);
+  const img = run.images[0];
+  img.onload();
+  assert(wrapper.getAttribute('aria-label') === '打开第 4978 张图片预览，共 5000 张' && !mirrorChecks,
+    'rendering a heavy thumbnail accessible label must not walk the mirror-preview mapping');
+  let opened;
+  sandbox.ATPPreviewer.open = (urls, index) => { opened = { urls, index }; };
+  img.onclick({});
+  assert(opened.index === previewIndex && opened.urls[previewIndex] === previewSrc && mirrorChecks > 0,
+    'opening the preview must still overlay its selected mirror URL at the original index');
+}
+
+async function checkViewportCompletedImageRecoverBehavior() {
+  const run = createLoaderCompletedRecoverySandbox();
+  const sandbox = run.sandbox;
   sandbox.window.innerHeight = 1000;
-  vm.createContext(sandbox);
-  vm.runInContext(read('loading-policy.js'), sandbox, { filename: 'loading-policy.js' });
+  sandbox.document.documentElement = { clientHeight: 1000, clientWidth: 1200 };
+  sandbox.IntersectionObserver = function() {
+    this.observe = function() {};
+    this.unobserve = function() {};
+    this.disconnect = function() {};
+  };
+  vm.runInContext(read('heavy-budget.js'), sandbox, { filename: 'heavy-budget.js' });
   vm.runInContext(read('viewport-observer.js'), sandbox, { filename: 'viewport-observer.js' });
 
+  const thread = run.addThread('viewport', 'https://img.example/viewport-complete.jpg', 0);
   const loading = createVerifyElement('atp-thumbnail-loading');
-  const wrapper = createVerifyElement('atp-thumb-wrapper');
+  const wrapper = createVerifyElement('atp-thumbnail-wrapper');
+  wrapper.getBoundingClientRect = function() { return { top: 60, bottom: 142, left: 10, right: 120, height: 82 }; };
   wrapper.appendChild(loading);
   const task = {
-    candidates: [{ src: 'https://img.example/viewport-complete.jpg' }],
+    candidates: thread.candidates,
     idx: 0,
     threadId: 'viewport',
     generation: 0,
@@ -9994,478 +11471,368 @@ function checkViewportCompletedImageRecoverBehavior() {
     imgData: task.candidates[0],
     loaded: false,
     inViewport: true,
-    lightweightPreloadInRange: false,
+    actualInViewport: true,
     slotRetryPending: false
   };
   assert(sandbox.ATPViewport.loadWrapper(wrapper, wrapperData, false), 'viewport completed recover test must start an active image load');
-  assert(typeof registeredRecover === 'function', 'viewport completed recover test must register an active recover handler');
-  assert(timers[0] && timers[0].delay === 15000, 'viewport recover test must start with the original timeout');
+  assert(sandbox.ATPLoader.getActive() === 1, 'viewport recover test must claim one active image slot');
+  assert(run.timers.some(function(t) { return !t.cleared && t.delay === 15000; }), 'viewport recover test must start with the original timeout');
   sandbox.ATPState.settings.imageTimeout = 3500;
-  registeredRecover('verify_incomplete_viewport');
-  assert(active && releaseCount === 0, 'viewport incomplete recover must keep the active image slot while continuing the request');
-  assert(failureCount === 0, 'viewport incomplete recover must not record a failure before error or timeout');
-  assert(timers[timers.length - 1].delay === 3500, 'viewport incomplete recover must recompute image timeout when continuing');
-  images[0].complete = true;
-  images[0].naturalWidth = 120;
-  images[0].naturalHeight = 90;
-  registeredRecover('verify_completed_viewport');
-  assert(releaseCount === 1 && !active, 'viewport completed recover must release the active image slot');
-  assert(successCount === 1 && threadDoneOk === 1, 'viewport completed recover must settle through the success path');
-  assert(successTasks.length === 1 && successTasks[0] === task, 'viewport successes must pass the task so the GIF lane can learn from them');
-  assert(failureCount === 0, 'viewport completed recover must not record fallback or failed placeholder work');
-  assert(wrapper.previewBound, 'viewport completed recover must keep preview activation from the success path');
-
-  const staleWrapper = createVerifyElement('atp-thumb-wrapper');
-  staleWrapper.appendChild(createVerifyElement('atp-thumbnail-loading'));
-  const staleTask = {
-    candidates: [{ src: 'https://img.example/viewport-stale.jpg' }],
-    idx: 0,
-    threadId: 'viewport',
-    generation: 0,
-    isFirstScreen: false
-  };
-  const staleWrapperData = {
-    task: staleTask,
-    imgData: staleTask.candidates[0],
-    loaded: false,
-    inViewport: true,
-    lightweightPreloadInRange: false,
-    slotRetryPending: false
-  };
-  const failureBeforeStale = failureCount;
-  const successBeforeStale = successCount;
-  const doneBeforeStale = threadDoneOk;
-  assert(sandbox.ATPViewport.loadWrapper(staleWrapper, staleWrapperData, false), 'viewport stale token test must start an active image load');
-  assert(activeLoadCount === 1, 'viewport stale token test must start with one registered active load');
-  const staleTimer = timers[timers.length - 1];
-  const staleImage = images[images.length - 1];
-  assert(sandbox.ATPLoader.acquireSlot(staleTask), 'viewport stale token test must reacquire the same task with a fresh slot token');
-  staleImage.onerror();
-  assert(activeLoadCount === 0, 'viewport stale token error must unregister the old active load');
-  assert(staleTimer.cleared, 'viewport stale token error must clear the old image timer');
-  assert(staleImage.canceled === true && staleImage.src === undefined, 'viewport stale token error must cancel the old image request');
-  assert(active === true && releaseCount === 1, 'viewport stale token error must not release the fresh active slot');
-  assert(failureCount === failureBeforeStale, 'viewport stale token error must not record image failure or failed placeholder work');
-  assert(successCount === successBeforeStale && threadDoneOk === doneBeforeStale, 'viewport stale token error must not record success for the old request');
-  sandbox.ATPLoader.releaseSlot(staleTask, token);
+  sandbox.ATPLoader.recoverActiveImageLoads('verify_incomplete_viewport');
+  assert(sandbox.ATPLoader.getActive() === 1 && thread.failedCount === 0, 'viewport incomplete recover must keep the active slot without recording failure');
+  assert(run.timers[run.timers.length - 1].delay === 3500, 'viewport incomplete recover must recompute image timeout when continuing');
+  run.images[0].complete = true;
+  run.images[0].naturalWidth = 120;
+  run.images[0].naturalHeight = 90;
+  sandbox.ATPLoader.recoverActiveImageLoads('verify_completed_viewport');
+  assert(sandbox.ATPLoader.getActive() === 0 && thread.loaded === 1 && thread.failedCount === 0,
+    'viewport completed recover must release the slot and settle through the success path');
+  assert(typeof wrapper.onclick === 'function' && typeof run.images[0].onclick === 'function',
+    'viewport completed recover must bind preview activation');
 
   function runViewportStaleBranch(label, trigger) {
-    const branchWrapper = createVerifyElement('atp-thumb-wrapper');
+    const branchWrapper = createVerifyElement('atp-thumbnail-wrapper');
+    branchWrapper.getBoundingClientRect = function() { return { top: 80, bottom: 162, left: 10, right: 120, height: 82 }; };
     branchWrapper.appendChild(createVerifyElement('atp-thumbnail-loading'));
+    const branchSrc = 'https://img.example/viewport-stale-' + label + '.jpg';
+    const branchThread = run.addThread('viewport-stale-' + label, branchSrc, 0);
     const branchTask = {
-      candidates: [{ src: 'https://img.example/viewport-stale-' + label + '.jpg' }],
+      candidates: branchThread.candidates,
       idx: 0,
-      threadId: 'viewport',
+      threadId: 'viewport-stale-' + label,
       generation: 0,
       isFirstScreen: false
     };
-    const branchWrapperData = {
+    assert(sandbox.ATPViewport.loadWrapper(branchWrapper, {
       task: branchTask,
       imgData: branchTask.candidates[0],
       loaded: false,
       inViewport: true,
-      lightweightPreloadInRange: false,
-      slotRetryPending: false
-    };
-    const beforeFailure = failureCount;
-    const beforeSuccess = successCount;
-    const beforeDone = threadDoneOk;
-    const beforeRelease = releaseCount;
-    assert(sandbox.ATPViewport.loadWrapper(branchWrapper, branchWrapperData, false), 'viewport stale token ' + label + ' test must start an active image load');
-    assert(activeLoadCount === 1, 'viewport stale token ' + label + ' test must start with one registered active load');
-    const branchTimer = timers[timers.length - 1];
-    const branchImage = images[images.length - 1];
-    const branchRecover = registeredRecover;
-    assert(sandbox.ATPLoader.acquireSlot(branchTask), 'viewport stale token ' + label + ' test must reacquire the same task with a fresh slot token');
-    trigger({ img: branchImage, timer: branchTimer, recover: branchRecover });
-    assert(activeLoadCount === 0, 'viewport stale token ' + label + ' must unregister the old active load');
+      actualInViewport: true
+    }, false), 'viewport stale token ' + label + ' test must start an active image load');
+    const branchTimer = run.timers[run.timers.length - 1];
+    const branchImage = run.images[run.images.length - 1];
+    assert(sandbox.ATPLoader.acquireSlot(branchTask), 'viewport stale token ' + label + ' test must reacquire with a fresh slot token');
+    trigger({ img: branchImage, timer: branchTimer });
     assert(branchTimer.cleared, 'viewport stale token ' + label + ' must clear the old image timer');
-    assert(branchImage.canceled === true && branchImage.src === undefined, 'viewport stale token ' + label + ' must cancel the old image request');
-    assert(releaseCount === beforeRelease, 'viewport stale token ' + label + ' must not release the fresh active slot');
-    assert(failureCount === beforeFailure, 'viewport stale token ' + label + ' must not record image failure or failed placeholder work');
-    assert(successCount === beforeSuccess && threadDoneOk === beforeDone, 'viewport stale token ' + label + ' must not record success for the old request');
-    sandbox.ATPLoader.releaseSlot(branchTask, token);
+    assert(branchImage.src === undefined && branchImage.onload === null && branchImage.onerror === null,
+      'viewport stale token ' + label + ' must cancel the old image request');
+    assert(sandbox.ATPLoader.getActive() === 1 && branchThread.loaded === 0 && branchThread.failedCount === 0,
+      'viewport stale token ' + label + ' must preserve the fresh slot and avoid settling the stale request');
+    sandbox.ATPLoader.releaseSlot(branchTask);
   }
-
-  runViewportStaleBranch('recover', function(ctx) {
-    ctx.recover('verify_stale_viewport_recover');
-  });
-  runViewportStaleBranch('timer', function(ctx) {
-    ctx.timer.callback();
-  });
-  runViewportStaleBranch('load', function(ctx) {
-    ctx.img.complete = true;
-    ctx.img.naturalWidth = 120;
-    ctx.img.onload();
-  });
+  runViewportStaleBranch('error', function(ctx) { ctx.img.onerror(); });
+  runViewportStaleBranch('recover', function() { sandbox.ATPLoader.recoverActiveImageLoads('verify_stale_viewport_recover'); });
+  runViewportStaleBranch('timer', function(ctx) { ctx.timer.callback(); });
+  runViewportStaleBranch('load', function(ctx) { ctx.img.complete = true; ctx.img.naturalWidth = 120; ctx.img.onload(); });
 
   // A timed-out viewport GIF must not restart without a Referer; a static one still may.
-  function runViewportTimeout(src) {
-    const timeoutWrapper = createVerifyElement('atp-thumb-wrapper');
-    timeoutWrapper.appendChild(createVerifyElement('atp-thumbnail-loading'));
-    const timeoutTask = { candidates: [{ src: src }], idx: 0, threadId: 'viewport', generation: 0, isFirstScreen: false };
-    const before = noReferrerCalls;
-    assert(sandbox.ATPViewport.loadWrapper(timeoutWrapper, {
-      task: timeoutTask, imgData: timeoutTask.candidates[0], loaded: false, inViewport: true,
-      lightweightPreloadInRange: false, slotRetryPending: false
-    }, false), 'viewport timeout test must start an active image load for ' + src);
-    timers[timers.length - 1].callback();
-    if (active) sandbox.ATPLoader.releaseSlot(timeoutTask, token);
-    return noReferrerCalls - before;
+  function runViewportTimeout(src, id) {
+    run.addThread(id, src, 0);
+    const tw = createVerifyElement('atp-thumbnail-wrapper');
+    tw.getBoundingClientRect = function() { return { top: 40, bottom: 122, left: 10, right: 120, height: 82 }; };
+    tw.appendChild(createVerifyElement('atp-thumbnail-loading'));
+    const tt = { candidates: [{ src: src }], idx: 0, threadId: id, generation: 0, isFirstScreen: false };
+    const beforeEvents = run.events.length;
+    sandbox.ATPState.settings.imageTaskDeadline = 0;
+    assert(sandbox.ATPViewport.loadWrapper(tw, { task: tt, imgData: tt.candidates[0], loaded: false, inViewport: true, actualInViewport: true }, false));
+    const timer = run.timers.filter(function(t) { return !t.cleared && (t.delay === 3500 || t.delay === 30000); }).slice(-1)[0];
+    timer.callback();
+    if (tt.slotActive) sandbox.ATPLoader.releaseSlot(tt);
+    return run.events.slice(beforeEvents).filter(function(ev) { return ev.type === 'image_retry' && ev.fields.reason === 'no_referrer'; }).length;
   }
-  assert(runViewportTimeout('https://img.example/viewport-timeout.jpg') === 1, 'a timed-out viewport static image must still try the no-Referer fallback');
-  assert(runViewportTimeout('https://img.example/viewport-timeout.gif') === 0, 'a timed-out viewport GIF must not restart without a Referer');
+  assert(runViewportTimeout('https://img.example/viewport-timeout.jpg', 'vp-to-jpg') === 1, 'a timed-out viewport static image must still try the no-Referer fallback');
+  assert(runViewportTimeout('https://img.example/viewport-timeout.gif', 'vp-to-gif') === 0, 'a timed-out viewport GIF must not restart without a Referer');
 
-  let heavyRegisteredRecover = null;
-  let heavyRegisteredCancel = null;
-  let heavyUnregisterCount = 0;
-  let heavySetSourceCount = 0;
-  let heavyCancelCount = 0;
+  // Heavy budget off-main-thread preview capture, BFCache recover, and capture failure safety
   let heavyCanvasDrawCount = 0;
   let heavyCanvasAvailable = true;
-  const heavyTimers = [];
   const heavyIdleCallbacks = [];
-  const heavyCanceledIdleCallbacks = [];
-  const heavySandbox = {
-    console: console,
-    Date: Date,
-    Map: Map,
-    Math: Math,
-    setTimeout: function(callback, delay) {
-      heavyTimers.push({ callback: callback, delay: delay, cleared: false });
-      return heavyTimers.length;
-    },
-    clearTimeout: function(id) {
-      if (heavyTimers[id - 1]) heavyTimers[id - 1].cleared = true;
-    },
-    requestIdleCallback: function(callback, options) {
-      const item = { callback: callback, options: options, canceled: false };
-      heavyIdleCallbacks.push(item);
-      return heavyIdleCallbacks.length;
-    },
-    cancelIdleCallback: function(id) {
-      heavyCanceledIdleCallbacks.push(id);
-      if (heavyIdleCallbacks[id - 1]) heavyIdleCallbacks[id - 1].canceled = true;
-    },
-    document: {
-      visibilityState: 'visible',
-      documentElement: { clientHeight: 1000 },
-      contains: function() { return true; },
-      createElement: function(tagName) {
-        const lowerTag = String(tagName || '').toLowerCase();
-        if (lowerTag === 'img') return createVerifyImageElement();
-        if (lowerTag === 'canvas') {
-          const canvas = createVerifyCanvasElement(function() { heavyCanvasDrawCount++; });
-          if (!heavyCanvasAvailable) canvas.getContext = function() { return null; };
-          return canvas;
-        }
-        return createVerifyElement('');
-      }
-    },
-    IntersectionObserver: function() {
-      this.observe = function() {};
-      this.unobserve = function() {};
-      this.disconnect = function() {};
-    },
-    ATPLoader: {
-      isPaused: function() { return false; },
-      isTaskCurrent: function() { return true; },
-      getAvailableSlots: function() { return 1; },
-      registerActiveImageLoad: function(control) {
-        heavyRegisteredRecover = control.recover;
-        heavyRegisteredCancel = control.cancel;
-        return function() {
-          heavyUnregisterCount++;
-          heavyRegisteredRecover = null;
-          heavyRegisteredCancel = null;
-        };
-      },
-      getTaskImageSrc: function(task) { return task.candidates[task.idx].src; },
-      getImageLoadTimeout: function(settings) { return (settings && settings.imageTimeout) || 15000; },
-      getImageMetrics: function(img) { return { naturalWidth: img.naturalWidth, naturalHeight: img.naturalHeight }; },
-      cancelImageLoadElement: function(img) { heavyCancelCount++; img.canceled = true; },
-      setImageSource: function(img, src) { heavySetSourceCount++; img.src = src; },
-      isHeavyChannelTask: function() { return true; }
-    },
-    ATPState: {
-      settings: {
-        pauseWhenHidden: true,
-        thumbWidth: 110,
-        thumbHeight: 82,
-        heavyImageOptimization: true,
-        heavyThumbnailClarity: 'balanced'
-      },
-      threads: {
-        heavy: { heavyMode: true, candidates: [{ src: 'https://img.example/heavy-complete.jpg' }] }
-      }
+  const heavyRun = createLoaderCompletedRecoverySandbox();
+  const hs = heavyRun.sandbox;
+  hs.window.innerHeight = 1000;
+  hs.document.documentElement = { clientHeight: 1000, clientWidth: 1200 };
+  Object.assign(hs.ATPState.settings, { heavyImageOptimization: true, heavyThumbnailClarity: 'balanced' });
+  hs.requestIdleCallback = function(callback, options) {
+    const item = { callback: callback, options: options, canceled: false };
+    heavyIdleCallbacks.push(item);
+    return heavyIdleCallbacks.length;
+  };
+  hs.cancelIdleCallback = function(id) {
+    if (heavyIdleCallbacks[id - 1]) heavyIdleCallbacks[id - 1].canceled = true;
+  };
+  const baseCreateEl = hs.document.createElement;
+  hs.document.createElement = function(tagName) {
+    if (String(tagName || '').toLowerCase() === 'canvas') {
+      const c = createVerifyCanvasElement(function() { heavyCanvasDrawCount++; });
+      if (!heavyCanvasAvailable) c.getContext = function() { return null; };
+      return c;
     }
+    return baseCreateEl(tagName);
   };
-  heavySandbox.window = heavySandbox;
-  heavySandbox.window.innerHeight = 1000;
-  vm.createContext(heavySandbox);
-  vm.runInContext(read('loading-policy.js'), heavySandbox, { filename: 'loading-policy.js' });
-  const viewportWithInternals = read('viewport-observer.js').replace(
-    /\s*window\.ATPViewport = ATPViewport;\s*\}\)\(\);/,
-    '\n  window.ATPViewport = ATPViewport;\n  window.__ATP_VERIFY_VIEWPORT_INTERNALS = { restoreHeavyImage: restoreHeavyImage, unloadHeavyImage: unloadHeavyImage, getViewportRectState: getViewportRectState, scheduleHeavyRestoreRetry: scheduleHeavyRestoreRetry, clearHeavyBudgetTimer: function() { if (heavyBudgetTimer) clearTimeout(heavyBudgetTimer); heavyBudgetTimer = null; }, heavyRenderItems: heavyRenderItems };\n})();'
-  );
-  vm.runInContext(viewportWithInternals, heavySandbox, { filename: 'viewport-observer.js' });
-  const heavyInternals = heavySandbox.__ATP_VERIFY_VIEWPORT_INTERNALS;
-  assert(heavyInternals && typeof heavyInternals.restoreHeavyImage === 'function', 'viewport completed heavy restore recover test must expose restore internals');
-  assert(typeof heavyInternals.unloadHeavyImage === 'function', 'viewport heavy restore unload test must expose unload internals');
-  assert(typeof heavyInternals.getViewportRectState === 'function', 'viewport heavy clipping test must expose geometry internals');
+  hs.IntersectionObserver = function() { this.observe = function() {}; this.unobserve = function() {}; this.disconnect = function() {}; };
+  vm.runInContext(read('viewport-observer.js'), hs, { filename: 'viewport-observer.js' });
+  vm.runInContext(read('heavy-budget.js').replace(
+    '  root.ATPHeavyBudget = ATPHeavyBudget;',
+    '  root.__ATP_HEAVY_INTERNALS = { heavyRenderItems: heavyRenderItems, restoreHeavyImage: restoreHeavyImage, unloadHeavyImage: unloadHeavyImage, scheduleHeavyRestoreRetry: scheduleHeavyRestoreRetry };\n  root.ATPHeavyBudget = ATPHeavyBudget;'
+  ), hs, { filename: 'heavy-budget.js' });
+  const internals = hs.__ATP_HEAVY_INTERNALS;
+  const heavyThread = heavyRun.addThread('heavy', 'https://image.imx.to/balanced-heavy.jpg', 0);
+  heavyThread.heavyMode = true;
 
-  const heavyScrollRoot = {
-    getBoundingClientRect: function() { return { top: 100, bottom: 500, left: 0, right: 500 }; }
-  };
-  const clippedHeavyWrapper = createVerifyElement('atp-thumb-wrapper atp-heavy-thumbnail');
-  clippedHeavyWrapper.closest = function(selector) { return selector === '.atp-scroll-viewport' ? heavyScrollRoot : null; };
-  clippedHeavyWrapper.getBoundingClientRect = function() { return { top: 560, bottom: 642, left: 0, right: 110, height: 82 }; };
-  const clippedHeavyState = heavyInternals.getViewportRectState(clippedHeavyWrapper);
-  assert(!clippedHeavyState.visible && !clippedHeavyState.inHeavyRestoreRange, 'heavy thumbnails clipped by an internal scroll root must not re-enter the restore budget while still outside that root');
-  clippedHeavyWrapper.getBoundingClientRect = function() { return { top: 200, bottom: 282, left: 0, right: 110, height: 82 }; };
-  const visibleHeavyState = heavyInternals.getViewportRectState(clippedHeavyWrapper);
-  assert(visibleHeavyState.visible && visibleHeavyState.inHeavyRestoreRange, 'heavy thumbnails entering their internal scroll root must become restore eligible');
-
-  const watchdogWrapper = createVerifyElement('atp-thumb-wrapper atp-heavy-thumbnail atp-heavy-unloaded');
-  watchdogWrapper.getBoundingClientRect = function() { return { top: 20, bottom: 102, left: 0, right: 110, height: 82 }; };
-  const watchdogData = { wrapper: watchdogWrapper, img: createVerifyImageElement(), task: { candidates: [{ src: 'https://img.example/watchdog.jpg' }], idx: 0, threadId: 'heavy', generation: 0 }, src: 'https://img.example/watchdog.jpg', unloaded: true, restoreRetryCount: 3, previewReady: true, previewCanvas: createVerifyCanvasElement() };
-  heavyInternals.heavyRenderItems.set(watchdogWrapper, watchdogData);
-  const watchdogTimerCount = heavyTimers.length;
-  heavyInternals.scheduleHeavyRestoreRetry(watchdogWrapper, watchdogData, 'verify_watchdog');
-  assert(heavyTimers.length === watchdogTimerCount + 1 && heavyTimers[heavyTimers.length - 1].delay === 15000, 'visible heavy restore retry exhaustion must fall back to a low-frequency watchdog instead of becoming a dead end');
-  heavyInternals.clearHeavyBudgetTimer();
-  heavyInternals.heavyRenderItems.delete(watchdogWrapper);
-  const heavyWrapper = createVerifyElement('atp-thumb-wrapper atp-heavy-thumbnail atp-heavy-unloaded atp-heavy-preview-active');
-  heavyWrapper.getBoundingClientRect = function() {
-    return { top: 10, bottom: 120, height: 110 };
-  };
-  const heavyImg = createVerifyImageElement();
-  heavyImg.style.visibility = 'hidden';
-  const heavyTask = {
-    candidates: [{ src: 'https://img.example/heavy-complete.jpg' }],
-    idx: 0,
-    threadId: 'heavy',
-    generation: 0,
-    isFirstScreen: false
-  };
-  const heavyData = {
-    wrapper: heavyWrapper,
-    img: heavyImg,
-    task: heavyTask,
-    src: 'https://img.example/heavy-complete.jpg',
-    noReferrer: false,
-    naturalWidth: 0,
-    naturalHeight: 0,
-    visibleSeenAt: 0,
-    visibleLocked: false,
-    visibleRestoreHoldUntil: 0,
-    visiblePreviewSince: 0,
-    visiblePreviewGraceActive: false,
-    visiblePreviewGraceMode: '',
-    previewCanvas: createVerifyCanvasElement(),
-    previewReady: true,
-    previewSrc: 'https://img.example/heavy-preview.jpg',
-    lightweightModeHold: false,
-    restoreRetryCount: 2,
-    restoreQueued: true,
-    unloaded: true
-  };
-  heavyInternals.heavyRenderItems.set(heavyWrapper, heavyData);
-  heavyInternals.restoreHeavyImage(heavyWrapper, heavyData);
-  assert(typeof heavyRegisteredRecover === 'function', 'viewport completed heavy restore recover test must register a recover handler');
-  assert(heavyData.restoreLoading === true && heavyData.unloaded === false, 'viewport heavy restore test must start a restore load');
-  assert(heavySetSourceCount === 1, 'viewport heavy restore test must set the image source once');
-  assert(heavyTimers[0] && heavyTimers[0].delay === 15000, 'viewport heavy restore test must start with the original restore timeout');
-  heavySandbox.ATPState.settings.imageTimeout = 3200;
-  heavyRegisteredRecover('verify_incomplete_heavy_restore');
-  assert(heavyTimers[0].cleared, 'viewport incomplete heavy restore recover must clear the old restore timeout before continuing');
-  assert(heavyTimers[heavyTimers.length - 1].delay === 3200, 'viewport incomplete heavy restore recover must recompute the restore timeout');
-  assert(heavyUnregisterCount === 0, 'viewport incomplete heavy restore recover must keep the active restore registration');
-  assert(heavyCancelCount === 0, 'viewport incomplete heavy restore recover must not cancel an in-flight restore with a valid src');
-  assert(heavyData.restoreLoading === true && heavyData.unloaded === false, 'viewport incomplete heavy restore recover must keep waiting for the current restore request');
-  const pausedRestoreTimerId = heavyData.restoreTimer;
-  heavySandbox.ATPViewport.pauseHeavyRestores();
-  assert(
-    pausedRestoreTimerId &&
-      heavyTimers[pausedRestoreTimerId - 1] &&
-      heavyTimers[pausedRestoreTimerId - 1].cleared &&
-      heavyData.restoreTimer === null,
-    'viewport heavy restore pause must clear active per-image restore timers'
-  );
-  heavySandbox.ATPState.settings.imageTimeout = 2600;
-  heavySandbox.ATPViewport.resumeHeavyRestores('verify_resume_heavy_restore');
-  const resumedRestoreTimer = heavyTimers[heavyData.restoreTimer - 1];
-  assert(
-    resumedRestoreTimer &&
-      resumedRestoreTimer.delay === 2600 &&
-      resumedRestoreTimer.cleared === false,
-    'viewport heavy restore resume must restart active per-image restore timers with the current timeout'
-  );
-  heavyImg.complete = true;
-  heavyImg.naturalWidth = 160;
-  heavyImg.naturalHeight = 120;
-  heavyRegisteredRecover('verify_completed_heavy_restore');
-  assert(heavyUnregisterCount === 1 && !heavyRegisteredRecover && !heavyRegisteredCancel, 'viewport completed heavy restore recover must unregister the active restore load');
-  assert(heavyData.restoreLoading === false && heavyData.unloaded === false, 'viewport completed heavy restore recover must keep the restored image loaded');
-  assert(heavyData.restoreRetryCount === 0, 'viewport completed heavy restore recover must reset the restore retry count through the load path');
-  assert(heavyData.naturalWidth === 160 && heavyData.naturalHeight === 120, 'viewport completed heavy restore recover must preserve loaded natural dimensions');
-  assert(!heavyWrapper.classList.contains('atp-heavy-unloaded'), 'viewport completed heavy restore recover must remove the unloaded placeholder class');
-  assert(!heavyWrapper.classList.contains('atp-heavy-preview-active'), 'viewport completed heavy restore recover must deactivate the preview overlay');
-  assert(heavyImg.style.visibility === '', 'viewport completed heavy restore recover must reveal the restored image');
-  assert(heavyCancelCount === 0, 'viewport completed heavy restore recover must not cancel completed restore requests');
-  assert(heavyData.restoreReveal === null && heavyData.restoreActiveUnregister === null, 'viewport completed heavy restore recover must clear reveal listeners and active unregister handles');
-  assert(heavyData.visibleRestoreHoldUntil > 0, 'viewport completed heavy restore recover must start the visible restore settle window');
-
-  const unloadingWrapper = createVerifyElement('atp-thumb-wrapper atp-heavy-thumbnail atp-heavy-unloaded atp-heavy-preview-active');
-  unloadingWrapper.getBoundingClientRect = function() {
-    return { top: 10, bottom: 120, height: 110 };
-  };
-  const unloadingImg = createVerifyImageElement();
-  unloadingImg.style.visibility = 'hidden';
-  const unloadingData = {
-    wrapper: unloadingWrapper,
-    img: unloadingImg,
-    task: heavyTask,
-    src: 'https://img.example/heavy-complete.jpg',
-    noReferrer: false,
-    naturalWidth: 0,
-    naturalHeight: 0,
-    visibleSeenAt: 0,
-    visibleLocked: false,
-    visibleRestoreHoldUntil: 0,
-    visiblePreviewSince: 0,
-    visiblePreviewGraceActive: false,
-    visiblePreviewGraceMode: '',
-    previewCanvas: createVerifyCanvasElement(),
-    previewReady: true,
-    previewSrc: 'https://img.example/heavy-preview.jpg',
-    lightweightModeHold: false,
-    restoreRetryCount: 0,
-    restoreQueued: true,
-    unloaded: true
-  };
-  heavyInternals.heavyRenderItems.set(unloadingWrapper, unloadingData);
-  const unregisterCountBeforeUnload = heavyUnregisterCount;
-  heavyInternals.restoreHeavyImage(unloadingWrapper, unloadingData);
-  const unloadRestoreTimerId = unloadingData.restoreTimer;
-  assert(unloadingData.restoreLoading === true && unloadingData.unloaded === false, 'viewport restore-unload cleanup test must start an in-flight restore');
-  heavyInternals.unloadHeavyImage(unloadingWrapper, unloadingData);
-  assert(unloadRestoreTimerId && heavyTimers[unloadRestoreTimerId - 1].cleared, 'viewport unloading an in-flight restore must clear its restore timeout');
-  assert(unloadingData.restoreTimer === null, 'viewport unloading an in-flight restore must clear the restore timer handle');
-  assert(unloadingData.restoreReveal === null, 'viewport unloading an in-flight restore must clear reveal listeners');
-  assert(unloadingData.restoreActiveUnregister === null, 'viewport unloading an in-flight restore must clear the active-load unregister handle');
-  assert(heavyUnregisterCount === unregisterCountBeforeUnload + 1, 'viewport unloading an in-flight restore must unregister its active image load control');
-  assert(!heavyRegisteredRecover && !heavyRegisteredCancel, 'viewport unloading an in-flight restore must clear stale active restore controls');
-  assert(unloadingData.restoreLoading === false && unloadingData.unloaded === true, 'viewport unloading an in-flight restore must return to the unloaded preview state');
-
-  const balancedWrapper = createVerifyElement('atp-thumb-wrapper');
-  balancedWrapper.getBoundingClientRect = function() {
-    return { top: 20, bottom: 130, height: 110 };
-  };
+  const balancedWrapper = createVerifyElement('atp-thumbnail-wrapper');
+  balancedWrapper.getBoundingClientRect = function() { return { top: 20, bottom: 102, left: 0, right: 110, height: 82 }; };
   const balancedImg = createVerifyImageElement();
-  balancedImg.complete = true;
-  balancedImg.naturalWidth = 2400;
-  balancedImg.naturalHeight = 1600;
-  balancedImg.clientWidth = 110;
-  balancedImg.clientHeight = 82;
-  balancedImg.src = 'https://img.example/balanced-heavy.jpg';
-  const balancedTask = {
-    candidates: [{ src: 'https://img.example/balanced-heavy.jpg' }],
-    idx: 0,
-    threadId: 'heavy',
-    generation: 0,
-    isFirstScreen: false
-  };
-  const drawCountBeforeBalanced = heavyCanvasDrawCount;
-  heavySandbox.ATPViewport.monitorLoadedHeavyImage(balancedWrapper, balancedImg, balancedTask);
-  const balancedData = heavyInternals.heavyRenderItems.get(balancedWrapper);
-  assert(balancedData && balancedData.unloaded === false, 'balanced heavy monitor test must track the loaded image without immediate unload');
-  assert(heavyCanvasDrawCount === drawCountBeforeBalanced, 'balanced heavy monitor must not draw preview canvas synchronously in the image onload path');
-  assert(heavyIdleCallbacks.length > 0, 'balanced heavy monitor must defer preview prewarm to an idle callback');
-  assert(balancedData.previewPrewarmTimer, 'balanced heavy monitor must remember its deferred preview prewarm handle');
-  const balancedIdle = heavyIdleCallbacks[heavyIdleCallbacks.length - 1];
-  balancedIdle.callback();
-  assert(heavyCanvasDrawCount === drawCountBeforeBalanced + 1, 'balanced heavy monitor idle callback must draw the preview canvas later');
-  assert(balancedData.previewReady === true && balancedData.previewPrewarmTimer === null, 'balanced heavy monitor idle callback must mark preview ready and clear the deferred handle');
+  Object.assign(balancedImg, { complete: true, naturalWidth: 2400, naturalHeight: 1600, src: 'https://image.imx.to/balanced-heavy.jpg' });
+  balancedWrapper.appendChild(balancedImg);
+  const balancedTask = { candidates: [{ src: balancedImg.src }], idx: 0, threadId: 'heavy', generation: 0, currentlyVisible: true };
+  hs.ATPViewport.monitorLoadedHeavyImage(balancedWrapper, balancedImg, balancedTask);
+  const balancedData = internals.heavyRenderItems.get(balancedWrapper);
+  assert(balancedData && !balancedData.unloaded, 'balanced heavy monitor must track the loaded image without immediate unload');
+  assert(heavyCanvasDrawCount === 0 && heavyIdleCallbacks.length > 0, 'balanced heavy monitor must never draw synchronously inside onload');
+  heavyIdleCallbacks[heavyIdleCallbacks.length - 1].callback();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert(heavyCanvasDrawCount === 1 && balancedData.previewReady === true, 'idle preview fallback must prepare the tiny preview canvas off the onload critical path');
 
-  heavySandbox.ATPState.settings.heavyThumbnailClarity = 'lightweight';
-  const lightweightWrapper = createVerifyElement('atp-thumb-wrapper');
-  lightweightWrapper.getBoundingClientRect = function() {
-    return { top: 30, bottom: 140, height: 110 };
-  };
-  const lightweightImg = createVerifyImageElement();
-  lightweightImg.complete = true;
-  lightweightImg.naturalWidth = 1800;
-  lightweightImg.naturalHeight = 1200;
-  lightweightImg.clientWidth = 110;
-  lightweightImg.clientHeight = 82;
-  lightweightImg.src = 'https://img.example/lightweight-heavy.jpg';
-  const lightweightTask = {
-    candidates: [{ src: 'https://img.example/lightweight-heavy.jpg' }],
-    idx: 0,
-    threadId: 'heavy',
-    generation: 0,
-    isFirstScreen: false
-  };
-  const drawCountBeforeLightweight = heavyCanvasDrawCount;
-  heavySandbox.ATPViewport.monitorLoadedHeavyImage(lightweightWrapper, lightweightImg, lightweightTask);
-  const lightweightData = heavyInternals.heavyRenderItems.get(lightweightWrapper);
-  assert(heavyCanvasDrawCount > drawCountBeforeLightweight, 'lightweight heavy monitor must still draw a preview synchronously before releasing the image');
-  assert(lightweightData && lightweightData.unloaded === true && lightweightData.lightweightModeHold === true, 'lightweight heavy monitor must unload the clear image after preparing a preview');
-  assert(lightweightWrapper.classList.contains('atp-heavy-preview-active'), 'lightweight heavy monitor must keep the preview overlay active after unload');
-  assert(heavyCanceledIdleCallbacks.length === 0, 'heavy preview prewarm test must not cancel unrelated idle callbacks');
+  hs.ATPState.settings.heavyThumbnailClarity = 'lightweight';
+  const lwWrapper = createVerifyElement('atp-thumbnail-wrapper');
+  lwWrapper.getBoundingClientRect = function() { return { top: 30, bottom: 112, left: 0, right: 110, height: 82 }; };
+  const lwImg = createVerifyImageElement();
+  Object.assign(lwImg, { complete: true, naturalWidth: 1800, naturalHeight: 1200, src: 'https://image.imx.to/lightweight-heavy.jpg' });
+  lwWrapper.appendChild(lwImg);
+  hs.ATPViewport.monitorLoadedHeavyImage(lwWrapper, lwImg, { candidates: [{ src: lwImg.src }], idx: 0, threadId: 'heavy', generation: 0, currentlyVisible: true });
+  heavyIdleCallbacks[heavyIdleCallbacks.length - 1].callback();
+  await Promise.resolve();
+  await Promise.resolve();
+  const lwData = internals.heavyRenderItems.get(lwWrapper);
+  assert(lwData && lwData.unloaded === true && lwData.lightweightModeHold === true && lwWrapper.classList.contains('atp-heavy-preview-active'),
+    'lightweight heavy monitor must bake preview asynchronously and unload the full-MP image');
 
   heavyCanvasAvailable = false;
-  const failedPreviewWrapper = createVerifyElement('atp-thumb-wrapper');
-  failedPreviewWrapper.getBoundingClientRect = function() {
-    return { top: 40, bottom: 150, left: 0, right: 110, height: 110 };
+  const failWrapper = createVerifyElement('atp-thumbnail-wrapper');
+  failWrapper.getBoundingClientRect = function() { return { top: 40, bottom: 122, left: 0, right: 110, height: 82 }; };
+  const failImg = createVerifyImageElement();
+  Object.assign(failImg, { complete: true, naturalWidth: 1600, naturalHeight: 1000, src: 'https://image.imx.to/preview-capture-fail.jpg' });
+  failWrapper.appendChild(failImg);
+  hs.ATPViewport.monitorLoadedHeavyImage(failWrapper, failImg, { candidates: [{ src: failImg.src }], idx: 0, threadId: 'heavy', generation: 0, currentlyVisible: true });
+  heavyIdleCallbacks[heavyIdleCallbacks.length - 1].callback();
+  await Promise.resolve();
+  await Promise.resolve();
+  const failData = internals.heavyRenderItems.get(failWrapper);
+  assert(failData && failData.unloaded === false && failImg.src === 'https://image.imx.to/preview-capture-fail.jpg' &&
+    !failWrapper.classList.contains('atp-heavy-unloaded') && !failWrapper.classList.contains('atp-heavy-preview-pending'),
+    'heavy preview capture failure must keep the decoded source image visible without leaving a pending placeholder');
+}
+
+async function checkHeavyRestoreRetryBackoff() {
+  const run = createLoaderCompletedRecoverySandbox();
+  const sandbox = run.sandbox;
+  let now = 100000;
+  sandbox.Date = class extends Date { static now() { return now; } };
+  const origSetTimeout = sandbox.setTimeout;
+  sandbox.setTimeout = (callback, delay) => {
+    const id = origSetTimeout(callback, delay);
+    run.timers[id - 1].dueAt = now + delay;
+    return id;
   };
-  const failedPreviewImg = createVerifyImageElement();
-  failedPreviewImg.complete = true;
-  failedPreviewImg.naturalWidth = 1600;
-  failedPreviewImg.naturalHeight = 1000;
-  failedPreviewImg.clientWidth = 110;
-  failedPreviewImg.clientHeight = 82;
-  failedPreviewImg.src = 'https://img.example/preview-capture-fail.jpg';
-  const failedPreviewTask = {
-    candidates: [{ src: failedPreviewImg.src }],
-    idx: 0,
-    threadId: 'heavy',
-    generation: 0,
-    isFirstScreen: false
+  function advanceTo(time) {
+    for (let steps = 0; steps < 100; steps++) {
+      const timer = run.timers.filter(item => !item.cleared && item.dueAt <= time)
+        .sort((a, b) => a.dueAt - b.dueAt)[0];
+      if (!timer) {
+        now = time;
+        return;
+      }
+      now = timer.dueAt;
+      timer.cleared = true;
+      timer.callback();
+    }
+    throw new Error('heavy restoration must not spin while awaiting its next attempt');
+  }
+  sandbox.innerHeight = 800;
+  sandbox.innerWidth = 1000;
+  sandbox.document.documentElement = { clientHeight: 800, clientWidth: 1000 };
+  sandbox.IntersectionObserver = class { observe() {} unobserve() {} disconnect() {} };
+  sandbox.SharedUtils = loadSharedUtils();
+  Object.assign(sandbox.ATPState.settings, { heavyImageOptimization: true, heavyThumbnailClarity: 'balanced' });
+  vm.runInContext(read('viewport-observer.js'), sandbox, { filename: 'viewport-observer.js' });
+  vm.runInContext(read('heavy-budget.js').replace(
+    '  root.ATPHeavyBudget = ATPHeavyBudget;',
+    '  root.verifyRestore = { heavyRenderItems, heavyRestoreQueue, restoreHeavyImage, scheduleHeavyRestoreRetry, scheduleHeavyBudgetReconcile, reconcileHeavyRenderBudget };\n  root.ATPHeavyBudget = ATPHeavyBudget;'
+  ), sandbox, { filename: 'heavy-budget.js' });
+  const viewport = sandbox.ATPViewport;
+  const { heavyRenderItems, restoreHeavyImage, scheduleHeavyRestoreRetry, scheduleHeavyBudgetReconcile, reconcileHeavyRenderBudget } = sandbox.verifyRestore;
+
+  function addUnloadedHeavy(id, top) {
+    const src = 'https://image.imx.to/' + id + '.jpg';
+    const thread = run.addThread(id, src, 0);
+    thread.heavyMode = true;
+    const task = createVerifyLaneTask(src, id, { currentlyVisible: top < 800, viewportPriority: top < 800 });
+    task.candidates = thread.candidates;
+    const wrapper = createVerifyElement('atp-thumbnail-wrapper');
+    wrapper.top = top;
+    wrapper.getBoundingClientRect = function() {
+      return { top: this.top, bottom: this.top + 120, left: 10, right: 130, width: 120, height: 120 };
+    };
+    const img = createVerifyImageElement();
+    Object.assign(img, { src, naturalWidth: 1600, naturalHeight: 1200, complete: true });
+    wrapper.appendChild(img);
+    viewport.monitorLoadedHeavyImage(wrapper, img, task);
+    const data = heavyRenderItems.get(wrapper);
+    img.removeAttribute('src');
+    Object.assign(data, { src, unloaded: true, previewReady: true, previewCanvas: createVerifyCanvasElement() });
+    return { wrapper, img, data, src };
+  }
+
+  const delayed = addUnloadedHeavy('verify-watchdog', 10);
+  delayed.data.restoreRetryCount = 3;
+  reconcileHeavyRenderBudget('before_error');
+  assert(delayed.data.restoreQueued, 'the fixture must have an already-queued restore before installing the backoff');
+  scheduleHeavyRestoreRetry(delayed.wrapper, delayed.data, 'restore_error');
+  const retryAt = delayed.data.restoreRetryAt;
+  assert(retryAt === now + 15000, 'the fourth restore failure must keep a 15-second watchdog deadline');
+  advanceTo(now + 200);
+  assert(!delayed.data.restoreQueued && !delayed.img.src && !restoreHeavyImage(delayed.wrapper, delayed.data),
+    'a queued restore and a direct restore entry must both honor the cooldown');
+  viewport.resumeHeavyRestores('scroll_idle_budget');
+  scheduleHeavyBudgetReconcile('earlier_observer', 0);
+  advanceTo(now);
+  assert(delayed.data.restoreRetryAt === retryAt, 'earlier budget wakes must preserve the 15s watchdog deadline');
+
+  const other = addUnloadedHeavy('verify-unrelated-success', 200);
+  reconcileHeavyRenderBudget('observer');
+  advanceTo(now + 200);
+  assert(other.img.src === other.src && other.data.restoreLoading, 'another visible heavy image must restore during the cooldown');
+  other.img.onload();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert(!other.data.restoreLoading && !other.data.unloaded, 'unrelated restore must complete cleanly');
+
+  advanceTo(retryAt - 1);
+  assert(!delayed.img.src && delayed.data.restoreRetryAt === retryAt,
+    'scrolling, observers and a different successful restore must not erase the per-image deadline');
+  reconcileHeavyRenderBudget('watchdog_check');
+  advanceTo(retryAt + 250);
+  assert(delayed.img.src === delayed.src && delayed.data.restoreLoading, 'a visible preview must retry after its watchdog expires');
+  delayed.img.onload();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert(delayed.data.restoreRetryCount === 0 && delayed.data.restoreRetryAt === 0,
+    'only a successful restore must clear this image’s retry history');
+
+  delayed.wrapper.top = 2400;
+  delete delayed.wrapper.__atpViewportBand;
+  delayed.img.removeAttribute('src');
+  Object.assign(delayed.data, { unloaded: true, restoreRetryCount: 3 });
+  scheduleHeavyRestoreRetry(delayed.wrapper, delayed.data, 'offscreen_error');
+  advanceTo(delayed.data.restoreRetryAt + 200);
+  reconcileHeavyRenderBudget('offscreen_observer');
+  assert(!delayed.data.restoreQueued && !delayed.img.src, 'an exhausted image outside the viewport must stay parked');
+
+  delayed.wrapper.top = 10;
+  delete delayed.wrapper.__atpViewportBand;
+  viewport.resumeHeavyRestores('scroll_idle_budget');
+  advanceTo(now + 250);
+  assert(delayed.img.src === delayed.src && delayed.data.restoreLoading,
+    'an exhausted image must regain its watchdog opportunity when it returns to view');
+  const staleOnload = delayed.img.onload;
+  delete sandbox.ATPState.threads['verify-watchdog'];
+  sandbox.ATPLoader.discardThreadImages(new Set(['verify-watchdog']));
+  if (staleOnload) staleOnload();
+  await Promise.resolve();
+  assert(!heavyRenderItems.has(delayed.wrapper) && heavyRenderItems.get(other.wrapper) === other.data &&
+    delayed.img.src === undefined && sandbox.ATPLoader.getActive() === 0,
+    'removing a post must clear its active heavy restore and preserve an unrelated image after a late callback');
+}
+
+function checkViewportHiddenImageTimeout() {
+  const run = createLoaderCompletedRecoverySandbox();
+  const sandbox = run.sandbox;
+  let now = 200000;
+  sandbox.Date = class extends Date { static now() { return now; } };
+  const origSetTimeout = sandbox.setTimeout;
+  sandbox.setTimeout = function(callback, delay) {
+    const id = origSetTimeout(callback, delay);
+    run.timers[id - 1].dueAt = now + delay;
+    return id;
   };
-  heavySandbox.ATPViewport.monitorLoadedHeavyImage(failedPreviewWrapper, failedPreviewImg, failedPreviewTask);
-  const failedPreviewData = heavyInternals.heavyRenderItems.get(failedPreviewWrapper);
-  assert(failedPreviewData && failedPreviewData.unloaded === false, 'heavy preview capture failure must keep the decoded source loaded');
-  assert(failedPreviewImg.src === 'https://img.example/preview-capture-fail.jpg' && failedPreviewImg.style.visibility !== 'hidden', 'heavy preview capture failure must not remove or hide the only usable image');
-  assert(!failedPreviewWrapper.classList.contains('atp-heavy-unloaded') && !failedPreviewWrapper.classList.contains('atp-heavy-preview-pending'), 'heavy preview capture failure must not leave a permanent unloaded pending placeholder');
-  heavyCanvasAvailable = true;
+  sandbox.innerHeight = 800;
+  sandbox.innerWidth = 1000;
+  sandbox.document.documentElement = { clientHeight: 800, clientWidth: 1000 };
+  sandbox.IntersectionObserver = class { observe() {} unobserve() {} disconnect() {} };
+  sandbox.SharedUtils = loadSharedUtils();
+  Object.assign(sandbox.ATPState.settings, {
+    heavyImageOptimization: true,
+    heavyThumbnailClarity: 'balanced',
+    imageTimeout: 4000,
+    largeImageTimeout: 4000
+  });
+  vm.runInContext(read('viewport-observer.js'), sandbox, { filename: 'viewport-observer.js' });
+  vm.runInContext(read('heavy-budget.js').replace(
+    '  root.ATPHeavyBudget = ATPHeavyBudget;',
+    '  root.verifyHiddenRestore = { heavyRenderItems, restoreHeavyImage };\n  root.ATPHeavyBudget = ATPHeavyBudget;'
+  ), sandbox, { filename: 'heavy-budget.js' });
+
+  const src = 'https://image.imx.to/hidden-timeout-guard.jpg';
+  const thread = run.addThread('hidden-timeout-thread', src, 0);
+  thread.heavyMode = true;
+  const task = createVerifyLaneTask(src, 'hidden-timeout-thread', { currentlyVisible: true, viewportPriority: true });
+  task.candidates = thread.candidates;
+  const wrapper = createVerifyElement('atp-thumbnail-wrapper');
+  wrapper.getBoundingClientRect = function() {
+    return { top: 20, bottom: 140, left: 10, right: 130, width: 120, height: 120 };
+  };
+  const img = createVerifyImageElement();
+  Object.assign(img, { src: src, naturalWidth: 1600, naturalHeight: 1200, complete: true });
+  wrapper.appendChild(img);
+  sandbox.ATPViewport.monitorLoadedHeavyImage(wrapper, img, task);
+  const data = sandbox.verifyHiddenRestore.heavyRenderItems.get(wrapper);
+  img.removeAttribute('src');
+  Object.assign(data, { src: src, unloaded: true, previewReady: true, previewCanvas: createVerifyCanvasElement() });
+
+  const beforeRestore = run.timers.length;
+  assert(sandbox.verifyHiddenRestore.restoreHeavyImage(wrapper, data), 'hidden timeout test must start an active heavy restore');
+  assert(run.timers.slice(beforeRestore).some(function(t) { return !t.cleared && t.delay === 4000; }),
+    'restoreHeavyImage must arm the 4000ms attempt timeout timer');
+  now += 1000;
+  sandbox.ATPViewport.pauseHeavyRestores();
+  const activeTimersWhilePaused = run.timers.slice(beforeRestore).filter(function(t) { return !t.cleared && t.delay === 4000; });
+  assert(activeTimersWhilePaused.length === 0, 'pauseHeavyRestores must pause active restore attempt timers while tab is hidden');
+
+  // Spend 60s hidden: must not fail or expire while paused
+  now += 60000;
+  assert(data.restoreLoading === true && !data.unloaded, 'in-flight heavy restore must not timeout while tab timers are paused');
+
+  sandbox.ATPViewport.resumeHeavyRestores('visibility_resume');
+  const resumedTimer = run.timers.find(function(t) { return !t.cleared && t.delay >= 2500 && t.delay <= 3500; });
+  assert(resumedTimer, 'resumeHeavyRestores must re-arm the remaining attempt timeout (~3000ms) instead of resetting or immediately expiring');
+  sandbox.ATPViewport.destroy();
 }
 
 function checkLoaderNestedScrollListener() {
   const timers = [];
   const windowListeners = {};
-  const windowListenerOptions = {};
   const documentListeners = {};
   const documentListenerOptions = {};
   const removedListeners = [];
-  let retryCount = 0;
   let resumeCount = 0;
-  let adaptiveUpdateCount = 0;
-  let adaptiveResetCount = 0;
-  const adaptiveUpdates = [];
-  const adaptiveResets = [];
+  let scheduleCount = 0;
   const sandbox = {
     console: console,
     URL: URL,
     TextDecoder: TextDecoder,
-    addEventListener: function(type, handler, options) {
-      windowListeners[type] = handler;
-      windowListenerOptions[type] = options || null;
-    },
-    removeEventListener: function(type, handler, options) {
+    Date: Date,
+    Math: Math,
+    Map: Map,
+    Set: Set,
+    WeakMap: WeakMap,
+    scrollY: 0,
+    innerHeight: 800,
+    addEventListener: function(type, handler) { windowListeners[type] = handler; },
+    removeEventListener: function(type, handler) {
       if (windowListeners[type] === handler) delete windowListeners[type];
-      removedListeners.push({ target: 'window', type: type, options: options || null });
+      removedListeners.push({ target: 'window', type: type });
     },
     setTimeout: function(callback, delay) {
       timers.push({ callback: callback, delay: delay, cleared: false });
@@ -10476,6 +11843,7 @@ function checkLoaderNestedScrollListener() {
     },
     document: {
       visibilityState: 'visible',
+      documentElement: { clientHeight: 800 },
       addEventListener: function(type, handler, options) {
         documentListeners[type] = handler;
         documentListenerOptions[type] = options || null;
@@ -10485,86 +11853,53 @@ function checkLoaderNestedScrollListener() {
         removedListeners.push({ target: 'document', type: type, options: options || null });
       }
     },
-    SharedUtils: {
-      isHeavyImageHost: loadSharedUtils().isHeavyImageHost,
-      prepareArticleExtractionContext: loadSharedUtils().prepareArticleExtractionContext.bind(loadSharedUtils()),
-      getImageDisplaySrc: function(imgData) { return imgData && imgData.src; },
-      getImagePreviewSrc: function(imgData) { return imgData && (imgData.previewSrc || imgData.src); }
+    IntersectionObserver: function() {
+      this.observe = function() {};
+      this.unobserve = function() {};
+      this.disconnect = function() {};
     },
-    Logger: {
-      event: function() {},
-      debug: function() {},
-      warn: function() {},
-      error: function() {}
-    }
+    SharedUtils: loadSharedUtils(),
+    Logger: { event: function() {}, debug: function() {}, warn: function() {}, error: function() {} }
   };
   sandbox.window = sandbox;
   sandbox.ATPState = {
-    settings: {
-      backgroundConcurrency: 3,
-      firstScreenConcurrency: 3,
-      heavyImageOptimization: true,
-      heavyImageConcurrency: 2
-    },
+    settings: { backgroundConcurrency: 3, firstScreenConcurrency: 3, heavyImageOptimization: true, heavyImageConcurrency: 2 },
     threads: {}
   };
-  sandbox.ATPViewport = {
-    retryVisiblePending: function() { retryCount++; },
+  sandbox.ATPHeavyBudget = {
     resumeHeavyRestores: function() { resumeCount++; },
-    updateScrollPreload: function(root, offset) { adaptiveUpdateCount++; adaptiveUpdates.push({ root: root, offset: offset }); },
-    resetScrollPreload: function(root) { adaptiveResetCount++; adaptiveResets.push(root || null); },
-    getPendingCount: function() { return 0; }
+    destroy: function() {}
   };
   vm.createContext(sandbox);
   vm.runInContext(read('loading-policy.js'), sandbox, { filename: 'loading-policy.js' });
+  vm.runInContext(read('viewport-observer.js'), sandbox, { filename: 'viewport-observer.js' });
   vm.runInContext(runtimeForVerify('loader.js'), sandbox, { filename: 'loader.js' });
 
-  const loader = sandbox.ATPLoader;
-  loader.ensureGlobalVisListener();
-  assert(!windowListeners.scroll, 'loader must avoid duplicate window scroll handling when document capture covers page and nested scrolling');
-  assert(typeof documentListeners.scroll === 'function', 'loader must listen for document capture scroll to catch nested thumbnail scrolling');
-  assert(documentListenerOptions.scroll && documentListenerOptions.scroll.passive === true, 'loader page scroll capture listener must stay passive');
-  assert(
-    documentListenerOptions.scroll &&
-      documentListenerOptions.scroll.passive === true &&
-      documentListenerOptions.scroll.capture === true,
-    'loader document scroll listener must use passive capture mode for nested scroll containers'
-  );
-  documentListeners.scroll({ type: 'scroll' });
-  assert(loader.isHeavyScrollActive(), 'nested document scroll must enter the loader heavy-scroll deferral state');
-  assert(adaptiveUpdateCount === 1, 'nested document scroll must update the adaptive forward preload range');
-  const nestedRoot = {
-    scrollTop: 480,
-    classList: { contains: function(name) { return name === 'atp-scroll-viewport'; } }
+  const origRequestSchedule = sandbox.ATPLoader.requestSchedule;
+  sandbox.ATPLoader.requestSchedule = function(reason) {
+    scheduleCount++;
+    return origRequestSchedule(reason);
   };
-  documentListeners.scroll({ type: 'scroll', target: nestedRoot });
-  assert(adaptiveUpdates[1].root === nestedRoot && adaptiveUpdates[1].offset === 480, 'nested thumbnail scrolling must report its own root and scrollTop to adaptive preloading');
-  assert(adaptiveResetCount === 1 && adaptiveResets[0] === null, 'switching from page scroll to a nested root must reset the previous adaptive margin immediately');
-  const retryCountBeforeIdle = retryCount;
-  const resumeCountBeforeIdle = resumeCount;
-  const idleTimer = timers.filter(function(timer) {
-    return !timer.cleared && timer.delay === 180;
-  })[0];
-  assert(idleTimer, 'nested document scroll must schedule the heavy-scroll idle timer');
+
+  sandbox.ATPViewport.observeBand(createVerifyElement('atp-thread-panel'), function() {});
+  assert(!windowListeners.scroll, 'viewport must avoid duplicate window scroll handling when document passive capture covers scroll');
+  assert(typeof documentListeners.scroll === 'function', 'viewport must attach one passive capture scroll listener');
+  assert(documentListenerOptions.scroll && documentListenerOptions.scroll.passive === true && documentListenerOptions.scroll.capture === true,
+    'document scroll listener must use passive capture mode');
+
+  documentListeners.scroll({ type: 'scroll' });
+  assert(sandbox.ATPLoader.isHeavyScrollActive(), 'scroll activity must enter the heavy-scroll deferral state');
+  const idleTimer = timers.find(function(timer) { return !timer.cleared && timer.delay === 180; });
+  assert(idleTimer, 'scroll activity must arm the 180ms scroll-idle timer');
   idleTimer.cleared = true;
   idleTimer.callback();
-  assert(!loader.isHeavyScrollActive(), 'nested scroll idle must clear the loader heavy-scroll deferral state');
-  assert(adaptiveResetCount === 2 && adaptiveResets[1] === nestedRoot, 'nested scroll idle must restore the active root base preload range');
-  assert(retryCount === retryCountBeforeIdle + 1, 'nested scroll idle must retry visible viewport pending loads');
-  assert(resumeCount === resumeCountBeforeIdle + 1, 'nested scroll idle must resume deferred heavy thumbnail restores');
+  assert(!sandbox.ATPLoader.isHeavyScrollActive(), 'scroll idle must clear the heavy-scroll deferral state');
+  assert(resumeCount === 1 && scheduleCount >= 1, 'scroll idle must resume heavy restores and wake the scheduler');
 
-  loader.removeGlobalVisListener();
-  const documentScrollRemove = removedListeners.filter(function(entry) {
-    return entry.target === 'document' && entry.type === 'scroll';
-  })[0];
-  assert(!windowListeners.scroll, 'loader teardown must remove the window scroll listener');
-  assert(!documentListeners.scroll, 'loader teardown must remove the document capture scroll listener');
-  assert(
-    documentScrollRemove &&
-      documentScrollRemove.options &&
-      documentScrollRemove.options.capture === true,
-    'loader teardown must remove the document scroll listener with capture enabled'
-  );
+  sandbox.ATPViewport.destroy();
+  const docScrollRemove = removedListeners.find(function(entry) { return entry.target === 'document' && entry.type === 'scroll'; });
+  assert(!documentListeners.scroll && docScrollRemove && docScrollRemove.options && docScrollRemove.options.capture === true,
+    'viewport destroy must cleanly remove the passive capture document scroll listener');
 }
 
 function checkLoaderViewportSlotWake() {
@@ -10943,11 +12278,19 @@ function checkLoaderViewportSlotWake() {
 function createLoaderSchedulingSandbox(settings, threads, viewportPendingCount) {
   const timers = [];
   const listeners = {};
+  const images = [];
+  let nowVal = 1000;
+  let fastScrolling = false;
+  let anyScrolling = false;
   const sandbox = {
     console: console,
     URL: URL,
     TextDecoder: TextDecoder,
-    Date: { now: function() { return 1000; } },
+    Date: { now: function() { return nowVal; } },
+    Math: Math,
+    Map: Map,
+    Set: Set,
+    WeakMap: WeakMap,
     innerHeight: 800,
     innerWidth: 1280,
     addEventListener: function() {},
@@ -10964,7 +12307,15 @@ function createLoaderSchedulingSandbox(settings, threads, viewportPendingCount) 
       documentElement: { clientHeight: 800, clientWidth: 1280 },
       addEventListener: function(type, callback) { listeners[type] = callback; },
       removeEventListener: function() {},
-      contains: function() { return true; }
+      contains: function() { return true; },
+      createDocumentFragment: function() { return []; },
+      createElement: function(tagName) {
+        const el = String(tagName || '').toLowerCase() === 'img'
+          ? createVerifyImageElement()
+          : createVerifyElement('');
+        if (String(tagName || '').toLowerCase() === 'img') images.push(el);
+        return el;
+      }
     },
     SharedUtils: {
       isHeavyImageHost: loadSharedUtils().isHeavyImageHost,
@@ -10990,18 +12341,29 @@ function createLoaderSchedulingSandbox(settings, threads, viewportPendingCount) 
   sandbox.ATPViewport = {
     getPendingCount: function() { return viewportPendingCount(); },
     getPendingStats: function() { return { pendingCount: viewportPendingCount() }; },
+    isScrolling: function() { return anyScrolling; },
+    isFastScrolling: function() { return fastScrolling; },
     retryVisiblePending: function() {},
     retryPendingSlotLoads: function() {}
   };
   vm.createContext(sandbox);
   vm.runInContext(read('loading-policy.js'), sandbox, { filename: 'loading-policy.js' });
   vm.runInContext(runtimeForVerify('loader.js'), sandbox, { filename: 'loader.js' });
-  return { sandbox: sandbox, loader: sandbox.ATPLoader, timers: timers, listeners: listeners };
+  return {
+    sandbox: sandbox,
+    loader: sandbox.ATPLoader,
+    timers: timers,
+    listeners: listeners,
+    images: images,
+    advance: function(ms) { nowVal += ms; },
+    setFastScrolling: function(val) { fastScrolling = !!val; anyScrolling = !!val; }
+  };
 }
 
 function makeLoaderSchedulingThread(id, top, taskCount) {
   const candidates = [];
   const firstTasks = [];
+  const grid = createVerifyElement('atp-thumbnail-container');
   for (let i = 0; i < taskCount; i++) {
     candidates.push({ src: 'https://img.example/' + id + '-' + i + '.jpg' });
     firstTasks.push({
@@ -11010,11 +12372,13 @@ function makeLoaderSchedulingThread(id, top, taskCount) {
       idx: i,
       threadId: id,
       generation: 0,
+      grid: grid,
       isFirstScreen: true,
       queuedAt: Date.now()
     });
   }
   return {
+    id: id,
     generation: 0,
     panel: {
       getBoundingClientRect: function() {
@@ -11022,9 +12386,11 @@ function makeLoaderSchedulingThread(id, top, taskCount) {
       }
     },
     container: {},
+    grid: grid,
     candidates: candidates,
     firstTasks: firstTasks,
     firstTaskOffset: 0,
+    firstScreenTotal: taskCount,
     firstScreenDone: false,
     resources: {}
   };
@@ -11061,39 +12427,28 @@ function checkLoaderFirstTaskLargeLanePromotion() {
     heavyImageOptimization: true,
     imageTimeout: 15000
   }, threads, function() { return 0; });
-  const started = [];
-  const activeTasks = [];
-  run.loader.globalLoadImage = function(task) {
-    assert(!task.viewportRegistration, 'GIF lane promotion test threads must all be visible');
-    assert(run.loader.acquireSlot(task), 'a scheduled first task must acquire its slot: ' + task.id);
-    started.push(task.id);
-    activeTasks.push(task);
-  };
-  run.loader.roundRobinSchedule();
-  assert(started.indexOf('gifA-0') !== -1 && started.indexOf('gifB-0') !== -1, 'the first two visible GIFs must fill the host GIF lane');
-  assert(started.indexOf('heavyT-0') === -1 && started.indexOf('mixed-0') === -1 && started.indexOf('mixed-1') === -1,
-    'GIFs beyond the host GIF lane must wait');
-  assert(started.indexOf('heavyT-1') !== -1 && started.indexOf('heavyT-2') !== -1,
-    'heavy-host first tasks must start while the thread head waits for the GIF lane');
-  assert(started.indexOf('mixed-2') !== -1, 'a static first task must start while GIFs ahead of it wait for the GIF lane');
-  const heavyQueued = threads.heavyT.firstTasks.slice(threads.heavyT.firstTaskOffset).map(function(task) { return task.id; });
-  assert(heavyQueued.join(',') === 'heavyT-0,heavyT-3',
-    'the waiting GIF must stay at the head, ahead of a task that cannot start either');
-  assert(threads.mixed.firstTasks[threads.mixed.firstTaskOffset].id === 'mixed-0' &&
-    threads.mixed.firstTasks[threads.mixed.firstTaskOffset + 1].id === 'mixed-1',
-    'waiting GIFs must keep their relative order');
-  // Once the lane frees, the waiting GIF starts even though the heavy task
-  // queued behind it still cannot.
-  ['gifA-0', 'gifB-0'].forEach(function(id) {
-    const holder = activeTasks.filter(function(task) { return task.id === id; })[0];
-    run.loader.releaseSlot(holder);
-  });
-  run.loader.roundRobinSchedule();
-  assert(started.indexOf('heavyT-0') !== -1, 'a waiting GIF must start as soon as its lane frees, not wait behind a blocked task');
-  assert(started.indexOf('heavyT-3') === -1, 'the heavy task must still wait for a heavy slot');
-  for (let i = 0; i < activeTasks.length; i++) {
-    if (activeTasks[i].id !== 'gifA-0' && activeTasks[i].id !== 'gifB-0') run.loader.releaseSlot(activeTasks[i]);
+  function flushSrcs() {
+    run.timers.filter(function(t) { return !t.cleared && t.delay === 0; }).forEach(function(t) { t.cleared = true; t.callback(); });
+    return run.images.map(function(img) { return img.src || (img.__atpTimingTask && img.__atpTimingTask.id); });
   }
+  run.loader.roundRobinSchedule();
+  const startedIds = run.images.map(function(img) { return img.__atpTimingTask && img.__atpTimingTask.id; });
+  flushSrcs();
+  assert(startedIds.indexOf('gifA-0') !== -1 && startedIds.indexOf('gifB-0') !== -1, 'the first two visible GIFs must fill the host GIF lane');
+  assert(startedIds.indexOf('heavyT-0') === -1 && startedIds.indexOf('mixed-0') === -1 && startedIds.indexOf('mixed-1') === -1,
+    'GIFs beyond the host GIF lane must wait');
+  assert(startedIds.indexOf('heavyT-1') !== -1 && startedIds.indexOf('heavyT-2') !== -1,
+    'heavy-host first tasks must start while the thread head waits for the GIF lane');
+  assert(startedIds.indexOf('mixed-2') !== -1, 'a static first task must start while GIFs ahead of it wait for the GIF lane');
+
+  run.images.filter(function(img) {
+    const tid = img.__atpTimingTask && img.__atpTimingTask.id;
+    return tid === 'gifA-0' || tid === 'gifB-0';
+  }).forEach(function(img) { img.onload(); });
+  const afterReleaseIds = run.images.map(function(img) { return img.__atpTimingTask && img.__atpTimingTask.id; });
+  assert(afterReleaseIds.indexOf('heavyT-0') !== -1, 'a waiting GIF must start as soon as its lane frees');
+  assert(afterReleaseIds.indexOf('heavyT-3') === -1, 'the heavy task must still wait for a heavy slot');
+  run.loader.resetActiveImageSlots('cleanup');
 }
 
 function checkLoaderViewportFirstTaskPriority() {
@@ -11102,30 +12457,20 @@ function checkLoaderViewportFirstTaskPriority() {
     nearB: makeLoaderSchedulingThread('nearB', 420, 3),
     far: makeLoaderSchedulingThread('far', 2600, 3)
   };
+  threads.far.readyImageQueue = true;
   const run = createLoaderSchedulingSandbox({
     backgroundConcurrency: 3,
     firstScreenConcurrency: 3,
     heavyImageOptimization: false,
     imageTimeout: 15000
   }, threads, function() { return 0; });
-  const started = [];
-  const activeTasks = [];
-  const registered = [];
-  run.loader.globalLoadImage = function(task) {
-    if (task.viewportRegistration) {
-      registered.push(task.id);
-      return;
-    }
-    started.push(task.id);
-    activeTasks.push(task);
-    assert(run.loader.acquireSlot(task), 'loader viewport first-task priority test must acquire an available slot');
-  };
   run.loader.roundRobinSchedule();
-  assert(started.length === 3, 'loader viewport first-task priority must fill the configured first-screen concurrency');
-  assert(started.every(function(id) { return id.indexOf('near') === 0; }), 'loader viewport first-task priority must not let far threads consume slots while visible threads are pending');
-  assert(started.indexOf('nearA-0') !== -1 && started.indexOf('nearB-0') !== -1, 'loader viewport first-task priority must retain round-robin fairness between visible threads');
-  assert(registered.length === 3 && registered.every(function(id) { return id.indexOf('far-') === 0; }), 'offscreen first tasks may register placeholders without consuming visible network slots');
-  for (let i = 0; i < activeTasks.length; i++) run.loader.releaseSlot(activeTasks[i]);
+  const startedIds = run.images.map(function(img) { return img.__atpTimingTask && img.__atpTimingTask.id; });
+  assert(startedIds.length === 3, 'loader viewport first-task priority must fill the configured first-screen concurrency');
+  assert(startedIds.every(function(id) { return id && id.indexOf('near') === 0; }), 'far threads must stay parked while visible threads are pending');
+  assert(startedIds.indexOf('nearA-0') !== -1 && startedIds.indexOf('nearB-0') !== -1, 'visible threads must retain round-robin fairness');
+  assert(threads.far.grid.children.length === 0, 'offscreen threads must not flood the DOM with placeholder wrappers');
+  run.loader.resetActiveImageSlots('cleanup');
 }
 
 function checkLoaderOffscreenFirstRowsUseAvailableSlots() {
@@ -11137,29 +12482,16 @@ function checkLoaderOffscreenFirstRowsUseAvailableSlots() {
     viewportPriorityReservedSlots: 2,
     heavyImageOptimization: true
   }, { farAuto: thread }, function() { return 0; });
-  const started = [];
-  run.loader.globalLoadImage = function(task) {
-    assert(task.viewportRegistration === false && task.viewportPriority === false,
-      'offscreen first-row tasks must load directly at low priority');
-    assert(run.loader.acquireSlot(task), 'offscreen first-row task must claim an available slot');
-    started.push(task);
-  };
   run.loader.roundRobinSchedule();
-  assert(started.length === 1 && run.loader.getActive() === 1,
-    'offscreen first rows must use the ordinary lanes left after the visible reserve (3 - 2 = 1), even when backgroundConcurrency is one: ' + started.length + '/' + run.loader.getActive());
+  assert(run.images.length === 1 && run.loader.getActive() === 1,
+    'offscreen first rows must use the ordinary lanes left after the visible reserve (3 - 2 = 1)');
 
-  // A post scrolled into view while offscreen loads are in flight must still
-  // get its reserved lanes instead of waiting for offscreen timeouts.
   run.sandbox.ATPState.threads.visibleLate = makeLoaderSchedulingThread('visibleLate', 100, 10);
-  run.loader.globalLoadImage = function(task) {
-    assert(run.loader.acquireSlot(task), 'visible first-row task must claim a reserved slot');
-    started.push(task);
-  };
   run.loader.roundRobinSchedule();
-  const lateVisibleStarted = started.filter(function(task) { return task.threadId === 'visibleLate'; }).length;
+  const lateVisibleStarted = run.images.filter(function(img) { return img.__atpTimingTask && img.__atpTimingTask.threadId === 'visibleLate'; }).length;
   assert(lateVisibleStarted === 2 && run.loader.getActive() === 3,
-    'visible first rows must use the reserved ordinary slots while offscreen first rows hold their lane: ' + lateVisibleStarted + '/' + run.loader.getActive());
-  started.forEach(function(task) { run.loader.releaseSlot(task); });
+    'visible first rows must use the reserved ordinary slots while offscreen first rows hold their lane');
+  run.loader.resetActiveImageSlots('cleanup');
 
   const fastThread = makeLoaderSchedulingThread('farFast', 4000, 10);
   const fast = createLoaderSchedulingSandbox({
@@ -11170,35 +12502,10 @@ function checkLoaderOffscreenFirstRowsUseAvailableSlots() {
     ordinaryHostConcurrency: 10,
     heavyImageOptimization: true
   }, { farFast: fastThread }, function() { return 0; });
-  const fastStarted = [];
-  fast.loader.globalLoadImage = function(task) {
-    assert(fast.loader.acquireSlot(task), 'fast offscreen first-row task must claim an available slot');
-    fastStarted.push(task);
-  };
   fast.loader.roundRobinSchedule();
-  assert(fastStarted.length === 3 && fast.loader.getActive() === 3,
+  assert(fast.images.length === 3 && fast.loader.getActive() === 3,
     'fast offscreen first rows must keep a small independent lane while leaving visible capacity free');
-  fastStarted.forEach(function(task) { fast.loader.releaseSlot(task); });
-
-  const scrollThread = makeLoaderSchedulingThread('farScrolling', 4000, 10);
-  const scrolling = createLoaderSchedulingSandbox({
-    autoLoadOffscreenFirstRowsEnabled: true,
-    firstScreenConcurrency: 12,
-    backgroundConcurrency: 6,
-    viewportPriorityReservedSlots: 7,
-    heavyImageOptimization: true
-  }, { farScrolling: scrollThread }, function() { return 0; });
-  const scrollingStarted = [];
-  scrolling.loader.globalLoadImage = function(task) { scrollingStarted.push(task); };
-  scrolling.loader.ensureGlobalVisListener();
-  assert(typeof scrolling.listeners.scroll === 'function', 'loader must observe document scroll activity');
-  scrolling.listeners.scroll({ target: scrolling.sandbox.document });
-  scrolling.loader.roundRobinSchedule();
-  assert(scrollingStarted.length === 0, 'new offscreen first-row requests must pause while the user scrolls');
-  const idleTimer = scrolling.timers.filter(function(timer) { return !timer.cleared; }).slice(-1)[0];
-  assert(idleTimer, 'scroll pause must schedule an idle wake');
-  idleTimer.callback();
-  assert(scrollingStarted.length > 0, 'offscreen first rows must resume after scrolling becomes idle');
+  fast.loader.resetActiveImageSlots('cleanup');
 
   const mixedNear = makeLoaderSchedulingThread('nearWhileScrolling', 100, 2);
   const mixedFar = makeLoaderSchedulingThread('farWhileScrolling', 4000, 2);
@@ -11209,13 +12516,15 @@ function checkLoaderOffscreenFirstRowsUseAvailableSlots() {
     viewportPriorityReservedSlots: 7,
     heavyImageOptimization: true
   }, { nearWhileScrolling: mixedNear, farWhileScrolling: mixedFar }, function() { return 0; });
-  const mixedStarted = [];
-  mixed.loader.globalLoadImage = function(task) { mixedStarted.push(task); };
-  mixed.loader.ensureGlobalVisListener();
-  mixed.listeners.scroll({ target: mixed.sandbox.document });
+  mixed.setFastScrolling(true);
   mixed.loader.roundRobinSchedule();
-  assert(mixedStarted.length === 2 && mixedStarted.every(function(task) { return task.threadId === 'nearWhileScrolling'; }),
-    'scroll pause must preserve visible image progress while deferring offscreen requests');
+  assert(mixed.images.length === 2 && mixed.images.every(function(img) { return img.__atpTimingTask && img.__atpTimingTask.threadId === 'nearWhileScrolling'; }),
+    'fast scroll must preserve visible image progress while pausing P3 offscreen dispatch');
+  mixed.setFastScrolling(false);
+  mixed.loader.roundRobinSchedule();
+  assert(mixed.images.some(function(img) { return img.__atpTimingTask && img.__atpTimingTask.threadId === 'farWhileScrolling'; }),
+    'offscreen first rows must resume after fast scrolling settles');
+  mixed.loader.resetActiveImageSlots('cleanup');
 }
 
 function checkReadyImageQueue() {
@@ -11253,6 +12562,41 @@ function checkReadyImageQueue() {
     return run;
   }
   const host = 'https://ready-queue.example/';
+  for (const pauseWhenHidden of [false, true]) {
+    const run = createRun({ pauseWhenHidden, autoLoadOffscreenFirstRowsEnabled: false,
+      firstScreenConcurrency: 4, backgroundConcurrency: 1, globalImageConcurrency: 4 });
+    const sandbox = run.sandbox;
+    sandbox.document.visibilityState = 'hidden';
+    sandbox.SharedUtils = loadSharedUtils();
+    vm.runInContext(read('renderer.js'), sandbox, { filename: 'renderer.js' });
+    function register(prefix, visibleBeforeCommit) {
+      const candidates = [0, 1].map(i => ({ src: host + prefix + i + '.jpg' }));
+      const cell = createVerifyElement('');
+      const panel = createVerifyElement('');
+      panel.getBoundingClientRect = () => ({ top: visibleBeforeCommit ? 100 : 2000, bottom: visibleBeforeCommit ? 300 : 2200 });
+      return sandbox.ATPRenderer.registerThread(candidates, {}, createVerifyElement(''), createVerifyElement(''),
+        cell, prefix, null, panel, [], candidates, null, false, 0, false, 100000, false, 0, 0, 0, { visibleBeforeCommit });
+    }
+    const far = register('offscreen', false);
+    const near = register('onscreen', true);
+    assert(run.images.length === (pauseWhenHidden ? 0 : 1) && far.loaded === 0,
+      'rows first registered in a hidden tab must obey the pause setting and the background concurrency cap');
+    if (pauseWhenHidden) {
+      sandbox.document.visibilityState = 'visible';
+      run.loader.syncVisibilityPauseState();
+    }
+    for (const image of run.images) {
+      assert(image.src.startsWith(host + 'onscreen'), 'a hidden commit must keep known offscreen rows parked');
+      image.onload();
+    }
+    assert(near.loaded === 2 && near.firstScreenDone && !far.firstScreenDone && run.loader.getActive() === 0,
+      'a previously visible post must finish after hidden registration under both pause modes');
+    sandbox.document.visibilityState = 'visible';
+    far.panel.getBoundingClientRect = () => ({ top: 10, bottom: 200 });
+    run.loader.syncVisibilityPauseState();
+    assert(run.images.length === 4 && run.images.at(-1).src.startsWith(host + 'offscreen'),
+      'a parked hidden commit must still dispatch when its row comes into view');
+  }
   const bounded = createRun({ gridCols: 5, viewportPendingLimit: 32 });
   const longGallery = bounded.addReadyThread('ready-bounded',
     Array.from({ length: 100 }, (_, index) => host + 'row-' + index + '.jpg'), 10);
@@ -11276,6 +12620,81 @@ function checkReadyImageQueue() {
   for (let i = 15; i < bounded.images.length; i++) bounded.images[i].onload();
   assert(admittedBeforeCollapse < 100 && bounded.images.length === admittedBeforeCollapse,
     'collapsing must stop admissions while in-flight requests finish');
+
+  function failReadyCandidate(run, img) {
+    const before = run.timers.length;
+    img.onerror();
+    const noReferrerWake = run.timers.slice(before).find(timer => !timer.cleared && timer.delay === 0);
+    assert(noReferrerWake && img.referrerPolicy === 'no-referrer', 'a candidate must exhaust its source retry before reaching the fallback lane');
+    noReferrerWake.cleared = true;
+    noReferrerWake.callback();
+    img.onerror();
+  }
+
+  const fallbackHost = 'https://ready-fallback.example/';
+  const constrained = createRun({ firstScreenConcurrency: 4, globalImageConcurrency: 4,
+    ordinaryHostConcurrency: 2, ordinaryFallbackLimit: 2, maxRetryPerImage: 0 });
+  constrained.addReadyThread('fallback-occupants', [fallbackHost + 'busy.gif', fallbackHost + 'busy.jpg'], 2);
+  const replaceable = constrained.addReadyThread('fallback-gallery', [host + 'bad.jpg', host + 'other.jpg'], 2);
+  replaceable.sourceCandidates = replaceable.candidates.concat([
+    { src: fallbackHost + 'candidate.gif', previewSrc: fallbackHost + 'original.gif' },
+    { src: fallbackHost + 'later.jpg' }
+  ]);
+  constrained.loader.globalSchedule();
+  const bad = constrained.images.find(img => img.src === host + 'bad.jpg');
+  const firstCell = bad.parentNode;
+  const lateCompletion = bad.onload;
+  failReadyCandidate(constrained, bad);
+  assert(constrained.images.length === 4 && constrained.loader.getActive() === 3 &&
+    bad.src === undefined && replaceable.failedCount === 0,
+    'a bad ordinary image must free its old slot and wait for the first replacement host to have capacity');
+  constrained.images.find(img => img.src === fallbackHost + 'busy.jpg').onload();
+  assert(constrained.images.length === 4, 'a free host slot alone must not admit a replacement GIF while the GIF lane is full');
+  constrained.advance(250);
+  constrained.images.find(img => img.src === fallbackHost + 'busy.gif').onload();
+  const replacement = constrained.images.at(-1);
+  assert(replacement.src === fallbackHost + 'candidate.gif' && replacement.parentNode === firstCell &&
+    replaceable.grid.children.length === 2 && firstCell.style.gridColumnStart === 1,
+    'a replacement must take its own host and GIF slots, choose the first hidden candidate and reuse the original cell');
+  assert(constrained.timers.some(timer => !timer.cleared && timer.delay === 750),
+    'a replacement must keep the remaining time from the originally admitted task');
+  lateCompletion();
+  assert(constrained.loader.getActive() === 2 && replaceable.loaded === 0,
+    'a late completion from the original candidate must not release or settle its replacement');
+  let openedReplacement = null;
+  constrained.sandbox.ATPPreviewer.open = (urls, index) => { openedReplacement = { urls, index }; };
+  replacement.onload();
+  replacement.onclick({});
+  constrained.images.find(img => img.src === host + 'other.jpg').onload();
+  assert(openedReplacement?.index === 0 && openedReplacement.urls.join(',') === fallbackHost + 'original.gif,' + host + 'other.jpg' &&
+    replaceable.loaded === 2 && !replaceable.failedCount && replaceable.sourceCandidates[0].src === host + 'bad.jpg',
+    'preview must open the replacement at the original gallery index, with the original source candidates kept for caching');
+
+  for (const limit of [0, 2]) {
+    const exhausted = createRun({ ordinaryFallbackLimit: limit, maxRetryPerImage: 0 });
+    const gallery = exhausted.addReadyThread('fallback-limit-' + limit, [host + 'missing-0.jpg'], 1);
+    gallery.sourceCandidates = Array.from({ length: 4 }, (_, index) => ({ src: host + 'missing-' + index + '.jpg' }));
+    exhausted.loader.globalSchedule();
+    for (let i = 0; i < exhausted.images.length && i < gallery.sourceCandidates.length; i++) {
+      assert(exhausted.images[i].src === gallery.sourceCandidates[i].src, 'ready replacements must retain hidden source order');
+      failReadyCandidate(exhausted, exhausted.images[i]);
+    }
+    assert(exhausted.images.length === 1 + limit && gallery.failedCount === 1 &&
+      gallery.grid.children.length === 1 && exhausted.loader.getActive() === 0,
+      'the ordinary fallback setting must bound hidden requests, including zero, and settle just the original cell');
+  }
+
+  const expired = createRun({ ordinaryHostConcurrency: 1, ordinaryFallbackLimit: 1, maxRetryPerImage: 0 });
+  expired.addReadyThread('fallback-expiry-occupant', [fallbackHost + 'hold.jpg'], 1);
+  const expiringGallery = expired.addReadyThread('fallback-expiry', [host + 'expired.jpg'], 1);
+  expiringGallery.sourceCandidates = expiringGallery.candidates.concat([{ src: fallbackHost + 'never-start.jpg' }]);
+  expired.loader.globalSchedule();
+  failReadyCandidate(expired, expired.images.find(img => img.src === host + 'expired.jpg'));
+  expired.advance(1000);
+  expired.images.find(img => img.src === fallbackHost + 'hold.jpg').onload();
+  assert(expired.images.length === 2 && expiringGallery.failedCount === 1 && expired.loader.getActive() === 0 &&
+    !expired.sandbox.__ATP_VERIFY_GET_ORDINARY_HOST_STATS('ready-fallback.example')?.failures,
+    'an expired replacement must settle without sending an image request or penalizing the replacement host');
 
   const continuing = createRun();
   const gallery = continuing.addReadyThread('ready-mixed', [
@@ -11311,6 +12730,71 @@ function checkReadyImageQueue() {
     continuing.loader._getQueueSnapshotForVerify().readyImageQueued === 0, 'all ready work must leave the queue on settlement');
 
   const otherHost = 'https://ready-other.example/';
+
+  // v1.19.0: O(1) on-the-fly 5,000-image expansion/collapse + 250ms P3->P1 preemption
+  const large = createRun({ gridCols: 3, visibleRows: 1, maxImagesPerPost: 5000, maxDisplayPerPost: 5000,
+    firstScreenConcurrency: 4, globalImageConcurrency: 4, ordinaryHostConcurrency: 1 });
+  large.sandbox.SharedUtils = loadSharedUtils();
+  large.sandbox.ATPCache.normalizeArticleData = data => data;
+  large.sandbox.Logger.isEnabled = () => false;
+  const createElement = large.sandbox.document.createElement;
+  large.sandbox.document.createElement = tag => Object.assign(createElement(tag), {
+    tagName: tag.toUpperCase(), addEventListener() {}, getBoundingClientRect: () => ({ top: 100, bottom: 300 })
+  });
+  vm.runInContext(read('renderer.js'), large.sandbox, { filename: 'renderer.js' });
+  const tailSrc = otherHost + 'tail.jpg';
+  const candidates = Array.from({ length: 5000 }, (_, i) => ({ src: i === 4999 ? tailSrc : host + i + '.jpg' }));
+  large.sandbox.ATPRenderer.injectThumbnails(large.sandbox.document.createElement('tbody'), { images: candidates, resources: {} },
+    { href: 'https://www.sehuatang.org/thread-5000-1-1.html' });
+  const post = Object.values(large.sandbox.ATPState.threads)[0];
+  const button = post.panel.children[0].children.find(el => el.className === 'atp-thumbnail-expand');
+  assert(large.images.length === 1 && post.readyImageLimit === 3,
+    'the large post must start collapsed with only its busy host in flight');
+  button.onclick();
+  assert(button.getAttribute('aria-expanded') === 'true' && post.readyImageLimit === 5000,
+    'the real expand action must expose every candidate without synchronous task-array allocation');
+  button.onclick();
+  assert(button.getAttribute('aria-expanded') === 'false' && post.readyImageLimit === 3 && large.images.length === 1,
+    'collapsing must immediately cap admissions back to the collapsed row limit');
+  const neighborSrc = 'https://neighbor.example/still.jpg';
+  large.addReadyThread('neighbor', [neighborSrc], 1);
+  large.loader.globalSchedule();
+  assert(large.images.some(img => img.src === neighborSrc) && post.loaded === 0,
+    'a nearby new post on another host must start while the large post waits on its first image');
+
+  // 250ms P3 -> P1 fast preemption without failure counting
+  const preemptRun = createRun({
+    firstScreenConcurrency: 2, backgroundConcurrency: 2, globalImageConcurrency: 2,
+    ordinaryHostConcurrency: 2, viewportPriorityReservedSlots: 0,
+    autoLoadOffscreenFirstRows: true, imageTimeout: 15000, imageTaskDeadline: 12000
+  });
+  const distantP3 = preemptRun.addReadyThread('p3-distant', [host + 'slow-a.gif', host + 'slow-b.jpg'], 2);
+  distantP3.top = 3500;
+  preemptRun.loader.globalSchedule();
+  assert(preemptRun.loader.getActive() === 2 && preemptRun.images.length === 2, 'offscreen P3 thread must fill both slots initially');
+  const distantFirstCell = distantP3.grid.children[0];
+  const oldLoad = preemptRun.images[0].onload;
+  const oldError = preemptRun.images[0].onerror;
+  preemptRun.advance(100);
+  const urgentVisible = preemptRun.addReadyThread('p1-urgent', [host + 'urgent.jpg'], 1);
+  urgentVisible.top = 100;
+  preemptRun.loader.globalSchedule();
+  assert(preemptRun.images.length === 2 && preemptRun.images.every(img => img.src),
+    'P3 requests younger than 250ms must not be preempted prematurely');
+  preemptRun.advance(200);
+  preemptRun.loader.globalSchedule();
+  assert(preemptRun.images.some(img => img.src === host + 'urgent.jpg') && preemptRun.loader.getActive() === 2,
+    'once >= 250ms old, a P3 transfer must yield immediately to an urgent P1 visible request');
+  if (oldLoad) oldLoad();
+  if (oldError) oldError();
+  assert(distantP3.loaded === 0 && distantP3.failedCount === 0,
+    'preempted P3 transfers must not count as failures or respond to stale callbacks');
+  preemptRun.images.find(img => img.src === host + 'urgent.jpg').onload();
+  assert(urgentVisible.loaded === 1 && preemptRun.loader.getActive() === 2,
+    'completing the urgent P1 image must let the preempted P3 task resume in its original cell');
+  assert(distantFirstCell.children.some(ch => ch.className === 'atp-thumbnail-img'),
+    'resumed P3 task must reuse its original thumbnail wrapper');
+
   const mixed = createRun({ ordinaryHostConcurrency: 1, viewportPendingLimit: 32, gridCols: 3 });
   const first = mixed.addReadyThread('ready-a', [host + 'a.gif', host + 'b.gif', otherHost + 'c.jpg'], 3);
   mixed.loader.globalSchedule();
@@ -11338,7 +12822,7 @@ function checkReadyImageQueue() {
   scroll.addReadyThread('ready-third-host', [otherHost + 'free.jpg'], 1);
   scroll.loader.globalSchedule();
   assert(scroll.images[6].src === otherHost + 'free.jpg', 'still-visible saturated posts must not block a new post on a free host');
-  oldThreads.forEach(function(thread) { thread.top = 850; });
+  oldThreads.forEach(function(thread) { thread.top = 2400; });
   scroll.addReadyThread('ready-current', [host + 'new.jpg', otherHost + 'new.jpg'], 2);
   scroll.loader.globalSchedule();
   assert(scroll.images.length === 8 && scroll.images[7].src === otherHost + 'new.jpg',
@@ -11346,6 +12830,21 @@ function checkReadyImageQueue() {
   assert(scroll.images[0].src && scroll.loader.getActive() === 8, 'parked tasks must leave existing requests in flight');
   scroll.images[0].onload();
   assert(scroll.images[8].src === host + 'new.jpg', 'the newly visible post must get the next slot on the busy host');
+
+  const manualOnly = createRun({ globalImageConcurrency: 1, firstScreenConcurrency: 1, ordinaryHostConcurrency: 1, imageTimeout: 15000 });
+  manualOnly.addThread('manual-transfer', host + 'clicked.jpg', 1);
+  const manualCell = createVerifyElement('atp-thumbnail-wrapper');
+  const manualLoading = createVerifyElement('atp-thumbnail-loading');
+  manualCell.appendChild(manualLoading);
+  manualOnly.loader.showFailedPlaceholder(manualCell, manualLoading, { candidates: [{ src: host + 'clicked.jpg' }],
+    idx: 0, threadId: 'manual-transfer', generation: 0, readyImageQueue: true }, host + 'clicked.jpg');
+  manualCell.onclick();
+  manualOnly.addReadyThread('waiting-for-manual', [host + 'auto.jpg'], 1);
+  manualOnly.loader.globalSchedule();
+  manualOnly.advance(1500);
+  manualOnly.loader.globalSchedule();
+  assert(manualOnly.images.length === 1 && manualOnly.images[0].src === host + 'clicked.jpg',
+    'a visible automatic image must wait for an active manual retry');
 
   const manual = createRun({
     firstScreenConcurrency: 10, globalImageConcurrency: 12, ordinaryHostConcurrency: 6, viewportPendingLimit: 32
@@ -11453,26 +12952,98 @@ function checkReadyImageQueue() {
     'parked surplus candidates must not leave an impossible loading total after collapsing');
 
   const scrolling = createRun();
-  const listeners = {};
   const frames = [];
-  scrolling.sandbox.document.addEventListener = (name, handler) => { listeners[name] = handler; };
   scrolling.sandbox.requestAnimationFrame = callback => frames.push(callback);
   const scrollingThread = scrolling.addReadyThread('ready-scroll-wake', [host + 'visible.jpg'], 1);
   scrollingThread.top = 3000;
-  scrolling.loader.ensureGlobalVisListener();
   scrolling.loader.globalSchedule();
+  assert(scrolling.images.length === 0, 'offscreen post must stay parked before entering viewport');
   scrolling.advance(12000);
   scrollingThread.top = 200;
-  listeners.scroll({ target: scrolling.sandbox.document });
-  listeners.scroll({ target: scrolling.sandbox.document });
-  assert(frames.length === 1 && scrolling.images.length === 0, 'continuous scrolling must coalesce the visible queue wake');
+  scrolling.loader.requestSchedule('viewport_band_change');
+  scrolling.loader.requestSchedule('viewport_band_change');
+  assert(frames.length === 1 && scrolling.images.length === 0, 'repeated band wakes in the same frame must coalesce');
   frames.shift()();
-  assert(scrolling.images[0].src === host + 'visible.jpg', 'newly visible work must dispatch before scroll idle');
+  assert(scrolling.images[0].src === host + 'visible.jpg', 'newly visible work must dispatch on the coalesced frame');
   scrolling.advance(100);
   scrolling.images[0].onload();
-  assert(scrollingThread.firstScreenTiming.result.maxViewportWaitMs === 12000 &&
-    scrollingThread.firstScreenTiming.result.maxQueueWaitExcludingViewportMs === 0,
-    'visible scheduler waiting must be distinguished from the time a post spent offscreen');
+  assert(scrollingThread.firstScreenDone && scrollingThread.loaded === 1,
+    'coalesced viewport wake must settle the newly visible post cleanly');
+
+  function setReadyPageVisibility(run, visibilityState) {
+    run.sandbox.document.visibilityState = visibilityState;
+    run.loader.syncVisibilityPauseState();
+  }
+  const interrupted = createRun({ pauseWhenHidden: true, firstScreenConcurrency: 1, globalImageConcurrency: 1 });
+  const slowThread = interrupted.addReadyThread('hidden-budget', [host + 'slow-switch.jpg'], 1);
+  interrupted.loader.globalSchedule();
+  const slowCell = slowThread.grid.children[0];
+  const slowTask = slowCell.__atpLoadTask;
+  for (const remaining of [650, 300]) {
+    interrupted.advance(350);
+    const previous = interrupted.images.at(-1);
+    const staleLoad = previous.onload;
+    setReadyPageVisibility(interrupted, 'hidden');
+    assert(interrupted.loader.getActive() === 0 && previous.src === undefined,
+      'a hidden page must cancel the old transfer and suspend its timeout');
+    interrupted.advance(5000);
+    setReadyPageVisibility(interrupted, 'visible');
+    staleLoad();
+    assert(interrupted.loader.getActive() === 1 && slowThread.loaded === 0 &&
+      interrupted.images.at(-1).parentNode === slowCell && slowThread.grid.children.length === 1 &&
+      slowTask.taskDeadlineAt - interrupted.sandbox.Date.now() === remaining,
+    'a resumed image must use the same cell and spend only its remaining foreground time');
+  }
+  interrupted.advance(300);
+  interrupted.timers.findLast(timer => !timer.cleared && timer.delay === 300).callback();
+  assert(slowThread.failedCount === 1 && interrupted.images.length === 3 && interrupted.loader.getActive() === 0,
+    'a slow image must time out after its total visible budget across multiple switches');
+
+  const manualSwitch = createRun({ pauseWhenHidden: true, backgroundConcurrency: 1,
+    firstScreenConcurrency: 1, globalImageConcurrency: 1, ordinaryHostConcurrency: 1 });
+  const manualSrc = host + 'retry-switch.jpg';
+  const manualThread = manualSwitch.addThread('manual-switch', manualSrc, 1);
+  const retryCell = createVerifyElement('atp-thumbnail-wrapper');
+  const failedLoading = createVerifyElement('atp-thumbnail-loading');
+  retryCell.appendChild(failedLoading);
+  manualSwitch.loader.showFailedPlaceholder(retryCell, failedLoading, {
+    candidates: [{ src: manualSrc }], idx: 0, threadId: 'manual-switch', generation: 0, readyImageQueue: true
+  }, manualSrc);
+  retryCell.onclick();
+  const retryLoading = retryCell.querySelector('.atp-thumbnail-loading');
+  manualSwitch.advance(100);
+  manualSwitch.images[0].onerror();
+  const fallbackStart = manualSwitch.timers.findLast(timer => !timer.cleared && timer.delay === 0);
+  fallbackStart.callback();
+  fallbackStart.cleared = true;
+  assert(manualSwitch.images[0].referrerPolicy === 'no-referrer', 'the manual transfer must enter its alternate source policy');
+  manualSwitch.addReadyThread('after-manual-switch', [host + 'after-retry.jpg'], 1);
+  manualSwitch.loader.globalSchedule();
+  for (const remaining of [700, 500]) {
+    manualSwitch.advance(200);
+    const previous = manualSwitch.images.at(-1);
+    const staleLoad = previous.onload;
+    setReadyPageVisibility(manualSwitch, 'hidden');
+    assert(manualSwitch.loader.getActive() === 0 && manualSwitch.loader._getQueueSnapshotForVerify().manualImageQueued === 1,
+      'the existing manual attempt must wait in its original queue while hidden');
+    manualSwitch.advance(5000);
+    setReadyPageVisibility(manualSwitch, 'visible');
+    const release = manualSwitch.timers.findLast(timer => !timer.cleared && timer.delay === 0);
+    release.callback();
+    release.cleared = true;
+    staleLoad();
+    const resumed = manualSwitch.images.at(-1);
+    assert(resumed.src === manualSrc && resumed.referrerPolicy === 'no-referrer' && resumed.parentNode === retryCell &&
+      retryCell.querySelector('.atp-thumbnail-loading') === retryLoading && manualThread.loaded === 0 &&
+      manualThread.failedCount === 1 && manualSwitch.loader.getActive() === 1 &&
+      manualSwitch.timers.some(timer => !timer.cleared && timer.delay === remaining),
+    'manual retry must resume the same source policy, timeout, and loading cell before automatic work');
+  }
+  manualSwitch.images[2].onload();
+  assert(manualThread.loaded === 1 && manualThread.failedCount === 0 && manualSwitch.images[3].src === host + 'after-retry.jpg' &&
+    manualSwitch.loader.getActive() === 1, 'the resumed manual retry must count once and release the same host slot');
+  manualSwitch.images[3].onload();
+  assert(manualSwitch.loader.getActive() === 0, 'settling both transfers must leave the queue empty');
 
   const retry = createRun({ firstScreenConcurrency: 1, globalImageConcurrency: 1, maxRetryPerImage: 1 });
   const retryThread = retry.addReadyThread('ready-retry', [host + 'broken.jpg', host + 'good.jpg'], 2);
@@ -11488,8 +13059,8 @@ function checkReadyImageQueue() {
     'a retry must use its original grid cell without adding a duplicate');
 
   const failover = createRun({ ordinaryHostConcurrency: 1 });
-  const dead = 'https://tu.dead.example/tupian/forum/202609/25/';
-  const live = 'https://tu.live.example/tupian/forum/202609/25/';
+  const dead = 'https://tu.w4kmzkm.com/tupian/forum/202609/25/';
+  const live = 'https://tu.djhdhs.us/tupian/forum/202609/25/';
   const attachment = i => '2302' + String(10 + i) + 'lco62asacdsxoz5a.jpg';
   failover.loader.recordDomainSuccess(live + attachment(0));
   failover.loader.recordDomainSuccess(live + attachment(1));
@@ -11511,6 +13082,64 @@ function checkReadyImageQueue() {
   failover.images[0].onload();
   assert(failover.images[2].src === live + attachment(4),
     'unsigned attachments from a failed host must use the previously healthy sibling after its slot frees');
+
+  const recoveredWhileQueued = createRun({ ordinaryHostConcurrency: 1 });
+  function recordFailures(run, base) {
+    for (let index = 0; index < 3; index++) {
+      const src = base + attachment(index + 10);
+      run.loader.recordTaskImageFailure({ candidates: [{ src }], idx: 0, readyImageQueue: true }, src, 'direct_fail', true);
+    }
+  }
+  recoveredWhileQueued.loader.recordDomainSuccess(live + attachment(0));
+  recoveredWhileQueued.loader.recordDomainSuccess(live + attachment(1));
+  recordFailures(recoveredWhileQueued, dead);
+  recoveredWhileQueued.addReadyThread('busy-mirror', [live + attachment(2)], 1);
+  const waiting = recoveredWhileQueued.addReadyThread('waiting-first-attempt', [unsigned], 1);
+  recoveredWhileQueued.loader.globalSchedule();
+  assert(recoveredWhileQueued.images.length === 1, 'the mirror must start full');
+  recoveredWhileQueued.loader.recordDomainSuccess(dead + attachment(9));
+  recoveredWhileQueued.loader.globalSchedule();
+  assert(recoveredWhileQueued.images[1]?.src === unsigned,
+    'an unsent image must use the recovered original while the previously selected mirror is still full');
+  recoveredWhileQueued.images[1].onload();
+  assert(waiting.loaded === 1, 'the original must settle once');
+
+  for (const hasAlternative of [false, true]) {
+    const changing = createRun({ ordinaryHostConcurrency: 1 });
+    changing.loader.recordDomainSuccess(live + attachment(0));
+    changing.loader.recordDomainSuccess(live + attachment(1));
+    changing.addReadyThread('busy-destination', [live + attachment(2)], 1);
+    const pending = changing.addReadyThread('retry-destination-changed', [unsigned], 1);
+    pending.cacheImages = pending.candidates;
+    changing.loader.globalSchedule();
+    changing.advance(100);
+    changing.images[1].onerror();
+    changing.images[1].onerror();
+    assert(changing.images.length === 2, 'the sibling retry must wait behind the blocker');
+    const cell = pending.grid.children[0];
+    const alternate = 'https://tu.ewrewej.la/tupian/forum/202609/25/';
+    if (hasAlternative) {
+      changing.loader.recordDomainSuccess(alternate + attachment(0));
+      changing.loader.recordDomainSuccess(alternate + attachment(1));
+    }
+    recordFailures(changing, live);
+    changing.loader.globalSchedule();
+    if (hasAlternative) {
+      assert(changing.images[2]?.src === alternate + attachment(4),
+        'a pending retry must use an available healthy sibling when the selected one has since failed');
+      changing.images[2].onload();
+      assert(pending.loaded === 1, 'the active alternative must load');
+    } else {
+      assert(pending.failedCount === 1 && cell.classList.contains('atp-thumbnail-failed'),
+        'a queued retry with no healthy destination must settle and keep its manual retry action');
+      cell.onclick();
+      assert(changing.images[2]?.src === unsigned, 'manual retry must return to the original');
+      changing.images[2].onload();
+      assert(pending.loaded === 1 && pending.failedCount === 0, 'the restored original must clear the failure');
+    }
+    assert(pending.grid.children.length === 1 && pending.grid.children[0] === cell && pending.cacheImages[0].src === unsigned,
+      'reselecting a destination must keep the same cell and cache URL');
+  }
 
   const rescue = createRun({ ordinaryHostConcurrency: 1 });
   rescue.loader.recordDomainSuccess(live + attachment(0));
@@ -11576,12 +13205,25 @@ function checkReadyImageQueue() {
   mirrorFailure.images[1].onerror();
   assert(mirrorFailure.images.length === 2 && mirrorFailureThread.failedCount === 1 && mirrorFailure.loader.getActive() === 0,
     'a failed mirror must not ping-pong between hosts or settle the image more than once');
+  for (let i = 0; i < 2; i++) {
+    const src = dead + attachment(i);
+    mirrorFailure.loader.recordTaskImageFailure({ candidates: [{ src }], idx: 0, readyImageQueue: true },
+      src, 'direct_fail', true);
+  }
+  const failedCell = mirrorFailureThread.grid.children[0];
+  failedCell.onclick();
+  assert(mirrorFailure.images[2].src === dead + attachment(4),
+    'a manual retry must return to the original URL even while it is marked temporarily unavailable');
+  mirrorFailure.images[2].onload();
+  assert(mirrorFailureThread.loaded === 1 && mirrorFailureThread.failedCount === 0 &&
+    mirrorFailureThread.grid.children[0] === failedCell,
+    'manual recovery of the original must update the existing cell and failure count');
 }
 
 function checkLoaderViewportRegistrationBudget() {
-  let pendingCount = 0;
   const candidates = [];
   const thread = {
+    id: 't1',
     generation: 0,
     panel: {},
     container: {},
@@ -11589,16 +13231,18 @@ function checkLoaderViewportRegistrationBudget() {
     firstTasks: [],
     firstTaskOffset: 0,
     firstScreenDone: true,
+    viewportBand: 3,
     resources: {}
   };
   const run = createLoaderSchedulingSandbox({
     backgroundConcurrency: 1,
     firstScreenConcurrency: 1,
     viewportPendingLimit: 6,
+    autoLoadOffscreenFirstRows: true,
     heavyImageOptimization: false,
     gridCols: 5,
     visibleRows: 2
-  }, { t1: thread }, function() { return pendingCount; });
+  }, { t1: thread }, function() { return 0; });
   const blocker = {
     candidates: [{ src: 'https://img.example/blocker.jpg' }],
     idx: 0,
@@ -11607,7 +13251,6 @@ function checkLoaderViewportRegistrationBudget() {
     queuedAt: Date.now()
   };
   assert(run.loader.acquireSlot(blocker), 'loader viewport registration test must occupy the only network slot');
-  const started = [];
   for (let i = 0; i < 5; i++) {
     candidates.push({ src: 'https://img.example/lazy-' + i + '.jpg' });
     run.loader.getBgTasks().push({
@@ -11620,105 +13263,80 @@ function checkLoaderViewportRegistrationBudget() {
       queuedAt: Date.now()
     });
   }
-  run.loader.globalLoadImage = function(task) {
-    assert(task.viewportRegistration === true, 'background viewport registration mode must be fixed before wrapper creation');
-    started.push(task.id);
-    pendingCount++;
-  };
   run.loader.processBgTasks();
-  assert(started.length === 5, 'loader viewport registration must batch lazy wrappers even while the network slot is occupied');
-  assert(pendingCount === 5, 'loader viewport registration must account each staged wrapper against the public pending budget');
-  assert(run.loader.getActive() === 1, 'loader viewport registration must not consume or bypass additional network slots');
+  assert(run.loader.getBgTasks().length === 0, 'loader must drain legacy BG_TASKS into the owning thread scheduler queue');
+  assert(thread.__schedQueue && thread.__schedQueue.tasks.length === 5, 'blocked background tasks must stay lightweight in JS without creating empty DOM wrappers');
+  assert(run.loader.getActive() === 1, 'blocked background tasks must not consume or bypass additional network slots');
   run.loader.releaseSlot(blocker);
 }
 
 function checkLoaderFirstScreenPendingBudget() {
-  let pendingCount = 0;
-  const registeredTasks = [];
   const thread = makeLoaderSchedulingThread('farBulk', 4000, 500);
   const run = createLoaderSchedulingSandbox({
     backgroundConcurrency: 1,
     firstScreenConcurrency: 3,
     viewportPendingLimit: 12,
+    autoLoadOffscreenFirstRows: false,
     heavyImageOptimization: false
-  }, { farBulk: thread }, function() { return pendingCount; });
-  run.loader.globalLoadImage = function(task) {
-    assert(task.viewportRegistration === true, 'offscreen first-screen tasks must stay on the slot-safe viewport registration path');
-    registeredTasks.push(task);
-    pendingCount++;
-  };
+  }, { farBulk: thread }, function() { return 0; });
+  const policy12 = run.sandbox.ATPLoadPolicy.getViewportPendingLimit(run.sandbox.ATPState.settings, 1);
+  assert(policy12 === 12, 'configured viewportPendingLimit must remain authoritative in loading policy');
   run.loader.roundRobinSchedule();
-  assert(pendingCount === 12, 'offscreen first-screen registration must stop exactly at the public pending limit');
-  assert(thread.firstTaskOffset === 12, 'offscreen first-screen queues must retain tasks beyond the pending high-water mark');
+  assert(thread.firstTaskOffset === 500 && thread.__schedQueue.tasks.length === 500, 'offscreen first-screen tasks must stay parked in the thread queue without DOM wrapper bloat when autoLoadOffscreenFirstRows is false');
+  assert(run.loader.getActive() === 0, 'parked offscreen first-screen tasks must not consume network slots');
   const admittedFirstTasks = [];
   for (let i = 0; i < 3; i++) {
-    registeredTasks[i].viewportPriority = true;
-    if (run.loader.acquireSlot(registeredTasks[i])) admittedFirstTasks.push(registeredTasks[i]);
+    const t = thread.__schedQueue.tasks[i];
+    t.viewportPriority = true;
+    t.currentlyVisible = true;
+    if (run.loader.acquireSlot(t)) admittedFirstTasks.push(t);
   }
-  assert(admittedFirstTasks.length === 3, 'visible first-screen tasks originating from viewport pending must retain first-screen concurrency instead of degrading to background concurrency');
+  assert(admittedFirstTasks.length === 3, 'visible first-screen tasks must retain first-screen concurrency instead of degrading to background concurrency');
   admittedFirstTasks.forEach(function(task) { run.loader.releaseSlot(task); });
 
-  let automaticPendingCount = 0;
-  const automaticThread = makeLoaderSchedulingThread('farAutomatic', 4000, 500);
-  const automaticRun = createLoaderSchedulingSandbox({
+  const autoLimit = run.sandbox.ATPLoadPolicy.getViewportPendingLimit({
     backgroundConcurrency: 1,
     firstScreenConcurrency: 20,
     viewportPendingLimit: 0,
     gridCols: 5,
     visibleRows: 2,
     heavyImageOptimization: false
-  }, { farAutomatic: automaticThread }, function() { return automaticPendingCount; });
-  automaticRun.loader.globalLoadImage = function() { automaticPendingCount++; };
-  automaticRun.loader.roundRobinSchedule();
-  assert(automaticPendingCount === 30, 'automatic viewport pending limit must be derived once from background policy even when first-screen concurrency is much larger');
-  assert(automaticThread.firstTaskOffset === 30, 'automatic first-screen registration must not exceed the same pending limit used by background scheduling');
+  }, 1);
+  assert(autoLimit === 30, 'automatic viewport pending limit must be derived from background policy even when first-screen concurrency is much larger');
 }
 
 function checkLoaderBackgroundOrdinaryPromotion() {
-  const started = [];
-  const sandbox = {
-    console: console,
-    URL: URL,
-    TextDecoder: TextDecoder,
-    addEventListener: function() {},
-    removeEventListener: function() {},
-    setTimeout: function() { return 1; },
-    clearTimeout: function() {},
-    document: {
-      visibilityState: 'visible',
-      addEventListener: function() {},
-      removeEventListener: function() {},
-      contains: function() { return true; }
-    },
-    SharedUtils: {
-      isHeavyImageHost: loadSharedUtils().isHeavyImageHost,
-      prepareArticleExtractionContext: loadSharedUtils().prepareArticleExtractionContext.bind(loadSharedUtils()),
-      getImageDisplaySrc: function(imgData) { return imgData && imgData.src; },
-      getImagePreviewSrc: function(imgData) { return imgData && (imgData.previewSrc || imgData.src); }
-    },
-    Logger: {
-      event: function() {},
-      debug: function() {},
-      warn: function() {},
-      error: function() {}
-    }
+  const images = [];
+  const thread = {
+    id: 't1',
+    generation: 0,
+    panel: {},
+    container: {},
+    grid: createVerifyElement('atp-thumbnail-container'),
+    candidates: [],
+    firstTasks: [],
+    firstTaskOffset: 0,
+    firstScreenTotal: 0,
+    firstScreenDone: true,
+    viewportBand: 1,
+    resources: {}
   };
-  sandbox.window = sandbox;
-  sandbox.ATPState = {
-    settings: {
-      backgroundConcurrency: 3,
-      firstScreenConcurrency: 3,
-      heavyImageOptimization: true,
-      heavyImageConcurrency: 1
-    },
-    threads: {
-      t1: { generation: 0, panel: {}, container: {} }
+  const run = createLoaderSchedulingSandbox({
+    backgroundConcurrency: 3,
+    firstScreenConcurrency: 3,
+    heavyImageOptimization: true,
+    heavyImageConcurrency: 1
+  }, { t1: thread }, function() { return 0; });
+  run.sandbox.document.createElement = function(tagName) {
+    const lower = String(tagName || '').toLowerCase();
+    if (lower === 'img') {
+      const img = createVerifyImageElement();
+      images.push(img);
+      return img;
     }
+    return createVerifyElement('');
   };
-  vm.createContext(sandbox);
-  vm.runInContext(read('loading-policy.js'), sandbox, { filename: 'loading-policy.js' });
-  vm.runInContext(runtimeForVerify('loader.js'), sandbox, { filename: 'loader.js' });
-  const loader = sandbox.ATPLoader;
+  const loader = run.loader;
   function makeTask(id, src) {
     return {
       id: id,
@@ -11726,6 +13344,8 @@ function checkLoaderBackgroundOrdinaryPromotion() {
       idx: 0,
       threadId: 't1',
       generation: 0,
+      grid: thread.grid,
+      isFirstScreen: true,
       queuedAt: Date.now()
     };
   }
@@ -11736,13 +13356,10 @@ function checkLoaderBackgroundOrdinaryPromotion() {
     queue.push(makeTask('heavy-' + i, 'https://image.imx.to/deferred-' + i + '.jpg'));
   }
   queue.push(makeTask('ordinary', 'https://img.example/ordinary.jpg'));
-  loader.globalLoadImage = function(task) {
-    started.push(task.id);
-  };
   loader.processBgTasks();
-  assert(started.indexOf('ordinary') !== -1, 'background scheduler must promote ordinary tasks blocked behind deferred heavy tasks');
-  assert(started[0] === 'ordinary', 'background scheduler must start the promoted ordinary task before deferred heavy tasks');
-  loader.releaseSlot(activeHeavy);
+  assert(images.length === 1 && images[0].src === 'https://img.example/ordinary.jpg',
+    'scheduler must promote ordinary tasks blocked behind 60 deferred heavy tasks without stalling');
+  loader.teardownActiveSlots('verify_done');
 }
 
 function checkLoaderMixedHeavyBackgroundDeferral() {
@@ -11866,42 +13483,32 @@ function checkLoaderOrdinaryBackgroundBatchRefill() {
   statusFrames.shift()();
   assert(statusWrites === 1, 'a queued progress update must skip the previous page generation');
 
-  let pendingCount = 0;
-  const viewport = { scrollTop: 0, clientHeight: 200, scrollHeight: 600, style: { maxHeight: '200px' } };
-  const pendingThread = Object.assign({}, thread, {
-    id: 'ordinary-pending-batch', grid: { parentNode: viewport },
+  const collapsedThread = Object.assign({}, thread, {
+    id: 'ordinary-collapsed-batch',
+    grid: createVerifyElement('atp-thumbnail-container'),
     statusEl: { textContent: '' }, nextIdx: 10, loaded: 10, failedCount: 0,
-    bgQueued: false, bgQueueActive: false, bgBatchPending: 0
+    bgQueued: false, bgQueueActive: false, bgBatchPending: 0,
+    backgroundUnlocked: false
   });
-  const pendingRun = createLoaderSchedulingSandbox({
+  const collapsedRun = createLoaderSchedulingSandbox({
     backgroundConcurrency: 3, firstScreenConcurrency: 3,
     maxImagesPerPost: 30, maxDisplayPerPost: 30, heavyImageOptimization: false
-  }, { 'ordinary-pending-batch': pendingThread }, function() { return pendingCount; });
-  pendingRun.loader.scheduleBgQueue = function() {};
-  const registered = [];
-  pendingRun.loader.globalLoadImage = function(task) {
-    registered.push(task);
-    pendingCount++;
-  };
-  pendingRun.loader.enqueueBgForThread(pendingThread.id);
-  pendingRun.loader.processBgTasks();
-  assert(registered.length === 6 && pendingCount === 6 &&
-    pendingThread.bgQueueActive === false && pendingThread.nextIdx === 16 &&
-    pendingRun.loader.getBgTasks().length === 0,
-    'ordinary batch must release after wrapper registration even when no image has settled');
-  pendingRun.loader.enqueueBgForThread(pendingThread.id);
-  assert(pendingThread.nextIdx === 16, 'ordinary background must stay bounded while the internal viewport is far from its staged tail');
-  viewport.scrollTop = 330;
-  pendingRun.loader.enqueueBgForThread(pendingThread.id);
-  assert(pendingThread.nextIdx === 22 && pendingRun.loader.getBgTasks().length === 6,
-    'scrolling near the staged tail must enqueue the next ordinary batch despite slow pending images');
+  }, { 'ordinary-collapsed-batch': collapsedThread }, function() { return 0; });
+  collapsedRun.loader.scheduleBgQueue = function() {};
+  collapsedRun.loader.globalSchedule = function() {};
+  collapsedRun.loader.enqueueBgForThread(collapsedThread.id);
+  assert(collapsedThread.nextIdx === 10 && collapsedRun.loader.getBgTasks().length === 0,
+    'collapsed inline gallery must stay bounded at firstScreenTotal until unlocked');
+  collapsedRun.loader.unlockThreadBackground(collapsedThread.id);
+  assert(collapsedThread.backgroundUnlocked === true && collapsedThread.nextIdx === 16,
+    'expanding an inline gallery must unlock and enqueue the next bounded batch');
 }
 
 function checkLoaderBackgroundIdleCleanup() {
   function makeSandbox(backgroundSpeed) {
     const timers = [];
-    const idleCallbacks = [];
-    const canceledIdleIds = [];
+    const rafCallbacks = [];
+    const canceledRafIds = [];
     const sandbox = {
       console: console,
       URL: URL,
@@ -11915,24 +13522,25 @@ function checkLoaderBackgroundIdleCleanup() {
       clearTimeout: function(id) {
         if (timers[id - 1]) timers[id - 1].cleared = true;
       },
-      requestIdleCallback: function(callback, options) {
-        const item = { callback: callback, options: options, canceled: false };
-        idleCallbacks.push(item);
-        return idleCallbacks.length;
+      requestAnimationFrame: function(callback) {
+        const item = { callback: callback, canceled: false };
+        rafCallbacks.push(item);
+        return rafCallbacks.length;
       },
-      cancelIdleCallback: function(id) {
-        canceledIdleIds.push(id);
-        if (idleCallbacks[id - 1]) idleCallbacks[id - 1].canceled = true;
+      cancelAnimationFrame: function(id) {
+        canceledRafIds.push(id);
+        if (rafCallbacks[id - 1]) rafCallbacks[id - 1].canceled = true;
       },
       document: {
         visibilityState: 'visible',
         addEventListener: function() {},
         removeEventListener: function() {},
-        contains: function() { return true; }
+        contains: function() { return true; },
+        createElement: function() { return createVerifyElement(''); }
       },
       SharedUtils: {
-      isHeavyImageHost: loadSharedUtils().isHeavyImageHost,
-      prepareArticleExtractionContext: loadSharedUtils().prepareArticleExtractionContext.bind(loadSharedUtils()),
+        isHeavyImageHost: loadSharedUtils().isHeavyImageHost,
+        prepareArticleExtractionContext: loadSharedUtils().prepareArticleExtractionContext.bind(loadSharedUtils()),
         getImageDisplaySrc: function(imgData) { return imgData && imgData.src; },
         getImagePreviewSrc: function(imgData) { return imgData && (imgData.previewSrc || imgData.src); },
         normalizeImageUrl: function(url) { return String(url || '').split('#')[0]; }
@@ -11955,7 +13563,7 @@ function checkLoaderBackgroundIdleCleanup() {
         visibleRows: 2
       },
       threads: {
-        t1: { generation: 0, panel: {}, container: {} }
+        t1: { id: 't1', generation: 0, panel: {}, container: {}, candidates: [] }
       }
     };
     sandbox.ATPViewport = {
@@ -11969,8 +13577,8 @@ function checkLoaderBackgroundIdleCleanup() {
     return {
       loader: sandbox.ATPLoader,
       timers: timers,
-      idleCallbacks: idleCallbacks,
-      canceledIdleIds: canceledIdleIds
+      rafCallbacks: rafCallbacks,
+      canceledRafIds: canceledRafIds
     };
   }
   function pushBackgroundTask(loader, id) {
@@ -11987,28 +13595,24 @@ function checkLoaderBackgroundIdleCleanup() {
   const fastRun = makeSandbox('fast');
   const loader = fastRun.loader;
   const timers = fastRun.timers;
-  const idleCallbacks = fastRun.idleCallbacks;
-  const canceledIdleIds = fastRun.canceledIdleIds;
   pushBackgroundTask(loader, 'clear-bg-tasks');
   loader.scheduleBgQueue();
-  assert(timers.length === 1 && timers[0].delay === 100, 'loader clearBgTasks test must schedule the background delay timer first');
+  assert(timers.length === 1 && timers[0].delay === 100, 'loader clearBgTasks test must schedule the P3 background delay timer first');
   loader.clearBgTasks();
-  assert(timers[0].cleared, 'loader clearBgTasks must cancel a pending ordinary background timer');
+  assert(timers[0].cleared, 'loader clearBgTasks must cancel a pending P3 background timer');
   pushBackgroundTask(loader, 'idle-cleanup');
   loader.scheduleBgQueue();
   assert(timers.length === 2 && timers[1].delay === 100 && !timers[1].cleared, 'loader clearBgTasks must let new background work schedule a fresh timer immediately');
   timers[1].callback();
-  assert(idleCallbacks.length === 1, 'loader idle cleanup test must create an idle callback after the background delay');
-  assert(idleCallbacks[0].options && idleCallbacks[0].options.timeout === 100, 'loader idle cleanup test must keep fast background idle timeout aligned with the configured speed');
+  assert(fastRun.rafCallbacks.length === 1, 'P3 timer must request a coalesced frame-friendly schedule pass');
   loader.pause();
-  assert(canceledIdleIds.length === 1 && canceledIdleIds[0] === 1, 'loader pause must cancel a pending background idle callback');
-  assert(idleCallbacks[0].canceled, 'loader idle cleanup test must mark the pending idle callback as canceled');
+  assert(fastRun.canceledRafIds.length === 1 && fastRun.rafCallbacks[0].canceled, 'loader pause must cancel a pending coalesced schedule pass');
   const speedCases = [
-    { speed: 'extreme', delay: 20, idleTimeout: 100 },
-    { speed: 'veryfast', delay: 50, idleTimeout: 100 },
-    { speed: 'fast', delay: 100, idleTimeout: 100 },
-    { speed: 'normal', delay: 300, idleTimeout: 100 },
-    { speed: 'slow', delay: 800, idleTimeout: 100 }
+    { speed: 'extreme', delay: 20 },
+    { speed: 'veryfast', delay: 50 },
+    { speed: 'fast', delay: 100 },
+    { speed: 'normal', delay: 300 },
+    { speed: 'slow', delay: 800 }
   ];
   for (const item of speedCases) {
     const run = makeSandbox(item.speed);
@@ -12016,9 +13620,9 @@ function checkLoaderBackgroundIdleCleanup() {
     run.loader.scheduleBgQueue();
     assert(run.timers.length === 1 && run.timers[0].delay === item.delay, 'loader background delay must follow ' + item.speed + ' speed');
     run.timers[0].callback();
-    assert(run.idleCallbacks.length === 1, 'loader background idle speed matrix must create an idle callback for ' + item.speed);
-    assert(run.idleCallbacks[0].options && run.idleCallbacks[0].options.timeout === item.idleTimeout, 'loader background idle timeout must follow the short floor for ' + item.speed);
+    assert(run.rafCallbacks.length === 1, 'loader background speed matrix must schedule a coalesced pass for ' + item.speed);
     run.loader.pause();
+    assert(run.rafCallbacks[0].canceled, 'loader pause must cancel pending schedule pass for ' + item.speed);
   }
 }
 
@@ -12082,11 +13686,17 @@ function checkViewportHeavyObserverBudgetBatching() {
   const timers = [];
   const idleCallbacks = [];
   const observers = [];
+  let nowMs = 10000;
+  const MockDate = {
+    now: function() { return nowMs; }
+  };
   const sandbox = {
     console: console,
-    Date: Date,
+    Date: MockDate,
     Map: Map,
+    Set: Set,
     Math: Math,
+    Promise: Promise,
     setTimeout: function(callback, delay) {
       timers.push({ callback: callback, delay: delay, cleared: false });
       return timers.length;
@@ -12104,6 +13714,8 @@ function checkViewportHeavyObserverBudgetBatching() {
     document: {
       visibilityState: 'visible',
       documentElement: { clientHeight: 1000 },
+      addEventListener: function() {},
+      removeEventListener: function() {},
       contains: function() { return true; },
       createElement: function(tagName) {
         const lowerTag = String(tagName || '').toLowerCase();
@@ -12130,13 +13742,17 @@ function checkViewportHeavyObserverBudgetBatching() {
       getAvailableSlots: function() { return 1; },
       getTaskImageSrc: function(task) { return task.candidates[task.idx].src; },
       getImageMetrics: function(img) { return { naturalWidth: img.naturalWidth, naturalHeight: img.naturalHeight }; },
-      isHeavyChannelTask: function() { return true; }
+      isHeavyChannelTask: function() { return true; },
+      requestSchedule: function() {},
+      globalSchedule: function() {}
     },
     ATPState: {
       settings: {
         pauseWhenHidden: true,
         heavyImageOptimization: true,
-        heavyThumbnailClarity: 'balanced'
+        heavyThumbnailClarity: 'balanced',
+        heavyDecodedImageLimit: 1,
+        heavyDecodedBudgetMP: 2
       },
       threads: {
         heavy: { heavyMode: true, candidates: [{ src: 'https://img.example/heavy-observer.jpg' }] }
@@ -12144,21 +13760,21 @@ function checkViewportHeavyObserverBudgetBatching() {
     }
   };
   sandbox.window = sandbox;
+  sandbox.globalThis = sandbox;
   sandbox.window.innerHeight = 1000;
   vm.createContext(sandbox);
   vm.runInContext(read('loading-policy.js'), sandbox, { filename: 'loading-policy.js' });
-  const source = read('viewport-observer.js')
+  vm.runInContext(read('viewport-observer.js'), sandbox, { filename: 'viewport-observer.js' });
+  const heavySource = read('heavy-budget.js')
     .replace(
-      'function getHeavyRenderSnapshot() {',
-      "function getHeavyRenderSnapshot() {\n    window.__heavySnapshotCount = (window.__heavySnapshotCount || 0) + 1;"
+      'function collectSinglePassBudgetState() {',
+      'function collectSinglePassBudgetState() {\n    root.__heavySnapshotCount = (root.__heavySnapshotCount || 0) + 1;'
     );
-  vm.runInContext(source, sandbox, { filename: 'viewport-observer.js' });
+  vm.runInContext(heavySource, sandbox, { filename: 'heavy-budget.js' });
 
   function makeHeavyWrapper(id) {
     const wrapper = createVerifyElement('atp-thumb-wrapper');
-    let visible = true;
     wrapper.getBoundingClientRect = function() {
-      if (!visible) return { top: 5000, bottom: 5110, height: 110 };
       return { top: 20 + id * 120, bottom: 130 + id * 120, height: 110 };
     };
     const img = createVerifyImageElement();
@@ -12168,66 +13784,72 @@ function checkViewportHeavyObserverBudgetBatching() {
     img.clientWidth = 110;
     img.clientHeight = 82;
     img.src = 'https://img.example/heavy-observer-' + id + '.jpg';
+    wrapper.appendChild(img);
     const task = {
       candidates: [{ src: img.src }],
-      idx: 0,
+      idx: id,
       threadId: 'heavy',
       generation: 0,
-      isFirstScreen: false
+      isFirstScreen: false,
+      currentlyVisible: true
     };
-    return {
-      wrapper: wrapper,
-      img: img,
-      task: task,
-      setVisible: function(nextVisible) { visible = !!nextVisible; }
-    };
+    return { wrapper: wrapper, img: img, task: task };
   }
 
   const loaded = makeHeavyWrapper(0);
-  sandbox.ATPViewport.monitorLoadedHeavyImage(loaded.wrapper, loaded.img, loaded.task);
-  assert(observers.length > 0 && observers[0].targets.indexOf(loaded.wrapper) !== -1, 'viewport heavy observer batching test must observe the heavy wrapper');
-  sandbox.__heavySnapshotCount = 0;
-  timers.length = 0;
-
-  observers[0].callback([{ target: loaded.wrapper, isIntersecting: true }]);
-  observers[0].callback([{ target: loaded.wrapper, isIntersecting: true }]);
-  assert(sandbox.__heavySnapshotCount === 0, 'heavy render observer must not run full budget snapshots synchronously');
-  assert(timers.length === 1 && timers[0].delay === 0, 'heavy render observer callbacks must coalesce one immediate budget timer');
-  timers[0].callback();
-  assert(sandbox.__heavySnapshotCount > 0, 'heavy render observer budget timer must run the deferred budget snapshot');
-
   const firstUnloaded = makeHeavyWrapper(1);
   const secondUnloaded = makeHeavyWrapper(2);
+  sandbox.ATPViewport.monitorLoadedHeavyImage(loaded.wrapper, loaded.img, loaded.task);
   sandbox.ATPViewport.monitorLoadedHeavyImage(firstUnloaded.wrapper, firstUnloaded.img, firstUnloaded.task);
   sandbox.ATPViewport.monitorLoadedHeavyImage(secondUnloaded.wrapper, secondUnloaded.img, secondUnloaded.task);
-  assert(
+  assert(observers.length === 3 && observers[0].targets.indexOf(loaded.wrapper) !== -1 &&
     observers[0].targets.indexOf(firstUnloaded.wrapper) !== -1 &&
-      observers[0].targets.indexOf(secondUnloaded.wrapper) !== -1,
-    'viewport heavy observer batching test must observe multiple heavy wrappers'
-  );
-  firstUnloaded.setVisible(false);
-  secondUnloaded.setVisible(false);
-  timers.length = 0;
-  observers[0].callback([
-    { target: firstUnloaded.wrapper, isIntersecting: false },
-    { target: secondUnloaded.wrapper, isIntersecting: false }
-  ]);
-  assert(sandbox.ATPViewport.getHeavyUnloadedCount() === 0, 'heavy exit unloading must wait for the debounce window');
-  for (let ti = 0; ti < timers.length; ti++) {
-    if (!timers[ti].cleared) timers[ti].callback();
+    observers[0].targets.indexOf(secondUnloaded.wrapper) !== -1,
+    'viewport heavy observer batching must register heavy wrappers on the 3 static band observers');
+
+  while (idleCallbacks.length) {
+    const ic = idleCallbacks.shift();
+    if (!ic.canceled) ic.callback({ timeRemaining: function() { return 20; } });
   }
+  return Promise.resolve().then(function() {
+    timers.length = 0;
+    sandbox.__heavySnapshotCount = 0;
 
-  assert(sandbox.ATPViewport.getHeavyUnloadedCount() >= 2, 'heavy exit debounce must unload wrappers still outside the restore range');
+    // Move firstUnloaded & secondUnloaded out of band 0 and band 1 (into band 2/3 offscreen)
+    observers[0].callback([
+      { target: firstUnloaded.wrapper, isIntersecting: false },
+      { target: secondUnloaded.wrapper, isIntersecting: false }
+    ]);
+    observers[1].callback([
+      { target: firstUnloaded.wrapper, isIntersecting: false },
+      { target: secondUnloaded.wrapper, isIntersecting: false }
+    ]);
+    assert(sandbox.__heavySnapshotCount === 0, 'heavy band exit must not run budget snapshots synchronously');
+    assert(sandbox.ATPViewport.getHeavyUnloadedCount() === 0, 'heavy exit unloading must wait for the 300ms debounce window');
 
-  firstUnloaded.setVisible(true);
-  secondUnloaded.setVisible(true);
-  sandbox.__heavySnapshotCount = 0;
-  timers.length = 0;
-  observers[0].callback([
-    { target: firstUnloaded.wrapper, isIntersecting: true },
-    { target: secondUnloaded.wrapper, isIntersecting: true }
-  ]);
-  assert(sandbox.__heavySnapshotCount === 1, 'heavy render observer must reuse one budget snapshot for a batch of unloaded restore entries');
+    nowMs += 350;
+    for (let ti = 0; ti < timers.length; ti++) {
+      if (!timers[ti].cleared) {
+        timers[ti].cleared = true;
+        timers[ti].callback();
+      }
+    }
+    assert(sandbox.ATPViewport.getHeavyUnloadedCount() >= 2, 'heavy exit debounce must unload offscreen wrappers exceeding budget');
+
+    // Re-enter band 0 together: must coalesce into ONE 0ms budget timer and ONE snapshot pass
+    sandbox.__heavySnapshotCount = 0;
+    timers.length = 0;
+    observers[0].callback([
+      { target: firstUnloaded.wrapper, isIntersecting: true },
+      { target: secondUnloaded.wrapper, isIntersecting: true }
+    ]);
+    assert(sandbox.__heavySnapshotCount === 0, 'heavy band enter must coalesce asynchronously instead of running synchronously');
+    const zeroTimers = timers.filter(function(t) { return !t.cleared && t.delay === 0; });
+    assert(zeroTimers.length === 1, 'heavy band enter batch must coalesce into a single 0ms budget timer');
+    zeroTimers[0].cleared = true;
+    zeroTimers[0].callback();
+    assert(sandbox.__heavySnapshotCount === 1, 'heavy budget timer must run a single budget snapshot for a batch of re-entering wrappers');
+  });
 }
 
 function createViewportRetrySandbox(options) {
@@ -12235,6 +13857,7 @@ function createViewportRetrySandbox(options) {
   const observers = [];
   let rectReads = 0;
   let availableSlots = options.availableSlots === undefined ? 2 : options.availableSlots;
+  let consumeSlotsOnStart = !!options.consumeSlotsOnStart;
   let paused = !!options.paused;
   let acquireCount = 0;
   const acquireMarkers = [];
@@ -12244,6 +13867,7 @@ function createViewportRetrySandbox(options) {
     console: console,
     Date: Date,
     Map: Map,
+    Set: Set,
     Math: Math,
     setTimeout: function(callback, delay) {
       timers.push({ callback: callback, delay: delay, cleared: false });
@@ -12255,6 +13879,8 @@ function createViewportRetrySandbox(options) {
     document: {
       visibilityState: options.visibilityState || 'visible',
       documentElement: { clientHeight: 1000 },
+      addEventListener: function() {},
+      removeEventListener: function() {},
       contains: function(node) { return !(node && node.detached); }
     },
     IntersectionObserver: function(callback, observerOptions) {
@@ -12274,10 +13900,15 @@ function createViewportRetrySandbox(options) {
       isTaskCurrent: function() { return true; },
       shouldSkipDomain: function() { return false; },
       getAvailableSlots: function() { return availableSlots; },
-      acquireSlot: function(task) {
+      startViewportWrapperLoad: function(wrapper, wrapperData) {
+        if (availableSlots <= 0) return false;
         acquireCount++;
-        acquireMarkers.push(task && task.verifyMarker);
-        return false;
+        acquireMarkers.push(wrapperData && wrapperData.task && wrapperData.task.verifyMarker);
+        if (consumeSlotsOnStart) {
+          availableSlots--;
+          return true;
+        }
+        return !!options.startSucceeds;
       },
       handleDetachedViewportTask: function() {
         detachedRecoveryCount++;
@@ -12293,6 +13924,7 @@ function createViewportRetrySandbox(options) {
     }
   };
   sandbox.window = sandbox;
+  sandbox.globalThis = sandbox;
   sandbox.window.innerHeight = 1000;
   vm.createContext(sandbox);
   vm.runInContext(read('loading-policy.js'), sandbox, { filename: 'loading-policy.js' });
@@ -12346,79 +13978,39 @@ function checkViewportPendingRetryBounds() {
   assert(actualOnly.getAcquireCount() === 0, 'actual-only retry must not let near/offscreen pending tasks compete for a freshly released slot');
   const actuallyVisible = actualOnly.observeWrapper(100);
   actualOnly.setPaused(true);
-  actualOnly.observers[1].callback([{ target: actuallyVisible, isIntersecting: true }]);
+  actualOnly.observers[0].callback([{ target: actuallyVisible, isIntersecting: true }]);
   actualOnly.setPaused(false);
   actualOnly.sandbox.ATPViewport.retryActualVisiblePending();
   assert(actualOnly.getAcquireMarkers().join(',') === '100', 'actual-only retries must attempt the true viewport entry without scanning offscreen wrappers');
+
+  // Once IntersectionObserver has delivered its first callback, retryVisiblePending must read ZERO getBoundingClientRect!
   const scanSandbox = createViewportRetrySandbox({ availableSlots: 2 });
-  for (let i = 0; i < 500; i++) {
+  const seed = scanSandbox.observeWrapper(1300);
+  scanSandbox.observers[0].callback([{ target: seed, isIntersecting: false }]);
+  for (let i = 1; i < 500; i++) {
     scanSandbox.observeWrapper(1300 + i);
   }
   scanSandbox.resetRectReads();
   scanSandbox.sandbox.ATPViewport.retryVisiblePending();
-  assert(scanSandbox.getRectReads() <= 12, 'viewport visible pending retry must bound layout reads by scanLimit');
-
-  const sharedRootScan = createViewportRetrySandbox({ availableSlots: 0 });
-  let sharedRootReads = 0;
-  let sharedRootTop = 0;
-  const sharedRoot = {
-    getBoundingClientRect: function() {
-      sharedRootReads++;
-      return { top: sharedRootTop, bottom: sharedRootTop + 400 };
-    }
-  };
-  for (let i = 0; i < 10; i++) sharedRootScan.observeWrapper(110 + i * 20, sharedRoot);
-  sharedRootReads = 0;
-  sharedRootScan.sandbox.ATPViewport.retryVisiblePending();
-  assert(sharedRootReads === 1, 'one read-only retry pass must share the root rect across all ten pending thumbnails');
-  sharedRootTop = 2000;
-  sharedRootReads = 0;
-  sharedRootScan.sandbox.ATPViewport.retryVisiblePending();
-  assert(sharedRootReads === 1, 'a later pass must read the moved root again');
-
-  let retryCallbacks = 0;
-  while (retryCallbacks < 80) {
-    const pendingTimers = scanSandbox.getPendingTimers();
-    if (!pendingTimers.length) break;
-    pendingTimers[0].cleared = true;
-    retryCallbacks++;
-    pendingTimers[0].callback();
-  }
-  assert(retryCallbacks > 0 && retryCallbacks < 80, 'viewport visible pending retry must stop self-scheduling after an empty full sweep');
-  assert(scanSandbox.getPendingTimers().length === 0, 'viewport visible pending retry must not leave an empty-sweep retry timer pending');
+  assert(scanSandbox.getRectReads() === 0, 'viewport visible pending retry must perform zero getBoundingClientRect reads after IO is active');
 
   const actualTailSandbox = createViewportRetrySandbox({ availableSlots: 2 });
+  const tailSeed = actualTailSandbox.observeWrapper(1300);
+  actualTailSandbox.observers[0].callback([{ target: tailSeed, isIntersecting: false }]);
   let actualTailWrapper = null;
-  for (let i = 0; i < 500; i++) {
+  for (let i = 1; i < 500; i++) {
     actualTailWrapper = actualTailSandbox.observeWrapper(1300 + i);
   }
   actualTailSandbox.resetRectReads();
-  actualTailSandbox.observers[1].callback([{ target: actualTailWrapper, isIntersecting: true }]);
-  assert(actualTailSandbox.getAcquireMarkers()[0] === 1799, 'true viewport observer must dispatch a tail pending wrapper directly without rotating through the pending Map');
-  assert(actualTailSandbox.getRectReads() <= 2, 'true viewport dispatch must not scan hundreds of offscreen pending wrappers');
-
-  const resetSandbox = createViewportRetrySandbox({ availableSlots: 2 });
-  for (let i = 0; i < 500; i++) {
-    resetSandbox.observeWrapper(1300 + i);
-  }
-  resetSandbox.sandbox.ATPViewport.retryVisiblePending();
-  for (let i = 0; i < 40; i++) {
-    const pendingTimers = resetSandbox.getPendingTimers();
-    assert(pendingTimers.length === 1, 'viewport visible pending retry reset test must keep a retry timer before clearing');
-    pendingTimers[0].cleared = true;
-    pendingTimers[0].callback();
-  }
-  resetSandbox.sandbox.ATPViewport.clearPendingRetryTimers();
-  assert(resetSandbox.getPendingTimers().length === 0, 'viewport visible pending retry reset test must clear pending retry timers');
-  resetSandbox.sandbox.ATPViewport.retryVisiblePending();
-  assert(resetSandbox.getPendingTimers().length === 1, 'viewport visible pending retry reset test must not reuse stale empty-scan progress after timer cleanup');
+  actualTailSandbox.observers[0].callback([{ target: actualTailWrapper, isIntersecting: true }]);
+  actualTailSandbox.sandbox.ATPViewport.retryActualVisiblePending();
+  assert(actualTailSandbox.getAcquireMarkers()[0] === 1799, 'band-0 observer must mark a tail pending wrapper visible without rotating through offscreen items');
+  assert(actualTailSandbox.getRectReads() === 0, 'band-0 observer dispatch must perform zero getBoundingClientRect layout reads');
 
   const pruneCountSandbox = createViewportRetrySandbox({ availableSlots: 0 });
-  const detachedCountWrapper = pruneCountSandbox.observeWrapper(1300);
+  const detachedCountWrapper = pruneCountSandbox.observeWrapper(2300);
   assert(pruneCountSandbox.sandbox.ATPViewport.getPendingCount() === 1, 'viewport prune count test must start with one pending wrapper');
   detachedCountWrapper.detached = true;
-  const pruneClock = Date.now();
-  pruneCountSandbox.sandbox.Date = { now: function() { return pruneClock + 201; } };
   assert(pruneCountSandbox.sandbox.ATPViewport.getPendingCount() === 0, 'viewport pending count must prune detached wrappers before reporting size');
   assert(pruneCountSandbox.getDetachedRecoveryCount() === 1, 'detached current viewport tasks must be handed back to the loader instead of being silently dropped');
 
@@ -12431,85 +14023,49 @@ function checkViewportPendingRetryBounds() {
   assert(pruneRetrySandbox.getDetachedRecoveryCount() === 1, 'viewport visible retry pruning must recover a detached current task exactly once');
 
   const insideSandbox = createViewportRetrySandbox({ paused: true, availableSlots: 1 });
-  const inside = insideSandbox.observeWrapper(1100);
-  assert(insideSandbox.observers[0].options.rootMargin !== '0px', 'viewport retry test must drive the lazy observer, got ' + insideSandbox.observers[0].options.rootMargin);
-  insideSandbox.resetRectReads();
-  insideSandbox.observers[0].callback([{ target: inside, isIntersecting: true }]);
+  const inside = insideSandbox.observeWrapper(2300);
+  insideSandbox.observers[1].callback([{ target: inside, isIntersecting: true }]);
   insideSandbox.setPaused(false);
-  insideSandbox.sandbox.ATPViewport.retryPendingSlotLoads(1);
-  assert(insideSandbox.getAcquireCount() === 1, 'viewport slot retry must keep pending entries inside the lazy preload margin (acquire=' + insideSandbox.getAcquireCount() + ')');
+  insideSandbox.sandbox.ATPViewport.retryPendingSlotLoads();
+  assert(insideSandbox.getAcquireCount() === 1, 'viewport slot retry must dispatch pending entries inside the band-1/2 preload margin');
 
   const outsideSandbox = createViewportRetrySandbox({ paused: true, availableSlots: 1 });
-  const outside = outsideSandbox.observeWrapper(1300);
-  outsideSandbox.resetRectReads();
-  outsideSandbox.observers[0].callback([{ target: outside, isIntersecting: true }]);
+  const outside = outsideSandbox.observeWrapper(2300);
+  outsideSandbox.observers[2].callback([{ target: outside, isIntersecting: false }]);
   outsideSandbox.setPaused(false);
-  outsideSandbox.sandbox.ATPViewport.retryPendingSlotLoads(1);
-  assert(outsideSandbox.getAcquireCount() === 0, 'viewport slot retry must clear pending entries outside the lazy preload margin');
+  outsideSandbox.sandbox.ATPViewport.retryPendingSlotLoads();
+  assert(outsideSandbox.getAcquireCount() === 0, 'viewport slot retry must skip pending entries outside the band-2 preload margin');
 
-  const hiddenSandbox = createViewportRetrySandbox({ visibilityState: 'hidden', availableSlots: 20 });
+  const hiddenSandbox = createViewportRetrySandbox({ visibilityState: 'hidden', availableSlots: 20, consumeSlotsOnStart: true });
   for (let i = 0; i < 500; i++) {
-    hiddenSandbox.observeWrapper(1300 + i);
+    hiddenSandbox.observeWrapper(2300 + i);
   }
-  hiddenSandbox.sandbox.ATPViewport.loadPendingWhenHidden(2);
-  assert(hiddenSandbox.getAcquireCount() <= 6, 'viewport hidden pending drain must bound load attempts by the requested max loads');
+  const hiddenStarted = hiddenSandbox.sandbox.ATPViewport.loadPendingWhenHidden(2);
+  assert(hiddenStarted === 2 && hiddenSandbox.getAcquireCount() === 2, 'viewport hidden pending drain must bound load attempts to the requested max loads');
 }
 
 function checkViewportAdaptivePreloadAndShimmer() {
-  const run = createViewportRetrySandbox({ availableSlots: 0 });
-  const wrapper = run.observeWrapper(1600);
-  assert(run.observers[0].options.rootMargin === '200px 0px 200px 0px', 'viewport lazy observer must start with symmetric 200px margins');
-  assert(run.observers[1].options.rootMargin === '0px', 'actual-visibility observer must use the true clipped viewport without preload margins');
-
-  run.observers[1].callback([{ target: wrapper, isIntersecting: false }]);
-  assert(!wrapper.classList.contains('atp-loading-near-viewport'), 'offscreen pending placeholders must not be marked as on screen');
-  run.observers[1].callback([{ target: wrapper, isIntersecting: true }]);
-  assert(wrapper.classList.contains('atp-loading-near-viewport'), 'on-screen pending placeholders must be marked as on screen');
-
-  run.sandbox.ATPViewport.updateScrollPreload(0, 1000);
-  run.sandbox.ATPViewport.updateScrollPreload(500, 1100);
-  const fastDownObserver = run.observers[run.observers.length - 1];
-  assert(fastDownObserver.options.rootMargin === '200px 0px 1000px 0px', 'fast downward scrolling must expand only the forward preload margin');
-  assert(fastDownObserver.targets.indexOf(wrapper) !== -1, 'adaptive observer rebuild must retain pending wrappers');
-
-  run.sandbox.ATPViewport.resetScrollPreload();
-  const idleObserver = run.observers[run.observers.length - 1];
-  assert(idleObserver.options.rootMargin === '200px 0px 200px 0px', 'scroll idle must restore the symmetric base preload margin');
-  const stats = run.sandbox.ATPViewport.getPendingStats();
-  assert(stats.lazyViewportMode === 'idle' && stats.lazyViewportTopMarginPx === 200 && stats.lazyViewportBottomMarginPx === 200, 'viewport diagnostics must expose the restored adaptive preload state');
-
   const early = createViewportRetrySandbox({ availableSlots: 0 });
-  early.sandbox.ATPViewport.updateScrollPreload(null, 0, 1000);
-  early.sandbox.ATPViewport.updateScrollPreload(null, 500, 1100);
-  assert(early.observers.length === 0, 'adaptive preload must avoid allocating observers before any wrapper exists');
-  early.observeWrapper(1400);
-  assert(early.observers.length === 2, 'first wrapper must initialize request and true-viewport observers');
-  assert(early.sandbox.ATPViewport.getPendingCount() === 1, 'first wrapper registration after early adaptive preload must not throw or lose pending state');
+  early.sandbox.ATPViewport.updateScrollPreload();
+  assert(early.observers.length === 0, 'passive scroll tracking must avoid allocating IntersectionObservers before any wrapper exists');
+  const wrapper = early.observeWrapper(2400);
+  assert(early.observers.length === 3, 'first observed wrapper must initialize the 3 persistent static band observers');
+  assert(early.observers[0].options.rootMargin === '0px', 'band-0 observer must use exact 0px viewport margin');
+  assert(early.observers[1].options.rootMargin === '240px 0px 240px 0px', 'band-1 observer must use symmetric 240px near-viewport margin');
+  assert(early.observers[2].options.rootMargin === '1000px 0px 1000px 0px', 'band-2 observer must use symmetric 1000px lookahead margin');
+  assert(early.sandbox.ATPViewport.getPendingCount() === 1, 'first wrapper registration must record pending state');
 
-  const emptyRootRun = createViewportRetrySandbox({ availableSlots: 0 });
-  const emptyScrollRoot = {
-    scrollTop: 0,
-    classList: { contains: function(name) { return name === 'atp-scroll-viewport'; } },
-    getBoundingClientRect: function() { return { top: 100, bottom: 500 }; }
-  };
-  emptyRootRun.sandbox.ATPViewport.updateScrollPreload(emptyScrollRoot, 0, 1000);
-  emptyRootRun.sandbox.ATPViewport.updateScrollPreload(emptyScrollRoot, 500, 1100);
-  assert(emptyRootRun.sandbox.ATPViewport.getPendingStats().adaptiveScrollRootCount === 0, 'scrolling an internal root with no pending wrappers must not retain an empty adaptive observer state');
+  early.observers[0].callback([{ target: wrapper, isIntersecting: false }]);
+  assert(!wrapper.classList.contains('atp-loading-near-viewport'), 'offscreen pending placeholders must not be marked as on screen');
+  early.observers[0].callback([{ target: wrapper, isIntersecting: true }]);
+  assert(wrapper.classList.contains('atp-loading-near-viewport'), 'band-0 visible pending placeholders must carry atp-loading-near-viewport');
 
-  const nested = createViewportRetrySandbox({ availableSlots: 0 });
-  const scrollRoot = {
-    scrollTop: 0,
-    classList: { contains: function(name) { return name === 'atp-scroll-viewport'; } },
-    getBoundingClientRect: function() { return { top: 100, bottom: 500 }; }
-  };
-  const nestedWrapper = nested.observeWrapper(700, scrollRoot);
-  assert(nested.observers[0].options.root === scrollRoot, 'nested thumbnail wrappers must use their own scroll viewport as the lazy observer root');
-  nested.sandbox.ATPViewport.updateScrollPreload(scrollRoot, 0, 1000);
-  scrollRoot.scrollTop = 500;
-  nested.sandbox.ATPViewport.updateScrollPreload(scrollRoot, 500, 1100);
-  const nestedFastObserver = nested.observers[nested.observers.length - 1];
-  assert(nestedFastObserver.options.root === scrollRoot && nestedFastObserver.options.rootMargin === '200px 0px 1000px 0px', 'fast nested scrolling must expand the forward margin inside the correct scroll root');
-  assert(nestedFastObserver.targets.indexOf(nestedWrapper) !== -1, 'nested adaptive observer rebuild must retain its pending wrappers');
+  early.sandbox.ATPViewport.updateScrollPreload();
+  assert(early.observers.length === 3, 'scrolling must NEVER disconnect or rebuild IntersectionObserver instances');
+  early.sandbox.ATPViewport.resetScrollPreload();
+  assert(early.observers.length === 3, 'scroll settle must preserve the same 3 persistent static observers');
+  const stats = early.sandbox.ATPViewport.getPendingStats();
+  assert(stats.lazyViewportMode === 'idle', 'viewport diagnostics must expose idle scroll state after reset');
 }
 
 function checkLoaderViewportPressureIntegration() {
@@ -12517,14 +14073,17 @@ function checkLoaderViewportPressureIntegration() {
   const observers = [];
   const images = [];
   const wrappers = [];
-  let rectReads = 0;
+  let nowMs = 50000;
+  const MockDate = { now: function() { return nowMs; } };
   const sandbox = {
     console: console,
     URL: URL,
     TextDecoder: TextDecoder,
-    Date: Date,
+    Date: MockDate,
     Math: Math,
     Map: Map,
+    Set: Set,
+    Promise: Promise,
     setTimeout: function(callback, delay) {
       timers.push({ callback: callback, delay: delay, cleared: false });
       return timers.length;
@@ -12578,6 +14137,7 @@ function checkLoaderViewportPressureIntegration() {
     }
   };
   sandbox.window = sandbox;
+  sandbox.globalThis = sandbox;
   sandbox.window.innerHeight = 1000;
   sandbox.window.innerWidth = 1200;
   sandbox.window.addEventListener = function() {};
@@ -12587,8 +14147,9 @@ function checkLoaderViewportPressureIntegration() {
     generation: 0,
     settings: {
       backgroundConcurrency: 3,
-      firstScreenConcurrency: 3,
+      firstScreenConcurrency: 6,
       backgroundSpeed: 'extreme',
+      autoLoadOffscreenFirstRows: true,
       gridCols: 5,
       visibleRows: 2,
       maxImagesPerPost: 500,
@@ -12602,32 +14163,17 @@ function checkLoaderViewportPressureIntegration() {
     threads: {}
   };
   vm.createContext(sandbox);
-  vm.runInContext(read('shared-utils.js') + '\nthis.SharedUtils = SharedUtils;', sandbox, { filename: 'shared-utils.js' });
+  vm.runInContext(runtimeForVerify('shared-utils.js') + '\nthis.SharedUtils = SharedUtils;', sandbox, { filename: 'shared-utils.js' });
   vm.runInContext(read('loading-policy.js'), sandbox, { filename: 'loading-policy.js' });
-  vm.runInContext(runtimeForVerify('loader.js'), sandbox, { filename: 'loader.js' });
   vm.runInContext(read('viewport-observer.js'), sandbox, { filename: 'viewport-observer.js' });
-
-  function runNextTimer(delay, message) {
-    const timer = timers.filter(function(item) {
-      return !item.cleared && item.delay === delay;
-    })[0];
-    assert(timer, message);
-    timer.cleared = true;
-    timer.callback();
-    return timer;
-  }
+  vm.runInContext(read('heavy-budget.js'), sandbox, { filename: 'heavy-budget.js' });
+  vm.runInContext(runtimeForVerify('loader.js'), sandbox, { filename: 'loader.js' });
 
   function getPendingTimers(delay) {
     return timers.filter(function(item) {
       return !item.cleared && (delay === undefined || item.delay === delay);
     });
   }
-
-  function resetRectReads() {
-    rectReads = 0;
-  }
-
-  let wrapperTop = 1100;
 
   function makeGrid() {
     const grid = createVerifyElement('atp-thumbnail-container');
@@ -12637,10 +14183,6 @@ function checkLoaderViewportPressureIntegration() {
       baseAppendChild.call(grid, child);
       if (child.className === 'atp-thumbnail-wrapper') {
         wrappers.push(child);
-        child.getBoundingClientRect = function() {
-          rectReads++;
-          return { top: wrapperTop, bottom: wrapperTop + 82, left: 0, right: 110, height: 82, width: 110 };
-        };
       }
       return child;
     };
@@ -12652,10 +14194,14 @@ function checkLoaderViewportPressureIntegration() {
     candidates.push({ src: 'https://img.example/pressure-' + i + '.jpg' });
   }
   const threadId = 'pressure-thread';
-  sandbox.ATPState.threads[threadId] = {
+  const panel = createVerifyElement('atp-thread-panel');
+  panel.getBoundingClientRect = function() {
+    return { top: 3000, bottom: 3200, height: 200 };
+  };
+  const thread = {
     id: threadId,
     generation: 0,
-    panel: createVerifyElement('atp-thread-panel'),
+    panel: panel,
     container: createVerifyElement('atp-processed'),
     statusEl: { textContent: '' },
     candidates: candidates,
@@ -12676,64 +14222,47 @@ function checkLoaderViewportPressureIntegration() {
     bgQueued: false,
     bgQueueActive: false,
     bgBatchPending: 0,
+    viewportBand: 3,
     resources: {},
     grid: makeGrid(),
     heavyMode: false,
     lightweightHeavyMode: false
   };
+  sandbox.ATPState.threads[threadId] = thread;
 
   sandbox.ATPLoader.enqueueBgForThread(threadId);
   assert(sandbox.ATPLoader.getBgTasks().length === 6, 'loader pressure test must stage a bounded background batch instead of enqueueing all high-fanout candidates: ' + sandbox.ATPLoader.getBgTasks().length);
   while (sandbox.ATPLoader.getBgTasks().length < 500) {
-    var pressureIndex = sandbox.ATPLoader.getBgTasks().length;
+    const pressureIndex = sandbox.ATPLoader.getBgTasks().length;
     sandbox.ATPLoader.getBgTasks().push({
       candidates: candidates,
       idx: pressureIndex,
       threadId: threadId,
       generation: 0,
-      grid: sandbox.ATPState.threads[threadId].grid,
+      grid: thread.grid,
       isFirstScreen: false,
       backgroundBatch: true,
-      queuedAt: Date.now(),
+      queuedAt: nowMs,
       queueKind: 'background'
     });
   }
-  sandbox.ATPState.threads[threadId].bgBatchPending = 500;
-  let bgRuns = 0;
-  while (sandbox.ATPViewport.getPendingCount() < 30 && bgRuns < 10) {
-    runNextTimer(20, 'loader pressure test must schedule bounded background processing timers');
-    bgRuns++;
-  }
-  assert(bgRuns === 1, 'loader pressure test must batch viewport placeholder registration instead of throttling non-network work by image concurrency');
-  assert(sandbox.ATPViewport.getPendingCount() === 30, 'loader must stop creating viewport placeholders at the pending budget');
-  assert(wrappers.length === 30, 'loader pressure test must create only the budgeted viewport wrappers before backoff');
-  assert(sandbox.ATPLoader.getBgTasks().length === 470, 'loader must keep remaining background work queued after the viewport pending budget is full');
-  assert(getPendingTimers(500).length === 1, 'loader must use a single pending-full backoff timer while viewport pending is saturated');
+  thread.bgBatchPending = 500;
 
-  resetRectReads();
-  wrapperTop = 100;
-  const started = sandbox.ATPViewport.retryVisiblePending();
-  assert(started === 3, 'viewport pressure retry must start no more than the available background slots (got ' + started + ')');
-  assert(rectReads <= 12, 'viewport pressure retry must keep layout reads bounded under many pending wrappers');
-  assert(sandbox.ATPLoader.getActive() === 3, 'viewport pressure retry must account started image slots through the loader');
-  assert(sandbox.ATPViewport.getPendingCount() === 27, 'viewport pressure retry must remove only started wrappers from pending');
-  assert(images.length === 3, 'viewport pressure retry must create one image element per started wrapper');
+  // Run one schedule pass: P3 must admit at most backgroundConcurrency (3) images and create ONLY 3 DOM wrappers!
+  sandbox.ATPLoader.roundRobinSchedule();
+  assert(sandbox.ATPLoader.getActive() === 3, 'P3 pressure pass must admit no more than backgroundConcurrency (3), got ' + sandbox.ATPLoader.getActive());
+  assert(wrappers.length === 3 && images.length === 3, 'P3 pressure pass must create DOM wrappers only for admitted images (got ' + wrappers.length + ')');
+  assert(thread.__schedQueue.tasks.length - thread.__schedQueue.offset === 497, 'remaining 497 tasks must stay lightweight in JS without DOM bloat');
+  assert(getPendingTimers(20).length === 1, 'P3 scheduler must arm a single 20ms pacing timer for remaining work');
 
+  nowMs += 25;
   images[0].naturalWidth = 120;
   images[0].naturalHeight = 90;
   images[0].onload();
-  assert(sandbox.ATPLoader.getActive() === 2, 'loader viewport completion must release the active slot before follow-up wake');
-  assert(sandbox.ATPState.threads[threadId].loaded === 1, 'loader viewport completion must settle the owning thread');
-  assert(sandbox.ATPViewport.getPendingCount() <= 30, 'loader follow-up scheduling must not exceed the configured viewport pending budget');
-
-  let zeroTimerRuns = 0;
-  while (sandbox.ATPLoader.getActive() < 3 && getPendingTimers(0).length && zeroTimerRuns < 4) {
-    runNextTimer(0, 'loader viewport completion must schedule coalesced wake timers');
-    zeroTimerRuns++;
-  }
-  assert(sandbox.ATPLoader.getActive() === 3, 'loader slot wake must let viewport pending continue after a completion frees capacity');
-  assert(sandbox.ATPViewport.getPendingCount() <= 30, 'viewport slot wake must consume pending work and immediately refill registration capacity without exceeding the public budget');
-  assert(sandbox.ATPLoader.getBgTasks().length > 0 && sandbox.ATPLoader.getBgTasks().length <= 470, 'loader slot wake must preserve remaining queued background work after configured-concurrency refill');
+  assert(thread.loaded === 1, 'loader completion must settle the owning thread');
+  assert(sandbox.ATPLoader.getActive() === 3, 'after P3 delay elapses, completion wakeup must refill back up to backgroundConcurrency (3)');
+  assert(thread.__schedQueue.tasks.length - thread.__schedQueue.offset === 496, 'completion refill must consume one more queued task');
+  sandbox.ATPLoader.teardownActiveSlots('verify_done');
 }
 
 async function checkBackgroundSettingsPatch() {
@@ -13845,8 +15374,10 @@ async function checkPopupActiveTabQueryFailureFeedback() {
 
 async function checkPopupForumPacerReset() {
   const now = Date.now();
+  const statusKey = 'atp_forum_pacer_status_v1';
+  const resetKey = 'atp_forum_pacer_reset_at';
   const sandbox = loadPopupSandbox({
-    atp_forum_pacer_status_v1: {
+    [statusKey]: {
       'www.sehuatang.org': { burst: 4, refillMs: 4000, learnedBurst: 4, learnedRefillMs: 3750, level: 0, pauseUntil: 0, at: now },
       'www.sehuatang.net': { burst: 10, refillMs: 2000, learnedBurst: 10, learnedRefillMs: 2000, level: 0, pauseUntil: 0, at: now }
     }
@@ -13861,14 +15392,17 @@ async function checkPopupForumPacerReset() {
   const button = sandbox.document.getElementById('resetForumPacer');
   button.click();
   await sandbox.__flushPromises(20);
-  assert(typeof sandbox.__storage.atp_forum_pacer_reset_at === 'number' && sandbox.__storage.atp_forum_pacer_reset_at >= now,
+  assert(typeof sandbox.__storage[resetKey] === 'number' && sandbox.__storage[resetKey] >= now,
     'the reset button must leave a reset marker every forum page follows');
-  const statusSet = sandbox.__storageSets.filter(function(items) { return items.atp_forum_pacer_status_v1; }).slice(-1)[0];
-  assert(statusSet, 'the reset must write the normal pace for the recorded forum hosts');
-  const statuses = statusSet.atp_forum_pacer_status_v1;
-  assert(statuses['www.sehuatang.org'].burst === 10 && statuses['www.sehuatang.net'].burst === 10,
-    'the reset must show every recorded forum host at the normal pace');
-  assert(/正常速度/.test(info.textContent) && button.textContent === '已重置（所有论坛域名）',
+  const resetWrites = sandbox.__storageSets.filter(items => Object.hasOwn(items, resetKey) || Object.hasOwn(items, statusKey));
+  assert(resetWrites.length === 1 && Object.keys(resetWrites[0]).join() === resetKey,
+    'the reset button must leave status ownership with the worker and write only the reset marker');
+  const statuses = {
+    'www.sehuatang.org': { burst: 10, refillMs: 2000, at: now },
+    'www.sehuatang.net': { burst: 10, refillMs: 2000, at: now }
+  };
+  for (const listener of sandbox.__storageListeners) listener({ [statusKey]: { newValue: statuses } }, 'local');
+  assert(/正常速度/.test(info.textContent) && button.textContent === '已重置节流速度',
     'the popup must confirm the reset: ' + info.textContent + ' / ' + button.textContent);
 
   // What a host reported lapses as the pacer's own state would: an unused
@@ -13892,6 +15426,43 @@ async function checkPopupForumPacerReset() {
   await empty.__flushPromises(20);
   assert(/尚无论坛节流记录/.test(empty.document.getElementById('forumPacerInfo').textContent),
     'without any recorded forum page the popup must say so');
+}
+
+async function checkPopupForumPacerCountdown() {
+  let now = Date.now();
+  const statusKey = 'atp_forum_pacer_status_v1';
+  const pauseUntil = now + 2400;
+  const popup = loadPopupSandbox({
+    [statusKey]: {
+      'www.sehuatang.org': { burst: 10, refillMs: 2000, retryAfterUntil: pauseUntil, at: now },
+      'sehuatang.org': { burst: 3, refillMs: 4000, pauseUntil: now + 9400, at: now }
+    }
+  }, {
+    activeTabs: [{ id: 54, url: 'https://www.sehuatang.org/forum-95-1.html' }],
+    now: () => now
+  });
+  await popup.window.__ATPPopupTest.loadUI();
+  await popup.__flushPromises(20);
+  const site = popup.document.getElementById('currentSite');
+  const pace = popup.document.getElementById('currentForumPace');
+  assert(site.textContent === 'sehuatang.org' && !pace.hidden && /突发 10.*论坛要求等待.*约 3 秒/.test(pace.textContent),
+    'the current-site setting must use the canonical site name while the pace describes the actual hostname');
+
+  function tick(delay) {
+    const timer = popup.__timers.findLast(timer => !timer.cleared && timer.delay === delay);
+    assert(timer, 'a pace display update must be scheduled after ' + delay + 'ms');
+    now += delay;
+    timer.callback();
+  }
+  tick(400);
+  assert(/约 2 秒/.test(pace.textContent), 'the popup countdown must update without a new storage report');
+  tick(1000);
+  assert(/约 1 秒/.test(pace.textContent), 'the countdown must continue through the final second');
+  tick(1000);
+  assert(/节流正常/.test(pace.textContent) && !/约 \d+ 秒/.test(pace.textContent),
+    'the expired pause must clear independently of the other hostname');
+  assert(popup.__storageGets.filter(key => key === statusKey).length === 1,
+    'showing the countdown must not poll extension storage');
 }
 
 // ---- Marked resources ----
@@ -14019,6 +15590,29 @@ async function checkMarksHandOutRaces() {
   const bg = loadBackgroundSandbox({ enableDebug: false });
   const M = bg.ATPMarks;
   const page = { url: 'https://www.sehuatang.org/forum-2-1.html', tab: { id: 7 } };
+  const orphan = makeMarksTestSnapshot(M, '977', '删除失败的记录', { baidu: [{ url: 'https://pan.baidu.com/s/1old' }] }, []);
+  const mark = function(op, value) { return sendMarksMessageForVerify(bg, Object.assign({ op }, value), page); };
+  const orphanId = 'builtin|977';
+  const orphanKey = M.itemKey(orphanId);
+  assert((await mark('mark', { snapshot: orphan })).created);
+  const previousDetail = bg.__storage[orphanKey];
+  const originalRemove = bg.chrome.storage.local.remove;
+  bg.chrome.storage.local.remove = function(keys, callback) {
+    bg.chrome.runtime.lastError = { message: 'fixture storage remove failure' };
+    callback();
+    bg.chrome.runtime.lastError = null;
+  };
+  const removal = await mark('unmark', { id: orphanId });
+  bg.chrome.storage.local.remove = originalRemove;
+  assert(removal.ok && !bg.__storage[orphanKey], 'unmark must invalidate the detail with the index even when storage.remove fails');
+  // A leftover detail written by an older version is never a membership record.
+  bg.__storage[orphanKey] = previousDetail;
+  const freshSnapshot = makeMarksTestSnapshot(M, '977', '重新标记', { quark: [{ url: 'https://pan.quark.cn/s/new' }] }, []);
+  assert((await mark('update', { snapshot: freshSnapshot })).marked === false, 'a stale tab must not revive an unmarked record');
+  assert(!bg.__storage[M.KEYS.INDEX].items.length);
+  assert((await mark('mark', { snapshot: freshSnapshot })).created, 'explicit re-mark must create a new entry over legacy orphan detail');
+  assert(bg.__storage[orphanKey].links.length === 1 && bg.__storage[orphanKey].links[0].url.includes('quark.cn'), 're-mark must not resurrect old links');
+  await mark('unmark', { id: orphanId });
   const popup = { url: 'chrome-extension://verify/popup.html' };
   const send = function(message, sender) { return sendMarksMessageForVerify(bg, message, sender || page); };
   const original = makeMarksTestSnapshot(M, '303', '实际复制的标题', { baidu: [{ url: 'https://pan.baidu.com/s/1copied' }] }, ['copied-password']);
@@ -14092,7 +15686,7 @@ async function checkPopupMarksClearConfirmation() {
   await mark('312');
   const changes = {};
   changes[M.KEYS.INDEX] = { newValue: shared[M.KEYS.INDEX] };
-  popup.__marksStorageListeners.forEach(function(listener) { listener(changes, 'local'); });
+  popup.__storageListeners.forEach(function(listener) { listener(changes, 'local'); });
   assert(!button.__atpConfirmArmed && /已取消清空确认/.test(popup.__elements.popupStatus.textContent),
     'a storage change must cancel confirmation immediately, before the delayed refresh');
   popup.__timers.filter(function(timer) { return !timer.cleared && timer.delay === 150; }).forEach(function(timer) {
@@ -14416,6 +16010,25 @@ async function checkResourcePanelMarkToggle() {
   assert(copied.op === 'copied' && copied.scope === 'type:baidu' && copied.snapshot.id === 'builtin|201' && copied.snapshot.title === '标题 A' &&
     copied.snapshot.links.length === 1 && copied.snapshot.passwords[0] === 'pw-201', 'a copy must be recorded with its thread and scope: ' + JSON.stringify(copied));
 
+  // The thread can gain another link while the clipboard operation is pending.
+  const copyThread = thread('203', '标题 C', { baidu: [{ url: 'https://pan.baidu.com/s/1BeforeCopy' }] });
+  const clipboardWrite = sandbox.navigator.clipboard.writeText;
+  let clipboardText;
+  let finishClipboardWrite;
+  sandbox.navigator.clipboard.writeText = function(text) {
+    clipboardText = text;
+    return new Promise(function(resolve) { finishClipboardWrite = resolve; });
+  };
+  const copyPending = panelApi._verifyCopyAndRecord(copyThread, 'https://pan.baidu.com/s/1BeforeCopy', null, 'all');
+  copyThread.resources.groups.baidu.push({ url: 'https://pan.baidu.com/s/1AfterCopy' });
+  finishClipboardWrite();
+  await copyPending;
+  sandbox.navigator.clipboard.writeText = clipboardWrite;
+  const delayedCopy = sandbox.__sent[sandbox.__sent.length - 1];
+  assert(delayedCopy.op === 'copied' && delayedCopy.snapshot.id === 'builtin|203' &&
+    delayedCopy.snapshot.links.length === 1 && delayedCopy.snapshot.links[0].url === clipboardText,
+    'the backup must use the links from the time the copy began');
+
   // A copy whose backup fails says so where the copy was made.
   const messageEl = { className: '', texts: [], setAttribute: function() {}, set textContent(value) { this.texts.push(value); }, get textContent() { return this.texts[this.texts.length - 1] || ''; } };
   const copySource = { querySelector: function() { return messageEl; } };
@@ -14430,19 +16043,20 @@ async function checkResourcePanelMarkToggle() {
   assert(await panelApi._verifyCopyAndRecord(unknownThread, 'text', null, 'all') === true && sandbox.__sent.length === sentBeforeUnknown,
     'a copy of an unidentifiable thread must still copy and send nothing');
   const panelSource = read('resource-panel.js');
-  assert(panelSource.indexOf("showMessage('已复制，但未能备份：' + why, sourceEl, true);") !== -1, 'a copy whose backup failed must say so');
-  assert(panelSource.indexOf("copyAndRecord(currentThread, formatTypeText(currentThread.resources, type), sourceEl, 'type:' + type);") !== -1 &&
-    panelSource.indexOf("copyAndRecord(currentThread, formatAllText(currentThread.resources), sourceEl, 'all');") !== -1 &&
-    panelSource.indexOf("copyAndRecord(currentThread, formatPasswordsOnly(currentThread.resources), sourceEl, 'passwords');") !== -1,
-    'every copy button must go into the daily backup with its scope');
+  assert(panelSource.includes("copyAndRecord(threadState, formatTypeText(threadState.resources, type), sourceEl, 'type:' + type);") &&
+    panelSource.includes("copyAndRecord(threadState, formatAllText(threadState.resources), sourceEl, 'all');") &&
+    panelSource.includes("copyAndRecord(threadState, formatPasswordsOnly(threadState.resources), sourceEl, 'passwords');"),
+    'every copy button must back up its own thread and scope');
   const renderer = read('renderer.js');
   assert(renderer.indexOf('threadState.markIdentity = identity.ok ? identity : null;') !== -1 &&
     renderer.indexOf("threadState.title = ATPMarks.findThreadTitle(container, link, identity.ok ? identity.tid : '');") !== -1,
     'each thread must carry its identity and list title for marking');
   const cacheSource = read('cache.js');
   const backgroundSource = read('background.js');
-  assert(cacheSource.split('SharedUtils.getCacheBytesInUse(function(bytesUsed)').length === 3 &&
-    backgroundSource.split('SharedUtils.getCacheBytesInUse(function(bytesUsed)').length === 3,
+  assert(cacheSource.indexOf('SharedUtils.getCacheBytesInUse(') !== -1 &&
+    cacheSource.indexOf('storage.local.getBytesInUse(') === -1 &&
+    backgroundSource.indexOf('SharedUtils.getCacheBytesInUse(') !== -1 &&
+    backgroundSource.indexOf('storage.local.getBytesInUse(') === -1,
     'cache eviction must measure usage without the marks and backups');
 }
 
@@ -14547,6 +16161,119 @@ async function checkPopupSaveFailureRollback() {
   assert(resetStatus.textContent.indexOf('操作失败') !== -1, 'popup reset-all save failures must announce the failed destructive action');
   assert(resetStatus.getAttribute('role') === 'alert', 'popup reset-all save failures must use alert semantics');
   assert(resetSettings.disabled === false, 'popup reset-all save failures must re-enable the reset button');
+
+  const queued = [];
+  const overlap = loadPopupSandbox({
+    settings: { gridCols: 5, firstScreenConcurrency: 8, backgroundConcurrency: 7 }
+  }, {
+    runtimeMessageHandler: function(message, reply) {
+      if (message.type !== 'SAVE_SETTINGS_PATCH') return false;
+      queued.push({ patch: message.settingsPatch, reply: reply });
+      return true;
+    }
+  });
+  const overlapHelpers = overlap.window.__ATPPopupTest;
+  await overlapHelpers.loadUI();
+  overlapHelpers.bindSchemaControls();
+  overlapHelpers.bindResetButtons();
+  const columns = overlap.__elements.gridCols;
+  function changeNumber(input, value) {
+    input.value = String(value);
+    input.dispatch('change');
+  }
+  function rejectWrite() {
+    queued.shift().reply({ ok: false, error: 'settings write rejected' });
+  }
+  function commitWrite() {
+    const write = queued.shift();
+    const confirmed = Object.assign({}, overlap.__storage.settings, write.patch);
+    overlap.__storage.settings = confirmed;
+    write.reply({ ok: true, settings: confirmed });
+  }
+
+  changeNumber(columns, 6);
+  changeNumber(columns, 7);
+  await overlap.__flushPromises(20);
+  assert(queued.length === 1 && queued[0].patch.gridCols === 6, 'overlapping edits must still save in order');
+  rejectWrite();
+  await overlap.__flushPromises(20);
+  assert(Number(columns.value) === 7 && queued[0].patch.gridCols === 7, 'an older failure must preserve a newer pending edit on the same field');
+  changeNumber(overlap.__elements.visibleRows, 0);
+  rejectWrite();
+  await overlap.__flushPromises(20);
+  assert(Number(columns.value) === 5 && overlapHelpers.getSettings().gridCols === 5,
+    'two rejected writes must restore the last confirmed value for the field');
+  assert(overlap.__elements.visibleRows.value === '0' && overlap.__elements.visibleRows.getAttribute('aria-invalid') === 'true',
+    'rolling back a setting must preserve unrelated inline validation');
+
+  changeNumber(columns, 6);
+  changeNumber(columns, 7);
+  await overlap.__flushPromises(20);
+  commitWrite();
+  await overlap.__flushPromises(20);
+  assert(Number(columns.value) === 7, 'an older successful write must keep the later edit visible until it settles');
+  rejectWrite();
+  await overlap.__flushPromises(20);
+  assert(Number(columns.value) === 6 && overlapHelpers.getSettings().gridCols === 6,
+    'a pending write must roll back to an earlier overlapping write that already succeeded');
+
+  changeNumber(columns, 8);
+  await overlap.__flushPromises(20);
+  overlap.__storage.settings = Object.assign({}, overlap.__storage.settings, { visibleRows: 3 });
+  overlapHelpers.applySavedSettings(overlap.__storage.settings);
+  assert(Number(columns.value) === 8 && Number(overlap.__elements.visibleRows.value) === 3,
+    'a storage update must preserve a pending edit and apply unrelated saved values');
+  columns.focus();
+  columns.value = '9';
+  columns.dispatch('input');
+  rejectWrite();
+  await overlap.__flushPromises(20);
+  assert(columns.value === '9' && overlapHelpers.getSettings().gridCols === 6 && overlapHelpers.getSettings().visibleRows === 3,
+    'a failed write must preserve both a new input draft and confirmed settings from another panel');
+  columns.dispatch('focusout');
+  columns.blur();
+
+  const preset = overlap.document.createElement('button');
+  preset.setAttribute('data-preset', 'ordinaryGentle');
+  preset.closest = function(selector) { return selector === '.btn-ordinary-preset' ? preset : null; };
+  overlap.__elements.settingsContainer.dispatch('click', { target: preset });
+  await overlap.__flushPromises(20);
+  assert(queued[0].patch.backgroundConcurrency === 1, 'the fixture must apply the ordinary-loading preset');
+  const firstScreenConcurrency = overlap.__elements.firstScreenConcurrency;
+  changeNumber(firstScreenConcurrency, 9);
+  changeNumber(columns, 8);
+  rejectWrite();
+  await overlap.__flushPromises(20);
+  assert(overlapHelpers.getSettings().backgroundConcurrency === 7 && Number(overlap.__elements.backgroundConcurrency.value) === 7,
+    'a failed preset must revert its untouched fields even if one preset field was edited again');
+  assert(overlapHelpers.getSettings().firstScreenConcurrency === 9 && Number(firstScreenConcurrency.value) === 9 &&
+    overlapHelpers.getSettings().gridCols === 8 && Number(columns.value) === 8,
+    'a failed preset must keep newer edits both within and outside the preset in sync with their controls');
+  commitWrite();
+  await overlap.__flushPromises(20);
+  commitWrite();
+  await overlap.__flushPromises(20);
+  assert(overlap.__storage.settings.backgroundConcurrency === 7 && overlap.__storage.settings.firstScreenConcurrency === 9 &&
+    overlap.__storage.settings.gridCols === 8, 'later writes must preserve unrelated confirmed values');
+
+  overlapHelpers.bindDisableSite();
+  const siteToggle = overlap.__elements.disableSite;
+  overlapHelpers.setDisableSiteHost('sehuatang.org');
+  siteToggle.checked = true;
+  siteToggle.dispatch('change');
+  await overlap.__flushPromises(20);
+  overlapHelpers.setDisableSiteHost('sehuatang.net');
+  siteToggle.checked = true;
+  siteToggle.dispatch('change');
+  rejectWrite();
+  await overlap.__flushPromises(20);
+  const pendingSites = overlapHelpers.getSettings().siteConfigs;
+  assert(!pendingSites['sehuatang.org'] && pendingSites['sehuatang.net'].disabled && siteToggle.checked,
+    'rolling back a site toggle must preserve a newer pending choice for a different site');
+  commitWrite();
+  await overlap.__flushPromises(20);
+  assert(!overlap.__storage.settings.siteConfigs['sehuatang.org'] && overlap.__storage.settings.siteConfigs['sehuatang.net'].disabled,
+    'later site writes must persist only their intended hostname');
 }
 
 async function checkCacheIndexErrorHandling() {
@@ -14810,7 +16537,7 @@ async function checkCacheIndexErrorHandling() {
   ]);
   const barrierEntries = barrierStorage[BarrierSharedUtils.CACHE_INDEX_KEY] && barrierStorage[BarrierSharedUtils.CACHE_INDEX_KEY].entries;
   assert(barrierResults.every(Boolean), 'cacheIndex update/remove barrier sequence must complete successfully');
-  assert(barrierGetCalls === 3 && barrierSetCalls === 4, 'cacheIndex must not coalesce updateEntries across write/remove barriers');
+  assert(barrierGetCalls === 1 && barrierSetCalls === 4, 'cacheIndex must not coalesce updateEntries across write/remove barriers');
   assert(
     barrierEntries &&
       !barrierEntries.article_cache_v13_barrier &&
@@ -15915,19 +17642,30 @@ function checkCriticalStaticRules() {
   const cache = read('cache.js');
   const background = read('background.js');
   const content = read('content.js');
-  const loader = read('loader.js');
-  const popup = read('popup.js');
+  const hostHealth = read('host-health.js');
+  const imageRunner = read('image-runner.js');
+  const loaderOnly = read('loader.js');
+  const loader = hostHealth + '\n' + imageRunner + '\n' + loaderOnly;
+  const popupOnly = read('popup.js');
+  const popupLogs = read('popup-logs.js');
+  const popup = popupOnly + '\n' + popupLogs;
   const popupHtml = read('popup.html');
   const popupCss = read('popup.css');
   const previewer = read('previewer.js');
   const renderer = read('renderer.js');
-  const viewport = read('viewport-observer.js');
+  const viewportOnly = read('viewport-observer.js');
+  const heavyBudget = read('heavy-budget.js');
+  const viewport = viewportOnly + '\n' + heavyBudget;
   const contentCss = read('content.css');
   const logger = read('logger.js');
-  const floatingPanel = read('floating-panel.js');
+  const settingsUi = read('settings-ui.js');
+  const floatingPanelOnly = read('floating-panel.js');
+  const floatingPanel = settingsUi + '\n' + floatingPanelOnly;
   const floatingPanelCss = read('floating-panel.css');
   const resourcePanel = read('resource-panel.js');
-  const sharedUtils = read('shared-utils.js');
+  const sharedUtilsOnly = read('shared-utils.js');
+  const htmlExtractors = read('html-extractors.js');
+  const sharedUtils = sharedUtilsOnly + '\n' + htmlExtractors;
   const defaults = read('defaults.js');
   const settingsSchema = read('settings-schema.js');
   const loadingPolicy = read('loading-policy.js');
@@ -15939,2452 +17677,170 @@ function checkCriticalStaticRules() {
   const gitignore = readIfExists('.gitignore');
   const claude = readIfExists('CLAUDE.md');
 
+  // 1. Settings normalization, schema & live/hotReload/pageReload contract
   assert(defaults.indexOf('function normalizeSettings(raw)') !== -1, 'defaults must normalize stored settings');
   assert(defaults.indexOf('function normalizeSiteConfigs(raw)') !== -1, 'defaults must normalize site-specific settings');
   assert(defaults.indexOf("out[host] = { disabled: normalizeBoolean(siteConfig.disabled, false) };") !== -1, 'defaults must keep only site disabled flags');
   assert(defaults.indexOf('const settings = Object.assign({}, ATP_DEFAULTS);') !== -1, 'defaults must not copy unknown stored settings fields into normalized settings');
   assert(defaults.indexOf('globalThis.ATPNormalizeSettings = normalizeSettings') !== -1, 'settings normalizer must be globally available');
-  assert(read('config.js').indexOf('ATPConfig.settings = ATPNormalizeSettings(result.settings)') !== -1, 'content config must normalize stored settings');
-  assert(popup.indexOf('settings = ATPNormalizeSettings(stored.settings)') !== -1, 'popup must normalize stored settings before rendering');
+  assert(config.indexOf('ATPConfig.settings = ATPNormalizeSettings(result.settings)') !== -1, 'content config must normalize stored settings');
+  assert(config.indexOf('ATPNormalizeSettings({ enabled: false })') !== -1, 'settings read failures must fail closed instead of default-enabling the extension');
+  assert(popupOnly.indexOf('applySavedSettings(stored.settings);') !== -1 &&
+    popupOnly.indexOf('confirmedSettings = ATPNormalizeSettings(savedSettings);') !== -1,
+    'popup must normalize stored settings before rendering');
   assert(content.indexOf('function needsSettingsReload(previousSettings, nextSettings)') !== -1, 'settings change handling must share schema-based reload detection');
   assert(content.indexOf("applyMode === 'hotReload' && previousSettings[item.key] !== nextSettings[item.key]") !== -1, 'settings change handling must reload for every schema-declared hot-reload setting');
   assert(settingsSchema.indexOf("HOT_RELOAD: 'hotReload'") !== -1 && settingsSchema.indexOf("PAGE_RELOAD: 'pageReload'") !== -1, 'settings schema must expose explicit live, hot-reload, and page-reload modes');
   assert(settingsSchema.indexOf('function ATPGetSettingsApplyMode(keys, schema)') !== -1, 'settings schema must centralize multi-field apply-mode precedence');
-  assert(content.indexOf('var nextSettings = ATPNormalizeSettings(Object.assign({}, ATPConfig.settings || {}, changes.settings.newValue));') !== -1, 'settings change handling must normalize merged settings');
-  assert(content.indexOf("previousSettings.heavyThumbnailClarity !== ATPConfig.settings.heavyThumbnailClarity") === -1, 'settings change handling must not only reload for heavy thumbnail clarity');
-  assert(content.indexOf("typeof window.__bfpPanel.setSettings === 'function'") !== -1, 'external settings changes must refresh the floating panel UI');
-  assert(content.indexOf('var containerParentObserver = null;') !== -1, 'content must keep a parent observer handle for full thread-list replacement');
-  assert(content.indexOf('function setupContainerParentObserver(container)') !== -1, 'content must bind a parent observer for thread container replacement');
-  assert(content.indexOf('nextParentObserver.observe(parent, { childList: true });') !== -1, 'content parent observer must watch only direct parent childList changes');
-  assert(content.indexOf("rebindThreadObserver('Thread container parent changed, rebinding')") !== -1, 'content parent observer must rebind when the thread list parent changes');
-  assert(content.includes('disconnectContainerParentObserver();\n    var container = ATPScanner.findThreadContainer(true);'), "content setupObserver must disconnect stale parent observers before rebinding");
-  assert(/disconnectContainerParentObserver\(\);\s*disconnectDormantObserver\(\);\s*unbindScroll\(\);/.test(content), 'content teardown paths must disconnect active and dormant observers before removing lifecycle bindings');
-  assert(floatingPanel.indexOf('setSettings(rawSettings)') !== -1, 'floating panel must expose settings refresh for external storage changes');
-  assert(floatingPanel.indexOf('field.type === \'checkbox\'') !== -1, 'floating panel settings refresh must update checkbox controls');
-  assert(scanner.indexOf('getSeparatorForTable: function(table, context)') !== -1, 'scanner must cache per-table separator lookups during candidate scans');
-  assert(scanner.indexOf('separatorByTable: typeof WeakMap') !== -1, 'scanner candidate scans must use a WeakMap cache for table separator lookups');
-  assert(scanner.indexOf("ATPScanner.isForumServiceThread(tbody, link, context)") !== -1, 'scanner must pass scan-local context into service-thread detection');
-  assert(scanner.indexOf('if (SERVICE_THREAD_KEYWORDS_RE.test(title)) return true;') !== -1, 'scanner service-thread checks must test title text before reading full row textContent');
-  assert(scanner.indexOf('var PRIMARY_THREAD_CONTAINER_SELECTORS = [') !== -1, 'scanner thread root selection must keep primary containers separate from candidate-probed fallbacks');
-  assert(scanner.indexOf('var HIGH_CONFIDENCE_THREAD_CONTAINER_SELECTORS = [') !== -1, 'scanner thread root selection must keep high-confidence containers separate from broad fallbacks');
-  assert(scanner.indexOf('var BROAD_THREAD_CONTAINER_SELECTORS = [') !== -1, 'scanner thread root selection must keep broad containers behind candidate checks');
-  assert(scanner.indexOf('function findArticleLink(tbody)') !== -1, 'scanner root selection and candidate scans must share article link lookup semantics');
-  assert(scanner.indexOf('function isUsableThreadLink(link)') !== -1, 'scanner root selection and candidate scans must share usable thread link checks');
-  assert(scanner.indexOf("'.icn a[href]'") !== -1 && scanner.indexOf('if (isUsableThreadLink(link)) return link;') !== -1, 'scanner article link lookup must skip unusable early selector matches before falling back to later thread links');
-  assert(scanner.indexOf('function hasArticleCandidate(root)') !== -1, 'scanner broad root selection must verify that a candidate row exists before choosing a broad container');
-  assert(scanner.indexOf('hasArticleCandidate: function(root)') !== -1, 'scanner must expose candidate checks for dormant content activation');
-  assert(scanner.indexOf('isUsableThreadLink(findArticleLink(row))') !== -1, 'scanner root selection must require a usable thread link, not only a candidate-looking row');
-  assert(scanner.indexOf('findFirstThreadContainer(HIGH_CONFIDENCE_THREAD_CONTAINER_SELECTORS, true)') !== -1, 'scanner must prefer populated high-confidence thread containers');
-  assert(scanner.indexOf('findFirstThreadContainer(BROAD_THREAD_CONTAINER_SELECTORS, true)') !== -1, 'scanner broad fallback containers must require article candidates');
-  assert(scanner.indexOf('findFirstThreadContainer(PRIMARY_THREAD_CONTAINER_SELECTORS, false)') !== -1, 'scanner must still observe an empty primary threadlist shell while rows are loading');
-  assert(scanner.indexOf('findFirstThreadContainer(HIGH_CONFIDENCE_THREAD_CONTAINER_SELECTORS, false)') !== -1, 'scanner must still observe empty high-confidence thread containers while rows are loading');
-  assert(scanner.indexOf('findFirstThreadContainer(BROAD_THREAD_CONTAINER_SELECTORS, true)') < scanner.indexOf('findFirstThreadContainer(PRIMARY_THREAD_CONTAINER_SELECTORS, false)'), 'scanner must prefer populated broad roots over empty primary shells');
-  assert(scanner.indexOf("document.querySelector('#threadlist, .bm_c") === -1, 'scanner thread root selection must not use one broad querySelector that can be captured by a decoy block');
-  assert(scanner.indexOf('function getReusableScanRoot(scanState)') !== -1, 'scanner candidate scans must centralize reusable thread-root validation');
-  assert(scanner.indexOf('document.contains(root)') !== -1, 'scanner cached thread roots must still be attached before reuse');
-  assert(scanner.indexOf('var root = getReusableScanRoot(scanState);') !== -1, 'scanner candidate scans must reuse a valid cursor root before selecting a new thread container');
-  assert(scanner.indexOf('if (!root) root = ATPScanner.findThreadContainer() || document;') !== -1, 'scanner candidate scans must select a thread container when no reusable root is available');
-  assert(scanner.indexOf('root.matches && root.matches(selectors[i])') !== -1, 'scanner scoped scans must still include the root node when it is a candidate row');
-  assert(scanner.indexOf('root.querySelectorAll(selectors[i])') !== -1, 'scanner candidate scans must query selector batches from the scoped root');
-  assert(scanner.indexOf('options.scanState') !== -1, 'scanner candidate scans must accept reusable cursor state');
-  assert(scanner.indexOf('var ARTICLE_SCAN_NODE_BUDGET = 120') !== -1, 'scanner candidate scans must have a bounded per-pass node budget');
-  assert(scanner.indexOf('var nodeBudget = Math.max(limit, Number(options.nodeBudget) || ARTICLE_SCAN_NODE_BUDGET);') !== -1, 'scanner candidate scans must allow tests and callers to tune the node budget while respecting result limits');
-  assert(scanner.indexOf('if (scannedNodes >= nodeBudget)') !== -1, 'scanner candidate scans must pause after the node budget instead of walking long offscreen lists in one pass');
-  assert(scanner.indexOf('var ARTICLE_VIEWPORT_SEEK_BACKTRACK = 8') !== -1, 'scanner viewport seeking must keep a small backtrack before the current viewport');
-  assert(scanner.indexOf('function getViewportSeekStartIndex(nodes, viewportTop)') !== -1, 'scanner viewport seeking must centralize row-position lookup');
-  assert(scanner.indexOf('var didResetScanState = false') !== -1, 'scanner viewport seeking must track whether the cursor was freshly reset');
-  assert(scanner.indexOf('didResetScanState = true') !== -1, 'scanner viewport seeking must only become eligible when scan state is reset');
-  assert(scanner.indexOf('var shouldSeekViewportStart = !!(scanState && didResetScanState && options.seekViewportStart') !== -1, 'scanner viewport seeking must only run after a scanState reset');
-  assert(scanner.indexOf('nodeIndex = getViewportSeekStartIndex(nodes, viewportTop);') !== -1, 'scanner viewport seeking must move the active cursor near the cached viewport top');
-  assert(scanner.indexOf('function isDecoratedArticleContainer(container)') !== -1, 'scanner must centralize decorated article container detection');
-  assert(scanner.indexOf("container.querySelector && container.querySelector('.atp-thumbnail-container,.atp-thumb-row')") !== -1, 'scanner decorated-container guard must detect thumbnails already injected into TBODYs');
-  assert(scanner.indexOf("parent.querySelector && parent.querySelector('.atp-thumbnail-container,.atp-thumb-row')") !== -1, 'scanner decorated-container guard must detect child TRs under decorated TBODYs');
-  assert(scanner.indexOf('isDecoratedArticleContainer: isDecoratedArticleContainer') !== -1, 'scanner must expose decorated-container detection for content live checks');
-  assert(scanner.indexOf('if (ATPScanner.isDecoratedArticleContainer(tbody))') !== -1, 'scanner candidate scans must skip already decorated article containers before link processing');
-  assert(scanner.indexOf('scanState.selectorIndex = i;') !== -1, 'scanner cursor state must remember the current selector');
-  assert(scanner.indexOf('scanState.nodeIndex = j + 1;') !== -1, 'scanner cursor state must remember the next node index');
-  assert(scanner.indexOf('var nodes = document.querySelectorAll(selectors[i]);') === -1, 'scanner candidate scans must not query the full document for every selector batch');
-  const scannerEntryIndex = scanner.indexOf('var entry = { container: tbody, link: link };');
-  const scannerAcceptIndex = scanner.indexOf('if (accept && !accept(entry))');
-  const scannerServiceIndex = scanner.indexOf('if (skipServiceThreads && ATPScanner.isForumServiceThread(tbody, link, context))');
-  assert(scannerEntryIndex !== -1 && scannerAcceptIndex !== -1 && scannerServiceIndex !== -1 && scannerEntryIndex < scannerAcceptIndex && scannerAcceptIndex < scannerServiceIndex, 'scanner must apply cheap accept filters before service-thread text checks');
-  assert(sharedUtils.indexOf('isHttpLikeUrl: function(url, baseUrl)') !== -1, 'shared utils must expose an HTTP URL guard');
-  assert(sharedUtils.indexOf('decodeHtmlEntities(String(relativeUrl))') !== -1, 'URL resolution must decode HTML entities before resolving');
-  assert(sharedUtils.indexOf('javascript|mailto|tel') !== -1, 'shared URL resolution must reject non-fetchable protocols');
-  assert(sharedUtils.indexOf('isDirectImageUrl: function(url)') !== -1, 'shared utils must provide a direct image URL guard');
-  assert(sharedUtils.indexOf("IMAGE_DIRECT_PARAM_NAMES: ['url', 'src', 'img', 'image', 'pic', 'path', 'file']") !== -1, 'direct image URL detection must keep proxy image parameter names at module scope');
-  assert(sharedUtils.indexOf('var imageParamNames = SharedUtils.IMAGE_DIRECT_PARAM_NAMES;') !== -1, 'direct image URL detection must reuse proxy image parameter names');
-  assert(sharedUtils.indexOf("var imageParamNames = ['url', 'src', 'img', 'image', 'pic', 'path', 'file'];") === -1, 'direct image URL detection must not allocate proxy image parameter names per URL');
-  assert(sharedUtils.indexOf('token: true') !== -1 && sharedUtils.indexOf('sign: true') !== -1 && sharedUtils.indexOf('signature: true') !== -1, 'image URL normalization must keep common signed URL parameters');
-  assert(sharedUtils.indexOf("'x-amz-security-token': true") !== -1 && sharedUtils.indexOf("'x-amz-signature': true") !== -1, 'image URL normalization must keep common mixed-case CDN signing parameters');
-  assert(sharedUtils.indexOf('String(k).toLowerCase()') !== -1, 'image URL normalization must match signing parameters case-insensitively');
-  assert(sharedUtils.indexOf('/\\.svg(?:[?#]|$)/') !== -1, 'image filtering must reject SVG URLs with query strings');
-  assert(sharedUtils.indexOf('readResponseArrayBufferLimited') !== -1, 'shared utils must provide bounded response reads');
-  assert(sharedUtils.indexOf("e.name = 'ResponseTooLargeError'") !== -1, 'bounded response reads must signal oversized responses');
-  assert(sharedUtils.indexOf('parseRetryAfterHeader: function(headers, now)') !== -1, 'shared utils must expose a Retry-After parser');
-  assert(sharedUtils.indexOf("headers.get('retry-after')") !== -1 && sharedUtils.indexOf('Date.parse(value)') !== -1, 'Retry-After parser must support seconds and HTTP-date values');
-  assert(sharedUtils.indexOf('effectiveFetchLimit: function(settings)') !== -1, 'shared utils must keep fetch and display image limits separate');
-  assert(sharedUtils.indexOf('effectiveFallbackLimit: function(settings)') !== -1, 'shared utils must bound ordinary fallback candidate expansion');
-  assert(sharedUtils.indexOf('extractImagesForSettings: function(html, baseUrl, settings)') !== -1, 'shared utils must centralize image candidate expansion');
-  assert(sharedUtils.indexOf('isHeavyImageCandidatePrefix: function(candidates, settings, limit)') !== -1, 'shared utils must detect heavy image prefixes without copying fallback candidates');
-  assert(sharedUtils.indexOf('var initialLimit = fetchLimit <= displayLimit ? displayLimit : fallbackLimit;') !== -1, 'shared image extraction must parse ordinary posts directly to the fallback pool');
-  assert(sharedUtils.indexOf('SharedUtils.extractImages(html, baseUrl, displayLimit)') === -1, 'shared image extraction must not parse once only to inspect the display pool');
-  assert(sharedUtils.indexOf('createImageCollectionGuard: function(images, maxCount, options, maxMs)') !== -1, 'shared image extraction must support soft-limit collection guards');
-  assert(sharedUtils.indexOf('DOM_IMAGE_EXTRACT_HTML_MAX_CHARS: 300000') !== -1, 'shared DOM image extraction must have a pre-parse size gate');
-  assert(/extractImagesByDom: function\(html, baseUrl, maxCount, options\)[\s\S]*?if \(html\.length > SharedUtils\.DOM_IMAGE_EXTRACT_HTML_MAX_CHARS\) \{[\s\S]*?return SharedUtils\.extractImagesByRegex\(html, baseUrl, maxCount, options\);/.test(sharedUtils), 'shared DOM image extraction must fall back to regex before parsing large HTML');
-  assert(/extractImagesByDom: function\(html, baseUrl, maxCount, options\)[\s\S]*?createImageCollectionGuard\(images, maxCount, options, 250\)/.test(sharedUtils), 'shared DOM image extraction must use a time-bounded collection guard');
-  assert(sharedUtils.indexOf('softLimit: initialLimit') !== -1, 'shared settings image extraction must use a soft fallback limit before heavy expansion');
-  assert(sharedUtils.indexOf('return SharedUtils.extractImages(html, baseUrl, fetchLimit);') === -1, 'shared heavy image extraction must not reparse the article to expand candidates');
-  assert(sharedUtils.indexOf('return SharedUtils.extractImagesByRegex(html, baseUrl, maxCount, options);') !== -1, 'regex image extraction must share soft-limit expansion behavior');
-  assert(sharedUtils.indexOf('SharedUtils.effectiveFallbackLimit(settings)') !== -1, 'non-heavy image posts must use a bounded fallback pool instead of the full fetch limit');
-  assert(sharedUtils.indexOf('limitImageResults: function(images, maxCount)') !== -1, 'shared image extraction must centralize result limiting');
-  assert(sharedUtils.indexOf('if (images.length > limit) images.length = limit;') !== -1, 'shared image extraction must trim oversized result arrays in place');
-  assert(sharedUtils.indexOf('return SharedUtils.limitImageResults(images, maxCount);') !== -1, 'shared image extraction must return image results through the limiting helper');
-  assert(sharedUtils.indexOf('return images.slice(0, maxCount);') === -1, 'shared image extraction must not copy image result arrays on every parse');
-  assert(fetcher.indexOf('SharedUtils.extractImagesForSettings(job.html, job.finalUrl, job.settings)') !== -1, 'content article parse queue must use shared candidate extraction');
-  assert(fetcher.indexOf('displayImages: SharedUtils.effectiveDisplayLimit(settings)') !== -1, 'background article fetch request must pass the display cap');
-  assert(content.indexOf('ATPFetcher.fetchArticleDataByBackground(job.url, makeArticlePaceOptions(job, generation))') !== -1, 'cross-origin article jobs must use the single-article background path and wait for the forum pacer');
-  assert(background.indexOf('SharedUtils.extractImagesForSettings(html, finalUrl, imageSettings)') !== -1, 'background article fetch must use shared candidate extraction');
-  assert(renderer.indexOf('prioritizeLoadedCandidates: function(candidates, loadedUrls)') !== -1, 'renderer must prefer previously successful image candidates');
-  assert(renderer.indexOf('if (!candidates.length || !loadedUrls.length) return candidates;') !== -1, 'renderer must not copy candidate pools when there are no loaded URLs to prioritize');
-  assert(renderer.indexOf('var indexByNormalized = {};') !== -1, 'renderer loaded-candidate priority must map normalized URLs to candidate indexes');
-  assert(renderer.indexOf('var previewKeys = new Array(candidates.length);') !== -1, 'renderer loaded-candidate priority must cache normalized preview keys');
-  assert(renderer.indexOf('var displayKeys = new Array(candidates.length);') !== -1, 'renderer loaded-candidate priority must cache normalized display keys');
-  assert(renderer.indexOf('previewKeys[i] = normalized;') !== -1, 'renderer loaded-candidate priority must store normalized preview keys during indexing');
-  assert(renderer.indexOf('displayKeys[i] = displayNormalized;') !== -1, 'renderer loaded-candidate priority must store normalized display keys during indexing');
-  assert(renderer.indexOf('var matchIndex = indexByNormalized[loaded];') !== -1, 'renderer loaded-candidate priority must resolve loaded hits by cached index');
-  assert(renderer.indexOf('var matchedPreviewKey = previewKeys[matchIndex]') !== -1, 'renderer loaded-candidate priority must mark cached preview keys on hit');
-  assert(renderer.indexOf('var matchedDisplayKey = displayKeys[matchIndex]') !== -1, 'renderer loaded-candidate priority must mark cached display keys on hit');
-  assert(renderer.indexOf('function markCandidateUsed(candidate)') === -1, 'renderer loaded-candidate priority must not reread candidates just to mark used keys');
-  assert(renderer.indexOf("var key = previewKeys[j] || '';") !== -1, 'renderer loaded-candidate priority must reuse preview keys during fallback append');
-  assert(renderer.indexOf('if (!key || used[key]) continue;') !== -1, 'renderer loaded-candidate priority must use cached preview keys for fallback filtering');
-  assert(renderer.indexOf('var key = SharedUtils.normalizeImageUrl(src);') === -1, 'renderer loaded-candidate priority must not renormalize preview URLs during fallback append');
-  assert(renderer.indexOf('SharedUtils.getImagePreviewSrc(candidates[j])') === -1, 'renderer loaded-candidate priority must not reread preview URLs during fallback append');
-  assert(renderer.indexOf('function copyCandidatePrefix(candidates, limit)') !== -1, 'renderer must centralize narrowed candidate copying');
-  assert(renderer.indexOf("typeof limit !== 'number' || !isFinite(limit)") !== -1, 'renderer narrowed candidate copying must ignore invalid limits');
-  assert(renderer.indexOf('var length = Math.max(0, Math.floor(limit));') !== -1, 'renderer narrowed candidate copying must use an integer array length');
-  assert(renderer.indexOf('var out = new Array(length);') !== -1, 'renderer narrowed candidate copying must preallocate the target array');
-  assert(renderer.indexOf('for (var i = 0; i < length; i++) out[i] = candidates[i];') !== -1, 'renderer narrowed candidate copying must copy by index');
-  assert(renderer.indexOf('var candidatePool = copyCandidatePrefix(images, fetchLimit)') !== -1, 'renderer must only copy the candidate pool through the narrowed copy helper');
-  assert(renderer.indexOf('images.length > fetchLimit ? images.slice(0, fetchLimit) : images') === -1, 'renderer must not slice the candidate pool when the fetch limit narrows it');
-  assert(renderer.indexOf('var candidatePool = images.slice(0, fetchLimit)') === -1, 'renderer must not always copy the candidate pool');
-  assert(renderer.indexOf('var sourceCandidates = candidatePool') !== -1, 'renderer must keep hidden source candidates available for replacement');
-  assert(renderer.indexOf('var renderLimit = heavyPlan.enabled ? heavyPlan.limit : displayLimit') !== -1, 'renderer must compute the displayed candidate limit once');
-  assert(renderer.indexOf('var allCandidates = copyCandidatePrefix(candidatePool, renderLimit)') !== -1, 'renderer must reuse narrowed copy helper for displayed candidates');
-  assert(renderer.indexOf('renderLimit < candidatePool.length ? candidatePool.slice(0, renderLimit) : candidatePool') === -1, 'renderer must not slice displayed candidates when the display limit narrows them');
-  assert(renderer.indexOf('candidatePool.slice(0, heavyPlan.enabled ? heavyPlan.limit : displayLimit)') === -1, 'renderer must not always copy allCandidates after building the candidate pool');
-  assert(renderer.indexOf('var displayCandidates = candidatePool.slice') === -1, 'renderer must not allocate display candidates separately before the heavy/non-heavy branch is known');
-  assert(renderer.indexOf('var normalizedTextAttachments = []') !== -1, 'renderer must build normalized TXT attachment arrays explicitly');
-  assert(renderer.indexOf('for (var tai = 0; tai < (textAttachments || []).length; tai++)') !== -1, 'renderer TXT attachment normalization must use one loop');
-  assert(renderer.indexOf('(textAttachments || []).map(function') === -1, 'renderer TXT attachment normalization must not allocate via map');
-  assert(renderer.indexOf('function mergeTextAttachments(freshAttachments, stableAttachments, pageUrl)') !== -1, 'renderer must merge current TXT links with stable cached links');
-  assert(renderer.indexOf('var needsFreshExtraction = (hasTransientLinks && !canReuseFreshLinks)') !== -1, 'renderer TXT scheduling must refresh stale transient links');
-  assert(renderer.indexOf('threadState.hasTextAttachments && expectedAttachmentCount > existingAttachments.length') !== -1, 'renderer mixed TXT marker detection must compare raw marker count against cached attachment count');
-  assert(renderer.indexOf('if (existingAttachments.length && !needsFreshExtraction)') !== -1, 'renderer must check for missing or stale links before reading existing attachments');
-  assert(renderer.indexOf('var fallbackToCachedAttachmentsAfterFreshFailure = function(message, e)') !== -1, 'renderer must fall back to cached TXT attachments when mixed-state fresh extraction fails');
-  assert(renderer.indexOf("threadState.textResourceMessage = 'TXT 附件重新提取失败，解析已缓存附件'") !== -1, 'renderer mixed TXT fresh-failure fallback must expose a transient fallback status');
-  assert(renderer.indexOf('doFetch(stableAttachments, expectedAttachmentCount - stableAttachments.length);') !== -1, 'renderer fresh-failure fallback must read stable TXT attachments and retain the missing count');
-  assert(renderer.indexOf('doFetch(attachments, missingAttachmentCount);') !== -1, 'renderer must fetch the merged TXT attachment set and retain missing attachment counts after fresh extraction');
-  assert(renderer.indexOf("heavyThumbnailClarity === 'lightweight'") !== -1, 'renderer must detect lightweight heavy thumbnail mode');
-  assert(renderer.indexOf('var visibleRowsForRender = heavyPlan.enabled && !heavyPlan.lightweight ? 1 : visRows') !== -1, 'lightweight heavy thumbnails must use the ordinary visible row count');
-  assert(renderer.indexOf('overflow-y:auto;overflow-x:auto') !== -1, 'thumbnail viewport must allow horizontal access when configured columns exceed a narrow container');
-  assert(renderer.indexOf("width:' + gridWidth + 'px;max-width:none") !== -1, 'thumbnail grid must keep its configured column width inside the horizontally scrollable viewport');
-  assert(renderer.indexOf('overflow-x:hidden') === -1, 'thumbnail viewport must not hide right-side thumbnails in narrow containers');
-  assert(renderer.indexOf('lightweightHeavyMode') !== -1, 'renderer must mark lightweight heavy threads for staged loading');
-  assert(renderer.indexOf('firstScreenTotal = Math.min(Math.max(1, cols || 5), allCandidates.length)') !== -1, 'lightweight heavy mode must only start one visible row initially');
-  assert(renderer.indexOf("statusEl.className = 'atp-thread-status'") !== -1, 'thread thumbnail status must have a stable styling hook');
-  assert(renderer.indexOf("statusEl.setAttribute('aria-live', 'off')") !== -1, 'thread thumbnail status must not live-announce every loading tick');
-  assert(renderer.indexOf("statusEl.setAttribute('role', 'status')") === -1, 'thread thumbnail status must not create one live status region per thread');
-  assert(renderer.indexOf("statusEl.setAttribute('aria-live', 'polite')") === -1, 'thread thumbnail status updates must not be announced for every loading tick');
-  assert(renderer.indexOf("statusEl.setAttribute('aria-atomic', 'true')") === -1, 'thread thumbnail status must not force atomic announcements on every loading tick');
-  assert(renderer.indexOf("expandBtn.type = 'button'") !== -1, 'thread thumbnail expand controls must not submit host forms');
-  assert(renderer.indexOf("expandBtn.className = 'atp-thumbnail-expand'") !== -1, 'thread thumbnail expand controls must use the shared accessible button style');
-  assert(renderer.indexOf("expandBtn.setAttribute('aria-expanded', 'false')") !== -1, 'thread thumbnail expand controls must expose collapsed state');
-  assert(renderer.indexOf("expandBtn.setAttribute('aria-label', '展开缩略图列表')") !== -1, 'thread thumbnail expand controls must expose a descriptive collapsed accessible name');
-  assert(renderer.indexOf("expandBtn.setAttribute('aria-controls', viewportId)") !== -1, 'thread thumbnail expand controls must reference the scroll viewport');
-  assert(renderer.indexOf("expandBtn.setAttribute('aria-expanded', expanded ? 'true' : 'false')") !== -1, 'thread thumbnail expand controls must update expanded state');
-  assert(renderer.indexOf("expandBtn.setAttribute('aria-label', expanded ? '收起缩略图列表' : '展开缩略图列表')") !== -1, 'thread thumbnail expand controls must keep the accessible name in sync with expanded state');
-  assert(renderer.indexOf('expandBtn.style.cssText') === -1, 'thread thumbnail expand controls must not rely on inline-only styling');
-  assert(renderer.indexOf('viewport.id = viewportId') !== -1, 'thread thumbnail scroll viewports must have stable ids for expand controls');
-  assert(fetcher.indexOf('SharedUtils.readResponseTextLimited(resp, SharedUtils.ARTICLE_HTML_MAX_BYTES)') !== -1, 'content article fetch must not read unlimited response bodies');
-  assert(fetcher.indexOf('SharedUtils.readResponseArrayBufferLimited(resp, TEXT_ATTACHMENT_MAX_BYTES)') !== -1, 'content TXT fetch must not read unlimited response bodies');
-  assert(fetcher.indexOf('fetchTextAttachmentsFreshByBackground') !== -1, 'cross-origin cached TXT markers must be re-extracted by background');
-  assert(fetcher.indexOf('type: SharedUtils.MESSAGE_TYPES.FETCH_TEXT_ATTACHMENTS_FRESH') !== -1, 'cross-origin fresh TXT extraction must use its dedicated background message');
-  assert(/if \(msg\.type === SharedUtils\.MESSAGE_TYPES\.FETCH_TEXT_ATTACHMENTS_FRESH\)[\s\S]*?textAttachments: Array\.isArray\(item\.textAttachments\) \? item\.textAttachments : \[\]/.test(background), 'background fresh TXT handler must return unfiltered attachments only on the dedicated path');
-  assert(fetcher.indexOf('function hasResourcePayload(resources)') !== -1, 'TXT resource fetch must use a shared payload check');
-  assert(sharedUtils.indexOf('hasResourcePayload: function(resources)') !== -1, 'shared utils must treat password-only resource payloads as valid');
-  assert(sharedUtils.indexOf('this.countResources(r) > 0 || r.passwords.length > 0') === -1, 'shared payload checks must not normalize resources twice');
-  assert(sharedUtils.indexOf('normalizePasswords: function(passwords)') !== -1, 'shared utils must normalize cached password lists');
-  assert(renderer.indexOf('SharedUtils.hasResourcePayload(resources)') !== -1, 'renderer must treat password-only TXT parse results as valid resources');
-  assert(renderer.indexOf('SharedUtils.hasResourcePayload(threadState.resources)') !== -1, 'renderer status must treat password-only resources as present');
-  assert(loader.indexOf('SharedUtils.hasResourcePayload(ts.resources)') !== -1, 'loader cache flush decisions must treat password-only resources as present');
-  assert(loader.indexOf('if (ts.loaded > 0 || SharedUtils.hasResourcePayload(ts.resources))') !== -1, 'loader must mark image-only completed threads as complete article cache writes');
-  assert(loader.indexOf('SharedUtils.hasResources(ts.resources)') === -1, 'loader must not use link-only resource checks for thread completion cache writes');
-  assert(resourcePanel.indexOf('function hasResourcePayload(resources)') !== -1, 'resource panel must share password-aware payload checks');
-  assert(resourcePanel.indexOf('data-copy-passwords="1"') !== -1, 'resource panel must expose a dedicated copy action for password-only resources');
-  assert(/if \(!groups\.length\) \{[\s\S]*?if \(resources\.passwords\.length\) \{[\s\S]*?data-copy-passwords="1"[\s\S]*?if \(statusMessage\)[\s\S]*?atp-resource-status[\s\S]*?if \(showTextFallbackActions\)[\s\S]*?getTextFallbackActionsHtml\(threadState, false\)[\s\S]*?return;/.test(resourcePanel), 'resource sidebar password-only branch must keep TXT status and automatic-failure fallback actions visible');
-  assert(resourcePanel.indexOf('function copyPasswordsOnly(sourceEl)') !== -1, 'resource panel password-only copy must not reuse link-copy settings');
-  assert(resourcePanel.indexOf('formatPasswords(resources, true)') !== -1, 'resource panel explicit password copy must ignore copyPasswordsWithLinks=false');
-  assert(resourcePanel.indexOf('function writeTextWithFallback(text)') !== -1, 'resource panel copy must centralize clipboard API and fallback copy handling');
-  assert(/function writeTextWithFallback\(text\)[\s\S]*?navigator\.clipboard\.writeText\(text\)[\s\S]*?catch \(e\) \{\}[\s\S]*?return fallbackCopy\(text\);/.test(resourcePanel), 'resource panel copy must fall back when clipboard.writeText throws synchronously');
-  assert(/function hasArticlePayload\(data\)[\s\S]*?SharedUtils\.hasResourcePayload\(data\.resources\)/.test(content), 'content article jobs must keep password-only resource results through the shared payload helper');
-  assert(content.indexOf('if (!hasArticlePayload(data))') !== -1, 'content streaming commits must use the shared article payload helper');
-  assert(fetcher.indexOf('function isAllowedArticleFinalUrl(url)') !== -1, 'content article fetch must validate final allowed article URLs');
-  assert(fetcher.indexOf('function isAllowedTextAttachmentFinalUrl(url)') !== -1, 'content TXT fetch must validate final allowed URLs');
-  assert(fetcher.indexOf('function isSameOriginUrl(url)') !== -1, 'fetcher same-origin URL checks must be centralized');
-  assert(fetcher.indexOf('if (isSameOriginUrl(attachments[a].url)) same.push(attachments[a]);') !== -1, 'TXT attachment partitioning must reuse centralized same-origin checks');
-  assert(/function followTextDownloadUrls[\s\S]*?if \(isSameOriginUrl\(url\)\)/.test(fetcher), 'TXT intermediary downloads must reuse centralized same-origin checks');
-  assert(fetcher.indexOf('if (!isSameOriginUrl(url))') !== -1, 'fresh TXT attachment fetches must use centralized same-origin fallback checks');
-  assert(fetcher.indexOf('new URL(attachments[a].url).origin') === -1, 'TXT attachment partitioning must not duplicate URL origin parsing');
-  assert(fetcher.indexOf('new URL(downloadUrls[d]).origin') === -1, 'TXT intermediary downloads must not duplicate URL origin parsing');
-  assert(fetcher.indexOf('new URL(url).origin !== location.origin') === -1, 'fresh TXT attachment fetches must not duplicate URL origin parsing');
-  assert(/if \(!isAllowedTextAttachmentFinalUrl\(finalAttachmentUrl\)\) \{\s+diagnosticFailure = 'redirect_not_allowed';\s+return SharedUtils\.emptyResources\(\);/.test(fetcher), 'content TXT fetch must reject disallowed redirects and classify the failure');
-  assert(sharedUtils.indexOf('SIGNED_TEXT_DOWNLOAD_HOSTS: Object.freeze(') !== -1 &&
-    sharedUtils.indexOf('SharedUtils.SIGNED_TEXT_DOWNLOAD_HOSTS.indexOf(u.hostname) !== -1') !== -1 &&
-    fetcher.indexOf('SharedUtils.isTextAttachmentUrlAllowedInZone') !== -1, 'content TXT fetch must allow signed downloads through the shared allowlist');
-  assert(fetcher.indexOf('文章重定向已拒绝') !== -1, 'content article fetch must reject disallowed redirects');
-  assert(fetcher.indexOf('for (var ai = 0; ai < sourceAttachments.length && attachments.length < TEXT_ATTACHMENT_MAX_COUNT; ai++)') !== -1, 'TXT attachment fetch must bound input attachments without slicing a full source array');
-  assert(/fetchTextAttachmentResourcesWithStatus: async function\(attachments, options\)[\s\S]*?var seenAttachments = \{\};[\s\S]*?SharedUtils\.normalizeTextAttachmentUrl\(attachment\.url\)[\s\S]*?seenAttachments\[attachmentKey\]/.test(fetcher), 'content TXT attachment fetch must dedupe equivalent URLs before direct or background fetches');
-  assert(fetcher.indexOf('(attachments || []).slice(0, TEXT_ATTACHMENT_MAX_COUNT)') === -1, 'TXT attachment fetch must not allocate a sliced attachment input array');
-  assert(/for \(var s = 0; s < same.length; s\+\+\) \{\s+var current = same\[s\];\s+var direct = await ATPFetcher\.fetchTextAttachmentResource/.test(fetcher), 'same-origin TXT fetch must read attachments sequentially so two automatic thread slots cannot fan out into six requests');
-  assert(fetcher.indexOf('await Promise.all(directPromises)') === -1, 'same-origin TXT attachment reads must not multiply automatic queue concurrency with Promise.all');
-  assert(fetcher.indexOf('same.map(function(attachment)') === -1, 'same-origin TXT fetch must not allocate promises with map');
-  assert(fetcher.indexOf('var crossCachePromises = []') !== -1 && fetcher.indexOf('crossCachePromises.push((function(attachment)') !== -1, 'cross-origin TXT cache prechecks must build promises with a loop');
-  assert(fetcher.indexOf('ATPCache.getCachedTextResources(attachment.url).then(function(cached)') !== -1, 'content cross-origin TXT prechecks must read positive cache before fail-cache');
-  assert(fetcher.indexOf('ATPCache.clearTextFailCache(attachment.url);') !== -1, 'content TXT positive cache hits must clear stale fail-cache entries');
-  assert(fetcher.indexOf('cross.map(function(a)') === -1, 'cross-origin TXT cache prechecks must not allocate promises with map');
-  assert(fetcher.indexOf('attachments.filter(function(a) { return !hardFailSet[a.url]; })') === -1, 'TXT background fallback must not allocate a filter result for remaining attachments');
-  assert(fetcher.indexOf('fetchTextAttachmentResources: async function(attachments, options)') !== -1, 'content TXT fetch must accept manual retry options');
-  assert(fetcher.indexOf('if (manualRetry) return { attachment: attachment, cached: null, fail: false };') !== -1, 'manual TXT retry must bypass cross-origin fail-cache prechecks');
-  assert(fetcher.indexOf('if (!manualRetry) {\n          var failCached = await ATPCache.getTextFailCache(attachment.url);') !== -1, 'manual TXT retry must bypass same-origin fail-cache reads');
-  assert(fetcher.indexOf('manualRetry: manualRetry') !== -1, 'content TXT background messages must carry manual retry state');
-  assert(!/if \(status === 429\) \{[\s\S]*?ATPCache\.setTextFailCache\(attachment\.url\);[\s\S]*?\n            \}/.test(fetcher), 'content TXT HTTP 429 must not write TEXT_FAIL cache');
-  assert(background.indexOf('SharedUtils.readResponseTextLimited(resp, SharedUtils.ARTICLE_HTML_MAX_BYTES)') !== -1, 'background article fetch must not read unlimited response bodies');
-  assert(background.indexOf('SharedUtils.readResponseArrayBufferLimited(resp, TEXT_ATTACHMENT_MAX_BYTES)') !== -1, 'background TXT fetch must not read unlimited response bodies');
-  assert(background.indexOf('SharedUtils.hasResourcePayload(redirectedResources)') !== -1, 'background TXT intermediary results must use normalized password-aware payload checks');
-  assert(background.indexOf('SharedUtils.hasResourcePayload(normalizedResources)') !== -1, 'background TXT cache writes must ignore invalid password placeholders');
-  assert(background.indexOf('SharedUtils.countResources(redirectedResources) || redirectedResources.passwords.length') === -1, 'background TXT intermediary checks must not use raw password length');
-  assert(background.indexOf('SharedUtils.countResources(normalizedResources) || normalizedResources.passwords.length') === -1, 'background TXT cache writes must not use raw password length');
-  assert(background.indexOf('for (var ai = 0; ai < sourceAttachments.length && attachments.length < TEXT_ATTACHMENT_MAX_COUNT; ai++)') !== -1, 'background TXT fetch helper must bound effective attachment inputs with loops');
-  assert(/async function fetchTextAttachmentResourcesWithStatus\(attachments, deadline, options\)[\s\S]*?var seenAttachments = \{\};[\s\S]*?SharedUtils\.normalizeTextAttachmentUrl\(attachment\.url\)[\s\S]*?seenAttachments\[attachmentKey\]/.test(background), 'background TXT resource fetch must dedupe equivalent URLs before fetching');
-  assert(/if \(msg\.type === SharedUtils\.MESSAGE_TYPES\.FETCH_TEXT_RESOURCES\)[\s\S]*?var seenAttachments = \{\};[\s\S]*?SharedUtils\.normalizeTextAttachmentUrl\(attachment\.url\)[\s\S]*?seenAttachments\[attachmentKey\]/.test(background), 'background TXT message handler must dedupe equivalent attachment URLs before scheduling fetches');
-  assert(background.indexOf('(attachments || []).slice(0, TEXT_ATTACHMENT_MAX_COUNT)') === -1, 'background TXT resource fetch must not allocate a sliced attachment input array');
-  assert(background.indexOf('function getDeadlineFetchTimeout(deadline, fallbackMs)') !== -1, 'background TXT fetch must clamp fetch timeouts to the content-side deadline');
-  assert(background.indexOf('var fetchTimeout = getDeadlineFetchTimeout(deadline, TEXT_ATTACHMENT_TIMEOUT);') !== -1, 'background TXT fetch must compute per-request timeout from remaining deadline');
-  assert(background.indexOf('setTimeout(function() { ctrl.abort(); }, fetchTimeout)') !== -1, 'background TXT fetch must abort using the deadline-clamped timeout');
-  assert(background.indexOf('}, depth + 1, deadline, options);') !== -1, 'background TXT intermediary recursion must preserve the original deadline');
-  assert(/async function fetchTextAttachmentResourcesWithStatus[\s\S]*?for \(var i = 0; i < attachments\.length; i\+\+\) \{[\s\S]*?await fetchTextAttachmentResource\(attachments\[i\], 0, deadline,/.test(background), 'background TXT resource fetch must keep each automatic thread to one attachment request at a time');
-  assert(background.indexOf('await Promise.all(promises)') === -1, 'background TXT attachment reads must not multiply automatic queue concurrency with Promise.all');
-  assert(background.indexOf('attachments.map(function(attachment)') === -1, 'background TXT resource fetch must not allocate promises with map');
-  assert(background.indexOf('var ARTICLE_FETCH_IN_FLIGHT = {}') !== -1, 'background article fetches must track in-flight requests for reuse');
-  assert(background.indexOf('function fetchArticleWithInflight(url, imageSettings, deadline)') !== -1, 'background article fetches must centralize in-flight reuse');
-  assert(background.indexOf('function createArticleFetchControl(deadline, articleSettings)') !== -1, 'background shared article fetches must own a settings-aware extendable fetch abort control');
-  assert(background.indexOf('function extendArticleFetchControl(control, deadline, articleSettings)') !== -1, 'background duplicate article fetches must be able to extend the shared fetch deadline');
-  assert(background.indexOf('if (existing.control && existing.control.controller && existing.control.controller.signal.aborted)') !== -1, 'background duplicate article fetches must not reuse already-aborted in-flight controls');
-  assert(background.indexOf('extendArticleFetchControl(existing.control, deadline, imageSettings);') !== -1, 'background duplicate article fetches must extend the underlying fetch when a later caller has more time');
-  assert(background.indexOf('return waitForArticleDeadline(existing.promise, deadline);') !== -1, 'background duplicate article fetches must share an existing in-flight promise');
-  assert(background.indexOf('var promise = fetchArticle(url, imageSettings, deadline, control);') !== -1, 'background shared in-flight article fetches must pass the extendable deadline control to the underlying fetch');
-  assert(background.indexOf('var promise = fetchArticle(url, imageSettings);') === -1, 'background shared in-flight article fetches must not ignore the content-side deadline');
-  assert(background.indexOf('var promise = fetchArticle(url, imageSettings, deadline);') === -1, 'background shared in-flight article fetches must not use an unextendable first-caller deadline');
-  assert(background.indexOf('control = control || createArticleFetchControl(deadline, imageSettings);') !== -1, 'background article fetch must use the shared settings-aware deadline control when one exists');
-  assert(fetcher.indexOf('var retryAfter = isTransientHttp ? SharedUtils.parseRetryAfterHeader(resp.headers) : 0;') !== -1, 'content article fetch must parse Retry-After for transient HTTP responses');
-  assert(fetcher.indexOf("return emptyArticleData(isTransientHttp, 'http_' + status, retryAfter);") !== -1, 'content article fetch must preserve Retry-After on retryable empty data');
-  assert(background.indexOf('var retryAfter = retryableHttp ? SharedUtils.parseRetryAfterHeader(resp.headers) : 0;') !== -1, 'background article fetch must parse Retry-After for transient HTTP responses');
-  assert(background.indexOf("retryAfter: Math.max(0, Number(item.retryAfter || 0) || 0)") !== -1, 'background FETCH_IMAGES responses must carry retry-after timestamps to content');
-  assert(background.indexOf('function normalizeBackgroundTextAttachments(item)') !== -1, 'background article responses must normalize TXT attachment markers before content rendering');
-  assert(background.indexOf("SharedUtils.isTransientTextAttachmentUrl(attachment.url, attachment.pageUrl || item.pageUrl || item.url || '')") !== -1, 'background article responses must filter transient TXT URLs before renderer sees them');
-  assert(background.indexOf('hasTextAttachments: textState.hasTextAttachments') !== -1 && background.indexOf('textAttachmentCount: textState.textAttachmentCount') !== -1, 'background article responses must preserve TXT marker count after filtering transient URLs');
-  assert(background.indexOf('item = makeDeadlineArticleResult();') !== -1, 'background article workers must return retryable deadline results for unscheduled URLs');
-  assert(content.indexOf('ATPFetcher.fetchArticleDataByBackground(job.url, makeArticlePaceOptions(job, generation))') !== -1, 'content cross-origin article jobs must delegate deadline handling to the fetcher');
-  assert(fetcher.indexOf('var deadline = Date.now() + articleTimeout;') !== -1 && fetcher.indexOf('deadline: deadline') !== -1, 'fetcher single article background fallback must pass the configured article deadline to background');
-  assert(background.indexOf('var sourceAttachments = Array.isArray(msg.attachments) ? msg.attachments : []') !== -1, 'background TXT message handler must ignore non-array attachment inputs');
-  assert(sharedUtils.indexOf('BG_FETCH_MAX_TEXT_ATTACHMENTS: 30') !== -1, 'shared utils must cap background TXT attachment message fanout');
-  assert(background.indexOf('var maxSourceAttachments = Math.max(0, Number(SharedUtils.BG_FETCH_MAX_TEXT_ATTACHMENTS) || 30);') !== -1, 'background TXT message handler must read the shared attachment fanout cap');
-  assert(background.indexOf('ai < maxSourceAttachments && attachments.length < TEXT_ATTACHMENT_MAX_COUNT') !== -1, 'background TXT message handler must cap raw attachment scanning before filtering valid attachments');
-  assert(background.indexOf('var textDeadline = Number(msg.deadline) || (Date.now() + SharedUtils.getTextAttachmentBackgroundTimeout(attachments.length));') !== -1, 'background TXT message handler must accept a content-provided deadline and provide a fallback');
-  assert(background.indexOf('var cached = await getCachedTextResources(attachment.url);\n    if (cached) {\n      clearTextFailCache(attachment.url);') !== -1, 'background TXT positive cache must be checked before stale TEXT_FAIL entries');
-  assert(background.indexOf('if (!manualRetry) {\n      var failCached = await getTextFailCache(attachment.url);') !== -1, 'manual background TXT retry must bypass fail-cache reads');
-  assert(background.indexOf('const TEXT_RESOURCE_MESSAGE_CONCURRENCY = 2;') !== -1 && background.indexOf('function enqueueTextResourceMessage(attachments, deadline, options)') !== -1, 'background TXT messages must share an extension-level concurrency cap of two');
-  assert(background.indexOf('enqueueTextResourceMessage(attachments, textDeadline, { manualRetry: manualRetry, owner: sender && sender.tab && sender.tab.id, zone: textSenderZone })') !== -1, 'background TXT message handler must enqueue work with trusted tab ownership, manual retry state and the sender site zone');
-  assert(!/if \(status === 429\) \{[\s\S]*?setTextFailCache\(attachment\.url\);[\s\S]*?\n        \}/.test(background), 'background TXT HTTP 429 must not write TEXT_FAIL cache');
-  assert(/catch \(e\) \{\s+diagnosticFailure = backgroundTextFailureClass\(e\);\s+return SharedUtils\.emptyResources\(\);\s+\} finally \{\s+logBackgroundTextDiagnostic/.test(background), 'background TXT unexpected exceptions must remain retryable instead of writing TEXT_FAIL cache');
-  assert(background.indexOf('(msg.attachments || []).filter(function(a)') === -1, 'background TXT message handler must not allocate filtered attachment arrays');
-  assert(background.indexOf('}).slice(0, TEXT_ATTACHMENT_MAX_COUNT)') === -1, 'background TXT message handler must not slice filtered attachment arrays');
-  assert(fetcher.indexOf('if (cached.textAttachments.length)') !== -1, 'fetcher must always scrub cached Discuz TXT URLs before returning cached article data');
-  assert(fetcher.indexOf('if (!cached.hasTextAttachments && cached.textAttachments.length)') === -1, 'cached Discuz TXT URL scrubbing must not depend on stale hasTextAttachments state');
-  assert(background.indexOf('function shortUrl(url)') !== -1, 'background redirect logging must truncate URLs');
-  assert(background.indexOf('function isAllowedOriginHost(host)') !== -1, 'background origin host checks must be centralized');
-  assert(background.indexOf("return u.protocol === 'https:' && isAllowedOriginHost(u.hostname);") !== -1, 'background originAllowed must require https and reuse the centralized host check');
-  assert(background.indexOf('return SharedUtils.isAllowedTextAttachmentUrl(url);') !== -1, 'background TXT final URL checks must use the shared HTTPS and path boundary');
-  assert(fetcher.indexOf('var zone = SharedUtils.getForumUrlZone(url);') !== -1 &&
-    sharedUtils.indexOf("return u.protocol === 'https:' ? SharedUtils.getForumSiteZone(u.hostname) : '';") !== -1, 'content article final URL checks must reject non-https and cross-site redirects');
-  assert(background.indexOf('!textAttachmentAllowedInZone(finalAttachmentUrl, options.zone)') !== -1, 'background TXT fetch must reject disallowed or cross-site final redirect URLs');
-  assert(background.indexOf("reason: 'redirect_disallowed'") !== -1, 'background article fetch must reject disallowed final redirect URLs');
-  assert(sharedUtils.indexOf('BG_FETCH_MAX_URLS: 60') !== -1, 'shared utils must cap background image fetch message fanout');
-  assert(background.indexOf('var sourceUrls = Array.isArray(msg.urls) ? msg.urls : []') !== -1, 'background image fetch handoff must ignore non-array URL inputs');
-  assert(background.indexOf('var maxSourceUrls = Math.max(0, Number(SharedUtils.BG_FETCH_MAX_URLS) || 60);') !== -1, 'background image fetch handoff must read the shared URL fanout cap');
-  assert(background.indexOf('for (var ui = 0; ui < sourceUrls.length && ui < maxSourceUrls; ui++)') !== -1, 'background image fetch handoff must collect allowed URLs in one bounded loop');
-  assert(background.indexOf('var urls = (msg.urls || []).filter(originAllowed)') === -1, 'background image fetch handoff must not allocate a filtered URL array via filter');
-  assert(background.indexOf('async function worker()') !== -1 && background.indexOf('var workerCount = Math.min(urls.length, ATPLoadPolicy.getArticleFetchConcurrency(imageSettings));') !== -1, 'background article fetches must use the configured refill worker pool');
-  assert(background.indexOf('var workers = new Array(workerCount);') !== -1 && background.indexOf('workers[i] = worker();') !== -1, 'background article worker pool must allocate only the bounded worker set');
-  assert(background.indexOf('var chunk = urls.slice(i, i + SharedUtils.BG_FETCH_CHUNK_SIZE)') === -1, 'background article batches must not allocate chunk slices');
-  assert(background.indexOf('chunk.map(function(u) { return fetchArticle(u, imageSettings); })') === -1, 'background article batches must not allocate promise arrays through map');
-  assert(background.indexOf('key.indexOf(_BASE.TEXT_FAIL_BASE) === 0 && key.indexOf(_BASE.TEXT_FAIL) !== 0') !== -1, 'background onInstalled cleanup must remove stale legacy TEXT_FAIL cache prefixes');
-  assert(cache.indexOf('getArticleCacheState: function(url)') !== -1, 'article fetches must expose a combined article/negative cache read path');
-  assert(cache.indexOf('chrome.storage.local.get([articleKey, negativeKey]') !== -1, 'combined article cache state reads must fetch article and negative cache keys together');
-  assert(cache.indexOf('negativeExpiresAt: negativeState ? negativeState.expiresAt : 0') !== -1, 'combined article cache state reads must expose negative cache expiry times');
-  assert(cache.indexOf('retryAfter: Math.max(0, Number(data.retryAfter || 0) || 0)') !== -1, 'article data normalization must preserve retry-after timestamps');
-  assert(fetcher.indexOf('var cacheState = await ATPCache.getArticleCacheState(url);') !== -1, 'content article fetch must use the combined article cache state read');
-  assert(fetcher.indexOf('if (await ATPCache.getNegativeCache(url))') === -1, 'content article fetch must not perform a second serial negative-cache read after article cache miss');
-  assert(fetcher.indexOf("return emptyArticleData(true, 'negative_cache', cacheState.negativeExpiresAt);") !== -1, 'content article negative-cache hits must retry at the negative cache expiry');
-  assert(fetcher.indexOf("return emptyArticleData(true, 'login_redirect');") !== -1, 'content article login redirects must be retryable instead of negative-cached');
-  assert(fetcher.indexOf("return emptyArticleData(true, blockedReason === 'cloudflare' ? 'cloudflare' : 'blocked');") !== -1, 'content article blocked pages must be retryable instead of negative-cached');
-  assert(fetcher.indexOf('var articleParseQueue = []') !== -1 && fetcher.indexOf('var articleParseRunning = false') !== -1, 'same-origin article parsing must use a single serialized queue');
-  assert(/async function runArticleParseJob\(job\)[\s\S]*?extractResources\(job\.html[\s\S]*?await yieldArticleParseSlice\(\);[\s\S]*?extractTextAttachments\(job\.html[\s\S]*?await yieldArticleParseSlice\(\);[\s\S]*?extractImagesForSettings\(job\.html/.test(fetcher), "same-origin resource, TXT, and image parsing must yield between atomic stages");
-  assert(fetcher.indexOf('var parsedArticle = await enqueueArticleParse(html, finalUrl, settings, url);') !== -1, 'same-origin network responses must enter the parse queue only after HTML is read and validated');
-  assert(content.indexOf('function cacheFetchedArticleData(url, data, writeStartedAt)') !== -1, 'background-fetched article data must be cached after rendering decisions');
-  assert(content.indexOf('ATPCache.setCachedArticleData(url, cacheData, !data.partial, writeStartedAt)') !== -1, 'background-fetched article cache must preserve partial state and cache generation time');
-  assert(content.indexOf('SharedUtils.isTransientTextAttachmentUrl(attachment.url, url)') !== -1, 'background-fetched cache must not persist transient TXT attachment URLs');
-  assert(/async function fetchCrossOriginArticle\(job, generation\)[\s\S]*?ATPCache\.getArticleCacheState\(job\.url\)/.test(content), 'content cross-origin jobs must pre-read article and negative cache state');
-  assert(content.indexOf('if (cacheState && cacheState.cached) return makeArticleFetchOutcome(cacheState.cached, null);') !== -1, 'content cross-origin jobs must reuse cached article data without background fetch');
-  assert(content.indexOf("makeRetryableEmptyInfo('negative_cache', cacheState.negativeExpiresAt)") !== -1, 'content cross-origin negative cache hits must preserve retryable expiry');
-  assert(content.indexOf('var data = await ATPFetcher.fetchArticleDataByBackground(job.url, makeArticlePaceOptions(job, generation));') !== -1, 'content cross-origin jobs must fetch only cache misses');
-  assert(content.indexOf('function getArticleGroupKey(url)') !== -1, 'content scan URL grouping must use normalized article URL keys');
-  assert(content.indexOf('var key = getArticleGroupKey(url);') !== -1, 'content scan URL grouping must compute one normalized group key per candidate');
-  assert(content.indexOf('var existing = jobsByKey[key];') !== -1 && content.indexOf('jobsByKey[key] = job;') !== -1, 'content streaming scheduler must group duplicate rows by normalized article URL');
-  assert(previewer.indexOf('function setPreviewImageSource(img, src, token, noReferrer)') !== -1, 'previewer must share image source loading policy with loader');
-  assert(loader.indexOf('function setImageSource(img, src, noReferrer, shouldApply)') !== -1, 'loader image source helper must support cancellable delayed assignment');
-  assert(loader.indexOf('function prepareThumbnailImage(img, task, w, h)') !== -1, 'loader must centralize thumbnail image initialization');
-  assert(loader.indexOf("img.loading = shouldLoadImageEagerly(task) ? 'eager' : 'lazy'") !== -1, 'thumbnail images must set loading priority by task type');
-  assert(loader.indexOf("img.fetchPriority = shouldUseHighFetchPriority(task) ? 'high' : 'low'") !== -1, 'thumbnail images must keep preload fetches low priority');
-  assert(loader.indexOf('function getPreviewActivationLabel(task)') !== -1, 'thumbnail preview wrappers must build contextual accessible names');
-  assert(loader.indexOf("return '打开第 ' + Math.min(index + 1, total) + ' 张图片预览，共 ' + total + ' 张';") !== -1, 'thumbnail preview wrappers must include image position and total count');
-  assert(loader.indexOf('function bindPreviewActivation(wrapper, openPreview, task)') !== -1, 'loader must centralize keyboard preview activation for thumbnail wrappers');
-  assert(loader.indexOf('function clearPreviewActivation(wrapper)') !== -1, 'loader must centralize preview keyboard activation cleanup');
-  assert(loader.indexOf("wrapper.removeAttribute('data-atp-thread-id')") !== -1, 'loader preview cleanup must remove stale thread focus metadata');
-  assert(loader.indexOf("wrapper.removeAttribute('data-atp-preview-index')") !== -1, 'loader preview cleanup must remove stale preview index metadata');
-  assert(loader.indexOf('wrapper.tabIndex = 0') !== -1, 'thumbnail preview wrappers must be focusable for keyboard users');
-  assert(loader.indexOf("wrapper.setAttribute('role', 'button')") !== -1, 'thumbnail preview wrappers must expose button semantics');
-  assert(loader.indexOf("wrapper.setAttribute('aria-label', getPreviewActivationLabel(task))") !== -1, 'thumbnail preview wrappers must avoid generic repeated preview labels');
-  assert(loader.indexOf("wrapper.setAttribute('data-atp-thread-id', task && task.threadId ? task.threadId : '')") !== -1, 'thumbnail preview wrappers must expose thread metadata for preview focus fallback');
-  assert(loader.indexOf("wrapper.setAttribute('data-atp-preview-index', String(task ? getTaskPreviewIndex(task) : 0))") !== -1, 'thumbnail preview wrappers must expose preview index metadata for preview focus fallback');
-  assert(loader.indexOf("key !== 'Enter' && key !== ' ' && key !== 'Spacebar'") !== -1, 'thumbnail preview wrappers must support Enter and Space activation');
-  assert(loader.indexOf('function retryKeyHandler(evt)') !== -1, 'failed thumbnail placeholders must handle keyboard retry activation');
-  assert(loader.indexOf('function setRetryActivation()') !== -1, 'failed thumbnail retry activation must support mouse and keyboard input');
-  assert(loader.indexOf('function setFailedRetryStatus(message, title, label)') !== -1, 'failed thumbnail placeholders must keep visible, title, and aria retry status updates together');
-  assert(loader.indexOf("retryStatus.className = 'atp-thumbnail-failed-status'") !== -1, 'failed thumbnail placeholders must include visible retry status text');
-  assert(loader.indexOf("setFailedRetryStatus('已排队，等待空槽'") !== -1, 'failed thumbnail retries must show their waiting state');
-  assert(/showFailedPlaceholder:[\s\S]*?wrapper\.setAttribute\('aria-label'/.test(loader), 'failed thumbnail placeholders must expose a retry aria-label');
-  assert(loader.indexOf('clearPreviewActivation(wrapper);\n      if (loadingEl && loadingEl.parentNode) loadingEl.remove();') !== -1, 'failed thumbnail placeholders must clear stale keyboard preview activation');
-  assert(loader.indexOf('bindPreviewActivation(wrapper, openPreview, task);') !== -1, 'direct thumbnail loads must bind keyboard preview activation with task context');
-  assert(viewport.indexOf('ATPLoader.bindPreviewActivation(wrapper, openPreview, task);') !== -1, 'viewport lazy thumbnail loads must bind keyboard preview activation with task context');
-  const previewOpenerMetadataPattern = /ATPPreviewer\.open\(allUrls, clickIndex, \{\s+opener: wrapper,\s+threadId: task\.threadId,\s+previewIndex: clickIndex,\s+preferOpenerFocus: preferOpenerFocus === true\s+\}\);/g;
-  const loaderPreviewOpenerCalls = loader.match(previewOpenerMetadataPattern) || [];
-  assert(loaderPreviewOpenerCalls.length >= 2, 'direct and retry thumbnail preview opens must pass opener focus metadata');
-  assert(previewOpenerMetadataPattern.test(viewport), 'viewport thumbnail preview opens must pass opener focus metadata');
-  assert(loader.indexOf('openPreview(true);') !== -1 && viewport.indexOf('openPreview(true);') !== -1, 'mouse thumbnail clicks must request opener-first focus restore');
-  assert(contentCss.indexOf('.atp-thumbnail-wrapper:focus-visible') !== -1, 'thumbnail wrappers must show a visible keyboard focus outline');
-  assert(/\.atp-thumbnail-wrapper\s*\{[\s\S]*?box-sizing: border-box;[\s\S]*?border: 0;[\s\S]*?box-shadow: inset 0 0 0 1px #e0e0e0;/.test(contentCss), 'thumbnail wrappers must keep configured dimensions without border overflow');
-  assert(/\.atp-thumbnail-img\s*\{[\s\S]*?object-fit: contain;[\s\S]*?object-position: center center;/.test(contentCss), 'thumbnail images must show the full image instead of cropping to a corner');
-  assert(/\.atp-thumbnail-loading\s*\{[\s\S]*?position: absolute;[\s\S]*?inset: 0;/.test(contentCss), 'thumbnail loading placeholders must overlay the wrapper instead of consuming grid height');
-  assert(renderer.indexOf('var viewportContentH = visibleRowsForRender * h + (visibleRowsForRender - 1) * gap;') !== -1, 'thumbnail viewport height must separate content rows from viewport padding');
-  assert(renderer.indexOf('var viewportH = viewportContentH + 12;') !== -1, 'thumbnail viewport height must include .atp-scroll-viewport vertical padding');
-  assert(contentCss.indexOf('.atp-thumbnail-expand') !== -1, 'thumbnail expand button must have a stable CSS class');
-  assert(/\.atp-thumbnail-expand\s*\{[\s\S]*?min-width: 44px;[\s\S]*?min-height: 24px;/.test(contentCss), 'thumbnail expand button must keep a practical touch target');
-  assert(contentCss.indexOf('.atp-thumbnail-expand:focus-visible') !== -1, 'thumbnail expand button must show a visible keyboard focus outline');
-  assert(/\.atp-thumbnail-expand:focus-visible\s*\{[\s\S]*?outline: 2px solid #23527c;/.test(contentCss), 'thumbnail expand button focus outline must be high contrast');
-  assert(loader.indexOf('function getBackgroundDelay(settings)') !== -1, 'background image scheduling must honor the configured speed');
-  assert(settingsSchema.indexOf("{ value: 'extreme', label: '极速 (20ms)' }") !== -1, 'background speed settings must expose a 20ms option');
-  assert(settingsSchema.indexOf("{ value: 'veryfast', label: '很快 (50ms)' }") !== -1, 'background speed settings must expose a 50ms option');
-  assert(loadingPolicy.indexOf("if (speed === 'extreme') return 20;") !== -1, 'loading policy must support the 20ms background speed');
-  assert(loadingPolicy.indexOf("if (speed === 'veryfast') return 50;") !== -1, 'loading policy must support the 50ms background speed');
-  assert(loader.indexOf('function getBackgroundIdleTimeout(delay)') !== -1, 'background idle scheduling must centralize the requestIdleCallback timeout');
-  assert(/function getBackgroundIdleTimeout\(delay\)[\s\S]*?return 100;/.test(loader), "background idle timeout must stay at 100ms after the configured delay");
-  assert(loader.indexOf('function getViewportPendingLimit(settings)') !== -1, 'background lazy placeholders must have one bounded but non-stalling pending budget');
-  assert(loader.indexOf('return ATPLoadPolicy.getViewportPendingLimit(settings, Math.max(1, Number(settings.backgroundConcurrency) || 1));') !== -1, 'first-screen and background placeholder registration must reuse the public background-derived pending limit');
-  assert(loader.indexOf('var inspectBudget = BG_TASKS.length;') !== -1, 'background queue processing must inspect the current queue without a hidden count cap');
-  assert(loader.indexOf('Date.now() < timeSliceEndsAt') !== -1, 'background queue processing must yield by a short time slice instead of a hidden task count');
-  assert(loader.indexOf('firstOrdinaryIndex: -1') !== -1, 'background queue snapshots must remember the first ordinary task position');
-  assert(loader.indexOf('function promoteFirstOrdinaryBgTask(bgSnapshot)') !== -1, 'background queue processing must be able to promote ordinary work past deferred heavy tasks');
-  assert(loader.indexOf('if (bgSnapshot.ordinary > 0) bgSnapshot = promoteFirstOrdinaryBgTask(bgSnapshot);') !== -1, 'background queue processing must prioritize ordinary work before inspecting deferred heavy heads');
-  assert(loader.indexOf("GLOBAL_BG_TIMER_KIND === 'idle'") !== -1, 'background timer cleanup must distinguish idle callbacks from timeouts');
-  assert(/requestIdleCallback\(function\(\)[\s\S]*?ATPLoader\.processBgTasks\(\);[\s\S]*?\}, \{ timeout: getBackgroundIdleTimeout\(delay\) \}\)/.test(loader), 'background idle callback must process one bounded background batch with a speed-aligned idle timeout');
-  assert(loader.indexOf('Math.max(1000, delay)') === -1, 'background idle callback must not restore the old fixed 1000ms timeout floor');
-  assert(loader.indexOf('while (deadline.timeRemaining() > 0') === -1, 'background idle callback must not run repeated global schedules in one idle tick');
-  assert(sharedUtils.indexOf('function addResourceCandidate(raw)') !== -1, 'resource extraction must collect links first and pair their share codes afterwards');
-  assert(sharedUtils.indexOf('collectAccessCodePairs: function(rawHtml, baseUrl, source)') !== -1 && sharedUtils.split('this.collectAccessCodePairs(rawHtml, baseUrl, source)').length === 2,
-    'share codes must be paired once per page, over one text that holds every link');
-  assert(sharedUtils.indexOf('function scanResourceText(scanText)') !== -1, 'resource extraction must scan text and href values without building one large scan string');
-  assert(sharedUtils.indexOf('var rawText = this.replaceHtmlTags(rawHtml, function(name, attrs, closing)') !== -1,
-    'TXT download extraction must read real link attributes and scan raw URLs outside tags');
-  assert(sharedUtils.indexOf('mergeUniqueLimited: function(primary, secondary, limit)') !== -1, 'resource password extraction must support bounded password merging');
-  assert(/resources\.passwords = source === 'txt' \? this\.extractArchivePasswords\(text\) : this\.mergeUniqueLimited\(\s*this\.extractArchivePasswordsFromHtml\(rawHtml\),\s*this\.extractArchivePasswords\(text\),\s*5\s*\);/.test(sharedUtils),
-    'resource password extraction must keep literal TXT extraction separate and cap HTML password merging at five without slicing a full merged list');
-  assert(sharedUtils.indexOf(').slice(0, 5)') === -1, 'resource password extraction must not allocate a sliced merged password list');
-  assert(sharedUtils.indexOf('var separator = /\\s+/.exec(v);') !== -1, 'resource password cleanup must find the first whitespace separator without splitting');
-  assert(sharedUtils.indexOf('v.substring(separator.index + separator[0].length)') !== -1, 'resource password cleanup must inspect only the password suffix after the first separator');
-  assert(sharedUtils.indexOf('v = v.substring(0, separator.index);') !== -1, 'resource password cleanup must keep the first token when the suffix is Chinese explanatory text');
-  assert(sharedUtils.indexOf('var parts = v.split(/\\s+/);') === -1, 'resource password cleanup must not split every password candidate into an array');
-  assert(sharedUtils.indexOf("parts.slice(1).join(' ')") === -1, 'resource password cleanup must not slice and join password suffix arrays');
-  assert(sharedUtils.indexOf('var group = resources.groups[type] || [];') !== -1, 'resource merging must reuse the normalized group reference');
-  assert(sharedUtils.indexOf('merged.groups[type].push(group[g]);') !== -1, 'resource merging must append group entries without concat allocation');
-  assert(sharedUtils.indexOf('merged.groups[type] = merged.groups[type].concat(resources.groups[type] || [])') === -1, 'resource merging must not concat group arrays for each source');
-  assert(sharedUtils.indexOf("var values = [href, this.extractHtmlAttr(attrs, 'title'), label];") !== -1, 'mailto password restoration must seed candidate values without concat');
-  assert(sharedUtils.indexOf('var dataValues = this.extractDataAttrValues(attrs);') !== -1, 'mailto password restoration must read data attributes once');
-  assert(sharedUtils.indexOf('for (var di = 0; di < dataValues.length; di++)') !== -1, 'mailto password restoration must append data attributes with a loop');
-  assert(sharedUtils.indexOf("].concat(this.extractDataAttrValues(attrs))") === -1, 'mailto password restoration must not concat data attribute values for every anchor');
-  assert(sharedUtils.indexOf('var cleaned = this.cleanResourceUrl(part);\n      if (cleaned) links.push(cleaned);') !== -1, 'protocol link extraction must skip empty links before pushing');
-  assert(sharedUtils.indexOf('var start = lower.indexOf(markerLower);') !== -1, 'protocol link extraction must scan marker positions with one cursor');
-  assert(sharedUtils.indexOf('var next = lower.indexOf(markerLower, start + marker.length);') !== -1, 'protocol link extraction must compute the next marker boundary on demand');
-  assert(sharedUtils.indexOf('positions.push(idx)') === -1, 'protocol link extraction must not allocate a marker positions array');
-  assert(sharedUtils.indexOf('var positions = []') === -1, 'protocol link extraction must not collect marker positions before extracting links');
-  assert(sharedUtils.indexOf('return links.filter(Boolean);') === -1, 'protocol link extraction must not allocate a second array just to drop empty links');
-  assert(sharedUtils.indexOf('IMAGE_KEEP_PARAM_MAP: {') !== -1, 'image URL normalization must keep its preserved-query map at module scope');
-  assert(sharedUtils.indexOf('var keepParamMap = SharedUtils.IMAGE_KEEP_PARAM_MAP;') !== -1, 'image URL normalization must reuse the shared preserved-query map');
-  assert(sharedUtils.indexOf("var keepParams = [\n        'id'") === -1, 'image URL normalization must not rebuild the preserved-query array per URL');
-  assert(sharedUtils.indexOf('for (var kp = 0; kp < keepParams.length; kp++)') === -1, 'image URL normalization must not rebuild the preserved-query map per URL');
-  assert(sharedUtils.indexOf('ARTICLE_KEEP_PARAM_MAP: {') !== -1, 'article URL normalization must keep its preserved-query map at module scope');
-  assert(sharedUtils.indexOf('var keepParamMap = SharedUtils.ARTICLE_KEEP_PARAM_MAP;') !== -1, 'article URL normalization must reuse the shared preserved-query map');
-  assert(sharedUtils.indexOf("var keepParams = ['mod', 'tid', 'page'];") === -1, 'article URL normalization must not rebuild the preserved-query array per URL');
-  assert(sharedUtils.indexOf('keepParams.indexOf(k)') === -1, 'article URL normalization must not scan a per-call keepParams array');
-  assert(sharedUtils.indexOf('getSrcsetUrls: function(srcset)') !== -1, 'image extraction must parse srcset best/smallest candidates with one helper');
-  assert(sharedUtils.indexOf('var srcsetUrls = SharedUtils.getSrcsetUrls(srcset);') !== -1, 'image extraction must reuse one srcset parse per image candidate');
-  assert(sharedUtils.indexOf("var parts = String(srcset || '').split(',');") === -1, 'srcset parsing must not allocate comma-split candidate arrays');
-  assert(sharedUtils.indexOf('var tokens = item.split(/\\s+/);') === -1, 'srcset parsing must not allocate per-candidate token arrays');
-  assert(sharedUtils.indexOf("text + '\\n' + this.extractHrefValues(decoded).join('\\n')") === -1, 'resource extraction must not concatenate full text and href values into a large scan string');
-  assert(sharedUtils.indexOf('ACCESS_CODE_PAIR_MAX_GAP: 220') !== -1 && sharedUtils.indexOf('ACCESS_CODE_PAIR_MAX_LINES: 3') !== -1, 'share codes must only pair with a nearby link');
-  assert(sharedUtils.indexOf('ACCESS_CODE_UNPAIRED_COST: 4') !== -1 && sharedUtils.indexOf('best[i - 2] + cost < best[i]') !== -1,
-    'share-code pairing must weigh leaving a link without a code against every neighbouring pair');
-  assert(sharedUtils.indexOf("var chosen = better(before, after) ? before : after;") !== -1 && sharedUtils.indexOf("if (x.crossings !== y.crossings) return x.crossings < y.crossings;") !== -1,
-    'each block must be paired both ways and the way that pairs more codes kept, so one stray code cannot flip a block');
-  assert(sharedUtils.indexOf('isNonShareCodePasswordLabel(lineBefore)') !== -1 && sharedUtils.indexOf("var blockRe = /(?:magnet:\\?|ed2k:\\/\\/|thunder:\\/\\/)") !== -1,
-    'archive and login passwords must not be share codes, and no code may pair across a magnet or ed2k link');
-  assert(sharedUtils.indexOf('var foreign = !pan && !blocking && (fileDrive || (SharedUtils.isForeignShareLink(href, baseUrl) &&') !== -1 &&
-    sharedUtils.indexOf("if (!SharedUtils.isForeignShareLink('https://' + m[2], baseUrl)) continue;") !== -1,
-    'links of other drives, with or without a scheme, must take part in pairing so they keep their own codes');
-  assert(sharedUtils.indexOf('} else if (ch === 10) {') !== -1 && sharedUtils.indexOf('if (ch === PARA_CODE) {') !== -1 &&
-    sharedUtils.indexOf(".replace(/[\\r\\n]+/g, ' ')") !== -1,
-    'share-code pairing must count lines as the reader sees them (blank lines and CR/LF are one break) and know paragraphs');
-  assert(sharedUtils.indexOf('var candidates = collect(/(?:提取码') === -1, 'resource access-code extraction must not allocate and concatenate candidate arrays');
-  assert(sharedUtils.indexOf('candidates.sort(function(a, b) { return a.score - b.score; })') === -1, 'resource access-code extraction must not sort all nearby candidates');
-  assert(sharedUtils.indexOf('(?:www\\.)?pan\\.baidu\\.com') !== -1, 'resource extraction must support common www pan host variants');
-  assert(sharedUtils.indexOf('提取[码碼]|提取密码|访问码|取件码') !== -1, 'resource URL cleanup must trim access-code labels from pan URLs');
-  assert(sharedUtils.indexOf('trailingPunctuation') !== -1, 'resource URL cleanup must centralize terminal punctuation trimming');
-  assert(sharedUtils.indexOf('if (/^ed2k:\\/\\//i.test(cleaned))') !== -1, 'resource URL cleanup must preserve ed2k filenames separately from magnet cleanup');
-  assert(sharedUtils.indexOf('if (/^magnet:\\?/i.test(cleaned))') !== -1, 'resource URL cleanup must trim magnet tails without using ed2k filename rules');
-  assert(sharedUtils.indexOf("var ed2kEnd = cleaned.indexOf('|/')") !== -1, 'ed2k URL cleanup must preserve filenames while trimming after the protocol terminator');
-  assert(sharedUtils.indexOf('解压码|解压口令|解壓密碼') !== -1, 'magnet URL cleanup must trim common password labels after protocol links');
-  assert(sharedUtils.indexOf('\\.(?:jpg|jpeg|png|gif|webp|txt|zip|rar|7z|torrent)') !== -1, 'resource URL cleanup must trim Chinese punctuation tails after direct file URLs');
-  assert(sharedUtils.indexOf("add(href, 'link-href')") !== -1, 'regex image extraction must scan and clean href image URLs');
-  assert(viewport.indexOf('ATPLoader.prepareThumbnailImage(img, task, w, h)') !== -1, 'viewport lazy loader must reuse thumbnail image initialization');
-  assert(viewport.indexOf('function getViewportRectState(wrapper, rootRects)') !== -1, 'viewport heavy rendering must centralize wrapper viewport geometry reads');
-  assert(viewport.indexOf('var viewportState = getViewportRectState(wrapper, rootRects)') !== -1, 'heavy render snapshots must share scroll root geometry across wrappers');
-  assert(viewport.indexOf('function isVisibleRestoreBudgetAllowed(wrapper, data, viewportState, snapshot)') !== -1, 'visible restore budget checks must accept cached viewport geometry and budget snapshots');
-  assert(viewport.indexOf('function getRestoreBudgetBlockReason(wrapper, data, viewportState, budget)') !== -1, 'restore defer reasons must accept cached viewport geometry and budget snapshots');
-  assert(viewport.indexOf('function isHeavyRestoreBudgetAllowed(wrapper, data, viewportState, budget)') !== -1, 'heavy restore budget checks must accept cached viewport geometry and budget snapshots');
-  assert(viewport.indexOf('function deferHeavyRestore(wrapper, data, reason, extra, viewportState)') !== -1, 'heavy restore defers must accept cached viewport geometry');
-  assert(viewport.indexOf('function queueHeavyRestore(wrapper, data, reason, skipBudgetCheck, budget)') !== -1, 'heavy restore queueing must accept a cached budget snapshot');
-  assert(viewport.indexOf('var allowed = skipBudgetCheck && !viewportState.visible') !== -1, 'heavy restore queueing must skip budget recomputation for non-visible budget-selected items');
-  assert(viewport.indexOf(': isHeavyRestoreBudgetAllowed(wrapper, data, viewportState, budget);') !== -1, 'heavy restore queueing must reuse one viewport geometry read and cached budget for range checks');
-  assert(viewport.indexOf('if (!allowed && (!skipBudgetCheck || viewportState.visible))') !== -1, 'heavy restore queueing must avoid a second viewport read for skip-budget checks');
-  assert(viewport.indexOf('var restoreQueueViewportState = typeof WeakMap') !== -1, 'heavy restore queue processing must cache wrapper geometry during each batch');
-  assert(viewport.indexOf('var restoreQueueBudget = null') !== -1, 'heavy restore queue processing must cache budget selection during each batch');
-  assert(viewport.indexOf('function getRestoreQueueViewportState(wrapper)') !== -1, 'heavy restore queue processing must share cached geometry between cleanup and sorting');
-  assert(viewport.indexOf('function getRestoreQueueBudget()') !== -1, 'heavy restore queue processing must reuse one heavy render snapshot for budget checks');
-  assert(viewport.indexOf('var viewportState = getRestoreQueueViewportState(wrapper);') !== -1, 'heavy restore queue cleanup must reuse cached geometry for range checks');
-  const restoreQueueBudgetChecks = viewport.match(/isHeavyRestoreBudgetAllowed\(wrapper, data, viewportState, getRestoreQueueBudget\(\)\)/g) || [];
-  assert(restoreQueueBudgetChecks.length === 1, 'heavy restore queue budget checks must run once during cleanup, not again during consumption');
-  assert(viewport.indexOf('deferHeavyRestore(wrapper, data, getRestoreBudgetBlockReason(wrapper, data, viewportState, getRestoreQueueBudget()), null, viewportState)') !== -1, 'heavy restore queue defers must reuse cached viewport geometry');
-  assert(viewport.indexOf('if (!isHeavyRestoreBudgetAllowed(wrapper, data))') === -1, 'heavy restore queue consumption must not recompute geometry and budget snapshots per item');
-  assert(viewport.indexOf('getHeavyRestoreDelayInfo(mp, getRestoreQueueBudget().snapshot.stats, restoredVisibleMP, restoredRangeMP)') !== -1, 'heavy restore delay pressure must project restored MP from the batch snapshot');
-  assert(viewport.indexOf('isMPBudgetReached(delayInfo.projectedVisibleMP, getHeavyVisibleRestoreBudgetMP())') !== -1, 'heavy restore batch consumption must stop before adding more configured visible restore pressure');
-  assert(viewport.indexOf('isMPBudgetReached(delayInfo.projectedRangeMP, getHeavyDecodedBudgetMP())') !== -1, 'heavy restore batch consumption must stop before adding more configured range restore pressure');
-  assert(viewport.indexOf("queueHeavyRestore(queueItem.wrapper, queueItem.data, 'budget_queue', true, budget)") !== -1, 'heavy budget reconciliation must pass its existing snapshot into restore queueing');
-  assert(viewport.indexOf("queueHeavyRestore(queueItem.wrapper, queueItem.data, 'budget_queue', true);") === -1, 'heavy budget reconciliation must not recompute budget selection per queued item');
-  assert(viewport.includes('var budget = getBudgetSelection();'), "heavy restore reconciliation must compute one shared budget");
-  assert(viewport.includes('var selected = budget.selected;'), "heavy clarity balanced restore must reuse selected budget items");
-  assert(viewport.includes('if (!queueItem || !queueItem.inRange || !queueItem.data || !queueItem.data.unloaded) continue;'), "restore queueing must skip loaded and out-of-range snapshot items");
-  assert(viewport.includes('if (!queueItem.visible && !selected.has(queueItem.wrapper)) continue;'), "heavy clarity balanced restore must only queue visible or budget-selected unloaded items");
-  assert(viewport.includes("queueHeavyRestore(queueItem.wrapper, queueItem.data, 'budget_queue', true, budget);"), "heavy clarity balanced restore must pass the cached budget into restore queueing");
-  assert(viewport.indexOf("queueHeavyRestore(balancedWrapper, balancedData, reason + '_balanced', true);") === -1, 'heavy clarity balanced restore must not bypass budget for all non-visible range items');
-  assert(viewport.indexOf('if (!viewportState.inHeavyRestoreRange)') !== -1, 'heavy restore queue cleanup must avoid re-reading layout for range checks');
-  assert(viewport.indexOf('isInHeavyRestoreRange(wrapper)) {\n        data.restoreQueued = false;') === -1, 'heavy restore queue cleanup must not read wrapper geometry separately before sorting');
-  assert(viewport.indexOf('return aState.centerDistance - bState.centerDistance;') !== -1, 'heavy restore queue sorting must use cached center distances instead of re-reading layout in the comparator');
-  assert(viewport.indexOf('for (var ei = 0; ei < entries.length; ei++)') !== -1, 'viewport observer callbacks must iterate entries with an index loop');
-  assert(viewport.indexOf('entries.forEach(function(entry)') === -1, 'viewport observer callbacks must not allocate forEach entry callbacks');
-  assert(previewer.indexOf('var previewLoadToken = 0') !== -1, 'previewer must guard against stale image load callbacks');
-  assert(previewer.indexOf('var previewTimer = null') !== -1, 'previewer must track image load timeout state');
-  assert(previewer.indexOf('function getPreviewTimeout()') !== -1, 'previewer must use the configured image timeout');
-  assert(previewer.indexOf('retryNoReferrerOrFail();') !== -1, 'preview timeout must share the no-referrer fallback path');
-  assert(previewer.indexOf('ATPLoader.setImageSource(img, src, !!noReferrer, isCurrentLoad)') !== -1, 'previewer must reuse loader no-referrer policy with a stale-load guard');
-  assert(previewer.indexOf('setPreviewImageSource(img, images[index], token, true)') !== -1, 'previewer must retry failed preview images once with no-referrer');
-  assert(previewer.indexOf('var previousBodyOverflow = null') !== -1, 'previewer must remember the page body overflow before locking scroll');
-  assert(previewer.indexOf('var previousFocusedElement = null') !== -1, 'previewer must remember the previously focused element before opening');
-  assert(previewer.indexOf('var previousFocusContext = null') !== -1, 'previewer must keep opener metadata for focus fallback');
-  assert(previewer.indexOf('function isFocusTargetAvailable(el)') !== -1, 'previewer focus restore must reject detached or hidden targets');
-  assert(previewer.indexOf("el.hidden || el.getAttribute('hidden') !== null") !== -1, 'previewer focus restore must reject hidden attribute targets');
-  assert(previewer.indexOf("el.style && (el.style.visibility === 'hidden' || el.style.display === 'none')") !== -1, 'previewer focus restore must reject inline-hidden targets');
-  assert(previewer.indexOf('window.getComputedStyle') !== -1 && previewer.indexOf("style.visibility === 'hidden'") !== -1 && previewer.indexOf("style.display === 'none'") !== -1, 'previewer focus restore must reject computed hidden or display-none targets');
-  assert(previewer.indexOf('return document.activeElement === el;') !== -1, 'previewer focus restore must confirm focus actually moved before reporting success');
-  assert(previewer.indexOf('el.focus();\n      return true;') === -1, 'previewer focus restore must not treat a non-throwing focus call as success');
-  assert(previewer.indexOf('function findThreadFocusTarget(context)') !== -1, 'previewer must find a same-thread fallback focus target when the opener disappears');
-  assert(previewer.indexOf("wrapper.getAttribute('data-atp-preview-index')") !== -1, 'previewer fallback must prefer the same preview thumbnail index');
-  assert(previewer.indexOf("ts.panel.querySelector('[data-resource-trigger]')") !== -1, 'previewer fallback must prefer the resource trigger before the panel container');
-  assert(previewer.indexOf('if (isFocusTargetAvailable(trigger)) return trigger;') !== -1, 'previewer fallback must reject hidden or detached resource triggers');
-  assert(previewer.indexOf('function buildPreviewFocusContext(options, startIndex)') !== -1, 'previewer must normalize opener metadata on open');
-  assert(previewer.indexOf('preferOpenerFocus: !!options.preferOpenerFocus') !== -1, 'previewer focus context must preserve mouse opener-first restore intent');
-  assert(previewer.indexOf('previousBodyOverflow = document.body.style.overflow') !== -1, 'previewer must save the existing body overflow only when opening from closed state');
-  assert(previewer.indexOf('previousFocusedElement = document.activeElement') !== -1, 'previewer must capture focus before opening');
-  assert(previewer.indexOf('previousFocusContext = buildPreviewFocusContext(options, currentIndex);') !== -1, 'previewer must store opener fallback context while opening');
-  assert(previewer.indexOf('open: function(imgList, startIndex, options)') !== -1, 'previewer open must accept opener fallback metadata');
-  assert(previewer.indexOf("previewOverlay.setAttribute('role', 'dialog')") !== -1, 'previewer overlay must expose dialog semantics');
-  assert(previewer.indexOf("previewOverlay.setAttribute('aria-modal', 'true')") !== -1, 'previewer overlay must declare modal behavior');
-  assert(previewer.indexOf('z-index:2147483647') !== -1, 'previewer modal must sit above the floating settings panel');
-  assert(previewer.indexOf('height:min(90vh, calc(100vh - 16px))') !== -1, 'previewer container must bound total modal height on short viewports');
-  assert(previewer.indexOf('flex:0 0 auto') !== -1, 'previewer toolbar must not consume image flex height');
-  assert(previewer.indexOf('flex:1 1 auto;min-height:0;max-height:100%;overflow:hidden') !== -1, 'previewer image wrapper must shrink inside the modal height');
-  assert(previewer.indexOf('max-height:100%;width:auto;height:auto;object-fit:contain') !== -1, 'previewer image must fit inside the wrapper instead of the viewport');
-  assert(previewer.indexOf('max-height:80vh') === -1, 'previewer image must not use viewport height that ignores toolbar height');
-  assert(previewer.indexOf("counter.setAttribute('aria-live', 'polite')") !== -1, 'previewer image status must be announced politely');
-  assert(previewer.indexOf('function focusPreviewCloseButton()') !== -1, 'previewer must move focus into the dialog after opening');
-  assert(previewer.indexOf('function keepPreviewFocusValid()') !== -1, 'previewer must repair focus after navigation controls become disabled');
-  assert(previewer.indexOf('function restorePreviousFocus()') !== -1, 'previewer must restore focus when closing');
-  assert(previewer.indexOf('function trapPreviewTab(e)') !== -1, 'previewer must keep tab focus inside the modal dialog');
-  assert(previewer.indexOf('if (!previewContainer.contains(document.activeElement))') !== -1, 'previewer tab trap must pull escaped focus back into the modal dialog');
-  assert(previewer.indexOf('var shouldRestoreOverflow = isOpen || previousBodyOverflow !== null') !== -1, 'previewer close must not touch body overflow when the preview was never opened');
-  assert(previewer.indexOf('document.body.style.overflow = previousBodyOverflow') !== -1, 'previewer must restore the original body overflow on close');
-  assert(previewer.indexOf('function releaseHiddenPreviewFocus()') !== -1, 'previewer must release focus left inside a hidden overlay when restore targets disappear');
-  assert(previewer.indexOf('if (!restorePreviousFocus()) releaseHiddenPreviewFocus();') !== -1, 'previewer close must blur hidden overlay focus after failed focus restoration');
-  assert(previewer.indexOf('if (context && context.preferOpenerFocus && focusIfAvailable(fallback)) return true;') !== -1, 'mouse-opened preview close must prefer opener or same-thread fallback before stale pre-click focus');
-  assert(previewer.indexOf('if (focusIfAvailable(el)) return true;\n    return focusIfAvailable(fallback);') !== -1, 'keyboard-opened preview close must restore previous focus before using opener fallback');
-  assert(previewer.indexOf("else if (e.key === 'Tab' && trapPreviewTab(e)) { e.stopPropagation(); }") !== -1, 'previewer keyboard handling must trap Tab in the modal and stop handled Tab events from reaching the page');
-  assert(previewer.indexOf("if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); ATPPreviewer.close(); }") !== -1, 'previewer Escape handling must not bubble to host-page shortcuts');
-  assert(previewer.indexOf("else if (e.key === 'ArrowLeft') { e.preventDefault(); e.stopPropagation(); ATPPreviewer.prev(); }") !== -1, 'previewer previous-image shortcut must not bubble to host-page shortcuts');
-  assert(previewer.indexOf("else if (e.key === 'ArrowRight') { e.preventDefault(); e.stopPropagation(); ATPPreviewer.next(); }") !== -1, 'previewer next-image shortcut must not bubble to host-page shortcuts');
-  assert(previewer.indexOf('return true;\n  }\n\n  var ATPPreviewer') !== -1, 'previewer Tab trap must report handled modal Tab events');
-  assert(previewer.indexOf('prevBtn.disabled = index === 0;') !== -1, 'previewer previous button must be disabled at the first image');
-  assert(previewer.indexOf('nextBtn.disabled = index === images.length - 1;') !== -1, 'previewer next button must be disabled at the last image');
-  assert(previewer.indexOf('keepPreviewFocusValid();') !== -1, 'previewer must keep focus on an enabled visible control after button state changes');
-  assert(previewer.indexOf('destroy: function() {\n      ATPPreviewer.close();') !== -1, 'previewer destroy must reuse close cleanup for timers, tokens, image src, and body overflow');
-  assert(viewport.indexOf('destroy: function()') !== -1, 'viewport destroy must expose cleanup for hot reload and disable paths');
-  assert(/destroy: function\(\) \{[\s\S]*?clearPendingRetryTimers\(\);/.test(viewport), 'viewport destroy must clear pending retry timers through the shared cleanup helper');
-  assert(viewport.indexOf('slotRetryTimer') === -1, 'viewport pending slot retries must not keep one timer per wrapper');
-  assert(viewport.indexOf('var pendingVisibleRetryCursor = 0') !== -1, 'viewport visible pending retries must keep a rotation cursor');
-  assert(viewport.indexOf('var pendingSlotRetryCursor = 0') !== -1, 'viewport slot pending retries must keep a rotation cursor');
-  assert(viewport.indexOf('var pendingHiddenLoadCursor = 0') !== -1, 'viewport hidden pending drains must keep a rotation cursor');
-  assert(viewport.indexOf('var pendingSlotRetryCount = 0') !== -1, 'viewport slot retry scheduling must keep an O(1) pending retry count');
-  assert(viewport.indexOf('function markPendingSlotRetry(data)') !== -1, 'viewport slot retry scheduling must centralize retry marking');
-  assert(viewport.indexOf('return pendingSlotRetryCount > 0;') !== -1, 'viewport slot retry checks must avoid scanning the whole pending map');
-  assert(/function clearPendingSlotRetry\(data\) \{[\s\S]*?if \(!pendingSlotRetryCount && pendingSlotRetryTimer\) \{[\s\S]*?clearTimeout\(pendingSlotRetryTimer\);[\s\S]*?pendingSlotRetryTimer = null;[\s\S]*?\}/.test(viewport), 'viewport slot retry cleanup must cancel the shared retry timer when no pending retries remain');
-  assert(viewport.indexOf('function shouldPausePendingRetryWhenHidden()') !== -1, 'viewport pending retries must share a hidden-page pause guard');
-  assert(viewport.indexOf("return document.visibilityState !== 'visible' && settings.pauseWhenHidden !== false;") !== -1, 'viewport pending retries must pause on hidden pages unless hidden loading is explicitly allowed');
-  assert(viewport.indexOf('function normalizePendingRetryCursor(cursor)') !== -1, 'viewport pending retry cursors must be normalized against the current pending size');
-  assert(viewport.indexOf('function refreshPendingViewportVisibility(wrapper, data, rootRects)') !== -1, 'viewport visible pending retry must refresh current geometry after BFCache or observer pauses');
-  assert(viewport.indexOf('var LAZY_VIEWPORT_MARGIN_PX = 200') !== -1, 'viewport pending visibility refresh must share the lazy-load root margin');
-  assert(/function refreshPendingViewportVisibility\(wrapper, data, rootRects\)[\s\S]*?data\.observerRoot \|\| getWrapperScrollRoot\(wrapper\)[\s\S]*?getLazyViewportBounds\(root, rootRects\)/.test(viewport), "viewport pending visibility refresh must use scroll-root-aware lazy bounds");
-  assert(viewport.indexOf('rootMargin: getLazyViewportRootMargin(root)') !== -1, 'viewport IntersectionObserver root margin must use the adaptive lazy viewport bounds');
-  assert(viewport.indexOf('var LAZY_VIEWPORT_FAST_MARGIN_PX = 1000') !== -1, 'viewport fast-scroll prefetch must retain a bounded forward margin');
-  assert(viewport.indexOf("var nextMode = delta > 0 ? 'fast_down' : 'fast_up';") !== -1, 'viewport adaptive prefetch must follow the current scroll direction');
-  assert(viewport.indexOf('!refreshPendingViewportVisibility(wrapper, data)') !== -1, 'viewport visible pending retry must not rely only on stale IntersectionObserver flags');
-  assert(viewport.indexOf('function markVisiblePendingSlotRetries(maxAttempts)') !== -1, 'viewport visible retry must preserve visible pending work when no image slots are available');
-  assert(/function markVisiblePendingSlotRetries\(maxAttempts\)[\s\S]*?var attemptLimit = Math\.max\(1, Math\.min\([\s\S]*?PENDING_SLOT_RETRY_SCAN_LIMIT[\s\S]*?refreshPendingViewportVisibility\(wrapper, data, rootRects\)[\s\S]*?markPendingSlotRetry\(data\);/.test(viewport), 'viewport no-slot visible retry must scan bounded pending wrappers, refresh geometry, and mark visible items for release-driven slot retry');
-  assert(viewport.indexOf('function clearPendingRetryTimers()') !== -1, 'viewport pending retry and wake timers must share a cleanup helper');
-  assert(viewport.indexOf('function resetPendingVisibleRetryEmptyScan()') !== -1, 'viewport pending retry cleanup must centralize visible empty-scan state resets');
-  assert(/function clearPendingRetryTimers\(\)[\s\S]*?resetPendingVisibleRetryEmptyScan\(\);/.test(viewport), 'viewport pending retry timer cleanup must reset stale visible empty-scan progress');
-  assert(/destroy: function\(\) \{[\s\S]*?clearPendingRetryTimers\(\);[\s\S]*?pendingVisibleRetryCursor = 0;[\s\S]*?pendingSlotRetryCursor = 0;/.test(viewport), 'viewport destroy must clear visible, slot, and background retry timers through the shared cleanup helper');
-  assert(viewport.indexOf('function cancelHeavyRestoreLoad(data, reason)') !== -1, 'viewport must centralize cancellation for in-flight heavy restores');
-  assert(viewport.indexOf('function unregisterHeavyRestoreLoad(data)') !== -1, 'viewport heavy restore cancellation must unregister loader active-load controls');
-  assert(viewport.indexOf('function clearHeavyRestoreLoadTimer(data)') !== -1, 'viewport heavy restore request timeouts must share a cleanup helper');
-  assert(/function cancelHeavyRestoreLoad\(data, reason\)[\s\S]*?clearRestoreReveal\(data\);[\s\S]*?unregisterHeavyRestoreLoad\(data\);[\s\S]*?if \(!data\.restoreLoading\) return;[\s\S]*?data\.restoreLoading = false;[\s\S]*?ATPLoader\.cancelImageLoadElement\(data\.img\);[\s\S]*?data\.wrapper\.classList\.add\('atp-heavy-unloaded'\);[\s\S]*?setHeavyPreviewActive\(data, true\);/.test(viewport), 'heavy restore cancellation must unregister, remove reveal listeners, cancel the image request, reset restoreLoading, and restore unloaded preview state');
-  assert(/function unloadHeavyImage\(wrapper, data, extra, renderContext\)[\s\S]*?clearHeavyRestoreLoadTimer\(data\);[\s\S]*?clearRestoreReveal\(data\);[\s\S]*?unregisterHeavyRestoreLoad\(data\);/.test(viewport), 'heavy image unloads must clear in-flight restore timers and active-load controls');
-  assert(viewport.indexOf("cancelHeavyRestoreLoad(data, 'cleanup');") !== -1, 'heavy render item cleanup must cancel in-flight restore image requests');
-  assert(viewport.indexOf("cancelHeavyRestoreLoad(renderData, 'destroy');") !== -1, 'viewport destroy must cancel in-flight restore image requests');
-  assert(/function restoreHeavyImage\(wrapper, data\)[\s\S]*?unregisterHeavyRestoreLoad\(data\);[\s\S]*?var reveal = function\(evt\) \{[\s\S]*?unregisterHeavyRestoreLoad\(data\);[\s\S]*?data\.restoreActiveUnregister = ATPLoader\.registerActiveImageLoad\(\{[\s\S]*?cancelHeavyRestoreLoad\(data, reason \|\| 'active_restore_cancel'\);/.test(viewport), 'heavy restore requests must register with the loader active-load registry and unregister on reveal');
-  assert(/function startHeavyRestoreLoadTimer\(wrapper, data\) \{[\s\S]*?clearHeavyRestoreLoadTimer\(data\);[\s\S]*?var restoreTimeout = ATPLoader\.getImageLoadTimeout[\s\S]*?data\.restoreTimer = setTimeout\(function\(\) \{[\s\S]*?cancelHeavyRestoreLoad\(data, 'restore_timeout'\);/.test(viewport) &&
-    /function restoreHeavyImage\(wrapper, data\)[\s\S]*?startHeavyRestoreLoadTimer\(wrapper, data\);[\s\S]*?ATPLoader\.setImageSource/.test(viewport), 'heavy restore requests must time out and return to the unloaded preview state when load/error never fires');
-  assert(/recover: function\(reason\)[\s\S]*?data\.restoreLoading[\s\S]*?data\.img\.currentSrc \|\| data\.img\.src[\s\S]*?startHeavyRestoreLoadTimer\(wrapper, data\);[\s\S]*?render_restore_recover_wait/.test(viewport), 'heavy restore BFCache recovery must keep waiting for valid in-flight restore requests');
-  assert(viewport.indexOf('function scheduleHeavyRestoreRetry(wrapper, data, reason)') !== -1, 'heavy restore failures must have a bounded retry scheduler');
-  assert(viewport.indexOf('HEAVY_RESTORE_RETRY_MAX = 3') !== -1 && viewport.indexOf('restoreRetryCount') !== -1, 'heavy restore retries must be bounded by per-thumbnail attempt state');
-  assert(/logHeavyRender\('render_restore_error'[\s\S]*?scheduleHeavyRestoreRetry\(wrapper, data, 'restore_error_retry'\);/.test(viewport), 'heavy restore error events must schedule a bounded retry while keeping the preview fallback');
-  assert(/cancelHeavyRestoreLoad\(data, 'restore_timeout'\);\n      scheduleHeavyRestoreRetry\(wrapper, data, 'restore_timeout_retry'\);/.test(viewport), 'heavy restore timeouts must schedule a bounded retry after restoring the preview fallback');
-  assert(/cancelHeavyRestores: function\(reason\)[\s\S]*?clearHeavyRestoreTimers\(\);[\s\S]*?cancelHeavyRestoreLoad\(cancelValue\.value, reason \|\| 'cancel_heavy_restores'\);/.test(viewport), 'viewport must expose non-destructive in-flight heavy restore cancellation for page lifecycle cleanup');
-  assert(viewport.indexOf('pendingVisibleRetryCursor = 0;\n      pendingSlotRetryCursor = 0;\n      pendingHiddenLoadCursor = 0;') !== -1, 'viewport destroy must reset pending retry cursors');
-  assert(viewport.indexOf('pendingSlotRetryCount = 0;') !== -1, 'viewport destroy must reset the O(1) slot retry count');
-  assert(viewport.indexOf('pendingWrappers.forEach(function(data) {\n        if (data && data.slotRetryTimer) clearTimeout(data.slotRetryTimer);') === -1, 'viewport destroy must not allocate pending Map.forEach callbacks');
-  assert(viewport.indexOf('heavyRenderItems.forEach(function(data) {\n        if (data && data.restoreTimer) clearTimeout(data.restoreTimer);') === -1, 'viewport destroy must not allocate heavy render Map.forEach callbacks');
-  assert(content.indexOf('var scanGeneration = 0') !== -1, 'content hot reload must have a generation token');
-  assert(content.indexOf('function clearScanTimers()') !== -1, 'content hot reload must clear stale scan timers');
-  assert(/function clearObserverRetryTimer\(resetCount\)[\s\S]*?clearTimeout\(observerRetryTimer\);[\s\S]*?observerRetryTimer = null;[\s\S]*?if \(resetCount !== false\) observerRetryCount = 0;/.test(content), 'content observer retry cleanup must clear the timer and reset count only when requested');
-  assert(!/function clearObserverRetryTimer\([^)]*\)\s*\{\s*clearObserverRetryTimer\(/.test(content), 'content observer retry cleanup must never call itself');
-  assert(/function setupObserver\(reason\)[\s\S]*?clearObserverRetryTimer\(false\);[\s\S]*?observerRetryCount\+\+;[\s\S]*?observerRetryCount >= OBSERVER_MAX_RETRIES[\s\S]*?setupDormantObserver\(\);/.test(content), "content observer retry setup must fall back to dormant DOM activation after bounded missing-container retries");
-  assert(content.indexOf('var OBSERVER_MAX_RETRIES = 4;') !== -1, 'content missing-container eager retries must remain short and bounded');
-  assert(/function setupObserver\(reason\)[\s\S]*?if \(!container \|\| \(ATPScanner\.hasArticleCandidate[\s\S]*?unbindScroll\(false\);[\s\S]*?setupDormantObserver\(\);/.test(content), "content must enter dormant mode for missing or empty thread containers without clearing unrelated scan timers");
-  assert(/function setupDormantObserver\(\)[\s\S]*?mutationsHaveThreadRowAdd\(ms\)[\s\S]*?setupObserver\('dormant'\);[\s\S]*?detectAndProcess\(true\);/.test(content), "content dormant mode must wake only for relevant article DOM additions");
-  assert(content.indexOf('function shouldPauseScanningWhenHidden()') !== -1, 'content scans must share a hidden-page pause guard');
-  assert(content.indexOf("return document.visibilityState !== 'visible' && (!settings || settings.pauseWhenHidden !== false);") !== -1, 'content hidden-page scan guard must honor pauseWhenHidden=false');
-  assert(content.indexOf('function pauseScanningForHiddenPage()') !== -1, 'content hidden-page scan pause must centralize scan abort side effects');
-  assert(/function pauseScanningForHiddenPage\(\)[\s\S]*?rescanRequested = true;[\s\S]*?clearScanTimers\(\);[\s\S]*?clearProcessCandidateQueue\(\);[\s\S]*?return true;/.test(content), 'content hidden-page scan pause must request a visible rescan and clear pending scan work');
-  assert(/async function processContainers\(containers, generation\)[\s\S]*?pauseScanningForHiddenPage\(\)[\s\S]*?while \(generation === scanGeneration && ATPConfig\.isEnabled\(\) && !pauseScanningForHiddenPage\(\)\)[\s\S]*?if \(!outcome \|\| generation !== scanGeneration \|\| pauseScanningForHiddenPage\(\)\) return;/.test(content), 'content streaming article workers must abort at async boundaries while hidden-page pause is active');
-  assert(content.indexOf('function syncLoaderVisibilityPauseState()') !== -1, 'content reload must centralize loader visibility pause state restoration');
-  assert(content.indexOf("typeof ATPLoader.syncVisibilityPauseState === 'function'") !== -1, 'content reload must prefer loader visibility pause synchronization when available');
-  assert(content.indexOf("!shouldPauseScanningWhenHidden() && typeof ATPLoader.resume === 'function'") !== -1, 'content reload fallback must not resume the loader while hidden-page pause is active');
-  assert(/function reloadThumbnails\(\)[\s\S]*?syncLoaderVisibilityPauseState\(\);[\s\S]*?detectAndProcess\(true\);/.test(content), 'content reload must restore loader state through the visibility-aware helper before rescanning');
-  assert(/function enableCurrentPage\(\)[\s\S]*?Logger\.startFlushTimer\(\);[\s\S]*?syncLoaderVisibilityPauseState\(\);[\s\S]*?detectAndProcess\(true\);/.test(content), 'content enable must restore loader state through the visibility-aware helper before fast initial scanning');
-  const enableCurrentPageBody = (content.match(/function enableCurrentPage\(\) \{([\s\S]*?)\n  \}/) || [])[1] || '';
-  assert(enableCurrentPageBody.indexOf('ATPLoader.resume()') === -1, 'content enable must not bypass hidden pause with a direct loader resume');
-  assert(/function detectAndProcess\(fromMutation, immediate\)[\s\S]*?if \(pauseScanningForHiddenPage\(\)\) return;[\s\S]*?scanDelayTimer = setTimeout\(function\(\)[\s\S]*?if \(pauseScanningForHiddenPage\(\)\) return;/.test(content), "content detectAndProcess must use the centralized hidden-page pause helper before starting or delaying article fetches");
-  assert(/function scheduleRetryScanAt\(dueAt\)[\s\S]*?if \(pauseScanningForHiddenPage\(\)\) return;[\s\S]*?retryScanTimer = setTimeout\(function\(\)[\s\S]*?if \(pauseScanningForHiddenPage\(\)\) return;/.test(content), 'content retry scans must use the centralized hidden-page pause helper before scheduling or firing');
-  assert(/function scheduleThrottledScan\(delay\)[\s\S]*?if \(pauseScanningForHiddenPage\(\)\) return;[\s\S]*?throttleScanTimer = setTimeout\(function\(\)[\s\S]*?if \(pauseScanningForHiddenPage\(\)\) return;/.test(content), 'content throttled scans must use the centralized hidden-page pause helper before scheduling or firing');
-  assert(/function handleScrollScan\(\)[\s\S]*?if \(pauseScanningForHiddenPage\(\)\) return;[\s\S]*?scrollScanTimer = setTimeout\(function\(\)[\s\S]*?if \(pauseScanningForHiddenPage\(\)\) return;/.test(content), 'content scroll scans must use the centralized hidden-page pause helper before scheduling or firing');
-  assert(/observer = new MutationObserver\(function\(ms\) \{[\s\S]*?if \(pauseScanningForHiddenPage\(\)\) return;/.test(content), 'content mutation scans must use the centralized hidden-page pause helper before scanning');
-  assert(/function handleVisibilityChange\(\)[\s\S]*?flushPendingData\(\);[\s\S]*?Logger\.flush\(\);[\s\S]*?pauseScanningForHiddenPage\(\);[\s\S]*?ensureObserverBound\('visibility'\);[\s\S]*?detectAndProcess\(true\);/.test(content), "content visibility changes must pause hidden scans through the shared helper and rescan after returning visible");
-  assert(/else if \(rescanRequested && ATPConfig\.isEnabled\(\)\) \{\s*rescanRequested = false;\s*ensureObserverBound\('visibility'\);\s*detectAndProcess\(true\);/.test(content), "content visible recovery must consume the hidden rescan request before starting the recovery scan");
-  assert(content.indexOf('function scheduleThrottledScan(delay)') !== -1, 'content scroll scans throttled by timing must be rescheduled');
-  assert(content.indexOf("node.querySelector && node.querySelector('.atp-thread-panel") === -1, 'content MutationObserver self-node filtering must not scan descendant subtrees for ATP markup');
-  assert(content.indexOf("node.closest && node.closest('.atp-thread-panel,.atp-thumb-row,.atp-thumbnail-container,.atp-thumbnail-wrapper,.atp-resource-sidebar,.atp-resource-inline')") !== -1, 'content MutationObserver self-node filtering must skip direct additions inside ATP-owned subtrees');
-  assert(content.indexOf("cls.contains('atp-heavy-preview-canvas')") !== -1, 'content MutationObserver self-node filtering must allow heavy preview canvas additions');
-  assert(content.indexOf('function isATPAddedNode(node)') !== -1 && content.indexOf('return false;\n  }\n\n  function mutationHasExternalAdd') !== -1, 'content MutationObserver self-node filtering must rely on direct ATP root classes');
-  assert(content.indexOf('MUTATION_ARTICLE_ADD_SELECTOR') !== -1, 'content MutationObserver must keep thread-like added-node selectors centralized');
-  assert(content.indexOf('function isArticleMutationNode(node)') !== -1, 'content MutationObserver must filter external additions to thread-like nodes before rescanning');
-  assert(content.indexOf('mutationHasExternalAdd(ms[i]) && mutationHasArticleAdd(ms[i])') !== -1, 'content MutationObserver must not clear the scanner cursor for unrelated external additions');
-  assert(content.indexOf('scheduleThrottledScan(SCAN_THROTTLE_MS - (now - lastScanTime) + 20)') !== -1, 'content scan throttle must not drop the final scroll-triggered scan');
-  assert(content.indexOf('function createProcessScanContext()') !== -1, 'content scan candidate filtering must create per-scan timing and viewport context');
-  assert(content.indexOf('var margin = getArticlePrefetchDistance();') !== -1, 'content scan context must read the public article prefetch distance once per scan');
-  assert(content.indexOf('viewportTop: -margin') !== -1, 'content scan context must cache the configured near-viewport upper bound');
-  assert(content.indexOf('viewportBottom: vh + margin') !== -1, 'content scan context must cache the configured near-viewport lower bound');
-  assert(content.indexOf('reachedBelowViewport: false') !== -1, 'content scan context must track when selector scanning has reached below the current viewport');
-  assert(content.indexOf('if (rect.top > scanContext.viewportBottom) scanContext.reachedBelowViewport = true;') !== -1, 'content near-viewport checks must mark below-viewport candidates to avoid empty chain scans');
-  assert(content.indexOf('return rect.bottom >= viewportTop && rect.top <= scanContext.viewportBottom;') !== -1, 'content near-viewport checks must use the cached upper and lower viewport bounds');
-  assert(content.indexOf('return isProcessCandidate(entry, scanContext);') !== -1, 'content detectProcessCandidates must reuse one scan context across candidate accept calls');
-  assert(content.indexOf('scanContext.now < retryAfter') !== -1, 'content retry filtering must reuse the per-scan timestamp instead of reading Date.now for every candidate');
-  assert(content.indexOf('rect.top <= vh + VIEWPORT_SCAN_MARGIN') === -1, 'content near-viewport checks must not use the removed fixed viewport margin');
-  assert(content.indexOf('var processCandidateQueue = []') !== -1, 'content chain scans must keep a candidate queue');
-  assert(content.indexOf('var processCandidateScanState = null') !== -1, 'content chain scans must keep reusable scanner cursor state');
-  assert(content.indexOf('function clearQueuedProcessCandidates()') !== -1, 'content chain scans must separate candidate queue clearing from scanner cursor invalidation');
-  assert(content.indexOf('function keepUnconsumedQueuedProcessCandidates()') !== -1, 'content scroll scans must compact queued candidates without dropping unconsumed entries');
-  assert(content.indexOf('function clearProcessCandidateQueue()') !== -1, 'content chain scan candidates must have a central invalidation helper');
-  const clearQueuedProcessCandidatesBody = (content.match(/function clearQueuedProcessCandidates\(\) \{([\s\S]*?)\n  \}/) || [])[1] || '';
-  const keepUnconsumedQueuedProcessCandidatesBody = (content.match(/function keepUnconsumedQueuedProcessCandidates\(\) \{([\s\S]*?)\n  \}/) || [])[1] || '';
-  assert(clearQueuedProcessCandidatesBody.indexOf('processCandidateScanState') === -1, 'content queue clearing must not clear the reusable scanner cursor state directly');
-  assert(keepUnconsumedQueuedProcessCandidatesBody.indexOf('for (var readIndex = processCandidateQueueCursor; readIndex < processCandidateQueue.length; readIndex++)') !== -1, 'content scroll-style queue compaction must keep unconsumed queued candidates with an indexed in-place pass');
-  assert(keepUnconsumedQueuedProcessCandidatesBody.indexOf('processCandidateQueue.length = writeIndex;') !== -1, 'content scroll-style queue compaction must trim the queue in place after keeping unconsumed candidates');
-  assert(keepUnconsumedQueuedProcessCandidatesBody.indexOf('processCandidateQueue.slice(processCandidateQueueCursor)') === -1, 'content scroll-style queue compaction must not allocate a new array on every scroll');
-  assert(keepUnconsumedQueuedProcessCandidatesBody.indexOf('processCandidateScanState = null;') !== -1, 'content scroll-style queue compaction must invalidate the scanner cursor for the shifted viewport');
-  assert(keepUnconsumedQueuedProcessCandidatesBody.indexOf('processCandidateQueueMayHaveMore = true;') !== -1, 'content scroll-style queue compaction must force a follow-up refill after kept candidates are consumed or filtered');
-  assert(/function clearProcessCandidateQueue\(\)[\s\S]*?clearQueuedProcessCandidates\(\);[\s\S]*?processCandidateScanState = null;/.test(content), 'content structural scan queue invalidation must clear the reusable scanner cursor state');
-  assert(content.indexOf('function takeQueuedProcessCandidates(limit, scanContext)') !== -1, 'content chain scans must consume candidates from the queued selector result');
-  assert(content.indexOf('function refillProcessCandidateQueue(limit, scanContext)') !== -1, 'content chain scans must refill candidates in one bounded selector scan');
-  assert(content.indexOf('var scanLimit = Math.max(1, Number(limit) || getArticleQueueHighWatermark());') !== -1, 'content selector scans must use the public queue watermark instead of a fixed processing batch');
-  assert(content.indexOf('processCandidateQueue = ATPScanner.detectArticleContainers({') !== -1, 'content selector scans must refill the shared candidate queue');
-  assert(content.indexOf('limit: scanLimit + 1') !== -1, 'content selector scans must use a sentinel candidate to avoid exact-cache empty rescans');
-  assert(content.indexOf('scanState: processCandidateScanState') !== -1, 'content selector scans must pass reusable scanner cursor state');
-  assert(content.indexOf('seekViewportStart: !processCandidateScanAllPhase') !== -1, 'content scans must seek to the viewport first, then cover the entire list');
-  assert(content.indexOf('viewportTop: processCandidateAbovePass ? (scanContext ? scanContext.viewportTop : -getArticlePrefetchDistance()) : 0,') !== -1, 'content selector scans must seek visible rows first, then the configured band above the viewport');
-  assert(content.indexOf('var hasSentinelCandidate = processCandidateQueue.length > scanLimit;') !== -1, 'content selector scans must keep sentinel candidates separate from scanner exhaustion state');
-  assert(content.indexOf('var shouldContinueScan = !!(processCandidateScanState && !processCandidateScanState.exhausted &&') !== -1, 'content selector scans must gate follow-up scans through a named decision');
-  assert(content.indexOf('!scanContext || !scanContext.reachedBelowViewport || processCandidateQueue.length > 0') !== -1, 'content selector scans must stop empty follow-up scans after reaching below the viewport');
-  assert(content.indexOf('processCandidateQueueMayHaveMore = hasSentinelCandidate || nearPhaseDone ||') !== -1, 'content selector scans must continue into the full-list phase after nearby work');
-  assert(content.indexOf('processCandidateQueueMayHaveMore = processCandidateQueue.length > scanLimit || !processCandidateScanState.exhausted;') === -1, 'content selector scans must not continue empty chains solely because the scanner cursor is not exhausted');
-  assert(content.indexOf('return takeQueuedProcessCandidates(limit, scanContext);') !== -1, 'content detectProcessCandidates must return from the queued selector results');
-  assert(/function bumpScanGeneration\(\)[\s\S]*?clearProcessCandidateQueue\(\);/.test(content), 'content generation changes must invalidate queued scan candidates');
-  assert(/function rebindThreadObserver\(reason\)[\s\S]*?disconnectContainerParentObserver\(\);[\s\S]*?bumpScanGeneration\(\);[\s\S]*?setupObserver\('rebind'\);[\s\S]*?detectAndProcess\(true\);/.test(content), "content observer rebinding must bump generation and immediately rescan after the thread container is replaced");
-  assert(/if \(!document\.contains\(container\)\) \{[\s\S]*?rebindThreadObserver\('Thread container replaced, rebinding'\);[\s\S]*?return;[\s\S]*?\}/.test(content), 'content container observer must use the shared rebind path when the thread container is replaced');
-  assert(/if \(ms\[i\]\.addedNodes\.length && mutationHasExternalAdd\(ms\[i\]\) && mutationHasArticleAdd\(ms\[i\]\)\) \{[\s\S]*?clearProcessCandidateQueue\(\);[\s\S]*?detectAndProcess\(true\);/.test(content), 'content thread-like external mutation scans must clear the scanner cursor before rescanning');
-  const handleScrollScanBody = (content.match(/function handleScrollScan\(\) \{([\s\S]*?)\n  \}/) || [])[1] || '';
-  assert(handleScrollScanBody.indexOf('keepUnconsumedQueuedProcessCandidates();') !== -1, 'content scroll scans must keep unconsumed queued candidates before rescanning near the new viewport');
-  assert(handleScrollScanBody.indexOf('clearQueuedProcessCandidates();') === -1, 'content scroll scans must not drop queued candidates while preserving the scanner cursor');
-  assert(handleScrollScanBody.indexOf('clearProcessCandidateQueue();') === -1, 'content scroll scans must use viewport-aware queue compaction instead of dropping queued candidates');
-  assert(content.indexOf('clearProcessCandidateQueue();\n      detectAndProcess(true);') !== -1, 'content retry and mutation scans must invalidate queued candidates before rescanning');
-  assert(content.indexOf('function commitArticleResult(job, summary, generation)') !== -1, 'content streaming scheduler must centralize single-article commits');
-  assert(content.indexOf('function getLiveCommitEntries(job)') !== -1, 'content streaming commits must filter detached or stale rows after async fetches');
-  assert(content.indexOf('var batchSize = ATPLoadPolicy.getArticleCommitBatchSize(getLoadPolicySettings());') !== -1, 'offscreen article commits must use the public per-frame batch size');
-  assert(content.indexOf('var workerCount = getArticleFetchConcurrency();') !== -1, 'content article workers must use the public concurrency setting');
-  assert(content.indexOf('var highWatermark = getArticleQueueHighWatermark();') !== -1, 'content article queue refill must use the public high watermark');
-  assert(content.indexOf('jobsByKey[key] = job;') !== -1, 'content streaming jobs must dedupe normalized article URLs');
-  assert(content.indexOf("Logger.event('article_fetch_start'") !== -1 && content.indexOf("Logger.event('article_fetch_done'") !== -1 && content.indexOf("Logger.event('article_commit'") !== -1, 'content streaming scheduler must log fetch and commit phase timings');
-  assert(content.indexOf('function isLiveProcessCandidate(entry, scanContext, expectedUrl)') !== -1, 'content scan result injection must centralize live candidate checks');
-  assert(content.indexOf('if (!el || !document.contains(el) || !link || !document.contains(link)) return false;') !== -1, 'content streaming commits must recheck container and link attachment before marking or injecting');
-  assert(content.indexOf('if (expectedUrl && getArticleGroupKey(link.href) !== getArticleGroupKey(expectedUrl)) return false;') !== -1, 'content scan result injection must reject stale entries whose article group changed');
-  assert(content.indexOf('if (ATPScanner.isDecoratedArticleContainer)') !== -1, 'content live candidate checks must prefer the shared decorated-container guard');
-  assert(content.indexOf('if (ATPScanner.isDecoratedArticleContainer(el)) return false;') !== -1, 'content live candidate checks must reject queued rows whose parent TBODY was decorated after scanning');
-  assert(content.indexOf('var existing = jobsByKey[key];') !== -1 && content.indexOf('jobsByKey[key] = job;') !== -1, 'content scan URL grouping must reuse one streaming job per normalized key');
-  assert(content.indexOf('if (hasMoreProcessCandidates())') !== -1, 'content chain scan scheduling must follow queued candidates instead of the small batch size');
-  assert(content.indexOf('if (c.length >= PROCESS_BATCH_LIMIT)') === -1, 'content chain scan scheduling must not use a full small batch as a proxy for rescanning the DOM');
-  assert(content.indexOf('function hasNearProcessCandidates()') === -1, 'content scan processing must not run an extra full DOM scan after every completed batch');
-  assert(content.indexOf('if (processing) {\n        rescanRequested = true;\n        return;\n      }') !== -1, 'content delayed scans must remember rescan requests when another scan is processing');
-  assert(content.includes('processing = false;\n        if (hasMoreProcessCandidates())'), "content no-candidate scans must continue draining queued candidates before honoring ordinary rescan requests");
-  assert(content.indexOf('if (rescanRequested) {\n          rescanRequested = false;') !== -1, 'content no-candidate scans must still honor queued rescan requests');
-  assert(content.indexOf('if (generation !== scanGeneration)') !== -1 && content.indexOf('detectAndProcess(true);') !== -1, 'content stale scan completion must schedule a current rescan when requested');
-  assert(content.indexOf('processContainers(c, generation).catch(function(e)') !== -1, 'content scan processing must log rejected scans');
-  assert(content.indexOf('bumpScanGeneration();') !== -1, 'content reload/disable paths must invalidate old async work');
-  assert(content.indexOf("ATPLoader.resetActiveImageSlots('reload')") !== -1, 'content hot reload must reset active image slots before clearing thumbnail DOM');
-  assert(content.indexOf("ATPLoader.resetActiveImageSlots('disable')") !== -1, 'content disable must reset active image slots before clearing thumbnail DOM');
-  assert(content.indexOf('flushPendingData();\n    clearThumbnailDom();') !== -1, 'content reload must flush pending loaded URL cache before clearing thread state');
-  assert(content.indexOf('ATPCache.clearFlushTimer();\n    Logger.flush();') === -1, 'content disable must not drop pending cache flushes before clearing thread state');
-  assert(content.indexOf("if (window.ATPPreviewer && typeof ATPPreviewer.close === 'function')") !== -1, 'content thumbnail cleanup must close previewer to clear preview timers and body scroll locks');
-  assert(content.indexOf("ATPLoader.teardownActiveSlots('clear_dom')") !== -1, 'content thumbnail cleanup must teardown active loader slots before removing thumbnail DOM');
-  assert(content.indexOf("window.addEventListener('beforeunload'") === -1, 'content must not register destructive beforeunload cleanup that can run before cancelled navigation');
-  assert(content.indexOf("teardownActiveSlots('beforeunload')") === -1, 'content must not teardown loader slots from beforeunload');
-  assert(content.indexOf('function teardownForPageExit(reason)') !== -1, 'content page-exit cleanup must be centralized behind pagehide');
-  assert(content.indexOf("window.addEventListener('pagehide', handlePageHide)") !== -1, 'content must use pagehide for page-exit cleanup');
-  assert(content.indexOf("window.addEventListener('pageshow', handlePageShow)") !== -1, 'content must handle BFCache pageshow recovery');
-  assert(content.indexOf('var followupScanTimer = null;') !== -1, 'content scan follow-up timers must be tracked for lifecycle cleanup');
-  assert(/function clearScanTimers\(\)[\s\S]*?if \(followupScanTimer\) \{[\s\S]*?clearTimeout\(followupScanTimer\);[\s\S]*?followupScanTimer = null;[\s\S]*?\}/.test(content), 'content lifecycle cleanup must clear pending follow-up scan timers');
-  assert(content.indexOf('function scheduleFollowupScan(delay, generation)') !== -1, 'content scan follow-ups must use a shared clearable scheduler');
-  assert(/function handlePageHide\(event\)[\s\S]*?if \(event && event\.persisted\) \{[\s\S]*?if \(!initialized \|\| !ATPConfig\.isEnabled\(\)\) \{[\s\S]*?bfcacheRecoveryPending = false;[\s\S]*?rescanRequested = false;[\s\S]*?return;[\s\S]*?\}[\s\S]*?bfcacheRecoveryPending = true;[\s\S]*?ATPLoader\.suspendActiveImageSlotsForBfcache\('bfcache_pagehide'\);[\s\S]*?ATPLoader\.pause\(\);[\s\S]*?return;[\s\S]*?\}[\s\S]*?teardownForPageExit\('pagehide'\);/.test(content), 'content pagehide must guard disabled or uninitialized BFCache state, suspend active image slot accounting for enabled BFCache, and teardown only non-persisted exits');
-  var pagehidePersistedBranch = (content.match(/function handlePageHide\(event\) \{[\s\S]*?\n  \}\n\n  function resumeFromBfcache/) || [''])[0];
-  assert(pagehidePersistedBranch.indexOf('clearScanTimers();') !== -1, 'content BFCache pagehide branch must clear pending content scan timers');
-  assert(pagehidePersistedBranch.indexOf('clearProcessCandidateQueue();') !== -1, 'content BFCache pagehide branch must clear queued scan candidates');
-  assert(pagehidePersistedBranch.indexOf("suspendActiveImageSlotsForBfcache('bfcache_pagehide')") !== -1, 'content BFCache pagehide branch must free frozen active slot capacity with a dedicated suspend reason');
-  assert(pagehidePersistedBranch.indexOf("resetActiveImageSlots('bfcache_pagehide')") === -1, 'content BFCache pagehide branch must not cancel active image recover controls');
-  assert(pagehidePersistedBranch.indexOf('destroy(') === -1 && pagehidePersistedBranch.indexOf('clearThumbnailDom(') === -1 && pagehidePersistedBranch.indexOf('teardownActiveSlots') === -1, 'content BFCache pagehide branch must not destroy DOM, panels, or active slots');
-  assert(/function resumeFromBfcache\(\)[\s\S]*?bfcacheRecoveryPending = false;[\s\S]*?rescanRequested = false;[\s\S]*?ATPLoader\.ensureGlobalVisListener\(\);[\s\S]*?shouldPauseScanningWhenHidden\(\)[\s\S]*?bfcacheRecoveryPending = true;[\s\S]*?ATPLoader\.recoverActiveImageLoads\('bfcache_pageshow'\);[\s\S]*?syncLoaderVisibilityPauseState\(\);[\s\S]*?ensureObserverBound\('bfcache'\);[\s\S]*?initFloatPanel\(\);[\s\S]*?detectAndProcess\(true\);/.test(content), "content BFCache resume must restore active or dormant scanning through setupObserver after loader recovery");
-  var pageshowPersistedBranch = (content.match(/function handlePageShow\(event\) \{[\s\S]*?\n  \}/) || [''])[0];
-  assert(/function handlePageShow\(event\)[\s\S]*?if \(!event \|\| !event\.persisted\) return;[\s\S]*?if \(!bfcacheRecoveryPending\) return;[\s\S]*?if \(!initialized \|\| !ATPConfig\.isEnabled\(\)\) \{[\s\S]*?bfcacheRecoveryPending = false;[\s\S]*?rescanRequested = false;[\s\S]*?return;[\s\S]*?\}[\s\S]*?resumeFromBfcache\(\);/.test(content), 'content BFCache pageshow must only consume pending visibility-aware recovery while initialized and enabled');
-  assert(pageshowPersistedBranch.indexOf('bfcacheRecoveryPending = true;') === -1, 'content BFCache pageshow must not re-arm a recovery that visibilitychange already consumed');
-  assert(/function handleVisibilityChange\(\)[\s\S]*?bfcacheRecoveryPending && ATPConfig\.isEnabled\(\)[\s\S]*?resumeFromBfcache\(\);/.test(content), 'content visibilitychange must resume deferred BFCache recovery once visible');
-  assert(/function teardownForPageExit\(reason\)[\s\S]*?ATPViewport\.cancelHeavyRestores\(reason\);[\s\S]*?ATPLoader\.teardownActiveSlots\(reason\);/.test(content), 'content non-persisted pagehide cleanup must cancel heavy restores and active loader slots');
-  assert(content.indexOf("if (typeof ATPLoader.removeGlobalVisListener === 'function') ATPLoader.removeGlobalVisListener();") !== -1, 'content hot reload must clear loader visibility and scroll listeners before destroying viewport state');
-  assert(content.indexOf('ATPLoader.getVisListener ? ATPLoader.getVisListener()') === -1, 'content unload cleanup must not bypass loader global listener cleanup');
-  assert(content.indexOf("if (typeof ATPLoader !== 'undefined' && typeof ATPLoader.removeGlobalVisListener === 'function')") !== -1, 'content page-exit cleanup must clear loader visibility, scroll listener, and scroll idle timer');
-  assert(content.indexOf('function removeNodes(nodes)') !== -1, 'content cleanup must centralize node removal loops');
-  assert(content.indexOf('function removeClassFromNodes(nodes, className)') !== -1, 'content cleanup must centralize class removal loops');
-  assert(content.indexOf('removeNodes(panels);') !== -1 && content.indexOf('removeNodes(rows);') !== -1, 'content thumbnail cleanup must remove panels and rows with indexed loops');
-  assert(content.indexOf("removeClassFromNodes(containers, 'atp-processed');") !== -1, 'content thumbnail cleanup must clear processed markers with an indexed loop');
-  assert(content.indexOf('panels.forEach(function(panel)') === -1, 'content thumbnail cleanup must not use NodeList.forEach for panels');
-  assert(content.indexOf('rows.forEach(function(row)') === -1, 'content thumbnail cleanup must not use NodeList.forEach for rows');
-  assert(content.indexOf('containers.forEach(function(c)') === -1, 'content thumbnail cleanup must not use NodeList.forEach for processed containers');
-  assert(content.indexOf('userInteracted') === -1, 'content must not keep unused user interaction state');
-  assert(content.indexOf('USER_EVENTS') === -1, 'content startup must not restore unused user interaction listener sets');
-  assert(content.indexOf('bindUserInteractionListeners') === -1, 'content startup must not bind unused user interaction listeners');
-  assert(content.indexOf('removeUserInteractionListeners') === -1, 'content teardown must not carry cleanup for removed user interaction listeners');
-  assert(config.indexOf('onUserInteraction') === -1, 'config must not expose an unused user interaction callback');
-  assert(content.indexOf("document.addEventListener('DOMContentLoaded', scheduleInit") !== -1, 'content script must initialize after DOM readiness instead of waiting only for full page load');
-  assert(content.indexOf("window.addEventListener('load', scheduleInit)") !== -1, 'content script must keep load as an init fallback');
-  assert(content.indexOf('var initInFlight = false') !== -1, 'content init must track in-flight startup separately from completed initialization');
-  assert(content.indexOf('if (initialized || initInFlight || loadInitTimer) return;') !== -1, 'content init scheduling must skip duplicate load fallback timers after initialization or while init is in-flight');
-  assert(/function addSettingsChangedListener\(\)[\s\S]*?chrome\.storage\.onChanged\.addListener\(handleSettingsChanged\);[\s\S]*?settingsListenerInstalled = true;/.test(content), 'content init must track storage listener installation');
-  assert(/function removeSettingsChangedListener\(\)[\s\S]*?chrome\.storage\.onChanged\.removeListener\(handleSettingsChanged\);[\s\S]*?settingsListenerInstalled = false;/.test(content), 'content init cleanup must remove installed storage listeners before retrying');
-  assert(/function cleanupFailedStartup\(\)[\s\S]*?clearScanTimers\(\);[\s\S]*?clearObserverRetryTimer\(\);[\s\S]*?clearProcessCandidateQueue\(\);[\s\S]*?removeSettingsChangedListener\(\);[\s\S]*?Logger\.stopFlushTimer/.test(content), 'content failed startup cleanup must clear partial enable timers and listeners');
-  assert(/async function init\(\)[\s\S]*?if \(initialized \|\| initInFlight\) return;[\s\S]*?initInFlight = true;[\s\S]*?startupCancelled = false;[\s\S]*?await ATPConfig\.getSettings\(\);[\s\S]*?if \(startupCancelled\) return;[\s\S]*?addSettingsChangedListener\(\);[\s\S]*?initialized = true;[\s\S]*?if \(ATPConfig\.isEnabled\(\)\) enableCurrentPage\(\);[\s\S]*?catch \(e\) \{[\s\S]*?cleanupFailedStartup\(\);[\s\S]*?finally \{[\s\S]*?initInFlight = false;/.test(content), 'content init and enable failures must release startup guards so a later DOM/load fallback can retry');
-  assert(/function teardownForPageExit\(reason\) \{[\s\S]*?startupCancelled = true;/.test(content), 'content non-BFCache teardown must cancel any pending startup before settings resolution can re-enable the page');
-  assert(/function scheduleInit\(\)[\s\S]*?loadInitTimer = setTimeout\(function\(\) \{[\s\S]*?init\(\);[\s\S]*?\}, 0\);/.test(content), 'content first init scheduling must not keep a fixed 500ms startup delay');
-  assert(!/function scheduleInit\(\)[\s\S]*?\}, 500\);/.test(content), 'content first init scheduling must not regress to a fixed 500ms startup delay');
-  assert(content.indexOf('} else if (!reloadNeeded) {\n        applyLiveSettings(previousSettings, nextSettings);') !== -1, 'content settings changes must reconfigure live subsystems only when a hot reload is not required');
-  assert(/function applyLiveSettings\(previousSettings, nextSettings\)[\s\S]*?ATPLoader\.reconfigure\(nextSettings\)[\s\S]*?ATPLoader\.syncVisibilityPauseState\(\)/.test(content), 'content live settings must reconfigure loader policy and resync visibility state');
-  assert(loader.indexOf('function retryViewportPendingSlotLoads()') !== -1, 'loader visibility recovery must centralize viewport pending-slot retries');
-  assert(loader.indexOf('function retryViewportVisiblePendingLoads()') !== -1, 'loader visibility recovery must centralize ordinary visible viewport retries');
-  assert(loader.indexOf('var GLOBAL_VIEWPORT_SLOT_WAKE_TIMER = null') !== -1, 'loader must coalesce viewport slot wake timers');
-  assert(loader.indexOf('function scheduleViewportPendingSlotWake()') !== -1, 'loader must expose a release-driven pending slot wake helper');
-  assert(loader.indexOf('if (released) scheduleViewportPendingSlotWake();') !== -1, 'loader must wake viewport pending slot retries after releasing an image slot');
-  assert(/pause: function\(\)[\s\S]*?clearViewportSlotWakeTimer\(\);[\s\S]*?clearBackgroundTimers\(\);/.test(loader), 'loader pause cleanup must cancel pending viewport slot wake timers');
-  assert(loader.indexOf('ATPViewport.clearHiddenLoadFlags();\n          retryViewportVisiblePendingLoads();\n          retryViewportPendingSlotLoads();') !== -1, 'loader must retry visible and slot-pending viewport loads after clearing hidden-load flags');
-  assert(/GLOBAL_PAUSED = false;[\s\S]*?retryViewportVisiblePendingLoads\(\);[\s\S]*?retryViewportPendingSlotLoads\(\);/.test(loader), 'loader must wake visible and slot-pending viewport loads when a paused page becomes visible');
-  assert(renderer.indexOf('function isThreadCurrent(threadState)') !== -1, 'renderer async TXT work must ignore stale generations');
-  assert(/function isThreadCurrent\(threadState\) \{[\s\S]*?if \(threadState\.panel && !document\.contains\(threadState\.panel\)\) return false;[\s\S]*?if \(threadState\.container && !document\.contains\(threadState\.container\)\) return false;[\s\S]*?return true;/.test(renderer), 'renderer async thread work must ignore detached panels and containers');
-  assert(renderer.indexOf('generation: generation') !== -1, 'renderer thread state and tasks must carry generation');
-  assert(renderer.indexOf('var registeredAt = Date.now();') !== -1, 'renderer thread registration must capture one timestamp for id and initial task timing');
-  assert(renderer.indexOf("var threadId = 't_' + registeredAt + '_'") !== -1, 'renderer thread ids must reuse the registration timestamp');
-  assert(renderer.indexOf('var queuedAt = registeredAt;') !== -1, 'renderer first-screen tasks must reuse the registration timestamp');
-  assert(renderer.indexOf("var threadId = 't_' + Date.now()") === -1, 'renderer thread registration must not read Date.now separately for thread ids');
-  assert(renderer.indexOf('firstTasks: new Array(firstScreenTotal)') !== -1, 'renderer first-screen task queues must be preallocated');
-  assert(renderer.indexOf('threadState.firstTasks[i] = {') !== -1, 'renderer first-screen task queues must be filled by index');
-  assert(renderer.indexOf('threadState.firstTasks.push({') === -1, 'renderer first-screen task queues must not grow with push during registration');
-  assert(renderer.indexOf('function countTableCells(row)') !== -1, 'renderer table colspan calculation must use a loop helper');
-  assert(renderer.indexOf('String(countTableCells(sampleTr) || 5)') !== -1, 'renderer table colspan calculation must reuse the loop helper fallback');
-  assert(renderer.indexOf("sampleTr.querySelectorAll('td,th').length") === -1, 'renderer table colspan calculation must not allocate querySelectorAll NodeLists');
-  assert(renderer.indexOf('function isDecoratedArticleContainer(container)') !== -1, 'renderer must have an insertion-time decorated-container guard');
-  assert(renderer.indexOf('var scanner = window.ATPScanner;') !== -1, 'renderer decorated-container guard must prefer the scanner helper when available');
-  assert(renderer.indexOf("parent.querySelector && parent.querySelector('.' + THUMB_CLASS + ',.atp-thumb-row')") !== -1, 'renderer decorated-container guard must detect child TRs under decorated TBODYs');
-  assert(renderer.indexOf('if (isDecoratedArticleContainer(container)) return;') !== -1, 'renderer must skip thumbnail insertion when the target or parent TBODY is already decorated');
-  assert(renderer.indexOf('loadedUrlMap: {}') !== -1, 'renderer thread state must track loaded URL keys to avoid duplicate cache flushes');
-  assert(loader.indexOf('var loadedKey = loadedUrl ? SharedUtils.normalizeImageUrl(loadedUrl) :') !== -1, 'loader must normalize loaded preview URLs before recording cache hits');
-  assert(loader.indexOf('if (loadedKey && !ts.loadedUrlMap[loadedKey])') !== -1, 'loader must not append duplicate loaded URLs for the same thread');
-  assert((loader.match(/var initialSrc = getTaskImageSrc\(task\);\n\s+markTaskCurrentSourceStart\(task, initialSrc, shouldUseNoReferrerByDefault\(initialSrc\)\);\n\s+setImageSource\(img, initialSrc, shouldUseNoReferrerByDefault\(initialSrc\), isActiveLoadCurrent\);/g) || []).length === 2, 'loader direct and retry initial image source setup must mark the current src before using one task src read with a stale-load guard');
-  assert(loader.indexOf('setImageSource(img, getTaskImageSrc(task), shouldUseNoReferrerByDefault(getTaskImageSrc(task)))') === -1, 'loader image source setup must not read the same task src twice');
-  assert(renderer.indexOf('textResourcesRetryable: false') !== -1, 'renderer must track retryable TXT resource states');
-  assert(renderer.indexOf('var AUTO_TEXT_RESOURCE_CONCURRENCY = 2;') !== -1, 'automatic TXT parsing must use an independent concurrency cap of two');
-  assert(renderer.indexOf('function queueAutomaticTextResourceLoad(threadState)') !== -1, 'renderer must queue newly detected TXT attachments automatically');
-  assert(renderer.indexOf('function drainAutomaticTextResourceQueue()') !== -1, 'renderer must drain automatic TXT work through a dedicated FIFO');
-  assert(renderer.indexOf('function releaseAutomaticTextResourceSlot(threadState, run)') !== -1, 'renderer must centralize idempotent automatic TXT run-slot release');
-  assert(renderer.indexOf('queueAutomaticTextResourceLoad(threadState);\n      if (window.ATPResourcePanel)') !== -1, 'renderer must mark automatic TXT work before the resource panel first renders');
-  assert(renderer.indexOf('var hasCachedTextResources = textResourcesComplete === true;') !== -1 && renderer.indexOf('textResourcesDone: hasCachedTextResources') !== -1, 'renderer must only reuse cached TXT completion from an explicit cache contract');
-  assert(renderer.indexOf('releaseAutomaticTextResourceSlot(threadState, run);') !== -1, 'renderer TXT terminal paths must release their own automatic run slot');
-  assert(renderer.indexOf('threadState.textResourcesRun === run && isThreadCurrent(threadState)') !== -1, 'renderer TXT callbacks must reject stale runs before mutating imported or newer state');
-  assert(renderer.indexOf('threadState.textResourcesRun = null;') !== -1, 'local TXT import must invalidate any older asynchronous TXT run');
-  assert(renderer.indexOf('threadState.textResourcesDone && !threadState.textResourcesRetryable') !== -1, 'TXT resource retry must stay available after empty or failed parses');
-  assert(renderer.indexOf('function normalizeTextResourceLoadResult(result, attachmentCount)') !== -1, 'renderer must normalize TXT resource fetch status before updating thread state');
-  assert(renderer.indexOf('threadState.textResourcesDone = hasFetchedResources && unresolvedCount === 0') !== -1, 'renderer must only close TXT parsing when payload exists and all attachments resolved');
-  assert(renderer.indexOf('threadState.textResourcesRetryable = retryableCount > 0 || !hasFetchedResources') !== -1, 'empty and retryable TXT resource parses must remain manually retryable');
-  assert(renderer.indexOf('scheduleTextResourceLoad: function(threadState, manualRetry)') !== -1, 'renderer TXT scheduling must accept manual retry state');
-  assert(renderer.indexOf('if (!threadState) return false;') !== -1, 'renderer TXT scheduling must return false for local early exits');
-  assert(renderer.indexOf('var failTextResourceLoad = function(message, e)') !== -1, 'renderer TXT scheduling must centralize local fetch startup failures');
-  assert(renderer.indexOf("if (!fetchPromise || typeof fetchPromise.then !== 'function')") !== -1, 'renderer TXT scheduling must reject non-promise TXT fetcher results without getting stuck loading');
-  assert(renderer.indexOf("if (!freshPromise || typeof freshPromise.then !== 'function')") !== -1, 'renderer TXT scheduling must reject non-promise fresh attachment results without getting stuck loading');
-  assert(/var makeTextRunOptions = function\(\) \{\s+return \{\s+manualRetry: !!manualRetry,/.test(renderer) && renderer.indexOf('ATPFetcher.fetchTextAttachmentResourcesWithStatus(attachments, fetchOptions)') !== -1, 'renderer TXT scheduling must pass manual retry state to the status-aware fetcher');
-  assert(resourcePanel.indexOf('|| threadState.textResourcesRetryable') !== -1, 'resource panel must keep TXT parse actions visible for retryable failures');
-  assert(resourcePanel.indexOf('if (threadState.textResourcesDone && !threadState.textResourcesRetryable) return false;') !== -1, 'resource panel must keep TXT parse actions visible for done-but-retryable states');
-  assert(resourcePanel.indexOf('function requestTextResourceManualLoad(threadState)') !== -1, 'resource panel TXT parse actions must route through one guarded manual scheduling helper');
-  assert(resourcePanel.indexOf('function shouldShowTextFallbackActions(threadState)') !== -1, 'resource panel must centralize automatic-failure fallback visibility');
-  assert(resourcePanel.indexOf('!threadState.textResourcesAutoQueued') !== -1 && resourcePanel.indexOf('!threadState.textResourcesAutoActive') !== -1 && resourcePanel.indexOf('threadState.textResourcesRetryable') !== -1, 'resource panel must hide manual TXT actions until automatic parsing has failed');
-  assert(resourcePanel.indexOf('window.ATPRenderer.scheduleTextResourceLoad(threadState, true)') !== -1, 'resource panel manual TXT parse must bypass fail-cache retries through the renderer scheduler');
-  assert(resourcePanel.indexOf('markTextResourceManualScheduleFailed') !== -1, 'resource panel manual TXT parse must keep local scheduling failures retryable');
-  assert((resourcePanel.match(/getTextFallbackActionsHtml\(threadState, false\)/g) || []).length >= 3 && resourcePanel.indexOf('getTextFallbackActionsHtml(threadState, true)') !== -1, 'resource panel manual TXT fallback actions must stay available in sidebar and inline views after automatic failure');
-  assert(resourcePanel.indexOf('return (threadState.hasTextAttachments || threadState.textResourcesRetryable) ? 1 : 0;') !== -1, 'resource panel must not show zero-count TXT parse actions for marker-only states');
-  assert(resourcePanel.indexOf('function getTextResourceStatusMessage(threadState, emptyFallback)') !== -1, 'resource panel must centralize TXT parse status messages');
-  assert(resourcePanel.indexOf('atp-resource-status') !== -1, 'resource sidebar must render persistent TXT parse status beside existing resources');
-  assert(resourcePanel.indexOf('atp-resource-inline-status') !== -1, 'inline resource panel must render persistent TXT parse status');
-  assert(/html \+= '<div class="atp-resource-empty"[\s\S]*?if \(showTextFallbackActions\)[\s\S]*?getTextFallbackActionsHtml\(threadState, false\)[\s\S]*?html \+= getLiveRegionHtml\('atp-resource-msg'\);[\s\S]*?setSidebarHtml\(el, renderSignature, html\);/.test(resourcePanel), 'resource sidebar automatic-failure state must keep a message live region for manual fallback feedback');
-  assert(resourcePanel.indexOf('!hasResourcePayload(threadState.resources) && !hasPendingAttachments && !statusMessage') !== -1, 'inline resource panel must stay visible for TXT loading or failure status without existing resources');
-  assert(loader.indexOf('function isTaskCurrent(task)') !== -1, 'loader must ignore stale image tasks after reload');
-  assert(loader.indexOf('var IMAGE_SLOT_EPOCH = 0') !== -1, 'loader active slot accounting must have an epoch for reload/disable resets');
-  assert(loader.indexOf('task.slotEpoch = IMAGE_SLOT_EPOCH') !== -1, 'loader active slot claims must stamp the current epoch');
-  assert(loader.indexOf('if (task.slotEpoch !== IMAGE_SLOT_EPOCH) return;') !== -1, 'loader high-fanout slot updates must ignore stale active slot epochs');
-  assert(loader.indexOf('var sameEpoch = task.slotEpoch === IMAGE_SLOT_EPOCH') !== -1, 'loader active slot releases must check the stamped epoch');
-  assert(loader.indexOf('task.slotCounted = true') !== -1, 'loader active slot claims must mark slots as counted');
-  assert(loader.indexOf('var counted = task.slotCounted !== false') !== -1, 'loader active slot releases must distinguish suspended uncounted slots');
-  assert(loader.indexOf('if (!sameEpoch || !registered || !counted) return;') !== -1, 'loader stale, unregistered, or suspended active slot releases must not decrement current slot counters');
-  assert(loader.indexOf('function resetActiveImageSlots(reason)') !== -1, 'loader must expose an active slot reset helper for reload/disable cleanup');
-  assert(loader.indexOf('function suspendActiveImageSlotsForBfcache(reason)') !== -1, 'loader must expose a non-canceling BFCache active slot suspend helper');
-  assert(loader.indexOf('suspendActiveImageSlotsForBfcache: function(reason)') !== -1, 'loader public API must expose BFCache active slot suspension');
-  assert(loader.indexOf('function teardownActiveSlots(reason)') !== -1, 'loader must expose a teardown helper for DOM and unload cleanup');
-  assert(loader.indexOf("logEventThrottled('activeSlotReset', 'image_slot_reset'") !== -1, 'loader active slot resets must emit structured diagnostics');
-  assert(loader.indexOf("logEventThrottled('activeSlotSuspend', 'image_slot_reset'") !== -1, 'loader BFCache active slot suspension must emit structured diagnostics');
-  assert(loader.indexOf('GLOBAL_ACTIVE = 0;\n    GLOBAL_HIGH_FANOUT_ACTIVE = 0;') !== -1, 'loader active slot reset must clear ordinary and high-fanout counters together');
-  assert(/function suspendActiveImageSlotsForBfcache\(reason\)[\s\S]*?task\.slotCounted = false;[\s\S]*?GLOBAL_ACTIVE = 0;[\s\S]*?GLOBAL_HIGH_FANOUT_ACTIVE = 0;/.test(loader), 'loader BFCache active slot suspension must mark frozen slots uncounted and free capacity without clearing slot registrations');
-  const suspendActiveBody = (loader.match(/function suspendActiveImageSlotsForBfcache\(reason\)[\s\S]*?\n  \}\n\n  function teardownActiveSlots/) || [''])[0];
-  assert(suspendActiveBody.indexOf('cancelActiveImageLoads') === -1, 'loader BFCache active slot suspension must not cancel active image load controls');
-  assert(loader.indexOf('var GLOBAL_ACTIVE_SLOTS = {}') !== -1, 'loader active slot accounting must track registered active slot tokens');
-  assert(loader.indexOf('var IMAGE_SLOT_TOKEN = 0') !== -1, 'loader active slot accounting must issue unique slot tokens');
-  assert(loader.indexOf('task.activeSlotToken = slotToken') !== -1, 'loader active slot claims must stamp a slot token');
-  assert(loader.indexOf('GLOBAL_ACTIVE_SLOTS[slotToken] = task') !== -1, 'loader active slot claims must register the task by token');
-  assert(loader.indexOf('function isRegisteredActiveSlot(task)') !== -1, 'loader active slot releases must verify registered active slots');
-  assert(loader.indexOf('clearRegisteredActiveSlots();') !== -1, 'loader active slot reset must clear stale slot registrations');
-  assert(loader.indexOf('var ACTIVE_IMAGE_LOADS = []') !== -1, 'loader must track active image load cancel handles');
-  assert(loader.indexOf("var HIDDEN_PAUSE_CANCEL_REASON = 'hidden_pause';") !== -1, 'loader must use a dedicated hidden-page active image cancel reason');
-  assert(loader.indexOf('function registerActiveImageLoad(control)') !== -1, 'loader must expose a registry for cancellable active image loads');
-  assert(loader.indexOf('function cancelActiveImageLoads(reason)') !== -1, 'loader active slot reset must cancel active image timers and handlers');
-  assert(loader.indexOf('function recoverActiveImageLoads(reason)') !== -1, 'loader must expose an active image recovery helper for BFCache pageshow');
-  assert(loader.indexOf('function requeuePausedImageTask(task, wrapper, loadingEl, reason)') !== -1, 'loader hidden-page cancellation must requeue unfinished direct image tasks');
-  assert(loader.indexOf('cancelActiveImageLoads(HIDDEN_PAUSE_CANCEL_REASON);') !== -1, 'loader hidden visibility pause must cancel in-flight image requests');
-  assert(loader.indexOf('releaseImageSlot(task, slotToken);\n          if (!requeuePausedImageTask(task, wrapper, lel, reason)) removeWrapper(wrapper);') !== -1, 'loader hidden-page direct cancel must release slots and requeue or remove unfinished placeholders');
-  assert(loader.indexOf('function getNoReferrerFallbackRetryTimeout(task)') !== -1, 'loader no-referrer fallback must compute an independent retry timeout');
-  assert(loader.indexOf('if (restartTimer) restartTimer(retryTimeout);') !== -1, 'loader no-referrer fallback must not restart a full image timeout');
-  assert(loader.indexOf('restoreSuspendedActiveSlotCountsForBfcache(reason);') !== -1, 'loader BFCache recovery must restore suspended slot counters before recovering active images');
-  assert(loader.indexOf('function restoreSuspendedActiveSlotCountsForBfcache(reason)') !== -1, 'loader must centralize BFCache suspended slot counter recovery');
-  assert(/function restoreSuspendedActiveSlotCountsForBfcache\(reason\)[\s\S]*?task\.slotCounted === false[\s\S]*?String\(task\.activeSlotToken\) === String\(slotToken\)[\s\S]*?task\.slotCounted = true;[\s\S]*?GLOBAL_ACTIVE\+\+;[\s\S]*?updateActiveHighFanoutSlot\(task, getTaskImageSrc\(task\)\);/.test(loader), 'loader BFCache suspended slot recovery must only recount current uncounted slots and recompute heavy accounting');
-  assert(loader.indexOf('recoverActiveImageLoads: function(reason)') !== -1, 'loader public API must expose BFCache active image recovery');
-  assert(loader.indexOf('unregisterActiveImageLoad(control);\n          control.cancel(reason || \'recover\');') !== -1, 'loader BFCache recovery must unregister legacy cancel-only active loads before canceling');
-  assert(loader.indexOf('cancelActiveImageLoads(reason);') !== -1, 'loader active slot reset must cancel active image loads before clearing counters');
-  assert(loader.indexOf('function cancelImageLoadElement(img)') !== -1, 'loader must centralize image element cancellation');
-  assert(loader.indexOf("img.removeAttribute('src');\n    img.removeAttribute('srcset');") !== -1, 'loader image cancellation must remove src and srcset');
-  assert(viewport.includes('function prunePendingWrappers(wakeBgQueue, force)') && viewport.includes('PENDING_PRUNE_MIN_INTERVAL_MS = 200'), "pending pressure pruning must remain bounded to a 200ms window");
-  assert(/getPendingCount: function\(\) \{[\s\S]*?prunePendingWrappers\(true\);[\s\S]*?return pendingWrappers\.size;/.test(viewport), 'viewport pending count must prune stale wrappers before returning size');
-  assert(viewport.indexOf("var hiddenPause = reason === 'hidden_pause' && isActiveLoadCurrent();") !== -1, 'viewport hidden-page active loads must use the loader hidden pause reason');
-  assert(viewport.indexOf('function requeueHiddenPausedWrapper()') !== -1, 'viewport hidden-page cancellation must put unfinished lazy loads back into pending');
-  assert(/window\.addEventListener\('atp-forum-pacer-reset', function\(\) \{\s*if \(!ATPConfig\.isEnabled\(\) \|\| !hasPaceBoundRetries\(\)\) return;\s*scheduleRetryScanAt\(Date\.now\(\)\);/.test(content),
-    'a manual pacer reset must wake the threads held by the pause');
-  assert(viewport.indexOf('if (ATPLoader.trySiblingHostFallback && ATPLoader.trySiblingHostFallback(task, img, startTimer, isActiveLoadCurrent)) return;') !== -1,
-    'viewport image errors must try a sibling attachment host too');
-  const fetcherSource = read('fetcher.js');
-  assert(fetcherSource.indexOf('data.freshTextAttachments = rawTextAttachments.slice();') !== -1 &&
-    content.indexOf('data.freshTextAttachments = result.data.freshTextAttachments;') !== -1,
-    'the article fetch must hand its fresh attachment links to the automatic TXT run');
-  assert(/^\s+if \(ATPLoader\.freezeAnimatedThumbnail\) ATPLoader\.freezeAnimatedThumbnail\(wrapper, img, task\);$/m.test(viewport),
-    'viewport-loaded GIF thumbnails must show a still frame too');
-  assert((loader.match(/^\s+freezeAnimatedThumbnail\(wrapper, img, task\);$/mg) || []).length === 2,
-    'direct and retried GIF thumbnails must both show a still frame');
-  assert((loader.match(/^\s+recordDomainSuccess\(getTaskImageSrc\(task\), task\);$/mg) || []).length === 2,
-    'direct and retried successes must pass the task so the GIF lane can learn from them');
-  const stillCss = read('content.css');
-  assert(/\.atp-gif-frozen \.atp-thumbnail-img \{\s*display: none !important;/.test(stillCss) &&
-    /\.atp-gif-frozen:hover \.atp-thumbnail-img \{\s*display: block !important;/.test(stillCss) &&
-    /\.atp-gif-frozen:hover \.atp-gif-still \{\s*display: none;/.test(stillCss),
-    'frozen GIF thumbnails must hide the animated image until hovered (overriding its inline display)');
-  assert(viewport.indexOf('if (didStart || !isLargeLaneBlockedWrapper(data)) attempted++;') !== -1 &&
-    viewport.indexOf('if (wrappedDidStart || !isLargeLaneBlockedWrapper(wrappedData)) attempted++;') !== -1,
-    'viewport visible retry scans must not spend their attempt budget on GIFs waiting for the host GIF lane');
-  assert(viewport.slice(viewport.indexOf('function requeueHiddenPausedWrapper()'), viewport.indexOf('function cancelActiveLoad(reason)'))
-    .indexOf('if (task) task.taskDeadlineAt = 0;') !== -1, 'viewport hidden-page requeue must give the resumed load a fresh task deadline');
-  assert((loader.match(/unregisterActiveLoad = registerActiveImageLoad\(\{ cancel: cancelActiveLoad, recover: recoverActiveLoad \}\);/g) || []).length === 2, 'loader direct and retry loads must register active image recover handlers');
-  assert((loader.match(/function recoverActiveLoad\(reason\) \{[\s\S]*?if \(img\.complete && img\.naturalWidth\) \{[\s\S]*?img\.onload\(\);[\s\S]*?return;[\s\S]*?recordTaskImageFailure/g) || []).length === 2, 'loader BFCache recovery must settle completed direct and retry images through the success path before recording failures');
-  assert((loader.match(/if \(\(img\.currentSrc \|\| img\.src\) && \(!document\.contains \|\| document\.contains\(wrapper\)\)\) \{[\s\S]*?startTimer\(\);[\s\S]*?return;[\s\S]*?\}/g) || []).length >= 2, 'loader BFCache recovery must continue incomplete active image requests while the wrapper is still live');
-  assert(viewport.indexOf('ATPLoader.registerActiveImageLoad({ cancel: cancelActiveLoad, recover: recoverActiveLoad })') !== -1, 'viewport active image loads must register with the loader recover registry');
-  assert(/function recoverActiveLoad\(reason\) \{[\s\S]*?if \(img\.complete && img\.naturalWidth\) \{[\s\S]*?img\.onload\(\);[\s\S]*?return;[\s\S]*?recordTaskImageFailure/.test(viewport), 'viewport BFCache recovery must settle completed images through the success path before recording failures');
-  assert(/function recoverActiveLoad\(reason\) \{[\s\S]*?if \(\(img\.currentSrc \|\| img\.src\) && \(!document\.contains \|\| document\.contains\(wrapper\)\)\) \{[\s\S]*?startTimer\(\);[\s\S]*?return;/.test(viewport), 'viewport BFCache recovery must continue incomplete active image requests while the wrapper is still live');
-  assert(/recover: function\(reason\) \{[\s\S]*?if \(data\.img && data\.img\.complete && data\.img\.naturalWidth && data\.restoreReveal\) \{[\s\S]*?data\.restoreReveal\(\{ type: 'load' \}\);[\s\S]*?return;[\s\S]*?cancelHeavyRestoreLoad/.test(viewport), 'viewport heavy restore BFCache recovery must reveal completed restored images before canceling and retrying');
-  assert(viewport.indexOf("scheduleHeavyRestoreRetry(wrapper, data, 'active_restore_recover_retry');") !== -1, 'viewport heavy restore recovery must reschedule frozen heavy restores after BFCache pageshow');
-  assert((loader.match(/releaseImageSlot\(task, slotToken\)/g) || []).length >= 2, 'loader direct image completions must release the captured slot token');
-  assert((loader.match(/ATPLoader\.releaseSlot\(task, slotToken\)/g) || []).length >= 2, 'loader retry image completions must release the captured slot token');
-  assert(viewport.indexOf('var slotToken = ATPLoader.getActiveSlotToken ? ATPLoader.getActiveSlotToken(task) : (task && task.activeSlotToken);') !== -1, 'viewport active image loads must capture the acquired slot token');
-  assert(viewport.indexOf('ATPLoader.isImageSlotCurrent(task, slotToken)') !== -1, 'viewport stale-load guards must validate the captured slot token');
-  assert((loader.match(/tryNoReferrerFallback\(task, img, [^,]+, startTimer, isActiveLoadCurrent\)/g) || []).length >= 4, 'loader direct and retry fallback retries must use stale-load guards');
-  assert((loader.match(/tryHeavyCandidateFallback\(task, img, startTimer, isActiveLoadCurrent\)/g) || []).length >= 3, 'loader direct candidate fallbacks must use stale-load guards');
-  assert(viewport.indexOf('ATPLoader.tryNoReferrerFallback(task, img, currentSrc, startTimer, isActiveLoadCurrent)') !== -1, 'viewport no-referrer fallback must use stale-load guards');
-  assert(viewport.indexOf('ATPLoader.tryHeavyCandidateFallback(task, img, startTimer, isActiveLoadCurrent)') !== -1, 'viewport candidate fallback must use stale-load guards');
-  assert(viewport.indexOf('var initialSrc = ATPLoader.getTaskImageSrc(task);') !== -1 && viewport.indexOf('ATPLoader.markTaskCurrentSourceStart(task, initialSrc, false);') !== -1, 'viewport initial image source assignment must mark the current src before loading');
-  assert(viewport.indexOf('ATPLoader.setImageSource(img, initialSrc, false, isActiveLoadCurrent)') !== -1, 'viewport initial image source assignment must use a stale-load guard');
-  assert(/function isThreadCurrent\(ts\) \{[\s\S]*?if \(ts\.panel && !document\.contains\(ts\.panel\)\) return false;[\s\S]*?if \(ts\.container && !document\.contains\(ts\.container\)\) return false;[\s\S]*?return true;/.test(loader), 'loader image tasks must ignore detached panels and containers');
-  assert(resourcePanel.indexOf('function isThreadAttached(threadState)') !== -1, 'resource panel must centralize live thread DOM checks');
-  assert(resourcePanel.indexOf('if (!isThreadAttached(threadState)) {\n        var wasDisplayed = currentThread === threadState || pinnedThread === threadState || hoverThread === threadState;\n        clearThreadRefs(threadState);') !== -1, 'resource panel updates must drop stale sidebar refs instead of rendering detached panels');
-  assert(loader.indexOf('DOMAIN_CIRCUIT') === -1, 'loader must not retain the old fixed-threshold ordinary domain circuit');
-  assert(loader.indexOf('function shouldSkipTaskDomain(task, url)') === -1, 'loader must not skip ordinary candidates through a hidden domain circuit');
-  assert(loader.indexOf('ATPLoadPolicy.getOrdinaryFallbackLimit(getCurrentSettings() || {})') !== -1, 'ordinary candidate fallback must use the public loading policy');
-  assert(loader.indexOf('generation: ts.generation') !== -1, 'loader background tasks must carry generation');
-  assert(loader.indexOf('if (!isTaskCurrent(task)) return true;') !== -1, 'loader failed stale tasks must not be requeued');
-  assert(viewport.indexOf('ATPLoader.isTaskCurrent') !== -1, 'viewport lazy loader must ignore stale image tasks');
-  assert(viewport.indexOf('ATPLoader.shouldSkipDomain(imgData.src)') === -1, 'viewport loading must not skip ordinary candidates through a hidden domain circuit');
-  assert(viewport.indexOf('wrapperData.inViewport = intersecting;') !== -1 &&
-    viewport.indexOf('(!wrapperData.observerRoot || isRectNearPageViewport(entry.boundingClientRect))') !== -1, 'viewport lazy loader must track whether retry candidates are still near the page viewport, not just inside their scroll box');
-  assert(viewport.indexOf("wrapperData.slotRetryPending && !wrapperData.forceLoadWhenHidden && !wrapperData.lightweightPreloadInRange") !== -1, 'ordinary viewport exits must not clear lightweight-preload slot retries that are still in preload range');
-  assert(viewport.indexOf('var stillHiddenForced = !!(data.forceLoadWhenHidden && document.visibilityState !== \'visible\');') !== -1, 'viewport lazy loader must keep hidden forced retry work while clearing normal offscreen retries');
-  assert(viewport.indexOf('if (!stillHiddenForced && !stillPreloadForced && !refreshPendingViewportVisibility(wrapper, data))') !== -1, 'viewport slot retry scans must refresh and clear normal offscreen work without dropping forced hidden/preload work');
-  assert(viewport.indexOf('if (!forceLoad && !wrapperData.inViewport) return false;') !== -1, 'viewport slot retries must not load images after the user scrolls away unless hidden loading forced them');
-  assert(sharedUtils.includes('getSrcsetUrls: function(srcset)'), "image extraction must centralize srcset candidate selection");
-  assert(sharedUtils.includes('var smallSrcset = srcsetUrls.smallest;'), "image extraction must support lightweight srcset display candidates");
-  assert(sharedUtils.includes('var bestSrcset = srcsetUrls.best;'), "preview candidates must use the unified best srcset result");
-  assert(sharedUtils.includes('return { best: bestUrl, smallest: smallestUrl };'), "one srcset pass must return both candidate sizes");
-  assert(sharedUtils.indexOf('getImagePreviewSrc: function(imgData)') !== -1, 'image candidates must expose a preview URL separate from the display URL');
-  assert(sharedUtils.indexOf('candidate.previewSrc = preview.url') !== -1, 'image extraction must keep full-size preview URLs when display thumbnails differ');
-  assert(loader.indexOf('getCandidatePreviewSrc: function(imgData)') !== -1, 'loader must expose candidate preview URL resolution');
-  assert(loader.indexOf('function buildPreviewUrls(candidates)') !== -1, 'loader preview URL lists must use a loop helper instead of repeated map callbacks');
-  assert(loader.indexOf('buildPreviewUrls: function(candidates)') !== -1, 'loader must expose preview URL list building for viewport restored thumbnails');
-  assert(loader.indexOf('var allUrls = buildPreviewUrls(previewCandidates);') !== -1, 'loader click preview paths must reuse the loop-based preview URL builder');
-  assert(viewport.indexOf('ATPLoader.buildPreviewUrls(previewCandidates)') !== -1, 'viewport restored thumbnail previews must reuse the loader preview URL builder');
-  assert(viewport.indexOf('for (var pui = 0; pui < previewCandidates.length; pui++)') !== -1, 'viewport preview URL fallback must avoid map callbacks');
-  assert(loader.indexOf('previewCandidates.map(function(c) { return getCandidatePreviewSrc(c); })') === -1, 'loader click preview paths must not allocate through repeated map callbacks');
-  assert(viewport.indexOf('previewCandidates.map(function(c)') === -1, 'viewport restored thumbnail previews must not allocate through direct map callbacks');
-  assert(loader.indexOf('previewHost: previewSrc && previewSrc !== src') !== -1, 'image diagnostics must include preview host when display and preview URLs differ');
-  assert(renderer.indexOf('SharedUtils.getImagePreviewSrc ? SharedUtils.getImagePreviewSrc') !== -1, 'renderer heavy diagnostics must classify hosts by preview URL');
-  assert(renderer.indexOf('function getImageHost(src)') !== -1, 'renderer host diagnostics must centralize candidate host parsing');
-  assert(renderer.indexOf('var host = getImageHost(src);') !== -1, 'renderer host diagnostics must reuse centralized candidate host parsing');
-  assert(renderer.indexOf('if (!host) continue;') !== -1, 'renderer host diagnostics must keep ignoring malformed candidate URLs');
-  assert(renderer.indexOf('var host = new URL(src).hostname') === -1, 'renderer host diagnostics must not parse candidate hosts inline');
-  assert(renderer.indexOf('function updateTopImageHost(topHosts, counts, host)') !== -1, 'renderer host diagnostics must keep a bounded top host set');
-  assert(renderer.indexOf('Object.keys(counts).sort(function(a, b)') === -1, 'renderer host diagnostics must not sort all host keys');
-  assert(renderer.indexOf('}).slice(0, 6).map(function(host)') === -1, 'renderer host diagnostics must not slice and map sorted host keys');
-  assert(viewport.indexOf('item.loaded && !item.visible && !selected.has(item.wrapper)') !== -1, 'heavy render budget must not unload currently visible thumbnails');
-  assert(viewport.indexOf('loadPendingWhenHidden: function(maxLoads)') !== -1, 'viewport pending wrappers must be drainable with a bounded hidden-load budget');
-  assert(viewport.indexOf('data.forceLoadWhenHidden = true') !== -1, 'hidden-tab pending viewport loads must remember forced hidden loading');
-  assert(viewport.indexOf('task.forceEager = forceLoad') !== -1, 'hidden-tab pending viewport loads must use eager image priority while forced');
-  assert(viewport.indexOf('var attempted = 0;\n      var attemptLimit = limit > 0') !== -1, 'hidden-tab pending drains must bound failed slot attempts');
-  assert(viewport.indexOf('var startIndex = normalizePendingRetryCursor(pendingHiddenLoadCursor);') !== -1, 'hidden-tab pending drains must start from the hidden-load cursor');
-  assert(viewport.indexOf('pendingHiddenLoadCursor = normalizePendingRetryCursor(nextCursor);') !== -1, 'hidden-tab pending drains must advance the hidden-load cursor');
-  assert(viewport.includes('if ((limit > 0 && started >= limit) || attempted >= attemptLimit) {'), "hidden-tab pending drains must stop after the bounded attempt window");
-  assert(viewport.includes('if (available <= 0) return started;'), "hidden-tab pending drains must stop when no image slot is available");
-  assert(viewport.indexOf('return started;') !== -1, 'hidden-tab pending viewport draining must report started loads for bounded scheduling');
-  assert(viewport.indexOf('clearHiddenLoadFlags: function()') !== -1, 'viewport hidden-load flags must be cleared after returning visible');
-  assert(/clearHiddenLoadFlags: function\(\) \{[\s\S]*?prunePendingWrappers\(true, true\);[\s\S]*?var pendingValues = pendingWrappers\.values\(\);/.test(viewport), "visible-tab hidden-load cleanup must prune then scan pending wrappers without Map.forEach callbacks");
-  assert(viewport.indexOf('data.forceLoadWhenHidden = false;') !== -1, 'visible-tab hidden-load cleanup must clear forced hidden loading flags');
-  assert(viewport.indexOf('pendingWrappers.forEach(function(data) {\n        if (!data) return;\n        data.forceLoadWhenHidden = false;') === -1, 'visible-tab hidden-load cleanup must not allocate a Map.forEach callback');
-  assert(loader.indexOf('function getAvailableBackgroundSlots(bgSnapshot)') !== -1, 'loader must bound hidden viewport draining by available image slots');
-  assert(loader.indexOf('function shouldBypassViewportLazyLoad(settings)') !== -1, 'loader must have an explicit hidden-tab eager background loading guard');
-  assert(loader.indexOf("settings.pauseWhenHidden === false && document.visibilityState !== 'visible'") !== -1, 'pauseWhenHidden=false must bypass viewport lazy loading while hidden');
-  assert(loader.indexOf('function drainHiddenViewportPending(settings, bgSnapshot)') !== -1, 'hidden-tab background scheduling must centralize viewport pending draining');
-  assert(loader.indexOf('drainHiddenViewportPending(settings, bgSnapshot);') !== -1, 'hidden-tab background scheduling must drain viewport pending wrappers before queuing more background tasks');
-  assert(loader.indexOf('ATPViewport.loadPendingWhenHidden(available)') !== -1, 'hidden-tab eager background loading must drain already-created viewport pending wrappers without creating a retry burst');
-  assert(loader.indexOf('ATPViewport.clearHiddenLoadFlags()') !== -1, 'visible tabs must clear hidden-load viewport flags');
-  assert(loader.indexOf('ATPViewport.clearPendingRetryTimers()') !== -1, 'hidden-tab pause must clear viewport retry and wake timers');
-  assert(loader.indexOf("ATPViewport.resumeHeavyRestores('hidden_loading_allowed')") !== -1, 'pauseWhenHidden=false must resume heavy restore scheduling while hidden loading is allowed');
-  assert(loader.indexOf("ATPViewport.resumeHeavyRestores('visibility_resume')") !== -1, 'visible tabs must resume deferred heavy thumbnail restores after hidden pause');
-  assert(loader.indexOf('ATPViewport.pauseHeavyRestores()') !== -1, 'hidden-tab pause must pause heavy restore timers');
-  assert(/function syncVisibilityPauseState\(settings, shouldSchedule\)[\s\S]*?GLOBAL_PAUSED = true;[\s\S]*?ATPViewport\.clearPendingRetryTimers\(\);[\s\S]*?ATPViewport\.pauseHeavyRestores\(\);/.test(loader), 'hidden-tab pause must clear viewport retry timers before pausing heavy restores');
-  assert(/function scheduleBgQueueWake\(\)[\s\S]*?if \(pendingBgWakeTimer\) return;[\s\S]*?ATPLoader\.isPaused\(\)[\s\S]*?ATPLoader\.globalSchedule\(\);/.test(viewport), "viewport background wakes must coalesce and respect loader pause");
-  assert(viewport.indexOf('function scheduleBgQueueWake()') !== -1, 'viewport pending starts must coalesce background queue wakeups');
-  assert(/function schedulePendingSlotRetry\(delay\)[\s\S]*?if \(isLoaderPaused\(\)\) return;[\s\S]*?ATPViewport\.retryPendingSlotLoads\(\);/.test(viewport), 'viewport slot retry timer callbacks must not run while the loader is paused');
-  assert(viewport.indexOf('if (ATPLoader.isPaused && ATPLoader.isPaused()) return;') !== -1, 'viewport background queue wakeups must not run while the loader is paused');
-  assert(viewport.indexOf('function isLoaderPaused()') !== -1, 'viewport restore scheduling must share the loader paused guard');
-  assert(/loadWrapper: function\(wrapper, wrapperData, forceLoad\)[\s\S]*?forceLoad = !!forceLoad;[\s\S]*?if \(isLoaderPaused\(\)\) \{[\s\S]*?markPendingSlotRetry\(wrapperData\);[\s\S]*?return false;[\s\S]*?\}[\s\S]*?if \(!ATPLoader\.acquireSlot\(task\)\)/.test(viewport), 'viewport loadWrapper must check paused state before acquiring an image slot');
-  assert(viewport.indexOf('function clearHeavyRestoreTimers()') !== -1, 'viewport heavy restore timers must share a cleanup helper');
-  assert(/function clearHeavyRestoreTimers\(\)[\s\S]*?clearTimeout\(heavyRestoreTimer\);[\s\S]*?heavyRestoreTimer = null;[\s\S]*?clearTimeout\(heavyBudgetTimer\);[\s\S]*?heavyBudgetTimer = null;/.test(viewport), 'viewport heavy restore cleanup must cancel both restore and budget timers');
-  assert(viewport.indexOf('pauseHeavyRestores: function()') !== -1, 'viewport must expose heavy restore pause for loader visibility changes');
-  assert(/function scheduleHeavyRestore\(delay\)[\s\S]*?if \(!heavyRestoreQueue\.length \|\| isLoaderPaused\(\)\) return;[\s\S]*?heavyRestoreTimer = setTimeout/.test(viewport), "heavy restore scheduling must not create timers while the loader is paused");
-  assert(/function processHeavyRestoreQueue\(\) \{[\s\S]*?heavyRestoreTimer = null;[\s\S]*?if \(isLoaderPaused\(\)\) return;/.test(viewport), 'heavy restore processing must keep the queue intact while the loader is paused');
-  assert(/function scheduleHeavyBudgetReconcile\(reason, delay\)[\s\S]*?if \(isLoaderPaused\(\)\) return;[\s\S]*?setTimeout\(function\(\) \{[\s\S]*?if \(isLoaderPaused\(\)\) return;/.test(viewport), 'heavy budget reconcile scheduling and callbacks must respect loader pause state');
-  assert(/resumeHeavyRestores: function\(reason\)[\s\S]*?clearHeavyRestoreTimers\(\);[\s\S]*?if \(isLoaderPaused\(\)\) return;[\s\S]*?reconcileHeavyRenderBudget\(reason \|\| 'scroll_idle_budget'\);[\s\S]*?scheduleHeavyRestore\(HEAVY_RESTORE_IDLE_KICK_DELAY\);/.test(viewport), "heavy restore resume must clear stale timers, reconcile budget, and reschedule queued restores");
-  assert(viewport.indexOf('scheduleBgQueueWake();') !== -1, 'viewport pending starts must wake background scheduling after freeing pending capacity');
-  assert(viewport.indexOf('function removePendingWrapper(wrapper, data, wakeBgQueue, keepLoadingAnimation)') !== -1, 'viewport pending removals must share one cleanup, wake, and loading-lifecycle helper');
-  assert(/function removePendingWrapper\(wrapper, data, wakeBgQueue, keepLoadingAnimation\)[\s\S]*?pendingWrappers\.delete\(wrapper\)[\s\S]*?if \(removed && wakeBgQueue\) scheduleBgQueueWake\(\);/.test(viewport), 'viewport pending removals must wake background scheduling when they free pending capacity');
-  assert((viewport.match(/pendingWrappers\.delete\(/g) || []).length === 1, 'viewport pending wrappers must only be deleted through removePendingWrapper');
-  assert((viewport.match(/removePendingWrapper\(wrapper, wrapperData, true/g) || []).length >= 4, 'viewport stale, skipped, and started pending removals must all wake the background queue');
-  assert(viewport.indexOf('removePendingWrapper(wrapper, wrapperData, true, true);') !== -1, 'started viewport requests must keep shimmer observation until the loading element settles');
-  assert(viewport.indexOf('removePendingWrapper(wrapper, wrapperData, false)') === -1, 'viewport loadWrapper must not remove pending wrappers without waking the background queue');
-  assert(/function releaseViewportSlot\(task, slotToken\) \{[\s\S]*?ATPLoader\.releaseSlot\(task, slotToken\);[\s\S]*?scheduleBgQueueWake\(\);[\s\S]*?\}/.test(viewport), 'viewport active slot releases must wake background scheduling explicitly');
-  assert((viewport.match(/releaseViewportSlot\(task, slotToken\)/g) || []).length >= 3, 'viewport fail, load completion, and hidden pause paths must release slots through the token-aware wake helper');
-  assert(loader.indexOf('function syncVisibilityPauseState(settings, shouldSchedule)') !== -1, 'loader must centralize visibility pause state synchronization');
-  assert(loader.indexOf('syncVisibilityPauseState(ATPLoader.getSettings(), false)') !== -1, 'loader must honor pauseWhenHidden for tabs that start hidden');
-  assert(loader.indexOf('syncVisibilityPauseState: function()') !== -1, 'loader must expose pause-state resync for settings changes');
-  assert(loader.indexOf('function clearBackgroundTimers()') !== -1, 'loader must centralize background timer cleanup');
-  assert(loader.indexOf('function clearBackgroundRetryTimer()') !== -1, 'loader must centralize background retry timer cleanup');
-  assert(/function clearBackgroundTimers\(\) \{[\s\S]*?clearBackgroundRetryTimer\(\);[\s\S]*?\n  \}/.test(loader), 'loader background timer cleanup must include the pending-full retry timer');
-  assert(loader.indexOf('var BG_PENDING_FULL_RETRY_MIN_MS = 500;') !== -1, 'loader pending-full retry backoff must retain the existing first retry floor');
-  assert(loader.indexOf('var BG_PENDING_FULL_RETRY_MAX_MS = 4000;') !== -1, 'loader pending-full retry backoff must cap repeated retries');
-  assert(loader.indexOf('function getNextBackgroundRetryDelay()') !== -1, 'loader pending-full retry must compute a backoff delay');
-  assert(loader.indexOf('function scheduleBackgroundCapacityRetry(bgSnapshot, reason)') !== -1, 'loader background capacity waits must share the pending retry backoff path');
-  assert(loader.indexOf('retryDelayMs: retryDelay') !== -1, 'loader pending-full diagnostics must report the current retry delay');
-  assert(/function scheduleBackgroundPendingRetry\(maxPending, pendingCount\)[\s\S]*?var retryDelay = getNextBackgroundRetryDelay\(\);[\s\S]*?setTimeout\(function\(\)[\s\S]*?\}, retryDelay\);/.test(loader), 'loader pending-full retry timers must use the computed backoff delay');
-  assert(/function scheduleBackgroundCapacityRetry\(bgSnapshot, reason\)[\s\S]*?var retryDelay = getNextBackgroundRetryDelay\(\);[\s\S]*?getQueueSnapshotFields\(bgSnapshot\)[\s\S]*?setTimeout\(function\(\)[\s\S]*?\}, retryDelay\);/.test(loader), 'loader background capacity retry timers must reuse backoff and the current queue snapshot');
-  assert(loader.indexOf('GLOBAL_BG_RETRY_DELAY_MS = 0;') !== -1, 'loader pending-full retry backoff must reset after cleanup or cancelled work');
-  assert(loader.indexOf('}, 500);') === -1, 'loader pending-full background retry must not use a fixed 500ms polling timer');
-  assert(loader.indexOf('GLOBAL_PAUSED = true;') !== -1, 'hidden-tab pause must enter the global paused state');
-  assert(loader.indexOf('function clearScrollIdleTimer()') !== -1, 'loader must centralize scroll-idle retry cleanup for pause paths');
-  assert(/GLOBAL_PAUSED = true;[\s\S]*?ATPViewport\.clearHiddenLoadFlags\(\);[\s\S]*?clearScrollIdleTimer\(\);[\s\S]*?clearViewportSlotWakeTimer\(\);[\s\S]*?clearBackgroundTimers\(\);/.test(loader), 'hidden-tab pause must clear hidden-load flags, scroll-idle timers, viewport slot wake timers, and pending background timers');
-  assert(loader.indexOf('clearBgTimer: function() {\n      clearBackgroundTimers();\n    }') !== -1, 'public background timer cleanup must reuse the centralized cleanup path');
-  assert(/pause: function\(\) \{[\s\S]*?GLOBAL_PAUSED = true;[\s\S]*?clearBackgroundTimers\(\);[\s\S]*?\}/.test(loader), 'public loader pause must clear background timers without relying on every caller');
-  assert(/pause: function\(\) \{[\s\S]*?GLOBAL_PAUSED = true;[\s\S]*?clearScrollIdleTimer\(\);[\s\S]*?clearViewportSlotWakeTimer\(\);[\s\S]*?clearBackgroundTimers\(\);[\s\S]*?ATPViewport\.clearPendingRetryTimers\(\);[\s\S]*?ATPViewport\.pauseHeavyRestores\(\);[\s\S]*?\}/.test(loader), 'public loader pause must clear scroll-idle and viewport retry timers before pausing heavy restores');
-  assert(/pause: function\(\) \{[\s\S]*?GLOBAL_PAUSED = true;[\s\S]*?clearBackgroundTimers\(\);[\s\S]*?ATPViewport\.pauseHeavyRestores\(\);[\s\S]*?\}/.test(loader), 'public loader pause must also pause heavy restore timers');
-  assert(/resume: function\(\) \{[\s\S]*?GLOBAL_PAUSED = false;[\s\S]*?retryViewportVisiblePendingLoads\(\);[\s\S]*?retryViewportPendingSlotLoads\(\);[\s\S]*?ATPViewport\.resumeHeavyRestores\('loader_resume'\);[\s\S]*?ATPLoader\.globalSchedule\(\);[\s\S]*?\}/.test(loader), 'public loader resume must wake viewport pending loads and queued heavy restores before global scheduling');
-  assert(/scheduleBgQueue: function\(\) \{[\s\S]*?clearBackgroundRetryTimer\(\);[\s\S]*?var delay = getBackgroundDelay\(settings\);/.test(loader), 'loader background scheduling must clear stale pending-full retry timers before normal scheduling');
-  assert(/scheduleBgQueue: function\(\) \{[\s\S]*?if \(!BG_TASKS\.length\) \{[\s\S]*?clearBackgroundRetryTimer\(\);[\s\S]*?var bgSnapshot = getTaskChannelSnapshot\(BG_TASKS\);[\s\S]*?if \(!hasBackgroundDispatchCapacity\(bgSnapshot\)\) \{[\s\S]*?scheduleBackgroundCapacityRetry\(bgSnapshot, 'background_capacity_wait'\);[\s\S]*?clearBackgroundRetryTimer\(\);/.test(loader), 'loader background scheduling must not create normal timers when neither network nor viewport-registration capacity is available');
-  assert(/clearBgTasks: function\(\)[\s\S]*?flushDiagnosticSummary\('clear_bg_tasks'\);[\s\S]*?BG_TASKS = \[\];[\s\S]*?markBgTasksChanged\(\);[\s\S]*?clearDeferredHeavyThreads\(\);[\s\S]*?clearBackgroundTimers\(\);/.test(loader), 'clearing background tasks must flush diagnostics, invalidate queue caches, clear deferred heavy work, and clear timers');
-  assert(loader.indexOf('roundRobinSchedule: function() {\n      if (GLOBAL_PAUSED) return;') !== -1, 'loader global scheduling must pause first-screen and background work while hidden loading is paused');
-  assert(loader.indexOf('scheduleBgQueue: function() {\n      if (GLOBAL_PAUSED) return;') !== -1, 'loader background queue scheduling must not create timers while globally paused');
-  assert(loader.indexOf('function getActiveFirstThreadIds(threads)') !== -1, 'loader must centralize active first-screen thread collection');
-  assert(loader.indexOf('for (var key in source)') !== -1, 'loader diagnostic summary merges must scan source objects without allocating Object.keys');
-  assert(loader.indexOf('Object.keys(source || {}).forEach(function(key)') === -1, 'loader diagnostic count merges must not allocate source key arrays');
-  assert(loader.indexOf('for (var queueKind in source)') !== -1, 'loader queue-kind age merges must scan source objects without allocating Object.keys');
-  assert(loader.indexOf('Object.keys(source || {}).forEach(function(queueKind)') === -1, 'loader queue-kind age merges must not allocate source key arrays');
-  assert(loader.indexOf('for (var host in hostStats)') !== -1, 'loader heavy-host health summaries must scan host stats without allocating Object.keys');
-  assert(loader.indexOf('Object.keys(HEAVY_HOST_HEALTH.stats || {}).forEach(function(host)') === -1, 'loader heavy-host health summaries must not allocate host key arrays');
-  assert(loader.indexOf('for (var tid in threads)') !== -1, 'loader active first-screen thread collection must scan threads without allocating Object.keys');
-  assert(loader.indexOf('Object.keys(threads || {}).forEach(function(tid)') === -1, 'loader active first-screen thread collection must not allocate thread id key arrays');
-  assert(renderer.indexOf('firstTaskOffset: 0') !== -1, 'renderer must initialize first-screen task queue offset');
-  assert(loader.indexOf('function hasPendingFirstTasks(ts)') !== -1, 'loader first-screen queues must test pending tasks through the offset helper');
-  assert(loader.indexOf('function peekFirstTask(ts)') !== -1, 'loader first-screen queues must read the current task through the offset helper');
-  assert(loader.indexOf('function consumeFirstTask(ts)') !== -1, 'loader first-screen queues must consume tasks without shifting the array');
-  assert(loader.indexOf('ts.firstTaskOffset = offset + 1') !== -1, 'loader first-screen queue consumption must advance the read offset');
-  assert(loader.indexOf('ts.firstTasks.splice(0, ts.firstTaskOffset)') !== -1, 'loader first-screen queue consumption must occasionally compact consumed prefixes');
-  assert(loader.indexOf('ts.firstTasks.shift()') === -1, 'loader first-screen scheduling must not shift every consumed task');
-  assert(loader.indexOf('ts.firstTasks[0]') === -1, 'loader first-screen scheduling must not bypass the offset-aware queue head helper');
-  assert(loader.indexOf('threadIds.splice(roundIdx % threadIds.length, 1)') !== -1, 'round-robin scheduling must remove inactive threads in place');
-  assert(loader.indexOf('threadIds = threadIds.filter') === -1, 'round-robin scheduling must not allocate a new thread id array when pruning inactive threads');
-  assert(loader.indexOf('var bgReadIndex = 0') !== -1, 'background scheduler must consume queued tasks with an index cursor');
-  assert(loader.indexOf('var task = BG_TASKS[bgReadIndex++]') !== -1, 'background scheduler must read queued tasks without shifting each item');
-  assert(loader.indexOf('if (bgReadIndex > 0) {\n        BG_TASKS.splice(0, bgReadIndex);\n        markBgTasksChanged();\n      }') !== -1, 'background scheduler must trim inspected tasks once and invalidate queue caches after a scheduling round');
-  assert(loader.indexOf('var task = BG_TASKS.shift()') === -1, 'background scheduler must not shift every queued background task');
-  assert(loader.indexOf('task.forceEager = shouldBypassViewportLazyLoad(settings)') !== -1, 'hidden-tab direct background image loads must force eager image loading only while hidden');
-  assert(loader.indexOf('function shouldLoadImageEagerly(task)') !== -1, 'loader must centralize eager image priority decisions');
-  assert(loader.indexOf('if (!bypassViewportLazyLoad && pendingCount >= maxPending)') !== -1, 'hidden-tab eager background loading must not be blocked by viewport pending wrappers');
-  assert(loader.indexOf("if (!bypassViewportLazyLoad && typeof requestIdleCallback !== 'undefined')") !== -1, 'hidden-tab eager background loading must not rely on requestIdleCallback');
-  assert(floatingPanel.indexOf('_clampPosition(x, y, panelSize)') !== -1, 'floating panel must clamp restored positions to the viewport');
-  assert(floatingPanel.indexOf('this._applyPosition(pos.x, pos.y)') !== -1, 'floating panel must reuse clamped position restore');
-  assert(floatingPanel.indexOf('_bindResize()') !== -1, 'floating panel must reclamp open panels after viewport resize');
-  assert(floatingPanel.indexOf('const keyboardTarget = this._shadow || this._panel;') !== -1, 'floating panel arrow-key isolation must bind inside the shadow UI');
-  assert(/this\._addListener\(keyboardTarget, 'keydown'[\s\S]*?\^Arrow[\s\S]*?e\.stopPropagation\(\);[\s\S]*?\}\);/.test(floatingPanel), 'floating panel arrow keys must stop after native controls receive keydown');
-  assert(!/this\._addListener\(document, 'keydown'[\s\S]*?\^Arrow[\s\S]*?e\.stopPropagation\(\);[\s\S]*?\}, true\);/.test(floatingPanel), 'floating panel document capture must not stop arrow keys before inputs and selects handle them');
-  assert(floatingPanel.indexOf('this._getFloatingActiveElement() === field') !== -1, 'floating panel dirty input protection must inspect shadow activeElement instead of document.activeElement');
-  assert(floatingPanel.indexOf('document.activeElement === field') === -1, 'floating panel dirty input protection must not rely on document.activeElement for shadow inputs');
-  assert(floatingPanel.includes('this._applyPosition(this._panel.offsetLeft, this._panel.offsetTop);'), "floating panel open must use untransformed layout offsets");
-  assert(floatingPanel.indexOf('type: SharedUtils.MESSAGE_TYPES.SAVE_SETTINGS_PATCH') !== -1, 'floating panel storage writes must use the shared background settings patch writer');
-  assert(floatingPanel.indexOf('settingsPatch: s || {}') !== -1, 'floating panel storage writes must send only the stable settings patch');
-  assert(floatingPanel.indexOf('if (!item || !requested[item.key] || !Object.prototype.hasOwnProperty.call(source, item.key)) continue;') !== -1, 'floating panel save payloads must include only requested schema fields already present in live panel settings');
-  assert(sharedUtils.indexOf('isSignedTextDownloadUrl: function(url, baseUrl)') !== -1, 'shared utils must centralize signed TXT download URL detection');
-  assert(sharedUtils.indexOf('if (SharedUtils.isSignedTextDownloadUrl(url, baseUrl)) return true;') !== -1, 'TXT attachment allowlist must reuse signed download detection');
-  assert(sharedUtils.indexOf('TEXT_TRANSIENT_PARAM_MAP: {') !== -1, 'shared utils must centralize transient TXT query parameters');
-  assert(sharedUtils.indexOf('isTransientTextAttachmentUrl: function(url, baseUrl)') !== -1, 'shared utils must centralize transient TXT attachment detection');
-  assert(sharedUtils.indexOf('isPersistableTextAttachmentUrl: function(url, baseUrl)') !== -1, 'shared utils must centralize persistable TXT attachment detection');
-  assert(sharedUtils.indexOf('sanitizeTextAttachmentPageUrl: function(url)') !== -1, 'shared utils must centralize TXT pageUrl sanitization');
-  assert(sharedUtils.indexOf('var looksLikeSignedDownload = SharedUtils.isSignedTextDownloadUrl(href, baseUrl);') !== -1, 'TXT attachment extraction must accept signed xia download links without .txt suffixes');
-  assert(sharedUtils.indexOf('return SharedUtils.isSignedTextDownloadUrl(raw, baseUrl);') !== -1, 'TXT download extraction must reuse signed download detection');
-  assert(sharedUtils.indexOf('isSameSupportedSiteHost: function(host, baseHost)') !== -1, 'Discuz TXT attachment detection must centralize supported host alias checks');
-  assert(sharedUtils.indexOf('var path = u.pathname.toLowerCase();') !== -1 && sharedUtils.indexOf('var query = u.search.slice(1).toLowerCase();') !== -1, 'Discuz TXT attachment detection must be case-insensitive');
-  assert(sharedUtils.indexOf("var cleanedHref = SharedUtils.cleanResourceUrl(String(href || '').replace(/\\\\\\//g, '/'));") !== -1, 'TXT attachment extraction must trim punctuation before resolving candidates');
-  assert(sharedUtils.indexOf('var key = SharedUtils.normalizeTextAttachmentUrl(url);') !== -1, 'TXT attachment extraction must dedupe candidates with normalized TXT attachment URLs');
-  assert(sharedUtils.indexOf('var key = url.replace(/#.*$/, \'\');') === -1, 'TXT extraction must not dedupe candidates with raw URL strings');
-  assert(sharedUtils.indexOf('callback(null, true)') !== -1, 'cacheIndex reads must distinguish storage errors from missing index');
-  assert(sharedUtils.indexOf('_queueOffset: 0') !== -1, 'cacheIndex write queue must track a read offset');
-  assert(sharedUtils.indexOf('SharedUtils.cacheIndex._queue[SharedUtils.cacheIndex._queueOffset++]') !== -1, 'cacheIndex write queue must consume by offset instead of shifting');
-  assert(sharedUtils.indexOf('SharedUtils.cacheIndex._queue.shift()') === -1, 'cacheIndex write queue must not shift on every drain');
-  assert(sharedUtils.indexOf('SharedUtils.cacheIndex._queue = [];\n        SharedUtils.cacheIndex._queueOffset = 0;') !== -1, 'cacheIndex write queue must reset storage after the offset reaches the end');
-  assert(sharedUtils.indexOf('updateEntries: function(updates, callback)') !== -1, 'cacheIndex must expose a batch update path for cache write bursts');
-  assert(sharedUtils.indexOf("_backgroundOwner: false") !== -1, 'cacheIndex mutations must default to non-owner mode outside the background service worker');
-  assert(sharedUtils.indexOf('type: SharedUtils.MESSAGE_TYPES.CACHE_INDEX_MUTATION') !== -1, 'cacheIndex public mutations must proxy through the shared background owner message contract');
-  assert(sharedUtils.indexOf("_shouldProxyMutation: function()") !== -1, 'cacheIndex must centralize owner proxy detection');
-  assert(sharedUtils.indexOf("_failUnavailableMutation: function(action, resultType, callback)") !== -1, 'cacheIndex non-owner mutations must fail instead of falling back to local writes when the background proxy is unavailable');
-  assert(sharedUtils.indexOf("_invokeCallback: function(callback, args)") !== -1, 'cacheIndex queue callbacks must be isolated from caller exceptions');
-  assert(sharedUtils.indexOf("_finishQueueCallback: function(callback, args, done)") !== -1, 'cacheIndex queue items must always release the queue after invoking callbacks');
-  assert(sharedUtils.indexOf("_takeMergedUpdateQueueItem: function(first)") !== -1, 'cacheIndex must coalesce adjacent updateEntries queue items');
-  assert(sharedUtils.indexOf("if (!next || next.kind !== 'updateEntries') break;") !== -1, 'cacheIndex update coalescing must stop at non-update queue barriers');
-  assert(sharedUtils.indexOf("kind: 'removeEntries'") !== -1, 'cacheIndex removeEntries must remain a queue barrier');
-  assert(sharedUtils.includes("if (!next || next.kind !== 'updateEntries') break;"), "cache index updates must not merge across non-update queue barriers");
-  assert(sharedUtils.indexOf("kind: 'rebuild'") !== -1, 'cacheIndex rebuild must remain a queue barrier');
-  assert(cache.indexOf('SharedUtils.cacheIndex.updateEntries(updates, function(success)') !== -1, 'cache writes must merge index updates for a storage batch and observe failures');
-  assert(cache.indexOf('SharedUtils.cacheIndex.updateEntry(dk') === -1, 'cache writes must not enqueue one index read/write per cached key');
-  assert(background.indexOf('SharedUtils.cacheIndex.updateEntries(updates, function(success)') !== -1, 'background cache writes must merge index updates for a storage batch and observe failures');
-  assert(background.indexOf('SharedUtils.cacheIndex.updateEntry(dk') === -1, 'background cache writes must not enqueue one index read/write per cached key');
-  assert(sharedUtils.indexOf("CACHE_GENERATION_KEY: 'atp_cache_generation_v1'") !== -1, 'shared utils must define one cache clear generation key');
-  assert(sharedUtils.indexOf("atp_cache_generation_v1'") < sharedUtils.indexOf('CACHE_INDEX_KEY'), 'cache generation key must stay outside CACHE_PREFIXES and cacheIndex types');
-  assert(cache.indexOf('function checkCacheWriteFresh(writeStartedAt, callback)') !== -1, 'content cache writes must read the cache generation before storage writes');
-  assert(cache.indexOf('removeStaleCacheWrite(d, function()') !== -1, 'content cache writes must remove post-set stale writes after cache generation changes');
-  assert(cache.indexOf('function cacheWriteValueMatches(currentValue, writtenValue)') !== -1, 'content stale cache cleanup must compare storage ownership before removal');
-  assert(cache.indexOf('cacheWriteValueMatches(result[key], d[key])') !== -1, 'content stale cache cleanup must not remove newer values at the same key');
-  assert(cache.indexOf('stampCacheWrite(d, writeStartedAt)') !== -1, 'content cache writes must stamp queued article/cache batches with their start time');
-  assert(cache.indexOf('CACHE_FLUSH_PENDING[threadId] = getCacheWriteStartedAt(writeStartedAt);') !== -1, 'delayed content cache flushes must retain the schedule generation time');
-  assert(background.indexOf('function checkCacheWriteFresh(writeStartedAt, callback)') !== -1, 'background cache writes must read the cache generation before storage writes');
-  assert(background.indexOf('removeStaleCacheWrite(d);') !== -1, 'background cache writes must remove post-set stale writes after cache generation changes');
-  assert(background.indexOf('function cacheWriteValueMatches(currentValue, writtenValue)') !== -1, 'background stale cache cleanup must compare storage ownership before removal');
-  assert(background.indexOf('cacheWriteValueMatches(result[key], d[key])') !== -1, 'background stale cache cleanup must not remove newer values at the same key');
-  assert(background.indexOf('setCachedTextResources(attachment.url, normalizedResources, writeStartedAt)') !== -1, 'background TXT fetches must pass fetch start time into cache writes');
-  assert(content.indexOf('job.fetchStartedAt = Date.now();') !== -1, 'content streaming jobs must retain a per-article start time for cache updates');
-  assert(content.indexOf('ATPRenderer.injectThumbnails(best.container, data, best.link, job.fetchStartedAt)') !== -1, 'content streaming commits must pass the article fetch start time into renderer state');
-  assert(renderer.indexOf('cacheWriteStartedAt: typeof cacheWriteStartedAt ===') !== -1, 'renderer thread state must retain the scan start time for delayed cache updates');
-  assert(renderer.indexOf('}, !threadState.partial, threadState.cacheWriteStartedAt);') !== -1, 'renderer resource-only cache writes must preserve the scan start time');
-  assert(loader.indexOf('ATPCache.scheduleCacheFlush(task.threadId, ts.cacheWriteStartedAt)') !== -1, 'loader delayed loaded-URL flushes must preserve the scan start time');
-  assert(background.indexOf('SharedUtils.cacheIndex._backgroundOwner = true;') !== -1, 'background service worker must own cacheIndex mutations');
-  assert(background.indexOf('if (msg.type === SharedUtils.MESSAGE_TYPES.CACHE_INDEX_MUTATION)') !== -1, 'background service worker must handle proxied cacheIndex mutations through the shared contract');
-  assert(background.indexOf('function handleCacheIndexMutationMessage(msg, sendResponse)') !== -1, 'background cacheIndex mutation handling must stay centralized');
-  assert(background.indexOf('function sanitizeCacheIndexUpdates(updates)') !== -1, 'background cacheIndex mutation handling must validate update payloads');
-  assert(background.indexOf('function sanitizeCacheIndexRemoveKeys(keys)') !== -1, 'background cacheIndex mutation handling must validate remove payloads');
-  assert(background.indexOf('function isCacheIndexRemoveKey(key)') !== -1, 'background cacheIndex remove validation must accept legacy/base-prefix cleanup keys separately from writes');
-  assert(background.indexOf('if (!isCacheIndexRemoveKey(key)) return null;') !== -1, 'background cacheIndex removeEntries must use cleanup-specific key validation');
-  assert(background.indexOf("if (action === 'write')") === -1, 'background cacheIndex mutation handling must not expose whole-index write messages');
-  assert(cache.indexOf('function clearNegativeCacheForNormalizedUrl(normalizedUrl)') !== -1, 'positive article cache writes must centralize stale negative cache cleanup');
-  assert(/setCachedArticleData: function\(url, data, complete, writeStartedAt\)[\s\S]*?enqueueArticleWrite\(key, function\(existing\)[\s\S]*?\}, function\(\) \{[\s\S]*?clearNegativeCacheForNormalizedUrl\(normalizedUrl\);/.test(cache), 'positive article cache writes must clear stale negative cache entries after successful writes');
-  assert(sharedUtils.indexOf('if (readFailed)') !== -1, 'cacheIndex writes must skip index mutation after storage read errors');
-  assert(sharedUtils.indexOf('callback(null);') !== -1, 'cacheIndex rebuild must not treat scan failures as an empty valid index');
-  assert(sharedUtils.indexOf('_invalidateNow: function(callback)') !== -1, 'cacheIndex rebuild write failures must have an index invalidation fallback');
-  assert(/SharedUtils\.cacheIndex\._writeNow\(entries, function\(success\)[\s\S]*?if \(success\) \{[\s\S]*?callback\(entries\);[\s\S]*?SharedUtils\.cacheIndex\._invalidateNow\(function\(\) \{[\s\S]*?callback\(null\);/.test(sharedUtils), 'cacheIndex rebuild must invalidate stale indexes after index write failures');
-  assert(sharedUtils.indexOf('callback(entries);') !== -1, 'cacheIndex rebuild must return null on scan failures instead of a fake empty index');
-  assert(cache.indexOf('if (!entries)') !== -1, 'content LRU eviction must skip eviction when cacheIndex rebuild fails');
-  assert(cache.indexOf("Logger.warn('LRU淘汰跳过'") !== -1, 'content LRU eviction must warn when cacheIndex rebuild fails');
-  assert(/if \(!entries\) \{[\s\S]*?pendingEvictBaseline = 0;[\s\S]*?evictionInProgress = false;/.test(cache), 'content LRU rebuild failure must clear pending eviction baseline before releasing callbacks');
-  assert(cache.indexOf('function normalizeCachedImage(image)') !== -1, 'article cache must normalize cached image URLs before loading');
-  assert(cache.indexOf('SharedUtils.decodeHtmlEntities(String(item.src))') === -1, 'article cache must not decode already extracted image URLs again');
-  assert(cache.indexOf('images: normalizeCachedImages(data.images)') !== -1, 'article data normalization must filter and repair cached image candidates');
-  assert(cache.indexOf('function normalizeCachedTextAttachments(attachments)') !== -1, 'article cache normalization must sanitize cached TXT attachment arrays');
-  assert(sharedUtils.indexOf('isAllowedTextAttachmentUrl: function(url, baseUrl)') !== -1, 'shared utils must centralize TXT attachment fetch allowlist checks');
-  assert(sharedUtils.indexOf("BUILTIN_FORUM_ROOTS: Object.freeze(['sehuatang.org', 'sehuatang.net'])") !== -1 &&
-    sharedUtils.indexOf('if (SharedUtils.isSupportedForumHost(host)) {') !== -1, 'shared TXT attachment allowlist must keep supported site hosts, including approved mirrors');
-  assertExactStringArray(loadSharedUtils().SIGNED_TEXT_DOWNLOAD_HOSTS, ['xia.ewrewej.la', 'xia.djhdhs.us'], 'signed TXT download hosts');
-  assert(sharedUtils.indexOf("TEXT_DIRECT_DOWNLOAD_HOSTS: Object.freeze(['dl.ldkms.la'])") !== -1 &&
-    sharedUtils.indexOf('return SharedUtils.TEXT_DIRECT_DOWNLOAD_HOSTS.indexOf(host) !== -1 && /\\.txt$/i.test(u.pathname);') !== -1, 'shared TXT attachment allowlist must keep dl.ldkms.la TXT files only');
-  assert(cache.indexOf("SharedUtils.isPersistableTextAttachmentUrl(url, raw.pageUrl || '')") !== -1, 'article cache normalization must drop non-persistable TXT attachments');
-  assert(cache.indexOf('function countTransientCachedTextAttachments(attachments)') !== -1, 'article cache normalization must preserve markers for transient TXT attachments');
-  assert(cache.indexOf("SharedUtils.sanitizeTextAttachmentPageUrl(raw.pageUrl || '')") !== -1, 'article cache normalization must strip TXT pageUrl query and hash before persistence');
-  assert(sharedUtils.indexOf('if (!SharedUtils.isAllowedTextAttachmentUrl(url, baseUrl)) return null;') !== -1, 'TXT attachment extraction must drop candidates outside the fetch allowlist');
-  assert(cache.indexOf('var textAttachments = normalizeCachedTextAttachments(data.textAttachments)') !== -1, 'article cache normalization must not trust cached TXT attachment arrays directly');
-  assert(cache.indexOf('var transientAttachmentCount = countTransientCachedTextAttachments(data.textAttachments)') !== -1, 'article cache normalization must count transient TXT attachments before dropping their URLs');
-  assert(cache.indexOf('var hasTextAttachments = textAttachments.length > 0 || !!data.hasTextAttachments || transientAttachmentCount > 0') !== -1, 'article cache normalization must preserve legacy and transient TXT markers even when old caches have no count');
-  assert(cache.indexOf('function deriveTextAttachmentCount(textAttachments, hasTextAttachments, markerCount)') !== -1, 'article cache normalization must centralize TXT marker count derivation');
-  assert(cache.indexOf('if (markerCount > cachedCount && markerCount <= maxCount) return markerCount;') !== -1, 'article cache normalization must preserve bounded mixed Discuz TXT markers');
-  assert(cache.indexOf('var textAttachmentCount = deriveTextAttachmentCount(textAttachments, hasTextAttachments, markerCount)') !== -1, 'article cache normalization must derive TXT counts through the marker-aware helper');
-  assert(cache.indexOf('var textAttachmentCount = textAttachments.length || (hasTextAttachments ? (markerCount || 1) : 0)') === -1, 'article cache normalization must not collapse mixed TXT markers to cached attachment length');
-  assert(cache.indexOf('!!data.hasTextAttachments && markerCount > 0') === -1, 'article cache normalization must not drop legacy TXT markers only because the old count is missing');
-  assert(cache.indexOf('textAttachmentCount: data.textAttachmentCount || 0') === -1, 'article cache normalization must not keep stale TXT attachment counts after filtering');
-  assert(cache.indexOf('function getValidTextResourceEntry(result, keys, ttlMs, now)') !== -1, 'content TXT resource reads must scan for the first valid cache candidate');
-  assert(background.indexOf('function getValidTextResourceEntry(result, keys, ttlMs, now)') !== -1, 'background TXT resource reads must scan for the first valid cache candidate');
-  assert(cache.indexOf('function getValidTextFailEntry(result, keys, ttlMs, now)') !== -1, 'content TXT fail reads must validate fail-cache timestamps per key');
-  assert(background.indexOf('function getValidTextFailEntry(result, keys, ttlMs, now)') !== -1, 'background TXT fail reads must validate fail-cache timestamps per key');
-  assert(cache.indexOf("typeof ts === 'number' && isFinite(ts) && now - ts < ttlMs") !== -1, 'content TXT fail reads must reject truthy non-number fail-cache values');
-  assert(background.indexOf("typeof ts === 'number' && isFinite(ts) && now - ts < ttlMs") !== -1, 'background TXT fail reads must reject truthy non-number fail-cache values');
-  assert(cache.indexOf('getFirstStoredValue') === -1, 'content TXT cache reads must not stop at the first stored current-or-legacy key');
-  assert(background.indexOf('getFirstStoredValue') === -1, 'background TXT cache reads must not stop at the first stored current-or-legacy key');
-  assert(background.indexOf("BGLOG.warn('LRU淘汰跳过'") !== -1, 'background LRU eviction must skip eviction when cacheIndex rebuild fails');
-  assert(cache.indexOf('function hasPendingCacheFlush()') !== -1, 'cache flush scheduling must be able to detect empty pending queues');
-  assert(cache.indexOf('if (!hasPendingCacheFlush() && CACHE_FLUSH_TIMER)') !== -1, 'immediate per-thread cache flush must clear stale delayed flush timers when no work remains');
-  assert(popup.indexOf('read(function(entries, readFailed)') !== -1, 'popup cache cleanup must handle cacheIndex read failures explicitly');
-  assert(popup.indexOf('resolve(newEntries);') !== -1, 'popup cache cleanup must not coerce cacheIndex rebuild failures into empty indexes');
-  assert(read('config.js').indexOf('if (!window.ATPState) window.ATPState = {};') !== -1, 'config settings load must initialize ATPState before writing settings');
-  assert(read('floating-panel.js').indexOf('settings apply failed') !== -1, 'floating panel must separate saved settings from apply callback failures');
-  assert(floatingPanel.indexOf('this._dirtyInputByKey = {};') !== -1, 'floating panel must track active dirty inputs separately from pending saves');
-  assert(floatingPanel.indexOf("this._addListener(this._settingsViewEl, 'input'") !== -1, 'floating panel must mark inputs dirty before change fires');
-  assert(floatingPanel.indexOf("this._addListener(this._settingsViewEl, 'focusout'") !== -1, 'floating panel must release dirty input protection after focus leaves');
-  assert(floatingPanel.indexOf('this._isDirtyInputProtected(item.key, field)') !== -1, 'floating panel external settings refresh must skip active dirty fields');
-  assert(floatingPanel.indexOf("this._root.style.visibility = 'hidden'") !== -1, 'floating panel must hide its shadow host until CSS is loaded');
-  assert(floatingPanel.indexOf("this._root.style.visibility = ''") !== -1, 'floating panel must reveal its shadow host after CSS is injected');
-  assert(floatingPanel.indexOf('this._setSettingsLoading(true);') !== -1, 'floating panel must render a settings loading state immediately after creating the panel');
-  assert(floatingPanel.indexOf("_settingsViewEl.setAttribute('aria-busy', loading ? 'true' : 'false')") !== -1, 'floating panel settings loading state must expose aria-busy');
-  assert(floatingPanel.indexOf('正在读取设置...') !== -1, 'floating panel settings loading state must show visible loading text');
-  assert(floatingPanel.indexOf('this._setSettingsLoading(false);') !== -1, 'floating panel settings render must clear the busy state');
-  assert(floatingPanelCss.indexOf('.bfp-loading') !== -1, 'floating panel loading state must have visible styling');
-  assert(floatingPanel.indexOf('this._dragFrame = requestAnimationFrame(flushDrag)') !== -1, 'floating panel drag updates must be coalesced with requestAnimationFrame');
-  assert(floatingPanel.indexOf('_applyPosition(drag.nextX, drag.nextY, drag.panelSize)') !== -1, 'floating panel drag must reuse cached panel dimensions while clamping');
-  assert(floatingPanel.indexOf("'PointerEvent' in window") !== -1, 'floating panel drag must prefer PointerEvent for touch support');
-  assert(floatingPanel.indexOf("this._addListener(header, 'pointerdown', startDrag)") !== -1, 'floating panel drag must start from pointerdown on touch-capable devices');
-  assert(floatingPanel.indexOf("this._addListener(document, 'pointercancel', endDrag)") !== -1, 'floating panel drag must finish cleanly after cancelled touch pointers');
-  assert(floatingPanel.indexOf("this._addListener(header, 'mousedown', startDrag)") !== -1, 'floating panel drag must keep a mouse fallback when PointerEvent is unavailable');
-  assert(floatingPanel.indexOf('setPointerCapture') !== -1 && floatingPanel.indexOf('releasePointerCapture') !== -1, 'floating panel drag must capture and release the active pointer');
-  assert(floatingPanelCss.indexOf('touch-action: none;') !== -1, 'floating panel header must prevent touch scrolling from stealing drag gestures');
-  assert(floatingPanel.indexOf('this._settingsEventsBound = false') !== -1, 'floating panel settings view must track delegated event binding state');
-  assert(floatingPanel.indexOf("this._addListener(this._settingsViewEl, 'change'") !== -1, 'floating panel settings controls must use delegated change handling');
-  assert(floatingPanel.indexOf("this._addListener(this._settingsViewEl, 'click'") !== -1, 'floating panel settings buttons must use delegated click handling');
-  assert(floatingPanel.indexOf('if (!e || e.isTrusted !== true) return;') !== -1, 'floating panel delegated settings handlers must reject synthetic DOM events');
-  assert(floatingPanel.indexOf("target.matches('input[type=\"number\"], select, input[type=\"checkbox\"]')") !== -1, 'floating panel delegated change handling must route supported settings controls');
-  assert(floatingPanel.indexOf("e.target.closest('.bfp-reset, .bfp-heavy-preset, .bfp-ordinary-preset')") !== -1, 'floating panel delegated click handling must route reset, heavy preset, and ordinary preset buttons');
-  assert(floatingPanel.indexOf("this._settingsViewEl.querySelectorAll('input[type=\"number\"]').forEach") === -1, 'floating panel settings render must not bind number inputs one-by-one');
-  assert(floatingPanel.indexOf("this._settingsViewEl.querySelectorAll('select').forEach") === -1, 'floating panel settings render must not bind selects one-by-one');
-  assert(floatingPanel.indexOf("this._settingsViewEl.querySelectorAll('input[type=\"checkbox\"]').forEach") === -1, 'floating panel settings render must not bind checkboxes one-by-one');
-  assert(floatingPanel.indexOf("this._settingsViewEl.querySelectorAll('.bfp-reset').forEach") === -1, 'floating panel settings render must not bind reset buttons one-by-one');
-  assert(floatingPanel.indexOf("this._settingsViewEl.querySelectorAll('.bfp-heavy-preset').forEach") === -1, 'floating panel settings render must not bind preset buttons one-by-one');
-  assert(read('floating-panel.css').indexOf('width: min(280px, calc(100vw - 16px));') !== -1, 'floating panel width must fit narrow viewports');
-  assert(read('floating-panel.css').indexOf('width: min(300px, calc(100vw - 16px));') !== -1, 'floating help panel width must fit narrow viewports');
-  assert(read('floating-panel.css').indexOf('max-height: min(520px, calc(100vh - 16px));') !== -1, 'floating panel height must fit short viewports');
-  assert(floatingPanel.indexOf("const btn = document.createElement('button');") !== -1, 'floating panel launcher must be a keyboard-accessible button');
-  assert(floatingPanel.indexOf("btn.setAttribute('aria-expanded', 'false')") !== -1, 'floating panel launcher must expose its collapsed state');
-  assert(floatingPanel.indexOf('_setLauncherOpenState(open)') !== -1, 'floating panel launcher state must be centralized for aria-expanded and tab order');
-  assert(floatingPanel.indexOf("this._launcher.setAttribute('tabindex', '-1')") !== -1, 'floating panel launcher must leave the tab order while the panel is open');
-  assert(floatingPanel.indexOf('_eventTargetsPanelFocusScope(e)') === -1, 'floating panel non-modal dialog must not keep a Tab focus-scope trap');
-  assert(floatingPanel.indexOf("panel.setAttribute('role', 'dialog')") !== -1, 'floating panel must expose dialog semantics');
-  assert(floatingPanel.indexOf("panel.setAttribute('aria-hidden', 'true')") !== -1, 'floating panel must hide closed panel content from assistive tech');
-  assert(floatingPanel.indexOf("this._panel.setAttribute('aria-hidden', 'false')") !== -1, 'floating panel must reveal panel content to assistive tech when opened');
-  assert(floatingPanel.indexOf("panel.setAttribute('aria-modal', 'false')") !== -1, 'floating panel must start with non-modal dialog semantics while hidden');
-  assert(floatingPanel.indexOf("this._panel.setAttribute('aria-modal', 'true')") === -1, 'floating panel must not claim modal semantics while the host page remains interactive');
-  assert(floatingPanel.indexOf("this._panel.setAttribute('aria-modal', 'false')") !== -1, 'floating panel must keep non-modal dialog semantics when closed');
-  assert(floatingPanel.indexOf('id="bfp-help-toggle"') !== -1 && floatingPanel.indexOf('aria-controls="bfp-help-panel"') !== -1, 'floating panel help toggle must point to the help panel');
-  assert(floatingPanel.indexOf("el.setAttribute('role', 'region')") !== -1, 'floating panel help panel must expose a named region');
-  assert(floatingPanel.indexOf("el.setAttribute('aria-labelledby', 'bfp-help-title')") !== -1, 'floating panel help panel must use its title as an accessible label');
-  assert(floatingPanel.indexOf('id="bfp-help-title"') !== -1, 'floating panel help title must be addressable by aria-labelledby');
-  assert(floatingPanel.indexOf('id="bfp-help-body" tabindex="0" aria-label=') !== -1, 'floating panel help body must be keyboard-focusable for scrolling');
-  assert(floatingPanel.indexOf("helpBtn.setAttribute('aria-expanded', 'true')") !== -1, 'floating panel help toggle must expose expanded state');
-  assert(floatingPanel.indexOf("helpBtn.setAttribute('aria-label', '关闭参数说明')") !== -1, 'floating panel help toggle label must expose the close action while help is open');
-  assert(floatingPanel.indexOf("helpBtn.setAttribute('aria-expanded', 'false')") !== -1, 'floating panel help toggle must expose collapsed state');
-  assert(floatingPanel.indexOf("helpBtn.setAttribute('aria-label', '打开参数说明')") !== -1, 'floating panel help toggle label must expose the open action while help is closed');
-  assert(floatingPanel.indexOf('this._hideHelp(true);') !== -1, 'floating panel help close must restore focus to the help toggle');
-  assert(floatingPanel.indexOf('this._panel.appendChild(el)') !== -1, 'floating panel help panel must stay inside the dialog subtree');
-  assert(floatingPanel.indexOf("this._helpPanel.setAttribute('aria-hidden', 'false')") !== -1, 'floating panel help panel must reveal assistive content when opened');
-  assert(floatingPanel.indexOf("this._helpPanel.setAttribute('aria-hidden', 'true')") !== -1, 'floating panel help panel must hide assistive content when closed');
-  assert(floatingPanel.indexOf('_bindKeyboard()') !== -1, 'floating panel must bind keyboard dismissal');
-  assert(floatingPanel.indexOf("if (e.key === 'Tab')") === -1, 'floating panel non-modal dialog must not intercept Tab while open');
-  assert(floatingPanel.indexOf('_trapPanelFocus(e);') === -1, 'floating panel keyboard handling must not route Tab through a focus trap');
-  assert(floatingPanel.indexOf("if (e.key !== 'Escape') return;") !== -1, 'floating panel must close from Escape');
-  assert(floatingPanel.indexOf('this._isPreviewOverlayActive() && !this._eventTargetsFloatingUI(e)') !== -1, 'floating panel Escape handling must not steal active preview modal shortcuts');
-  assert(floatingPanel.indexOf("if (!this._eventTargetsFloatingUI(e)) return;\n      if (this._isPreviewOverlayActive()") === -1, 'floating panel Escape handling must still close when focus escaped the dialog');
-  assert(floatingPanel.indexOf('_getFloatingFocusables()') === -1, 'floating panel non-modal dialog must not keep unused focus-trap focusable collection');
-  assert(floatingPanel.indexOf('_trapPanelFocus(e)') === -1, 'floating panel non-modal dialog must not keep a Tab focus trap');
-  assert(floatingPanel.indexOf('_focusPanelInitialControl()') !== -1, 'floating panel must move focus inside when opened');
-  assert(floatingPanel.indexOf('_restoreLauncherFocus()') !== -1, 'floating panel must restore focus to the launcher when closed');
-  assert(floatingPanel.indexOf('this._focusPanelInitialControl();') !== -1, 'floating panel open must focus the initial panel control');
-  assert(floatingPanel.indexOf('this._restoreLauncherFocus();') !== -1, 'floating panel close must restore launcher focus');
-  assert(floatingPanel.indexOf('_closeWithFocusRestore(restoreFocus)') !== -1, 'floating panel must separate focus-restoring and non-focus-restoring close paths');
-  assert(floatingPanel.indexOf('_closeWithoutFocusRestore()') !== -1, 'floating panel outside clicks must be able to close without stealing page focus');
-  assert(floatingPanel.indexOf("this._addListener(document, 'pointerdown', closeFromOutsidePointer, true)") !== -1, 'floating panel outside close must use capture-phase pointerdown when available');
-  assert(floatingPanel.indexOf("this._addListener(document, 'mousedown', closeFromOutsidePointer, true)") !== -1, 'floating panel outside close must use a capture-phase mousedown fallback');
-  assert(floatingPanel.indexOf("this._addListener(document, 'click'") === -1, 'floating panel outside close must not depend on bubbling click events');
-  assert(floatingPanel.indexOf('this._closeWithoutFocusRestore();') !== -1, 'floating panel outside click close must not restore launcher focus');
-  assert(floatingPanel.indexOf('_releaseHiddenPanelFocus()') !== -1, 'floating panel must release focus left inside hidden panel controls');
-  assert(floatingPanel.indexOf('if (!wasHidden && !restoreFocus) this._releaseHiddenPanelFocus();') !== -1, 'floating panel outside-click close must blur hidden panel focus without restoring launcher focus');
-  assert(read('floating-panel.css').indexOf('.bfp-launcher:focus-visible') !== -1, 'floating panel launcher must show keyboard focus');
-  assert(/\.bfp-launcher:focus-visible\s*\{[\s\S]*?outline: 3px solid #143152;[\s\S]*?box-shadow: 0 0 0 6px rgba\(255,255,255,0\.85\), 0 4px 18px rgba\(20,49,82,0\.38\);/.test(read('floating-panel.css')), 'floating panel launcher focus ring must stay high contrast on varied page backgrounds');
-  assert(read('floating-panel.css').indexOf('.bfp-help-body:focus-visible') !== -1, 'floating panel scrollable help body must show keyboard focus');
-  assert(read('floating-panel.css').indexOf('.bfp-help-panel.bfp-help-stacked') !== -1, 'floating panel help panel must have a stacked small-screen layout');
-  assert(floatingPanel.indexOf("this._helpPanel.classList.remove('bfp-help-stacked')") !== -1, 'floating panel help positioning must measure the natural panel width before deciding stacked mode');
-  assert(floatingPanel.indexOf("this._helpPanel.classList.toggle('bfp-help-stacked', !fitsBeside)") !== -1, 'floating panel help positioning must switch to stacked mode when it cannot fit beside the panel');
-  assert(floatingPanel.indexOf('helpW = this._helpPanel.offsetWidth || helpW;') !== -1, 'floating panel help positioning must remeasure after switching stacked mode');
-  assert(floatingPanel.indexOf('const fitsLeft = main.left - gap - helpW >= 8;') !== -1, 'floating panel help beside placement must check actual left-side space');
-  assert(floatingPanel.indexOf('const fitsRight = main.right + gap + helpW <= viewportW - 8;') !== -1, 'floating panel help beside placement must check actual right-side space');
-  assert(floatingPanel.indexOf('const fitsBeside = fitsLeft || fitsRight;') !== -1, 'floating panel help beside placement must not rely on total viewport width alone');
-  assert(floatingPanel.indexOf('_setHelpDocked(docked)') !== -1, 'floating panel help positioning must centralize docked state cleanup');
-  assert(floatingPanel.indexOf('_focusDockedHelpIfNeeded(hiddenTargets)') !== -1, 'floating panel docked help must move focus out of covered panel controls');
-  assert(floatingPanel.indexOf('this._helpPanel && this._helpPanel.contains(active)') !== -1, 'floating panel docked help must not steal focus already inside help');
-  assert(floatingPanel.indexOf("this._setHelpDocked(true);") !== -1, 'floating panel help positioning must dock inside the panel when short viewports cannot fit stacked help');
-  assert(floatingPanel.indexOf("this._helpPanel.style.left = '';") !== -1, 'floating panel docked help must clear fixed left positioning');
-  assert(read('floating-panel.css').indexOf('.bfp-help-panel.bfp-help-docked') !== -1, 'floating panel help panel must have an internal docked layout for cramped viewports');
-  assert(read('floating-panel.css').indexOf('.bfp-panel.bfp-help-docked-open .bfp-header') !== -1, 'floating panel docked help must hide covered header controls');
-  assert(read('floating-panel.css').indexOf('.bfp-panel.bfp-help-docked-open .bfp-body') !== -1, 'floating panel docked help must hide covered settings content');
-  assert(read('floating-panel.css').indexOf('visibility: hidden;') !== -1, 'floating panel hidden states must leave the tab order');
-  assert(contentCss.indexOf('@media (max-height: 420px)') !== -1, 'resource sidebar must remain usable in short desktop viewports');
-  assert(contentCss.indexOf('@media (prefers-reduced-motion: reduce)') !== -1, 'content CSS must honor reduced-motion preferences for thumbnail loading');
-  // A running animation per loading thumbnail cost about a third of the main
-  // thread while scrolling a list whose image host is slow (1.18.0 profile).
-  assert(!/\binfinite\b|animation:\s*atp-shimmer|@keyframes atp-shimmer/.test(contentCss), 'thumbnail loading placeholders must stay static: no infinite or per-thumbnail animation');
-  assert(/\.atp-thumbnail-loading\s*\{[\s\S]*?background:[\s\S]*?\}/.test(contentCss), 'thumbnail loading placeholders must keep a static skeleton background');
-  assert(/@media \(prefers-reduced-motion: reduce\) \{[\s\S]*?\.atp-thumbnail-wrapper:hover \.atp-thumbnail-img\s*\{[\s\S]*?transform: none;/.test(contentCss), 'thumbnail hover scale must be disabled for reduced-motion users');
-  assert(read('popup.css').indexOf('@media (prefers-reduced-motion: reduce)') !== -1, 'popup CSS must honor reduced-motion preferences');
-  assert(read('floating-panel.css').indexOf('@media (prefers-reduced-motion: reduce)') !== -1, 'floating panel CSS must honor reduced-motion preferences');
-  assert(/@media \(prefers-reduced-motion: reduce\) \{[\s\S]*?\.bfp-launcher:hover\s*\{[\s\S]*?transform: none;/.test(floatingPanelCss), 'floating launcher hover scale must be disabled for reduced-motion users');
-  assert(floatingPanelCss.indexOf('.bfp-row {\n  display: flex;\n  justify-content: space-between;\n  align-items: flex-start;\n  gap: 4px 8px;\n  flex-wrap: wrap;') !== -1, 'floating panel setting rows must wrap instead of squeezing controls on narrow panels');
-  assert(floatingPanelCss.indexOf('.bfp-row-label {\n  font-size: 11px;\n  color: #555;\n  display: flex;\n  align-items: center;\n  flex: 1 1 120px;\n  flex-wrap: wrap;') !== -1, 'floating panel setting labels must be flexible and wrap on narrow panels');
-  assert(floatingPanelCss.indexOf('min-width: 0;') !== -1, 'floating panel setting labels and selects must allow narrow-panel shrinking without overflow');
-  assert(floatingPanelCss.indexOf('.bfp-row-input-wrap {\n  display: flex;') !== -1 && floatingPanelCss.indexOf('  max-width: 100%;\n}\n.bfp-row input[type="number"]') !== -1, 'floating panel input wrappers must not overflow narrow panel widths');
-  assert(floatingPanelCss.indexOf('max-width: calc(100% - 28px);') !== -1 && floatingPanelCss.indexOf('box-sizing: border-box;') !== -1, 'floating panel numeric inputs must fit inside wrapped input rows');
-  assert(floatingPanelCss.indexOf('.bfp-check-row {\n  display: flex;') !== -1 && floatingPanelCss.indexOf('  flex-wrap: wrap;') !== -1, 'floating panel checkbox rows must wrap in narrow panels');
-  assert(fetcher.indexOf('partial: htmlTruncated') !== -1, 'fetcher must mark truncated article data as partial');
-  assert(fetcher.indexOf('retryableEmpty: !!retryable') !== -1, 'fetcher must mark transient empty article fetches as retryable');
-  assert(fetcher.indexOf('retryableEmpty: htmlTruncated') === -1, 'truncated empty article parses must not be treated as short-interval retryable fetches');
-  assert(fetcher.indexOf('ATPCache.setCachedArticleData(url, data, !htmlTruncated, writeStartedAt)') !== -1, 'fetcher must not complete-cache truncated article data');
-  assert(fetcher.indexOf('文章HTML截断且无结果，不写负缓存') !== -1, 'fetcher must avoid negative cache for truncated empty results');
-  assert(fetcher.indexOf('function getTextResourceDeadline(options, count)') !== -1, 'content TXT fetch orchestration must centralize the shared TXT deadline');
-  assert(fetcher.indexOf('return Date.now() + SharedUtils.getTextAttachmentBackgroundTimeout(count);') !== -1, 'content TXT shared deadline must use the shared timeout helper when callers do not provide a deadline');
-  assert(fetcher.indexOf('options = withTextResourceDeadline(options, deadline);') !== -1, 'content TXT fetch orchestration must pass one shared deadline through direct and background fallbacks');
-  assert(fetcher.indexOf('getTextAttachmentFetchTimeout(options.deadline)') !== -1, 'content TXT direct fetch must clamp its abort timeout to the shared deadline');
-  assert(fetcher.indexOf('function isTextResourceDeadlineExhausted(deadline)') !== -1, 'content TXT fetch orchestration must centralize expired shared deadline checks');
-  assert(fetcher.indexOf('if (deadline <= Date.now()) return 0;') !== -1, 'content TXT direct fetch timeout helper must report exhausted deadlines before starting fetch work');
-  assert(fetcher.indexOf('if (isTextResourceDeadlineExhausted(deadline))') !== -1, 'content TXT background fallback must skip runtime messages after the shared deadline is exhausted');
-  assert(fetcher.indexOf('var fetchTimeout = getTextAttachmentFetchTimeout(options.deadline);') !== -1, 'content TXT direct fetch must read the shared-deadline timeout once before arming abort timers');
-  assert(fetcher.indexOf('if (fetchTimeout <= 0)') !== -1, 'content TXT direct fetch must skip network work after the shared deadline is exhausted');
-  assert(fetcher.indexOf('function getSafeAttachmentReferrer(attachment)') !== -1, 'content TXT direct fetch must centralize safe referrer selection');
-  assert(fetcher.indexOf('if (referrerUrl.origin !== targetUrl.origin) return \'\';') !== -1, 'content TXT direct fetch must reject cross-origin cached pageUrl referrers');
-  assert(fetcher.indexOf("referrerUrl.search = '';") !== -1 && fetcher.indexOf("referrerUrl.hash = '';") !== -1, 'content TXT direct fetch must strip same-origin referrer query and hash');
-  assert(fetcher.indexOf('var referrer = getSafeAttachmentReferrer(attachment);') !== -1, 'content TXT direct fetch must use the safe referrer helper');
-  assert(fetcher.indexOf('var deadline = getTextResourceDeadline(options, attachments.length);') !== -1, 'content TXT background messages must reuse an existing shared deadline or create one fallback deadline');
-  assert(fetcher.indexOf('var timeoutMs = Math.max(1, deadline - Date.now());') !== -1, 'content TXT background wait must be limited to the remaining shared deadline');
-  assert(fetcher.indexOf('deadline: deadline') !== -1, 'content TXT background messages must include the deadline for background timeout clamping');
-  assert(sharedUtils.indexOf('return SharedUtils.TEXT_ATTACHMENT_TIMEOUT * (count * 2 + 1) + SharedUtils.BG_FETCH_TIMEOUT_BUFFER_MS;') !== -1, 'shared TXT deadline must scale with sequential attachment page-session and fallback attempts');
-  assert(cache.indexOf('nextData.partial ? false') !== -1, 'cache must preserve partial article state');
-  assert(cache.indexOf('nextData.partial &&\n          existing &&\n          existing.complete') !== -1, 'partial article cache writes must detect fresh complete existing entries');
-  assert(cache.indexOf('existingData.resources = SharedUtils.mergeResources(existingData.resources, nextData.resources);') !== -1, 'partial article cache writes must merge resources without downgrading complete entries');
-  assert(cache.indexOf('retryableEmpty: !!data.retryableEmpty') !== -1, 'article data normalization must preserve retryable empty fetch state');
-  assert(/function getValidTextResourceEntry\(result, keys, ttlMs, now\)[\s\S]*?SharedUtils\.hasResourcePayload\(normalizedResources\)/.test(cache), 'content TXT positive cache reads must ignore entries without a resource payload');
-  assert(cache.indexOf("cleanupInvalidTextCacheKeys(entry.invalidKeys, '无效TXT资源缓存')") !== -1, 'content TXT positive cache reads must remove empty resource cache entries');
-  assert(/function getValidTextResourceEntry\(result, keys, ttlMs, now\)[\s\S]*?SharedUtils\.hasResourcePayload\(normalizedResources\)/.test(background), 'background TXT positive cache reads must ignore entries without a resource payload');
-  assert(background.indexOf("cleanupInvalidTextCacheKeys(entry.invalidKeys, '无效TXT资源缓存')") !== -1, 'background TXT positive cache reads must remove empty resource cache entries');
-  assert(cache.indexOf('CACHE_WRITE_CHECK_INTERVAL_MS = 5000') !== -1, 'cache write quota checks must be time-throttled');
-  assert(cache.indexOf('CACHE_WRITE_CHECK_BATCH = 12') !== -1, 'cache write quota checks must run after a bounded write batch');
-  assert(cache.indexOf('function runCacheWriteCheck()') !== -1, 'cache write quota checks must be centralized behind a throttled runner');
-  assert(/function bumpCacheWrite\(\)[\s\S]*?setTimeout\(runCacheWriteCheck, CACHE_WRITE_CHECK_INTERVAL_MS - elapsed\)/.test(cache), 'cache write success path must schedule delayed quota checks instead of reading bytes on every write');
-  assert(background.indexOf('var bgEvictionCheckTimer = null') !== -1, 'background cache writes must keep a coalesced eviction check timer');
-  assert(background.indexOf('function scheduleBgEvictionCheck()') !== -1, 'background cache writes must schedule quota checks behind a coalesced helper');
-  assert(background.indexOf('if (bgEvictionCheckTimer) return;') !== -1, 'background cache writes must not schedule one eviction check per TXT cache write');
-  assert(background.indexOf('if (typeof baselineBytes === \'number\' && baselineBytes > 0) {\n    runBackgroundEviction(callback, baselineBytes);\n    return;\n  }') !== -1, 'background baseline eviction must not reread storage bytes after a quota failure');
-  assert(background.indexOf('function runBackgroundEviction(callback, triggerBytes)') !== -1, 'background eviction must centralize bytes-threshold handling for measured and baseline paths');
-  assert(background.indexOf('updateIndexForWrite(d);\n    checkAndEvict();') === -1, 'background TXT cache success writes must not run quota checks synchronously');
-  assert(background.indexOf('partial: htmlTruncated') !== -1, 'background fetch must return partial flag for truncated HTML');
-  assert(background.indexOf('retryableEmpty: retryableHttp') !== -1, 'background fetch must mark transient HTTP empty results as retryable');
-  assert(background.indexOf('resp.status === 401 || resp.status === 403 || resp.status === 429') !== -1, 'background fetch must treat auth/challenge HTTP responses as retryable');
-  assert(background.indexOf("reason: 'login_redirect', images: [], retryableEmpty: true") !== -1, 'background fetch must treat login redirects as retryable empty results');
-  assert(background.indexOf('if (blocked) return { ok: false, reason: blocked, images: [], retryableEmpty: true };') !== -1, 'background fetch must treat blocked challenge pages as retryable empty results');
-  assert(background.indexOf('retryableEmpty: htmlTruncated') === -1, 'background truncated empty article parses must not be short-interval retryable');
-  assert(content.indexOf('emptyRetryAfterByUrl') !== -1, 'content scans must back off retryable empty article fetches instead of marking them complete');
-  assert(content.indexOf('emptyRetryAttemptsByUrl') !== -1, 'content retryable empty backoff must track attempts per URL');
-  assert(content.indexOf('EMPTY_RETRY_MAX_DELAY') !== -1, 'content retryable empty backoff must cap repeated transient retries');
-  assert(content.indexOf('function clearRetryableEmpty(url)') !== -1, 'content retryable empty state must be cleared after success or permanent empty results');
-  assert(/if \(retryAfter\) \{\s*delete emptyRetryAfterByUrl\[retryKey\];\s*delete emptyRetryPaceBound\[retryKey\];\s*\}/.test(content) && !content.includes('if (retryAfter) clearRetryableEmpty(url);'), "expired retry timestamps must not reset the bounded attempt counter");
-  assert(content.indexOf('retryScanDueAt') !== -1, 'content retry scan timer must track its scheduled due time');
-  assert(content.indexOf('function scheduleRetryScanAt(dueAt)') !== -1, 'content retry scans must be scheduled by absolute retry due time');
-  assert(content.indexOf('scheduleRetryScanAt(retryAfter)') !== -1, 'content scans must reschedule skipped not-yet-due retry rows');
-  assert(content.indexOf('function makeRetryableEmptyInfo(reason, retryAfter)') !== -1, 'content scans must keep retryable empty metadata with retry-after timestamps');
-  assert(content.indexOf('var explicitRetryAfter = getRetryableEmptyRetryAfter(info);') !== -1, 'content retryable empty tracking must read explicit retry-after timestamps');
-  assert(content.indexOf('var dueAt = Math.max(explicitRetryAfter || 0, Date.now() + delay);') !== -1, 'content retryable empty tracking must honor explicit retry-after timestamps as a floor without shortening the backoff');
-  assert(content.indexOf('delay = Math.max(0, dueAt - Date.now());') !== -1, 'content retryable empty logging must report the effective retry delay, including negative-cache expiry');
-  assert(content.indexOf('function isSameOriginUrl(url)') !== -1, 'content scan URL origin checks must be centralized');
-  assert(content.indexOf('sameOrigin: isSameOriginUrl(url)') !== -1, 'content article jobs must reuse centralized same-origin checks');
-  assert(content.indexOf('var uObj = new URL(u);') === -1, 'content scan URL partitioning must not duplicate URL origin parsing');
-  assert(content.indexOf('uObj.origin === location.origin') === -1, 'content scan URL partitioning must not depend on inline URL objects');
-  assert(content.indexOf('function fetchSameOriginArticle(url, paceOptions)') !== -1, 'content same-origin jobs must use a reusable fetch wrapper');
-  assert(content.indexOf('async function fetchCrossOriginArticle(job, generation)') !== -1, 'content cross-origin jobs must use a single-article fetch path');
-  assert(content.indexOf('async function fetchArticleJob(job, generation)') !== -1, 'content article scheduling must dispatch through a reusable single-job fetch path');
-  assert(content.indexOf('if (!job.sameOrigin) return await fetchCrossOriginArticle(job, generation);') !== -1, 'content article jobs must route cross-origin work through the background fetch path');
-  assert(content.indexOf("Logger.warn('同源文章抓取异常', logUrl(job.url));") !== -1, 'content same-origin fetch failures must log readable Chinese diagnostics');
-  assert(content.indexOf("Logger.warn('鍚屾簮寮傚父'") === -1, 'content same-origin fetch failures must not log mojibake diagnostics');
-  assert(content.indexOf('var jobsByKey = {};') !== -1, 'content article scheduler must deduplicate normalized URLs through a job map');
-  assert(content.indexOf('var highWatermark = getArticleQueueHighWatermark();') !== -1, 'content article scheduler must read the public queue high-watermark policy');
-  assert(content.indexOf('var workerCount = getArticleFetchConcurrency();') !== -1, 'content article scheduler must read the public worker concurrency policy');
-  assert(content.indexOf('var workers = new Array(workerCount);') !== -1, 'content article scheduler must allocate only the configured worker set');
-  assert(content.indexOf('for (var i = 0; i < workerCount; i++) workers[i] = worker();') !== -1, 'content article scheduler must start each configured worker once');
-  assert(content.indexOf('outcome = await fetchArticleJob(job, generation);') !== -1, 'content workers must refill directly with single-article jobs');
-  assert(content.indexOf('commitPromises.push(enqueueArticleCommit(job, summary, generation));') !== -1, 'content workers must commit each article as soon as its job completes');
-  assert(content.indexOf("Logger.event('article_fetch_start'") !== -1, 'content article jobs must emit fetch-start diagnostics');
-  assert(content.indexOf("Logger.event('article_fetch_done'") !== -1, 'content article jobs must emit fetch-complete diagnostics');
-  assert(content.indexOf("Logger.event('article_commit'") !== -1, 'content article jobs must emit commit diagnostics');
-  assert(content.indexOf('batch.push(fetchSameOriginArticle') === -1, 'content same-origin fetch batches must not dynamically grow promise arrays');
-  assert(content.indexOf('same.slice(k, k + concurrency)') === -1, 'content same-origin fetch batches must not allocate chunk slices');
-  assert(content.indexOf('chunk.map(async function') === -1, 'content same-origin fetch batches must not allocate map results for each chunk');
-  assert(content.indexOf('async function fetchSameOriginArticles(urls, crossFallback, generation)') === -1, 'content must not retain the old same-origin batch worker path');
-  assert(content.indexOf('var workerCount = Math.min(urls.length, 3);') === -1, 'content worker concurrency must not retain the old hidden cap of 3');
-  assert(content.indexOf('urls: crossFetch') === -1, 'content cross-origin work must not be held behind an all-URL batch handoff');
-  assert(/type: SharedUtils\.MESSAGE_TYPES\.FETCH_TEXT_RESOURCES[\s\S]*?\}, function\(resp\) \{\n\s+var runtimeError = chrome\.runtime\.lastError;\n\s+if \(done\) return;/.test(fetcher), 'fetcher TXT background callbacks must snapshot runtime.lastError before stale checks');
-  assert(/type: SharedUtils\.MESSAGE_TYPES\.FETCH_IMAGES[\s\S]*?\}, function\(resp\) \{\n\s+var runtimeError = chrome\.runtime\.lastError;\n\s+if \(done\) return;/.test(fetcher), 'fetcher article background callbacks must snapshot runtime.lastError before stale checks');
-  assert(content.indexOf('var data = await ATPFetcher.fetchArticleDataByBackground(job.url, makeArticlePaceOptions(job, generation));') !== -1, 'content cross-origin jobs must reuse the fetcher background callback path');
-  assert(content.indexOf("makeRetryableEmptyInfo('background_timeout', 0)") !== -1, 'content scans must retry background timeouts instead of permanently processing the row');
-  assert(content.indexOf("makeRetryableEmptyInfo(data.emptyReason || 'same_origin_retryable', data.retryAfter)") !== -1, 'content same-origin retryable empty results must retain retry metadata');
-  assert(content.indexOf("makeRetryableEmptyInfo(data.emptyReason || 'partial_empty', data.retryAfter)") !== -1, 'content partial empty results must back off instead of marking rows processed');
-  assert(content.indexOf('rememberRetryableEmpty(job.url, job.retryableEmpty);') !== -1, 'content retryable/partial empty jobs must persist their retry metadata before returning');
-  assert(content.indexOf('function shouldNegativeCacheEmptyReason(reason)') !== -1, 'content scans must centralize deterministic empty negative-cache decisions');
-  assert(content.indexOf("return reason !== 'html_too_large' && !isRetryableEmptyReason(reason);") !== -1, 'content negative-cache decisions must exclude oversized and retryable empty reasons');
-  assert(content.indexOf("if (shouldNegativeCacheEmptyReason(data.emptyReason || '')) ATPCache.setNegativeCache(job.url, job.fetchStartedAt);") !== -1, 'content scans must negative-cache only deterministic empty background article results');
-  assert(loader.indexOf('ts.paused = true') === -1, 'loader must not permanently pause a thread after consecutive image failures');
-  assert(loader.indexOf('!ts.paused') === -1, 'loader scheduling must not skip queued thread work because of stale pause state');
-  assert(loader.indexOf("img.referrerPolicy = 'no-referrer'") !== -1, 'loader must retry failed images with no-referrer fallback');
-  assert(loader.indexOf("img.referrerPolicy === 'no-referrer'") !== -1, 'loader must not repeat no-referrer retry after default no-referrer load');
-  assert(loader.indexOf('function isHighFanoutImageHost') !== -1, 'loader must isolate high-fanout image hosts from global circuit breaking');
-  assert(loader.indexOf('function getUrlHost(url)') !== -1, 'loader URL host parsing must be centralized');
-  assert(loader.includes('return !!(host && SharedUtils.isHeavyImageHost(host));'), "high-fanout host detection must reuse centralized URL host parsing");
-  assert(loader.indexOf('function extractDomain(url)') === -1, 'loader must not retain the removed fixed-threshold domain circuit');
-  assert(loader.indexOf('var host = new URL(url).hostname') === -1, 'high-fanout host detection must not duplicate URL host parsing');
-  assert(loader.indexOf('return new URL(url).hostname;\n    } catch (e) {\n      return null;') === -1, 'domain circuit extraction must not duplicate URL host parsing');
-  assert(loader.indexOf('HEAVY_HOST_HEALTH') !== -1, 'loader must track high-fanout host health separately from ordinary host adaptation');
-  assert(loader.indexOf('function recordHeavyHostFailure') !== -1, 'loader must cool down failing high-fanout hosts without skipping ordinary hosts');
-  assert(loader.indexOf('function recordHeavyHostSuccess') !== -1, 'loader must recover high-fanout host health after successful loads');
-  assert(loader.indexOf('function recordTaskImageFailure') !== -1, 'loader must record high-fanout candidate failures before final slot failure');
-  assert(loader.indexOf("recordTaskImageFailure(task, currentSrc, 'candidate_error', false)") !== -1, 'direct high-fanout candidate errors must feed host health before fallback replacement');
-  assert(loader.indexOf("recordTaskImageFailure(task, currentSrc, 'candidate_timeout', false)") !== -1, 'direct high-fanout candidate timeouts must feed host health before fallback replacement');
-  assert(viewport.indexOf("ATPLoader.recordTaskImageFailure(task, currentSrc, 'candidate_error', false)") !== -1, 'viewport high-fanout candidate errors must feed host health before fallback replacement');
-  assert(viewport.indexOf("ATPLoader.recordTaskImageFailure(task, currentSrc, 'candidate_timeout', false)") !== -1, 'viewport high-fanout candidate timeouts must feed host health before fallback replacement');
-  assert(loader.indexOf('function getEffectiveHighFanoutSlotLimit') !== -1, 'loader must apply high-fanout host health to the effective heavy slot limit');
-  assert(loader.indexOf("reason: 'heavy_host_open'") !== -1, 'loader diagnostics must expose high-fanout host open-state deferrals');
-  assert(loader.indexOf('heavyHostCooldownRemainingMs') !== -1, 'loader diagnostics must include high-fanout host cooldown remaining time');
-  assert(loader.indexOf('maxHeavyHostCooldownRemainingMs') !== -1, 'diagnostic summaries must include high-fanout host cooldown peaks');
-  assert(loader.indexOf('function recordHeavyHostFailure(url, reason, task)') !== -1, 'high-fanout host failures must retain task context and the failure reason for diagnostics');
-  assert(loader.indexOf('recordHeavyHostFailure(url, reason, task)') !== -1, 'high-fanout host failure routing must preserve request epoch context');
-  assert(loader.indexOf('function getTaskStampedHostHealthEpoch') !== -1, 'loader host failure dedupe must use the epoch stamped when the current request started');
-  assert(loader.indexOf('function isStaleHostFailure') !== -1, 'loader host health must ignore failures from requests started before recovery');
-  assert(loader.indexOf('stats.cooldownCount = 0;') !== -1, 'successful heavy host recovery must reset exponential cooldown state');
-  assert(loader.indexOf("task && isPriorityImageTask(task) && stats.state === 'open'") !== -1, 'open heavy hosts must retain a bounded visible recovery probe path');
-  assert(loader.indexOf('heavyHostPriorityActive') !== -1, 'visible heavy probes must enforce their own configured concurrency');
-  assert(viewport.indexOf('ATPLoader.recordDomainFailure(currentSrc, failReason)') !== -1, 'viewport failures must feed high-fanout host health with the resolved failure reason');
-  assert(loader.indexOf('GLOBAL_HIGH_FANOUT_ACTIVE') !== -1, 'loader must track active high-fanout image slots separately');
-  assert(settingsSchema.indexOf("key: 'ordinaryFallbackLimit'") !== -1, 'settings schema must expose configurable ordinary candidate fallback');
-  assert(/key: 'ordinaryFallbackLimit'[\s\S]*?min: 0, max: 50[\s\S]*?recommendedMax: 10/.test(settingsSchema), 'ordinary candidate fallback must expose its full public range');
-  assert(loader.indexOf('MAX_INLINE_FALLBACKS_PER_SLOT') === -1, 'loader must not retain the old hidden ordinary fallback cap of 2');
-  assert(settingsSchema.indexOf("key: 'heavyImageConcurrency'") !== -1, 'settings schema must expose configurable heavy image concurrency');
-  assert(/key: 'heavyImageConcurrency'[\s\S]*?min: 1, max: 128[\s\S]*?recommendedMax: 12/.test(settingsSchema), 'heavy image concurrency must expose an adjustable 1-128 range with a conservative recommendation');
-  assert(settingsSchema.indexOf("enabledWhen: { key: 'heavyImageOptimization', value: true }") !== -1, 'heavy image concurrency control must depend on heavy optimization');
-  assert(settingsSchema.indexOf("key: 'heavyThumbnailClarity'") !== -1, 'settings schema must expose heavy thumbnail clarity mode');
-  assert(settingsSchema.indexOf("default: 'balanced'") !== -1, 'heavy thumbnail clarity must default to balanced mode');
-  assert(settingsSchema.indexOf("{ value: 'balanced', label: '均衡' }") !== -1, 'heavy thumbnail clarity must include balanced mode');
-  assert(settingsSchema.indexOf("{ value: 'lightweight', label: '轻量缩略' }") !== -1, 'heavy thumbnail clarity must include lightweight mode');
-  assert(/key: 'heavyThumbnailClarity'[\s\S]*?immediate: false/.test(settingsSchema), 'heavy thumbnail clarity changes must reload thumbnails because they affect display counts');
-  assert(settingsSchema.indexOf("key: 'heavyPreviewStarvationWait'") !== -1, 'settings schema must expose configurable visible heavy preview starvation wait');
-  assert(settingsSchema.indexOf('default: 8') !== -1, 'heavy preview starvation wait must default to 8 seconds');
-  assert(/key: 'heavyPreviewStarvationWait'[\s\S]*?min: 0, max: 120[\s\S]*?recommendedMax: 24/.test(settingsSchema), 'heavy preview starvation wait must expose an adjustable 0-120 second range');
-  assert(settingsSchema.indexOf("key: 'heavyPreviewStarvationMP'") !== -1, 'settings schema must expose configurable visible heavy preview starvation MP cap');
-  assert(settingsSchema.indexOf('default: 820') !== -1, 'heavy preview starvation MP must default to 820MP');
-  assert(/key: 'heavyPreviewStarvationMP'[\s\S]*?min: 0, max: 10000[\s\S]*?recommendedMax: 2000/.test(settingsSchema), 'heavy preview starvation MP must expose an adjustable 0-10000MP range');
-  assert(settingsSchema.indexOf("key: 'heavyRestoreFastBatchSize'") !== -1, 'settings schema must expose configurable low-pressure heavy restore batch size');
-  assert(/key: 'heavyRestoreFastBatchSize'[\s\S]*?min: 1, max: 128[\s\S]*?recommendedMax: 6/.test(settingsSchema), 'low-pressure heavy restore batch size must expose an adjustable 1-128 range');
-  assert(settingsSchema.indexOf("key: 'heavyRestorePressureBatchSize'") !== -1, 'settings schema must expose configurable pressured heavy restore batch size');
-  assert(/key: 'heavyRestorePressureBatchSize'[\s\S]*?min: 1, max: 128[\s\S]*?recommendedMax: 4/.test(settingsSchema), 'pressured heavy restore batch size must expose an adjustable 1-128 range');
-  assert(loader.indexOf('function getHeavyImageConcurrency') !== -1, 'loader must read configurable heavy image concurrency');
-  assert(loader.indexOf('ATPLoadPolicy.getHeavyConcurrencyCeiling(settings || getCurrentSettings())') !== -1, 'loader must use the centralized heavy concurrency policy without a hidden lower ceiling');
-  assert(loader.indexOf('function isHeavyChannelTask') !== -1, 'loader must separate heavy channel classification from raw host detection');
-  assert(loader.indexOf('function getHighFanoutSlotLimit') !== -1, 'loader must reserve room for ordinary image hosts when high-fanout hosts are pending');
-  assert(loader.indexOf('return getHighFanoutSlotLimitForTask(settings, hasOrdinaryWork, null)') !== -1, 'generic heavy image channel must keep the conservative ordinary-work guard');
-  assert(loader.indexOf('ATPLoadPolicy.getOrdinaryReservedSlots(settings) - getActiveOrdinaryCount()') !== -1, 'mixed-image scheduling must reserve only the remaining user-configured ordinary slots');
-  assert(loader.indexOf('function shouldDeferTaskForSlots') !== -1, 'loader must apply ordinary and heavy channel limits independently');
-  assert(loader.indexOf('function getOrdinaryImageSlotLimit') !== -1, 'loader must normalize ordinary image concurrency separately from the total slot budget');
-  assert(loader.indexOf('function getTotalImageSlotLimit') !== -1, 'loader must cap combined ordinary and heavy image starts under the active slot budget');
-  assert(loader.indexOf('function getViewportPriorityReservedSlots') !== -1, 'loader must reserve public global slots for actually visible image work');
-  assert(loader.indexOf('function getGlobalSlotAdmissionLimit') !== -1, 'loader must centralize visible-reserve admission for offscreen work');
-  assert(loader.indexOf('ATPLoadPolicy.getViewportPriorityReservedSlots(getCurrentSettings() || {})') !== -1, 'loader visible reserve must use its independent public setting');
-  assert(loader.indexOf('task && (task.isFirstScreen || isPriorityImageTask(task))') !== -1, 'ordinary images entering the viewport must use visible concurrency even after first-screen scheduling');
-  assert(settingsSchema.indexOf("key: 'viewportPriorityReservedSlots'") !== -1, 'settings schema must expose configurable viewport-priority reserved slots');
-  assert(/key: 'viewportPriorityReservedSlots'[\s\S]*?min: 0, max: 128[\s\S]*?recommendedMax: 16/.test(settingsSchema), 'viewport priority reserve must expose its full public range');
-  assert(settingsSchema.indexOf("label: '弱图可见并发'") !== -1, 'the existing ordinary first-screen concurrency key must be presented as public weak-image visible concurrency');
-  assert(loadingPolicy.indexOf("getViewportPriorityReservedSlots: function(settings)") !== -1, 'loading policy must centralize viewport priority reserve normalization');
-  assert(/function getTotalImageSlotLimit\(\)[\s\S]*?ATPLoadPolicy\.getGlobalImageConcurrency\([\s\S]*?getOrdinaryImageSlotLimit\(settings\.firstScreenConcurrency\)[\s\S]*?getHeavyImageConcurrency\(settings\)/.test(loader), 'loader total slot budget must use visible ordinary concurrency instead of being redefined by background callers');
-  assert(loadingPolicy.indexOf("return Math.max(1, Number(ordinaryLimit) || 1) + Math.max(0, Number(heavyLimit) || 0);") !== -1, 'automatic global concurrency must preserve the sum of ordinary and heavy channel ceilings');
-  assert(loader.indexOf("reason: 'global_limit'") !== -1, 'loader must log when combined ordinary/heavy slots hit the global active budget');
-  assert(loader.indexOf('GLOBAL_ACTIVE >= totalLimit') !== -1, 'loader must defer new image starts when active slots already hit the total limit');
-  assert(loader.indexOf('getTotalImageSlotLimit(ordinaryLimit) - GLOBAL_ACTIVE') === -1, 'background callers must not redefine automatic global slots with their smaller ordinary limit');
-  assert(loader.indexOf('getTotalImageSlotLimit() - GLOBAL_ACTIVE') !== -1, 'available slot calculations must subtract already active ordinary/heavy requests from the stable global budget');
-  assert(loader.indexOf('GLOBAL_ACTIVE >= getBackgroundGlobalAdmissionLimit(totalLimit)') !== -1, 'background scheduling must stop before consuming the viewport-priority global reserve');
-  assert(loader.indexOf('getGlobalSlotAdmissionLimit(null, totalLimit)') === -1, 'background capacity checks must not bypass viewport reserve by passing a null task');
-  assert(loader.indexOf('var normalizedOrdinaryLimit = getOrdinaryImageSlotLimit(ordinaryLimit);') !== -1, 'ordinary image scheduling must keep a separately normalized ordinary concurrency limit');
-  assert(loader.indexOf('getActiveOrdinaryCount() >= limit') !== -1, 'ordinary image scheduling must be bounded by ordinary concurrency only');
-  assert(loader.indexOf('var activeOrdinary = getActiveOrdinaryCount();\n    var ordinaryAvailable = Math.max(0, Math.max(1, Number(ordinaryLimit) || 1) - activeOrdinary);') !== -1, 'available background slot calculation must reuse the active ordinary count');
-  assert(loader.indexOf('var activeOrdinary = getActiveOrdinaryCount();\n    var ordinaryAvailable = counts.ordinary > 0 && activeOrdinary < ATPLoader.getBgConc();') !== -1, 'background capacity checks must reuse the active ordinary count');
-  assert(loader.indexOf('function getTaskChannelSnapshot(tasks)') !== -1, 'loader must collect task channel counts and first heavy task in one scan');
-  assert(loader.indexOf('firstHeavyTask: null') !== -1, 'task channel snapshots must include the first heavy task');
-  assert(loader.indexOf('function getAvailableSlotsForLimits(ordinaryLimit, hasNonHighFanoutWaiting, bgSnapshot)') !== -1, 'available background slot calculation must accept a reusable channel snapshot');
-  assert(loader.indexOf('var heavyTask = bgSnapshot ? bgSnapshot.firstHeavyTask : findFirstHeavyTask(BG_TASKS);') !== -1, 'available background slot calculation must reuse the first heavy task from a provided snapshot');
-  assert(loader.indexOf('function hasBackgroundCapacity(bgSnapshot)') !== -1, 'background capacity checks must accept a reusable channel snapshot');
-  assert(loader.indexOf('var counts = bgSnapshot || getTaskChannelSnapshot(BG_TASKS);') !== -1, 'background capacity checks must reuse provided channel snapshots');
-  assert(loader.indexOf('var heavyTask = counts.firstHeavyTask || null;') !== -1, 'background capacity checks must reuse first heavy task from the channel snapshot');
-  assert(loader.indexOf('var heavyHasOrdinaryWork = !!hasNonHighFanoutWaiting || activeOrdinary > 0;') !== -1, 'available background slot calculation must reuse activeOrdinary for heavy pressure');
-  assert(loader.indexOf('var hasOrdinaryWork = counts.ordinary > 0 || activeOrdinary > 0;') !== -1, 'background capacity checks must reuse activeOrdinary for heavy pressure');
-  assert(loader.indexOf('function getAvailableBackgroundSlots(bgSnapshot)') !== -1, 'background available slot calculation must accept a reusable channel snapshot');
-  assert(/function getAvailableBackgroundSlots\(bgSnapshot\)[\s\S]*?var snapshot = bgSnapshot \|\| getTaskChannelSnapshot\(BG_TASKS\);[\s\S]*?getAvailableSlotsForLimits\(ATPLoader\.getBgConc\(\), snapshot\.ordinary > 0, snapshot\)/.test(loader), 'background available slot calculation must derive ordinary pressure and first heavy task from one snapshot');
-  assert(loader.indexOf('function drainHiddenViewportPending(settings, bgSnapshot)') !== -1, 'hidden viewport pending drain must accept the background channel snapshot');
-  assert(loader.indexOf('var available = getAvailableBackgroundSlots(bgSnapshot);') !== -1, 'hidden viewport pending drain must reuse the background channel snapshot for available slots');
-  assert(loader.indexOf('function getQueueSnapshotFields(existingBgSnapshot)') !== -1, 'scheduler diagnostics must accept a reusable background channel snapshot');
-  assert(loader.indexOf('var bgCounts = existingBgSnapshot || getCachedBgSnapshot();') !== -1, 'scheduler diagnostics must reuse provided or version-cached background channel snapshots');
-  assert(loader.indexOf('var bgHeavyTask = bgCounts.firstHeavyTask;') !== -1, 'scheduler diagnostics must reuse the first heavy task from channel snapshots');
-  assert(/var bgSnapshot = \(!promotedVisible && existingBgSnapshot\) \|\| getTaskChannelSnapshot\(BG_TASKS\);[\s\S]*?drainHiddenViewportPending\(settings, bgSnapshot\);/.test(loader), "background task processing must pass the channel snapshot into hidden pending drain");
-  assert(loader.indexOf('var hasNonHighFanoutWaiting = bgSnapshot.ordinary > 0;') !== -1, 'background task processing must cache ordinary background queue presence per round');
-  assert(loader.indexOf('shouldDeferTaskForSlots(task, maxBg, hasNonHighFanoutWaiting)') !== -1, 'background task processing must reuse cached ordinary queue presence for defer checks');
-  assert(/processBgTasks: function\(existingBgSnapshot\)[\s\S]*?var hasNonHighFanoutWaiting = bgSnapshot\.ordinary > 0;[\s\S]*?shouldDeferTaskForSlots\(task, maxBg, hasNonHighFanoutWaiting\)/.test(loader), "background task processing must not rescan ordinary background work for every task");
-  assert(/requestIdleCallback\(function\(\)[\s\S]*?ATPLoader\.processBgTasks\(\);[\s\S]*?\}, \{ timeout: getBackgroundIdleTimeout\(delay\) \}\)/.test(loader), 'background idle drain must reuse the bounded background task processor');
-  assert(loader.indexOf('pendingCount >= getViewportPendingLimit(ATPLoader.getSettings(), ATPLoader.getBgConc())') === -1, 'background idle drain must not recompute settings and pending limit on every iteration');
-  assert(loader.indexOf('heavyUnloaded: heavyRenderStats ? heavyRenderStats.heavyUnloaded : 0') !== -1, 'scheduler diagnostics must reuse heavy render stats for unloaded counts');
-  assert(loader.indexOf('heavyUnloaded: window.ATPViewport && ATPViewport.getHeavyUnloadedCount ? ATPViewport.getHeavyUnloadedCount() : 0') === -1, 'scheduler diagnostics must not rescan heavy render items for unloaded counts after reading heavy stats');
-  assert(loader.indexOf('var now = Date.now();\n      for (var i = 0; i < toEnqueue; i++)') !== -1, 'background batch enqueue must reuse one timestamp for the batch');
-  assert(loader.indexOf('for (var i = 0; i < toEnqueue; i++) {\n        var now = Date.now();') === -1, 'background batch enqueue must not read Date.now for every queued task');
-  const roundRobinBgCapacityChecks = loader.match(/if \(hasBackgroundDispatchCapacity\(bgSnapshot\) && BG_TASKS\.length > 0\)/g) || [];
-  assert(roundRobinBgCapacityChecks.length >= 1, 'round-robin scheduling must reuse the existing background channel snapshot for network-or-registration capacity checks');
-  assert(loader.indexOf('hasBackgroundCapacity()') === -1, 'background scheduler must not rescan background channels when a snapshot is already available');
-  assert(/id="toggleEnabled"[^>]*aria-label=/.test(popupHtml), "popup master toggle must expose an accessible name");
-  assert(popupHtml.indexOf('aria-controls="helpPanel"') !== -1, 'popup help toggle must point to the help panel');
-  assert(popupHtml.indexOf('aria-controls="logPanel"') !== -1, 'popup log toggle must point to the log panel');
-  assert(popupHtml.indexOf('id="helpHeading"') !== -1, 'popup help heading must remain addressable');
-  assert(popupHtml.indexOf('id="logHeading"') !== -1, 'popup log heading must remain addressable');
-  assert(popupHtml.indexOf('id="helpTitle"') !== -1, 'popup help region must use a static title label');
-  assert(popupHtml.indexOf('id="logTitle"') !== -1, 'popup log region must use a static title label');
-  assert(popupHtml.indexOf('id="helpPanel" class="help-panel hidden" role="region" aria-labelledby="helpTitle" aria-hidden="true"') !== -1, 'popup help panel must start hidden as a labelled region');
-  assert(popupHtml.indexOf('id="helpPanel" class="help-panel hidden" role="region" aria-labelledby="helpTitle" aria-hidden="true" tabindex="0"') !== -1, 'popup help panel must be keyboard-focusable for scrolling');
-  assert(popupHtml.indexOf('id="logPanel" class="log-panel hidden" role="region" aria-labelledby="logTitle" aria-hidden="true"') !== -1, 'popup log panel must start hidden as a labelled region');
-  assert(popupHtml.indexOf('aria-labelledby="helpHeading"') === -1, 'popup help region label must not include the disclosure button text');
-  assert(popupHtml.indexOf('aria-labelledby="logHeading"') === -1, 'popup log region label must not include dynamic count or disclosure button text');
-  assert(popupHtml.indexOf('id="logFilter" aria-label="日志筛选"') !== -1, 'popup log filter must expose an accessible name');
-  assert(popupHtml.indexOf('id="logSearch" type="search" placeholder="host/type" aria-label="搜索日志"') !== -1, 'popup log search must expose an accessible name beyond placeholder text');
-  assert(popupHtml.indexOf('id="logCount" class="log-count" aria-live="polite" aria-atomic="true"') !== -1, 'popup log count must announce refresh results without reading every log entry');
-  assert(popupHtml.indexOf('id="logViewer" class="log-viewer" role="region" aria-live="off" aria-busy="false"') !== -1, 'popup log viewer must not live-announce bulk log refreshes');
-  assert(popupHtml.indexOf('id="logViewer" class="log-viewer" role="region" aria-live="off" aria-busy="false" aria-label=') !== -1 && popupHtml.indexOf('tabindex="0"') !== -1, 'popup log viewer must remain keyboard-focusable for scrolling');
-  assert(popupHtml.indexOf('id="popupStatus"') !== -1, 'popup must render a persistent status region for settings feedback');
-  assert(popupHtml.indexOf('role="status" aria-live="polite"') !== -1, 'popup settings feedback must be announced politely');
-  assert(popup.indexOf('function setPopupStatus(text, type, persist)') !== -1, 'popup must centralize settings status feedback');
-  assert(popup.indexOf('function clearPopupStatusIfText(text)') !== -1, 'popup must only clear startup status messages that are still current');
-  assert(popup.indexOf("clearPopupStatusIfText('正在读取设置...')") !== -1, 'popup loadUI completion must not clear unrelated persistent startup errors');
-  assert(popup.indexOf("setPopupStatus('');\n    if (!chrome.tabs") === -1, 'popup loadUI must not unconditionally clear the status live region');
-  assert(popup.indexOf("els.popupStatus.setAttribute('role', type === 'err' ? 'alert' : 'status')") !== -1, 'popup settings errors must use alert semantics');
-  assert(popup.indexOf("els.popupStatus.setAttribute('aria-live', type === 'err' ? 'assertive' : 'polite')") !== -1, 'popup settings errors must be announced assertively');
-  assert(popup.indexOf('setPopupStatus(successMessage, successType, successPersist)') !== -1, 'popup button actions must allow success helpers to choose status severity');
-  assert(popupCss.indexOf('.popup-status-warn') !== -1, 'popup must style partial-success maintenance warnings distinctly');
-  assert(popup.indexOf('id="disableSiteHint"') !== -1, 'popup unsupported site toggle must render a persistent hint element');
-  assert(popup.indexOf("disableEl.setAttribute('aria-describedby', 'disableSiteHint')") !== -1, 'popup unsupported site toggle must describe the disabled control with a persistent hint');
-  assert(popup.indexOf("disableEl.removeAttribute('aria-describedby')") !== -1, 'popup supported site toggle must remove stale unsupported-site descriptions');
-  assert(popupCss.indexOf('.site-disable-hint') !== -1 && popupCss.indexOf('.site-disable-hint-empty') !== -1, 'popup unsupported site hint must have visible and hidden styles');
-  assert(popup.indexOf('function clearButtonTextTimer(btn)') !== -1, 'popup button status restore timers must have per-button cleanup');
-  assert(/function clearButtonTextTimer\(btn\)[\s\S]*?btn\.__atpTextRestoreTimer[\s\S]*?clearTimeout\(btn\.__atpTextRestoreTimer\);[\s\S]*?btn\.__atpTextRestoreTimer = null;/.test(popup), 'popup button text timer cleanup must cancel stale per-button restore timers');
-  assert(/function setButtonTextLater\(btn, text, delay\)[\s\S]*?clearButtonTextTimer\(btn\);[\s\S]*?btn\.__atpTextRestoreTimer = setTimeout\(function\(\) \{[\s\S]*?btn\.__atpTextRestoreTimer = null;[\s\S]*?btn\.textContent = text;/.test(popup), 'popup button text restore must replace older timers and clear its handle after firing');
-  assert(popup.indexOf('function setButtonBusy(btn, busy)') !== -1, 'popup button actions must keep busy state behind a reusable helper');
-  assert(/function setButtonBusy\(btn, busy\)[\s\S]*?btn\.__atpBusy = !!busy;[\s\S]*?btn\.setAttribute\('aria-disabled', 'true'\);[\s\S]*?btn\.removeAttribute\('aria-disabled'\);/.test(popup), 'popup busy buttons must stay focusable and expose aria-disabled');
-  assert(/async function runButtonAction\(btn, workingText, successText, restoreText, action\)[\s\S]*?if \(btn && btn\.__atpBusy\) return null;[\s\S]*?clearButtonTextTimer\(btn\);[\s\S]*?setButtonBusy\(btn, true\);/.test(popup), 'popup button actions must guard duplicate actions without disabling the focused button');
-  assert(popup.indexOf('function armDestructiveConfirm(btn, confirmText, statusText, restoreText)') !== -1, 'popup destructive buttons must share a confirmation helper');
-  assert(popup.indexOf('function handlePopupKeydown(e)') !== -1 && popup.indexOf("document.addEventListener('keydown', handlePopupKeydown)") !== -1, 'popup destructive confirmation must support Escape cancellation');
-  assert(popup.indexOf('async function runDestructiveButtonAction(btn, confirmText, confirmStatus, workingText, successText, restoreText, action)') !== -1, 'popup destructive buttons must route execution through a confirmation wrapper');
-  assert(popup.indexOf("btn.setAttribute('data-confirming', 'true')") !== -1 && popup.indexOf("btn.setAttribute('aria-describedby', 'popupStatus')") !== -1, 'popup destructive confirmation must expose visible and described confirmation state');
-  assert(popupCss.indexOf('.btn[data-confirming="true"]') !== -1 && popupCss.indexOf('.btn-secondary[data-confirming="true"]') !== -1, 'popup destructive confirmation state must be styled');
-  ['clearImageCache', 'clearFailCache', 'clearAllCache', 'clearTestCache', 'resetSettings', 'clearLogs'].forEach(function(id) {
-    assert(popup.indexOf('runDestructiveButtonAction(els.' + id) !== -1, 'popup destructive button must require confirmation: ' + id);
-  });
-  assert(popup.indexOf("if (workingText) setPopupStatus(workingText, 'info', true);") !== -1, 'popup button actions must announce busy state through the live status region');
-  assert(popup.indexOf('setPopupStatus(successMessage, successType, successPersist);') !== -1, 'popup button actions must announce successful completion through the live status region');
-  assert(/finally \{[\s\S]*?setButtonBusy\(btn, false\);[\s\S]*?\}/.test(popup), 'popup button actions must clear aria-disabled busy state after completion');
-  assert(resourcePanel.indexOf('var messageTimer = null') === -1, 'resource panel copy feedback must not use one global message timer across inline rows');
-  assert(resourcePanel.indexOf('function clearMessageTimer(el)') !== -1, 'resource panel copy feedback must have per-message timer cleanup');
-  assert(/function clearMessageTimer\(el\)[\s\S]*?el\.__atpMessageAnnounceTimer[\s\S]*?clearTimeout\(el\.__atpMessageAnnounceTimer\);[\s\S]*?el\.__atpMessageAnnounceTimer = null;[\s\S]*?el\.__atpMessageTimer[\s\S]*?clearTimeout\(el\.__atpMessageTimer\);[\s\S]*?el\.__atpMessageTimer = null;/.test(resourcePanel), 'resource panel message timer cleanup must cancel stale per-element announce and restore timers');
-  assert(/function showMessage\(text, sourceEl, isError\)[\s\S]*?clearMessageTimer\(el\);[\s\S]*?el\.textContent = '';[\s\S]*?el\.__atpMessageAnnounceTimer = setTimeout\(function\(\) \{[\s\S]*?el\.__atpMessageAnnounceTimer = null;[\s\S]*?el\.textContent = text;[\s\S]*?el\.__atpMessageTimer = setTimeout\(function\(\) \{[\s\S]*?el\.__atpMessageTimer = null;[\s\S]*?el\.textContent = '';[\s\S]*?\}, 1500\);[\s\S]*?\}, 0\);/.test(resourcePanel), 'resource panel messages must clear and replay repeated live-region text before restoring each element through its own timer');
-  assert(resourcePanel.indexOf('clearTimeout(messageTimer)') === -1 && resourcePanel.indexOf('messageTimer = setTimeout') === -1, 'resource panel message timers must not cancel unrelated message elements');
-  assert(/destroy: function\(\)[\s\S]*?clearMessageTimers\(sidebar\);[\s\S]*?sidebar\.remove\(\);/.test(resourcePanel), "resource panel destruction must clear live-region timers before removing sidebar");
-  assert(popupHtml.indexOf('id="clearTestCache" class="btn btn-secondary">一键清空缓存和日志</button>') !== -1, 'popup destructive maintenance action must say that logs are also cleared');
-  assert(popup.indexOf("setPopupStatus('操作失败：' + errorMessage(e), 'err', true)") !== -1, 'popup generic button failures must be announced through the live status region');
-  assert(popup.indexOf("var stored = await storageGet('settings', '读取设置');") !== -1, 'popup settings reads must surface storage failures instead of rendering defaults');
-  assert(popup.indexOf("storageGetOrDefault('settings'") === -1, 'popup settings reads must not silently fall back to default settings after storage failures');
-  assert(popup.indexOf('var settingsLoadFailed = false') !== -1, 'popup must track failed settings loads');
-  assert(popup.indexOf("if (settingsLoadFailed || !settings) throw new Error('settings not loaded');") !== -1, 'popup saves must fail closed when settings were not loaded');
-  assert(popup.indexOf('function setSettingsControlsDisabled(disabled)') !== -1, 'popup must be able to disable setting controls after load failures');
-  assert(popup.indexOf('function ensureSettingsReady(el)') !== -1, 'popup setting handlers must guard changes before settings finish loading');
-  assert(popup.indexOf('if (els.resetSettings) els.resetSettings.disabled = !!disabled;') !== -1, 'popup reset-all must be disabled while settings controls are disabled');
-  assert(popup.indexOf("els.resetSettings.addEventListener('click', function() {\n    if (!ensureSettingsReady(els.resetSettings)) return;") !== -1, 'popup reset-all must guard clicks before settings finish loading');
-  assert(popup.indexOf("setSettingsControlsDisabled(true);\n    setPopupStatus('正在读取设置...', 'info', true);") !== -1, 'popup must disable settings and announce a loading state before async settings reads finish');
-  assert(popup.indexOf('function getTabHostname(url)') !== -1, 'popup site-specific setting must parse the active tab URL through a reusable helper');
-  assert(popup.indexOf("if (!chrome.tabs || typeof chrome.tabs.query !== 'function')") !== -1, 'popup active-site initialization must guard missing tabs.query');
-  assert(/chrome\.tabs\.query\(\{ active: true, currentWindow: true \}, function\(tabs\) \{[\s\S]*?if \(chrome\.runtime\.lastError\)[\s\S]*?setDisableSiteHost\(''\);[\s\S]*?errorMessage\(chrome\.runtime\.lastError\)/.test(popup), 'popup active-site initialization must consume tabs.query lastError and disable site-specific controls');
-  assert(popup.indexOf("setDisableSiteHost(tabs[0] ? getSupportedTabHostname(tabs[0].url) : '')") !== -1, 'popup must disable the site-specific setting when the active tab is not a supported or approved forum host');
-  assert(popup.indexOf('loadUI: loadUI') !== -1, 'popup verify hooks must expose active-tab initialization behavior');
-  assert(popup.indexOf("setPopupStatus('当前页面不支持站点禁用', 'err', true);") !== -1, 'popup unsupported site toggles must announce an error instead of only flashing');
-  assert(popup.indexOf('function formatDefaultValue(item)') !== -1, 'popup help must format schema defaults for users');
-  assert(popup.indexOf("if (item.type === 'boolean') return item.default ? '开启' : '关闭';") !== -1, 'popup help must render boolean defaults as labels');
-  assert(popup.indexOf("if (item.type === 'select')") !== -1 && popup.indexOf("if (options[oi].value === item.default) return options[oi].label;") !== -1, 'popup help must render select defaults as option labels');
-  assert(popup.indexOf('function setDisclosureState(button, panel, expanded)') !== -1, 'popup must centralize disclosure aria state');
-  assert(popup.indexOf("button.setAttribute('aria-expanded', expanded ? 'true' : 'false')") !== -1, 'popup disclosure buttons must update aria-expanded');
-  assert(popup.indexOf("panel.setAttribute('aria-hidden', expanded ? 'false' : 'true')") !== -1, 'popup disclosure panels must update aria-hidden');
-  assert(popupCss.indexOf('max-width: 100vw;') === -1 && /html,\s*body\s*\{[^}]*min-width: 320px;/.test(popupCss), 'native popup must use a stable document width instead of a viewport-dependent auto-size feedback loop');
-  assert(popup.indexOf('function setLogViewerBusy(busy, text)') !== -1, 'popup log loading must centralize aria-busy updates');
-  assert(/setLogViewerBusy\(true,[\s\S]*?\)/.test(popup), 'popup log expansion must show a loading state before storage reads');
-  assert(popup.indexOf("setPopupStatus('保存中...', 'info', true)") !== -1, 'popup must show an in-progress settings save state');
-  assert(popup.indexOf('function cloneSettingsForSave(source, changedKeys)') !== -1, 'popup settings saves must clone a stable changed-field payload before async writes');
-  assert(popup.indexOf('function cloneSiteConfigsForSave(siteConfigs)') !== -1, 'popup settings save snapshots must clone siteConfigs separately');
-  assert(popup.indexOf('snapshot.siteConfigs = cloneSiteConfigsForSave(source.siteConfigs)') !== -1, 'popup settings save snapshots must deep-clone site config patches');
-  assert(popup.indexOf('function queueSettingsWrite(snapshot)') !== -1, 'popup settings saves must be serialized so the latest user edit wins storage order');
-  assert(popup.indexOf('type: SharedUtils.MESSAGE_TYPES.SAVE_SETTINGS_PATCH') !== -1, 'popup settings saves must send stable patches through the shared background writer contract');
-  assert(popup.indexOf('settingsPatch: snapshot') !== -1, 'popup settings saves must send the stable snapshot instead of the mutable live settings object');
-  assert(popup.indexOf('storageSet({ settings: settings }, \'保存设置\')') === -1, 'popup settings saves must not pass the mutable live settings object to storage');
-  assert(popup.indexOf('var savedSettings = await queueSettingsWrite(snapshot);\n      if (seq !== saveStatusSeq) return;') !== -1, 'popup settings saves must ignore stale success results after queued writes finish');
-  assert(popup.indexOf('var refreshResult = await refreshCurrentPage();') !== -1, 'popup settings saves must wait for current-tab refresh results before reporting refresh-dependent success');
-  assert(popup.indexOf("setPopupStatus(formatRefreshFailureStatus(refreshResult, '已保存'), 'warn', true)") !== -1, 'popup settings saves must show a persistent warning when refresh fails after a successful save');
-  assert(popup.indexOf("if (applyMode === 'pageReload')") !== -1, 'popup settings saves must reserve current-tab reloads for page-reload changes');
-  assert(popup.indexOf('if (needRefresh) refreshCurrentPage();') === -1, 'popup settings saves must not fire-and-forget current-tab refreshes');
-  assert(/function refreshCurrentPage\(\)[\s\S]*?chrome\.tabs\.query[\s\S]*?chrome\.runtime\.lastError[\s\S]*?chrome\.tabs\.reload[\s\S]*?chrome\.runtime\.lastError/.test(popup), 'popup current-tab refresh must check both query and reload lastError states');
-  assert(popup.indexOf("return { text: formatRefreshFailureStatus(result.refresh, '已恢复'), type: 'warn', persist: true };") !== -1, 'popup reset-all success must preserve refresh-failure warnings after reloading popup UI state');
-  assert(background.indexOf('function cloneSettingsPatch(patch)') !== -1, 'background settings patch writes must clone incoming patch payloads');
-  assert(background.indexOf('function isAllowedSettingsPatchKey(key)') !== -1, 'background settings patch writes must whitelist accepted keys');
-  assert(background.indexOf('if (!isAllowedSettingsPatchKey(key)) continue;') !== -1, 'background settings patch cloning must drop unknown patch keys');
-  assert(background.indexOf('function isValidSiteConfigHost(host)') !== -1, 'background settings patch writes must validate site config hosts');
-  assert(background.indexOf("siteConfigs[host] = { disabled: normalizeBooleanSetting(siteConfig.disabled, false) };") !== -1, 'background settings patch writes must keep only site disabled flags');
-  assert(background.indexOf('function applySettingsPatch(patch)') !== -1, 'background settings patch writes must merge patches with current settings');
-  assert(background.indexOf('current = ATPNormalizeSettings(current);') !== -1, 'background settings patch writes must normalize stored settings before merging patches');
-  assert(background.indexOf('var merged = Object.assign({}, current, stablePatch);') !== -1, 'background settings patch writes must preserve unchanged settings fields');
-  assert(background.indexOf("if (Object.prototype.hasOwnProperty.call(stablePatch, 'siteConfigs'))") !== -1, 'background settings patch writes must merge siteConfigs only when included in the patch');
-  assert(background.indexOf('if (msg.type === SharedUtils.MESSAGE_TYPES.SAVE_SETTINGS_PATCH)') !== -1, 'background must handle popup settings patch saves through the shared contract');
-  assert(background.indexOf('queueSettingsPatch(msg.settingsPatch || {})') !== -1, 'background must serialize popup settings patch saves');
-  assert(popup.indexOf("setPopupStatus('已保存，刷新后生效', 'ok')") !== -1 && popup.indexOf("'已保存，缩略图已自动重新加载'") !== -1, 'popup must distinguish page reload and thumbnail hot-reload success states');
-  assert(popup.indexOf("setPopupStatus('保存失败：' + errorMessage(e), 'err', true)") !== -1, 'popup must keep settings save failures visible');
-  assert(popup.indexOf("setPopupStatus('设置读取失败：' + errorMessage(e), 'err', true)") !== -1, 'popup must keep settings load failures visible');
-  assert(popup.indexOf('var seq = ++saveStatusSeq') !== -1 && popup.indexOf('if (seq === saveStatusSeq)') !== -1, 'popup settings status must ignore stale overlapping save results');
-  assert(popup.indexOf('aria-label="恢复\' + esc(item.label) + \'默认值"') !== -1, 'popup setting reset buttons must expose a per-setting accessible name');
-  assert(popup.indexOf('var settingSaveSeqByKey = {}') !== -1, 'popup must track per-setting save attempts');
-  assert(popup.indexOf('var dirtySettingInputByKey = {}') !== -1, 'popup must track active dirty setting inputs');
-  assert(popup.indexOf('function isSettingInputProtected(key, el)') !== -1, 'popup saved-settings redraws must detect active dirty inputs');
-  assert(popup.indexOf('if (isSettingInputProtected(key, el)) return;') !== -1, 'popup saved-settings redraws must not overwrite active dirty inputs');
-  assert(popup.indexOf('function markSettingSaveAttempt(key, value)') !== -1, 'popup must stamp setting save attempts with the attempted value');
-  assert(popup.indexOf('function isSettingSaveAttemptCurrent(attempt)') !== -1, 'popup must avoid stale save failure rollback after newer edits');
-  assert(popup.indexOf('function rollbackSettingValue(key, previous, el)') !== -1, 'popup must centralize setting rollback UI repair');
-  assert(popup.indexOf("if (['gridCols','visibleRows'].indexOf(key) !== -1) updateFirstScreen();") !== -1, 'popup setting rollback must repair the first-screen count');
-  assert(popup.indexOf('var previousSettings = Object.assign({}, settings, { siteConfigs: cloneSiteConfigsForSave(settings.siteConfigs) });') !== -1, 'popup reset-all must snapshot current settings before applying defaults');
-  assert(/var resetKeys = getAllSettingsPatchKeys\(\);[\s\S]*?var saveResult = await saveSettings\(getSettingsApplyMode\(resetKeys\), resetKeys\);[\s\S]*?catch \(e\) \{[\s\S]*?settings = previousSettings;[\s\S]*?applySavedSettings\(previousSettings\);[\s\S]*?throw e;/.test(popup), 'popup reset-all save failures must restore local settings and UI before reporting failure');
-  assert(popup.indexOf("return Object.assign({}, saveResult || { ok: true }, { reload: { ok: false, error: errorMessage(e) } });") !== -1, 'popup reset-all post-save reload failures must not roll back saved defaults');
-  assert(popup.indexOf("return { text: '已恢复，但重新读取设置失败：' + (result.reload.error || '未知错误'), type: 'warn', persist: true };") !== -1, 'popup reset-all post-save reload failures must surface a persistent warning');
-  assert(popup.indexOf('function markSiteSaveAttempt(hostname, value)') !== -1, 'popup site-specific saves must be protected from stale rollback');
-  assert(popup.indexOf('if (isSiteSaveAttemptCurrent(attempt))') !== -1, 'popup site-specific save failures must not rollback newer site toggles');
-  assert(popupCss.indexOf('.popup-status-err') !== -1, 'popup must style persistent settings errors');
-  assert(popupCss.indexOf('.toggle-switch input:focus-visible + .toggle-slider') !== -1, 'popup master toggle must show a visible keyboard focus ring');
-  assert(popupCss.indexOf('.setting-row input[type="number"]:focus-visible') !== -1, 'popup numeric settings must show a visible keyboard focus ring');
-  assert(popupCss.indexOf('.log-tools select:focus-visible') !== -1, 'popup log controls must show a visible keyboard focus ring');
-  assert(popupCss.indexOf('.help-panel:focus-visible') !== -1, 'popup help scroll area must show a visible keyboard focus ring');
-  assert(popupCss.indexOf('.log-viewer:focus-visible') !== -1, 'popup log scroll area must show a visible keyboard focus ring');
-  assert(popupCss.indexOf('.btn-reset:focus-visible') !== -1, 'popup reset buttons must show a visible keyboard focus ring');
-  assert(/\.btn-heavy-preset,\s*\.btn-ordinary-preset\s*\{[\s\S]*?min-width: 24px;[\s\S]*?min-height: 24px;/.test(popupCss), 'popup preset buttons must keep at least a 24px target');
-  assert(/\.btn-toggle\s*\{[\s\S]*?min-width: 24px;[\s\S]*?min-height: 24px;/.test(popupCss), 'popup disclosure buttons must keep at least a 24px target');
-  assert(popupCss.indexOf('.btn-reset:not(:disabled):not([aria-disabled="true"]):hover') !== -1, 'popup reset hover styles must not apply to disabled or aria-disabled buttons');
-  assert(popupCss.indexOf('.btn:disabled') !== -1 && popupCss.indexOf('.setting-row select:disabled') !== -1, 'popup controls must have disabled styling');
-  assert(popupCss.indexOf('.btn[aria-disabled="true"]') !== -1 && popupCss.indexOf('.btn-heavy-preset[aria-disabled="true"]') !== -1, 'popup busy buttons must share disabled styling while remaining focusable');
-  assert(floatingPanel.indexOf('if (this._msgTimer)') !== -1 && floatingPanel.indexOf('clearTimeout(this._msgTimer);') !== -1, 'floating panel messages must clear old auto-dismiss timers before showing a new message');
-  assert(floatingPanel.indexOf('role="status" aria-live="polite" aria-atomic="true"') !== -1, 'floating panel message region must announce status changes');
-  assert(floatingPanel.indexOf("el.setAttribute('role', type === 'err' ? 'alert' : 'status')") !== -1, 'floating panel errors must use alert semantics');
-  assert(floatingPanel.indexOf('this._saveSeqByKey = {}') !== -1, 'floating panel must track per-setting save attempts');
-  assert(floatingPanel.indexOf('this._saveChain = Promise.resolve()') !== -1, 'floating panel settings saves must be serialized so the latest user edit wins storage order');
-  assert(floatingPanel.indexOf('this._saveStatusSeq = 0') !== -1, 'floating panel settings save status must ignore stale queued save results');
-  assert(floatingPanel.indexOf('this._settingsLoadFailed = false') !== -1, 'floating panel must track settings load failures');
-  assert(floatingPanel.indexOf('this._settingsLoadFailed = true') !== -1, 'floating panel must enter a failed-load state when initial settings read fails');
-  assert(floatingPanel.indexOf('if (this._settingsLoadFailed) return false;') !== -1, 'floating panel failed-load state must disable settings fields');
-  assert(floatingPanel.indexOf("this.showMessage('设置读取失败，请重新打开面板后再试', 'err');") !== -1, 'floating panel failed-load state must block saving default settings');
-  assert(floatingPanel.indexOf('const saveSeq = ++this._saveStatusSeq;') !== -1, 'floating panel settings saves must stamp status attempts');
-  assert(floatingPanel.indexOf('const patchKeys = Array.isArray(changedKeys) ? changedKeys : (changedKey ? [changedKey] : []);') !== -1, 'floating panel settings saves must derive explicit changed-field patch keys');
-  assert(floatingPanel.indexOf('const snapshot = this._cloneSettingsForSave(this.settings, patchKeys);') !== -1, 'floating panel settings saves must clone a stable changed-field payload before async storage writes');
-  assert(floatingPanel.indexOf('await this._queueSettingsSave(snapshot);') !== -1, 'floating panel settings saves must use the serialized save queue');
-  assert(floatingPanel.indexOf("if (saveSeq === this._saveStatusSeq) {\n        console.warn('[FloatingPanel] settings save failed:', e);\n        this.showMessage('设置保存失败', 'err');\n      }\n      return false;") !== -1, 'floating panel settings saves must return failure while suppressing stale queued error messages');
-  assert(floatingPanel.indexOf('if (saveSeq !== this._saveStatusSeq) return true;') !== -1, 'floating panel settings saves must ignore stale success/apply results after queued writes finish');
-  assert(floatingPanel.indexOf('var refreshKeys = patchKeys.length ? patchKeys : (changedKey ? [changedKey] : []);') !== -1, 'floating panel save success messages must inspect every changed key for apply-mode guidance');
-  assert(floatingPanel.indexOf('var applyMode = this._getSettingsApplyMode(refreshKeys);') !== -1, 'floating panel multi-field saves must use the shared apply-mode precedence');
-  assert(floatingPanel.indexOf("else if (applyMode === 'hotReload') successMessage += '，缩略图已自动重新加载';") !== -1, 'floating panel custom save messages must report completed thumbnail hot reloads');
-  assert(floatingPanel.indexOf('_cloneSettingsForSave(source, changedKeys)') !== -1, 'floating panel settings saves must clone live changed-field settings before storage writes');
-  assert(floatingPanel.indexOf('if (!keys.length) return snapshot;') !== -1, 'floating panel settings saves must not fall back to full-schema snapshots without changed keys');
-  assert(floatingPanel.indexOf('if (!item || !requested[item.key] || !Object.prototype.hasOwnProperty.call(source, item.key)) continue;') !== -1, 'floating panel settings save snapshots must include only requested schema fields');
-  assert(floatingPanel.indexOf('this._saveSettings(null, key, [key])') !== -1, 'floating panel field changes must save only the changed key');
-  assert(floatingPanel.indexOf('key, [key])') !== -1, 'floating panel resets must save only the reset key');
-  assert(floatingPanel.indexOf("this._applySettingsPreset(el, this._getHeavyOriginalPreset(), '已恢复重图原始预设', 'heavyImageConcurrency')") !== -1, 'floating panel heavy preset reset must route through the shared preset saver');
-  assert(floatingPanel.indexOf('this._saveSettings(message, changedKey, presetKeys)') !== -1, 'floating panel preset saves must include only preset keys');
-  assert(floatingPanel.indexOf('_queueSettingsSave(snapshot)') !== -1, 'floating panel settings saves must centralize queued storage writes');
-  assert(floatingPanel.indexOf('this.storage.setSettings(this.settings)') === -1, 'floating panel settings saves must not pass the mutable live settings object to storage');
-  assert(floatingPanel.indexOf('<label class="bfp-row-label" for="') !== -1, 'floating panel select and numeric controls must have associated labels');
-  assert(floatingPanel.indexOf('aria-label="恢复\' + this._esc(item.label) + \'默认值"') !== -1, 'floating panel reset buttons must expose a per-setting accessible name');
-  assert(floatingPanel.indexOf('_markSaveAttempt(key, value)') !== -1, 'floating panel must stamp setting save attempts with the attempted value');
-  assert(floatingPanel.indexOf('_isSaveAttemptCurrent(attempt)') !== -1, 'floating panel must avoid stale save failure rollback after newer edits');
-  assert(floatingPanel.indexOf('_setButtonBusy(el, busy)') !== -1, 'floating panel busy buttons must keep focusable aria-disabled state behind a helper');
-  assert(floatingPanel.indexOf('if (!el || el.__bfpBusy) return;') !== -1, 'floating panel heavy preset must ignore duplicate busy clicks without disabling focus');
-  assert(floatingPanel.indexOf('this._setButtonBusy(el, true);') !== -1 && floatingPanel.indexOf('this._setButtonBusy(el, false);') !== -1, 'floating panel heavy preset must mark and clear focus-safe busy state');
-  assert(floatingPanel.indexOf('el.disabled = true') === -1, 'floating panel heavy preset must not disable the focused button while saving');
-  assert(floatingPanelCss.indexOf('.bfp-reset:not(:disabled):not([aria-disabled="true"]):hover') !== -1, 'floating panel reset hover styles must not apply to disabled or aria-disabled buttons');
-  assert(floatingPanelCss.indexOf('.bfp-row input[type="number"]:focus-visible') !== -1, 'floating panel numeric settings must show a visible keyboard focus ring');
-  assert(floatingPanelCss.indexOf('.bfp-row select:focus-visible') !== -1, 'floating panel select settings must show a visible keyboard focus ring');
-  assert(floatingPanelCss.indexOf('.bfp-reset:focus-visible') !== -1, 'floating panel reset buttons must show a visible keyboard focus ring');
-  assert(/\.bfp-header \.bfp-header-btn:focus-visible,\s*\.bfp-help-header button:focus-visible\s*\{[\s\S]*?outline: 2px solid #fff;[\s\S]*?box-shadow: 0 0 0 4px rgba\(20,49,82,0\.65\);/.test(floatingPanelCss), 'floating panel header buttons must use a high-contrast focus ring on colored headers');
-  assert(/\.bfp-header-btn\s*\{[\s\S]*?min-width: 24px;[\s\S]*?min-height: 24px;/.test(floatingPanelCss), 'floating panel header buttons must keep at least a 24px target');
-  assert(/\.bfp-help-header button\s*\{[\s\S]*?min-width: 24px;[\s\S]*?min-height: 24px;/.test(floatingPanelCss), 'floating panel help header buttons must keep at least a 24px target');
-  assert(/\.bfp-reset\s*\{[\s\S]*?min-width: 24px;[\s\S]*?min-height: 24px;/.test(floatingPanelCss), 'floating panel reset buttons must keep at least a 24px target');
-  assert(/\.bfp-heavy-preset,\s*\.bfp-ordinary-preset\s*\{[\s\S]*?min-width: 24px;[\s\S]*?min-height: 24px;/.test(floatingPanelCss), 'floating panel preset buttons must keep at least a 24px target');
-  assert(floatingPanelCss.indexOf('.bfp-row select:disabled') !== -1, 'floating panel controls must have disabled styling');
-  assert(floatingPanelCss.indexOf('.bfp-heavy-preset[aria-disabled="true"]') !== -1, 'floating panel busy preset buttons must share disabled styling while remaining focusable');
-  assert(popup.indexOf('function updateDependentControls()') !== -1, 'popup must disable dependent settings when their parent option is off');
-  assert(popup.indexOf('HEAVY_ORIGINAL_PRESET') !== -1, 'popup must provide a heavy tuning preset reset');
-  assert(popup.indexOf("ATPGetSettingsPreset('heavyOriginal', SETTINGS_SCHEMA)") !== -1, 'popup heavy preset must come from the settings schema');
-  assert(popup.indexOf('btn-heavy-preset') !== -1, 'popup must render a heavy preset reset button');
-  assert(popup.indexOf('function forEachHeavyOriginalPreset(callback)') !== -1, 'popup heavy preset reset must centralize preset field iteration');
-  assert(popup.indexOf('for (var key in HEAVY_ORIGINAL_PRESET)') !== -1, 'popup heavy preset reset must scan preset fields without Object.keys allocation');
-  assert(popup.indexOf('forEachHeavyOriginalPreset(function(key)') !== -1, 'popup heavy preset reset must reuse preset field iteration for apply and rollback');
-  assert(popup.indexOf('Object.keys(HEAVY_ORIGINAL_PRESET).forEach') === -1, 'popup heavy preset reset must not allocate preset key arrays');
-  assert(floatingPanel.indexOf('_refreshDependentFields()') !== -1, 'floating panel must disable dependent settings when their parent option is off');
-  assert(floatingPanel.indexOf('_getHeavyOriginalPreset()') !== -1, 'floating panel must provide a heavy tuning preset reset');
-  assert(floatingPanel.indexOf("ATPGetSettingsPreset('heavyOriginal', this.schema)") !== -1, 'floating panel heavy preset must come from the settings schema');
-  assert(floatingPanel.indexOf('bfp-heavy-preset') !== -1, 'floating panel must render a heavy preset reset button');
-  assert(floatingPanel.indexOf('bfp-ordinary-preset') !== -1 && floatingPanel.indexOf('_onOrdinaryPreset') !== -1, 'floating panel must render and apply ordinary loading presets');
-  assert(popup.indexOf('btn-ordinary-preset') !== -1 && popup.indexOf('applyOrdinaryPresetButton') !== -1, 'popup must render and apply ordinary loading presets');
   assert(settingsSchema.indexOf('ordinaryGentle') !== -1 && settingsSchema.indexOf('ordinaryBalanced') !== -1 && settingsSchema.indexOf('ordinaryFast') !== -1, 'ordinary loading presets must come from the shared settings schema helper');
-  assert(loader.indexOf('ATPLoadPolicy.getHeavyImageTimeout(settings)') !== -1, 'high-fanout image timeout must use the public loading policy');
-  assert(loader.indexOf('HIGH_FANOUT_IMAGE_TIMEOUT_MS = 8000') === -1, 'high-fanout image timeout must not retain the old hidden 8-second cap');
-  assert(loader.indexOf('function getImageLoadTimeout') !== -1, 'loader must centralize image timeout decisions');
-  assert(loader.indexOf('function logDebugThrottled') !== -1, 'high-frequency image debug logs must be throttled');
-  assert(loader.indexOf('function hasNonHighFanoutFirstTask') !== -1, 'first-screen scheduling must detect ordinary image tasks behind high-fanout tasks');
-  assert(loader.indexOf('function hasNonHighFanoutBgTask') !== -1, 'background scheduling must detect ordinary image tasks behind high-fanout tasks');
-  assert(loader.indexOf('var BG_TASKS_VERSION = 0') !== -1, 'background queue ordinary-task checks must have a queue version');
-  assert(loader.indexOf('function markBgTasksChanged()') !== -1, 'background queue mutations must share cache invalidation');
-  assert(loader.indexOf('if (BG_ORDINARY_CACHE_VERSION === BG_TASKS_VERSION) return BG_HAS_ORDINARY_TASK;') !== -1, 'background ordinary-task checks must reuse cached queue state between mutations');
-  assert(loader.indexOf('BG_ORDINARY_CACHE_VERSION = BG_TASKS_VERSION;') !== -1, 'background ordinary-task cache must record the scanned queue version');
-  assert(loader.indexOf('BG_TASKS.push(task);\n          markBgTasksChanged();') !== -1, 'background task requeue must invalidate queue caches');
-  assert(loader.indexOf('BG_TASKS.push({\n          candidates: ts.candidates,') !== -1 && loader.indexOf('markBgTasksChanged();\n      ts.bgQueued = ts.nextIdx >= ts.candidates.length;') !== -1, 'background batch enqueue must invalidate queue caches once per batch');
-  assert(loader.indexOf('High fanout slot deferred') !== -1, 'loader must log when high-fanout image tasks yield scheduler slots');
-  assert(loader.indexOf('MAX_HEAVY_INLINE_FALLBACKS_PER_SLOT') === -1, 'heavy fallback must not retain the old hidden per-slot cap');
-  assert(loader.indexOf('MAX_LIGHTWEIGHT_HEAVY_BG_FALLBACKS_PER_SLOT') === -1, 'lightweight heavy fallback must not retain a smaller hidden cap');
-  assert(loader.indexOf('HEAVY_COOLING_STOP_LOSS_TIMEOUT_MS') === -1, 'heavy timeout must not retain the old 3.5-second stop-loss cap');
-  assert(loader.indexOf('HEAVY_STALE_BACKGROUND_TIMEOUT_MS') === -1, 'heavy background timeout must not retain the old 6-second cap');
-  assert(loader.indexOf('return ATPLoadPolicy.getHeavyFallbackLimit(getCurrentSettings() || {});') !== -1, 'heavy fallback attempts must use the public loading policy');
-  assert(loader.indexOf('function refreshHeavyHostState(host, stats, settings, now)') !== -1, 'heavy hosts must use an explicit refreshable state machine');
-  assert(loader.indexOf("stats.state === 'open'") !== -1 && loader.indexOf("setHeavyHostState(host, stats, 'half_open', 'cooldown_elapsed', settings)") !== -1, 'open heavy hosts must transition to half-open after the configured cooldown');
-  assert(loader.indexOf('function scheduleHeavyHostWake(host, delayMs)') !== -1, 'open heavy hosts must schedule a wake when their cooldown expires');
-  assert(loader.indexOf('var DEFERRED_HEAVY_THREADS = {};') !== -1, 'heavy background threads must remain resumable while a host is open');
-  assert(loader.indexOf('function applyHeavyBackgroundDeferred(ts, threadId, deferInfo)') !== -1, 'heavy background work must be deferred without consuming candidates');
-  assert(loader.indexOf('task.taskDeadlineAt = taskDeadlineMs > 0 ? now + taskDeadlineMs : 0;') !== -1, 'image task deadlines must be initialized from the public loading policy on first slot claim');
-  assert(loader.indexOf('function reconfigureLoader(settings)') !== -1, 'loader must support live policy reconfiguration');
-  assert(loader.indexOf('var extraFields = extra || {};') !== -1, 'loader image event diagnostics must preserve extra fallback fields before bulky state fields');
-  assert(/Object\.assign\(\s*fields,\s*extraFields,[\s\S]*?getHeavyHostHealthLogFields/.test(loader), 'loader must put fallback-specific fields early enough for structured log retention');
-  assert(loader.indexOf('getImageTimeoutLogFields(settings, task)') !== -1, 'loader must keep high-fanout timeout diagnostics near fallback-specific fields');
-  assert(loader.indexOf('task.inlineFallbacks') !== -1, 'candidate fallback attempts must be bounded per active slot');
-  assert(loader.indexOf('var replacementDisplaySrc = getCandidateDisplaySrc(replacement);') !== -1, 'fallback replacement must resolve displaySrc separately from previewSrc');
-  assert(loader.indexOf('var replacementPreviewSrc = getCandidatePreviewSrc(replacement);') !== -1, 'fallback replacement must preserve previewSrc separately from displaySrc');
-  assert(loader.indexOf('updateActiveHighFanoutSlot(task, replacementDisplaySrc)') !== -1, 'fallback replacement must update high-fanout slot accounting from the display URL');
-  assert(loader.indexOf('setImageSource(img, replacementDisplaySrc, shouldUseNoReferrerByDefault(replacementDisplaySrc), shouldApply);') !== -1, 'fallback replacement must load the display URL into the thumbnail image');
-  assert(loader.indexOf('GLOBAL_HIGH_FANOUT_ACTIVE > slotLimit') !== -1, 'heavy fallback must stop prolonging slots when high-fanout hosts exceed their slot limit');
-  assert(loader.indexOf('function findFallbackCandidate') !== -1, 'fallback replacement must centralize candidate selection');
-  assert(loader.indexOf('requireNonHighFanout') !== -1, 'failed high-fanout heavy candidates must be able to forbid same-host fallback');
-  assert(loader.indexOf('function findOrdinaryAnywhere') !== -1, 'heavy fallback must search the whole candidate pool for ordinary-host replacements');
-  assert(loader.indexOf('var ordinary = findMatching(true) || findOrdinaryAnywhere()') !== -1, 'failed heavy high-fanout candidates must prefer ordinary-host replacements when available');
-  assert(loader.indexOf('ordinaryOnly && isHighFanoutImageHost(candidatePreviewSrc)') !== -1, 'ordinary fallback selection must skip high-fanout preview hosts on the first pass');
-  assert(loader.indexOf('function hasOrdinaryFallbackCandidate') !== -1, 'heavy fallback must detect whether ordinary replacements exist before high-fanout rescue');
-  assert(loader.indexOf('var allowHeavyRescue = preferOrdinary && !ordinaryFallbackAvailable') !== -1, 'all-heavy posts must be able to try a bounded high-fanout rescue candidate');
-  assert(loader.indexOf('findFallbackCandidate(ts, fallbackIdx, preferOrdinary, requireOrdinary)') !== -1, 'failed high-fanout heavy candidates must prefer ordinary fallback but allow bounded all-heavy rescue');
-  assert(viewport.indexOf('ATPLoader.acquireSlot(task)') !== -1, 'viewport lazy loading must count task host type when acquiring slots');
-  assert(viewport.indexOf('function releaseViewportSlot(task, slotToken)') !== -1, 'viewport lazy loading must release task host accounting through a token-aware wake helper');
-  assert(viewport.indexOf('ATPLoader.getImageLoadTimeout(currentSettings, task)') !== -1, 'viewport lazy loading must recompute high-fanout timeout policy when restarting timers without an override');
-  assert((loader.match(/: getImageLoadTimeout\(ATPLoader\.getSettings\(\), task\);/g) || []).length >= 2, 'loader direct and retry loads must recompute image timeout when restarting timers without an override');
-  assert(loader.indexOf('function tryHeavyCandidateFallback') !== -1, 'loader must keep replacement candidate fallback after image failures');
-  assert(loader.indexOf('ts.sourceCandidates.length <= ts.candidates.length') !== -1, 'candidate fallback must only run when hidden replacement candidates exist');
-  assert(loader.indexOf('Image candidate fallback') !== -1, 'candidate fallback logging must cover ordinary and heavy posts');
-  assert(loader.indexOf('ts.heavyMode && ts.sourceCandidates ? ts.sourceCandidates : (ts.candidates || [])') !== -1, 'ordinary previews must stay limited to rendered candidates');
-  assert(viewport.indexOf('ts.heavyMode && ts.sourceCandidates ? ts.sourceCandidates : ts.candidates') !== -1, 'viewport previews must not expose ordinary hidden fallback candidates');
-  assert(loader.indexOf("img.removeAttribute('src')") !== -1, 'no-referrer retry must force same-URL image reload');
-  assert(popup.indexOf('discoverCacheKeysByTypes') !== -1, 'popup cache cleanup must fall back to storage discovery when cacheIndex is stale');
-  assert(popup.indexOf('async function storageGetKeys(action)') !== -1, 'popup storage discovery must centralize key-only reads');
-  assert(popup.indexOf("typeof area.getKeys === 'function'") !== -1, 'popup storage discovery must feature-detect storage.getKeys');
-  assert(popup.indexOf("var all = await storageGet(null, action || '读取 storage 键');") !== -1, 'popup storage discovery must keep a get(null) fallback for older browsers');
-  assert(popup.indexOf("var names = await storageGetKeys('发现缓存键');") !== -1, 'popup cache key discovery must read key names without storage values when possible');
-  assert(popup.indexOf("var names = await storageGetKeys('发现日志键');") !== -1, 'popup log key discovery must read key names without storage values when possible');
-  assert(popup.indexOf("storageGet(null, '发现缓存键')") === -1, 'popup cache key discovery must not directly read all storage values');
-  assert(popup.indexOf("storageGet(null, '发现日志键')") === -1, 'popup log key discovery must not directly read all storage values');
-  assert(popup.indexOf('Object.keys(all).filter(function(k)') === -1, 'popup cache key discovery must not allocate a filtered storage-key array');
-  assert(popup.indexOf('async function removeCacheKeys(keys)') !== -1, 'popup cache key removal must stay awaitable');
-  assert(popup.indexOf("var removedCount = await countExistingKeys(keys, '统计缓存清理项');") !== -1, 'popup ordinary cache cleanup must count existing keys before removal');
-  assert(popup.indexOf('var cacheIndexStatus = await removeCacheIndexEntries(keys);') !== -1, 'popup cache key removal must wait for cacheIndex deletion status');
-  assert(popup.indexOf('return { count: removedCount, cacheIndexStatus: cacheIndexStatus };') !== -1, 'popup ordinary cache cleanup must report the actual existing-key removal count with cacheIndex status');
-  assert(popup.indexOf('function rebuildCacheIndexAfterRemoveFailure()') !== -1, 'popup cache index removal failure must have a rebuild fallback');
-  assert(popup.indexOf('SharedUtils.cacheIndex.rebuild(function(entries)') !== -1, 'popup cache index removal failure fallback must rebuild through SharedUtils');
-  assert(popup.indexOf('function removeCacheIndexEntries(keys)') !== -1, 'popup must centralize cacheIndex removal behind a Promise wrapper');
-  assert(
-    /function removeCacheIndexEntries\(keys\)[\s\S]*?new Promise\(function\(resolve\)[\s\S]*?SharedUtils\.cacheIndex\.removeEntries\(keys, function\(success\)/.test(popup),
-    'popup cacheIndex removal wrapper must wait for the removeEntries callback'
-  );
-  assert(popup.indexOf('if (success === false)') !== -1, 'popup cacheIndex removal wrapper must treat write failures as failures');
-  assert(popup.indexOf('resolve({ ok: false, rebuilt: !!entries });') !== -1, 'popup cacheIndex removal wrapper must return rebuild status instead of masking successful storage deletion');
-  assert(popup.indexOf('function clearTestCacheAndLogs()') !== -1, 'popup one-click cache/log cleanup must be testable as a single maintenance action');
-  assert(popup.indexOf("return { text: message + getCacheIndexStatusSuffix(result), type: 'warn', persist: true };") !== -1, 'popup cache cleanup partial failures must report a persistent warning status');
-  assert(popup.indexOf("var storageNames = await storageGetKeys('发现一键清空键');") !== -1, 'popup one-click cleanup must discover storage keys once per maintenance action');
-  assert(popup.indexOf('var discoveredKeys = cacheKeysFromNames(storageNames, types);') !== -1, 'popup one-click cleanup must reuse discovered storage keys for cache cleanup');
-  assert(popup.indexOf('var logKeys = getLogKeysFromNames(storageNames);') !== -1, 'popup one-click cleanup must reuse discovered storage keys for read-only log cleanup');
-  assert(popup.indexOf('var logKeys = await discoverLogKeysFromNames(storageNames);') === -1, 'popup one-click cleanup must not write the log index before deleting it');
-  assert(popup.indexOf('var removedCount = countExistingKeysFromNames(keys, storageNames);') !== -1, 'popup one-click cleanup must count existing keys from the reused key set');
-  assert(popup.indexOf("var removedCount = await countExistingKeys(keys, '统计一键清空项');") === -1, 'popup one-click cleanup must not enumerate storage keys again for removal counts');
-  assert(popup.includes('function writeLogIndexBestEffort(keys, prunedKeys)'), "popup log discovery must keep log index writes best-effort");
-  assert(popup.includes('await writeLogIndexBestEffort(indexed, stale);'), "popup discovered log index writes must not block log reads");
-  assert(popup.indexOf('var cacheIndexStatus = await removeCacheIndexEntries(cacheKeys);') !== -1, 'popup one-click cache/log cleanup must wait for cacheIndex deletion status');
-  assert(popup.indexOf('SharedUtils.cacheIndex.removeEntries(keys);') === -1, 'popup cache cleanup must not fire-and-forget cacheIndex key removal');
-  assert(popup.indexOf('SharedUtils.cacheIndex.removeEntries(cacheKeys);') === -1, 'popup one-click cleanup must not fire-and-forget cacheIndex key removal');
-  assert(
-    popup.indexOf('return await discoverLogKeysFromStorage();') !== -1,
-    'popup log reads with discovery must use actual storage keys as the authoritative content shard set'
-  );
-  assert(
-    popup.indexOf('await writeLogIndexBestEffort(indexed, stale);') !== -1,
-    'popup log discovery must attempt a best-effort content log index rewrite even when no content shards are present'
-  );
-  assert(popup.indexOf('refreshLogCount();') !== -1, 'popup startup must refresh log count without rendering hidden logs');
-  assert(popup.indexOf('loadLogEntries({ allowDiscovery: false, prune: false })') !== -1, 'popup initial log count must start from an indexed read');
-  assert(/async function refreshLogCount\(\)[\s\S]*?loadLogEntries\(\{ allowDiscovery: false, prune: false \}\)[\s\S]*?if \(!logs\.length\) \{[\s\S]*?loadLogEntries\(\{ allowDiscovery: true, prune: false \}\)/.test(popup), 'popup initial log count must discover missing content log shards only after an empty indexed read');
-  assert(popup.indexOf("setPopupStatus('读取日志计数失败：' + errorMessage(e), 'err', true)") !== -1, 'popup startup log count failures must surface the error in the persistent status region');
-  assert(popup.indexOf('loadLogs();') === -1, 'popup must not call full log loading without explicit options');
-  assert(logger.indexOf('function requeueBatch(batch, reason)') !== -1, 'content logger must requeue failed flush batches');
-  assert(background.indexOf('function requeueBatch(batch, reason)') !== -1, 'background logger must requeue failed flush batches');
-  assert(logger.indexOf("window.addEventListener('beforeunload'") === -1, 'content logger must not register beforeunload from a manifest content script');
-  assert(logger.indexOf("window.addEventListener('pagehide', handlePageHide)") !== -1, 'content logger must flush through pagehide instead of beforeunload');
-  assert(logger.indexOf("document.addEventListener('visibilitychange', handleVisibilityFlush)") !== -1, 'content logger must flush when the document becomes hidden');
-  assert(/function handleVisibilityFlush\(\)[\s\S]*?document\.visibilityState === 'hidden'[\s\S]*?flush\(\);/.test(logger), 'content logger hidden visibility flush must only run when the document is hidden');
-  assert(logger.indexOf('MAX_FLUSH_RETRIES = 3') !== -1, 'content logger requeue must have a retry cap');
-  assert(background.indexOf('MAX_FLUSH_RETRIES = 3') !== -1, 'background logger requeue must have a retry cap');
-  assert(logger.indexOf('SESSION_ID') !== -1, 'content logger must stamp logs with a page session id');
-  assert(logger.indexOf('pageUrl: getPageUrl()') !== -1, 'content logger must include page URL context');
-  assert(logger.indexOf('pageHost: getPageHost()') !== -1, 'content logger must include page host context');
-  assert(logger.indexOf('version: getVersion()') !== -1, 'content logger must include extension version context');
-  assert(logger.indexOf('timezoneNameCache = null') !== -1, 'content logs must cache the page timezone name instead of creating Intl formatters per log');
-  assert(logger.indexOf('function logEvent(type, fields, level)') !== -1, 'content logger must expose structured event logging');
-  assert(content.indexOf("Logger.event('scan_complete'") !== -1, 'content scan completion must emit structured diagnostics');
-  assert(content.indexOf('if (!job.summaryCounted) {') !== -1, 'content article commits must count each deduplicated job once');
-  assert(content.indexOf('summary.articles++;') !== -1, 'content article commits must update the shared streaming summary');
-  assert(content.indexOf("Logger.info('扫描完成', '文章' + summary.articles") !== -1, 'content scan completion info log must reuse the streaming summary');
-  assert(content.indexOf('articles: summary.articles') !== -1, 'content scan completion event must reuse the streaming summary');
-  assert(content.indexOf('Object.keys(results).length') === -1, 'content scan completion must not allocate a result-key array for counting');
-  assert(renderer.indexOf("Logger.event('thread_registered'") !== -1, 'renderer must emit structured thread registration diagnostics');
-  assert(loader.indexOf('Logger.event(type, logFields') !== -1, 'loader image diagnostics must include structured task fields');
-  assert(loader.indexOf("'schedule_state'") !== -1, 'loader must emit throttled scheduler state diagnostics');
-  assert(loader.indexOf("'image_start'") !== -1, 'loader must log image load starts');
-  assert(loader.indexOf("'image_done'") !== -1, 'loader must log image load completion');
-  assert(loader.indexOf("'image_defer'") !== -1, 'loader must log high-fanout deferrals');
-  assert(loader.indexOf('function recordDiagnosticEvent') !== -1, 'high-volume image diagnostics must be aggregated before storage');
-  assert(loader.indexOf("'diagnostic_summary'") !== -1, 'aggregated image diagnostics must emit diagnostic_summary events');
-  assert(loader.indexOf('function shouldSuppressDiagnosticDetail') !== -1, 'routine image diagnostics must be suppressible after aggregation');
-  assert(loader.indexOf('recordDiagnosticEvent(type, nextFields)') !== -1, 'throttled scheduler and scroll diagnostics must feed diagnostic summaries');
-  assert(loader.indexOf('if (!nextFields) {') !== -1, 'throttled diagnostics must allow lazy field builders to suppress empty events');
-  assert(loader.indexOf("logEventThrottled('schedule_state', 'schedule_state', function()") !== -1, 'scheduler diagnostics must build queue snapshots lazily after throttle checks');
-  var scheduleStateStart = loader.indexOf("logEventThrottled('schedule_state', 'schedule_state', function()");
-  assert(loader.indexOf('function getFirstTaskChannelSnapshot(threadIds, threads)') !== -1, 'loader must collect first-screen task channel counts and first heavy task in one scan');
-  assert(loader.indexOf('var firstHeavyTask = firstCounts.firstHeavyTask;') !== -1, 'scheduler diagnostics must reuse first heavy first-screen task from channel snapshots');
-  assert(loader.indexOf('function countFirstTaskChannels(threadIds, threads)') === -1, 'scheduler diagnostics must not keep the old first-screen count-only scan helper');
-  assert(loader.indexOf('function findFirstHeavyFirstTask(threadIds, threads)') === -1, 'scheduler diagnostics must not keep the old first-heavy first-screen scan helper');
-  var scheduleStateCount = loader.indexOf('var firstCounts = getFirstTaskChannelSnapshot(activeThreadIds, threads || {});', scheduleStateStart);
-  assert(scheduleStateStart !== -1 && scheduleStateCount > scheduleStateStart, 'scheduler queue counting must happen inside the throttled callback');
-  assert(/if \(!GLOBAL_ACTIVE && !readyImageQueued && !MANUAL_IMAGE_RETRIES\.length && !firstCounts\.ordinary && !firstCounts\.heavy &&\s+!bgCounts\.ordinary && !bgCounts\.heavy\) return null;/.test(loader), 'lazy scheduler diagnostics must preserve the no-work no-log behavior');
-  assert(loader.indexOf('function getTaskFailureLogFields') !== -1, 'failed image diagnostics must include queue and lifecycle snapshots');
-  assert(loader.indexOf('taskAgeMs') !== -1, 'failed image diagnostics must include task age');
-  assert(loader.indexOf('queueWaitMs') !== -1, 'failed image diagnostics must include scheduler wait time');
-  assert(loader.indexOf('maxViewportPending') !== -1, 'diagnostic summaries must include viewport pending peaks');
-  assert(loader.indexOf('maxBgHeavyQueue') !== -1, 'diagnostic summaries must include heavy background queue peaks');
-  assert(loader.indexOf("queueKind: stagedLightweight ? 'lightweight_background' : 'background'") !== -1, 'background tasks must label their queue origin');
-  assert(loader.indexOf("queueKind: 'manual_retry'") !== -1, 'manual retry tasks must label their queue origin');
-  assert(renderer.indexOf("queueKind: 'first_screen'") !== -1, 'first-screen tasks must label their queue origin');
-  assert(loader.indexOf("'fallback_pick'") !== -1, 'loader must log replacement candidate picks');
-  assert(loader.indexOf("'fallback_miss'") !== -1, 'loader must log replacement candidate misses');
-  assert(viewport.indexOf('ATPLoader.logImageDone') !== -1, 'viewport lazy loads must participate in image completion diagnostics');
-  assert(viewport.indexOf('function getViewportPendingLogFields') !== -1, 'viewport failures must include pending-state diagnostics');
-  assert(viewport.indexOf('pendingAgeMs') !== -1, 'viewport diagnostics must include pending age');
-  assert(viewport.indexOf('pendingCountAtLoad') !== -1, 'viewport diagnostics must capture pending depth when the load starts');
-  assert(viewport.indexOf('forceLoadWhenHidden') !== -1, 'viewport diagnostics must distinguish hidden-tab forced loads');
-  assert(viewport.indexOf('slotRetries') !== -1, 'viewport diagnostics must expose slot retry pressure');
-  assert(loader.includes('HEAVY_SCROLL_IDLE_MS = 180'), "heavy image loading must wait for a short scroll idle window");
-  assert(loader.indexOf('GLOBAL_SCROLL_CAPTURE_OPTIONS = { passive: true, capture: true }') !== -1, 'loader nested scroll listener must use a passive capture options object');
-  assert(loader.indexOf("document.addEventListener('scroll', GLOBAL_SCROLL_LISTENER, GLOBAL_SCROLL_CAPTURE_OPTIONS)") !== -1, 'loader must capture nested thumbnail scroll containers through document scroll');
-  assert(loader.indexOf("document.removeEventListener('scroll', GLOBAL_SCROLL_LISTENER, GLOBAL_SCROLL_CAPTURE_OPTIONS)") !== -1, 'loader teardown must remove the nested scroll capture listener');
-  assert(loader.indexOf('function isHeavyScrollDeferred') !== -1, 'loader must defer high-fanout image starts while the user is actively scrolling');
-  assert(loader.indexOf("reason: 'scrolling'") !== -1, 'heavy scroll deferrals must be visible in structured diagnostics');
-  assert(loader.indexOf('function getViewportPendingCountFromStats(stats)') !== -1, 'loader diagnostics must derive viewport pending count from pending stats when available');
-  assert(loader.indexOf('var viewportPendingStats = getViewportPendingStatsFields();') !== -1, 'loader diagnostics must read viewport pending stats once per snapshot');
-  assert(loader.indexOf('viewportPending: getViewportPendingCountFromStats(viewportPendingStats)') !== -1, 'loader diagnostics must reuse pending stats for viewportPending');
-  assert(loader.indexOf('}, viewportPendingStats, getOrdinaryHostActiveTopFields(), healthTask') !== -1, 'loader diagnostics must merge the reused pending stats object');
-  assert(loader.indexOf('viewportPending: ATPLoader.getViewportPendingCount ? ATPLoader.getViewportPendingCount() : 0') === -1, 'loader diagnostics must not read pending count separately when pending stats are already collected');
-  assert(loader.indexOf('heavyUnloaded: heavyRenderStats ? heavyRenderStats.heavyUnloaded : 0') !== -1, 'scheduler diagnostics must include unloaded heavy thumbnail count from reused stats');
-  assert(loader.indexOf('heavyRestoreQueued: window.ATPViewport && ATPViewport.getHeavyRestoreQueueCount') !== -1, 'scheduler diagnostics must include queued heavy thumbnail restores');
-  assert(loader.indexOf('function getImageMetrics') !== -1, 'image diagnostics must include decoded image dimensions');
-  assert(loader.indexOf('ATPViewport.resumeHeavyRestores') !== -1, 'heavy thumbnail restores must resume after scroll idle');
-  assert(loader.indexOf('isHeavyScrollActive: function()') !== -1, 'viewport virtualization must be able to defer restores while scrolling');
-  assert(loader.indexOf('logRenderEvent: function(type, task, fields, level)') !== -1, 'loader must expose render diagnostics for viewport virtualization');
-  assert(viewport.indexOf('monitorLoadedHeavyImage: function(wrapper, img, task)') !== -1, 'loaded heavy thumbnails must be monitored for offscreen release');
-  assert(viewport.indexOf('HEAVY_RESTORE_BATCH_SIZE = 1') !== -1, 'heavy thumbnail restores must keep a minimum batch size');
-  assert(viewport.indexOf('HEAVY_RESTORE_FAST_BATCH_SIZE = 2') !== -1, 'low-pressure heavy restores must default to two thumbnails per batch');
-  assert(viewport.indexOf('HEAVY_RESTORE_FAST_BATCH_MAX_SIZE') === -1, 'low-pressure heavy restore batch size must not retain the old hidden cap of 6');
-  assert(viewport.indexOf('HEAVY_RESTORE_PRESSURE_BATCH_MAX_SIZE') === -1, 'pressured heavy restore batch size must not retain the old hidden cap of 4');
-  assert(viewport.indexOf('function getHeavyRestoreFastBatchSize') !== -1, 'heavy restore queue must read the configured low-pressure batch size');
-  assert(viewport.indexOf('function getHeavyRestorePressureBatchSize') !== -1, 'heavy restore queue must read the configured pressured batch size');
-  assert(viewport.indexOf("'heavyRestoreFastBatchSize',\n      HEAVY_RESTORE_FAST_BATCH_SIZE,\n      HEAVY_RESTORE_BATCH_SIZE\n    ") !== -1, 'low-pressure restore batches must use the user setting without a second maximum');
-  assert(viewport.indexOf("'heavyRestorePressureBatchSize',\n      HEAVY_RESTORE_PRESSURE_BATCH_SIZE,\n      HEAVY_RESTORE_BATCH_SIZE\n    ") !== -1, 'pressured restore batches must use the user setting without a second maximum');
-  assert(viewport.indexOf('HEAVY_RESTORE_FAST_DELAY = 90') !== -1, 'low-pressure heavy restores must use a faster idle delay');
-  assert(viewport.indexOf("pressure: 'fast'") !== -1, 'heavy restore diagnostics must expose the fast low-pressure lane');
-  assert(viewport.indexOf('restoreFastBatchSize: fastBatchLimit') !== -1, 'heavy restore diagnostics must expose the configured low-pressure batch size');
-  assert(viewport.indexOf('restorePressureBatchSize: pressureBatchLimit') !== -1, 'heavy restore diagnostics must expose the configured pressured batch size');
-  assert(viewport.indexOf('fastRestored') !== -1, 'heavy restore batching must track low-pressure lane restores separately');
-  assert(viewport.indexOf('pressureRestored') !== -1, 'heavy restore batching must track pressured lane restores separately');
-  assert(viewport.indexOf('ATPLoadPolicy.getHeavyVisibleBudgetMP(getCurrentSettings() || {})') !== -1, 'visible heavy thumbnail budget must use the public loading policy');
-  assert(viewport.indexOf('HEAVY_UNLOAD_BATCH_SIZE = 4') !== -1, 'heavy thumbnail releases must be batched to avoid preview-generation bursts');
-  assert(viewport.indexOf('function scheduleHeavyBudgetReconcile') !== -1, 'batched heavy thumbnail releases must schedule follow-up reconciliation');
-  assert(viewport.indexOf('function reconcileVisibleRenderPressure') !== -1, 'visible heavy thumbnail pressure must be reconciled separately from offscreen budget');
-  assert(viewport.indexOf("'visible_budget_unload'") !== -1, 'newly visible heavy thumbnails over the MP budget must keep a diagnostic unload reason');
-  assert(viewport.indexOf('visibleLocked') !== -1, 'heavy visible pressure must protect thumbnails that are already stable in view');
-  assert(viewport.indexOf('HEAVY_VISIBLE_LOCK_DELAY_MS = 1200') !== -1, 'visible heavy thumbnails must only become protected after a short stable display window');
-  assert(viewport.indexOf('function isVisibleStable') !== -1, 'visible heavy thumbnail locking must be based on display stability');
-  assert(viewport.indexOf('visibleLocked: false') !== -1, 'newly loaded heavy thumbnails must not be locked before they are stable in view');
-  assert(viewport.indexOf('data.restoreLoading') !== -1, 'visible heavy locking must not treat hidden restoring thumbnails as stable');
-  assert(viewport.indexOf('function getHeavyVisibleRestoreBudgetMP()') !== -1, 'visible heavy thumbnail restore budget must derive from the public main budget');
-  assert(viewport.indexOf('function getHeavyVisibleRestoreSoftBudgetMP()') !== -1, 'visible heavy thumbnail soft budget must derive from the public main budget');
-  assert(viewport.indexOf('function getHeavyRangeRestoreSoftBudgetMP()') !== -1, 'range heavy thumbnail soft budget must derive from the public main budget');
-  assert(viewport.indexOf('var loaded = !data.unloaded && !restoring') !== -1, 'hidden restore-loading thumbnails must not count as clear visible heavy MP');
-  assert(viewport.indexOf('heavyVisibleRestoringMP') !== -1, 'restore-loading heavy thumbnails must be diagnosed separately from clear visible MP');
-  assert(loader.indexOf('maxHeavyVisibleRestoringMP') !== -1, 'diagnostic summaries must expose restore-loading visible MP pressure');
-  assert(viewport.indexOf('HEAVY_VISIBLE_RESTORE_SETTLE_MS = 1400') !== -1, 'newly restored visible heavy thumbnails must have a short settle window');
-  assert(viewport.indexOf('function isVisibleRestoreSettling') !== -1, 'visible pressure must distinguish newly restored thumbnails from stable candidates');
-  assert(viewport.indexOf('!isVisibleRestoreSettling(visibleItem.data, now)') !== -1, 'visible pressure unloads must not immediately blur newly restored thumbnails');
-  assert(viewport.indexOf('var candidates = [];\n    var items = snapshot.items || [];') !== -1, 'visible pressure unloads must collect candidates in one pass without chained filters');
-  assert(viewport.indexOf('var visibleItems = (snapshot.items || []).filter') === -1, 'visible pressure unloads must not allocate a separate visibleItems array');
-  assert(loader.indexOf('maxHeavyVisibleRestoreSettlingMP') !== -1, 'diagnostic summaries must expose restore-settle visible MP pressure');
-  assert(viewport.indexOf('HEAVY_RESTORE_SOFT_PRESSURE_DELAY = 650') !== -1, 'heavy thumbnail restore queue must have a soft pressure delay');
-  assert(viewport.indexOf('HEAVY_RESTORE_DEFER_RETRY_DELAY = 420') !== -1, 'visible preview deferrals must retry instead of waiting for another scroll event');
-  assert(viewport.includes('HEAVY_VISIBLE_PREVIEW_MAX_WAIT_MS = 600'), "visible preview heavy thumbnails must have a bounded normal wait before grace restore");
-  assert(viewport.indexOf('function getHeavyVisiblePreviewGraceMP()') !== -1, 'visible preview grace must derive from the public visible MP budget');
-  assert(viewport.includes('HEAVY_VISIBLE_RESTORE_GRACE_MS = 900'), "ultra-heavy visible thumbnails must wait longer before grace restore");
-  assert(viewport.indexOf('function getVisiblePreviewStableGraceWaitMS()') !== -1, 'stable preview wait must derive from the user-configured starvation wait');
-  assert(viewport.indexOf('function getHeavyVisibleStableGraceMP()') !== -1, 'stable visible preview grace must derive from the public visible MP budget');
-  assert(viewport.indexOf('function getVisiblePreviewLateGraceWaitMS()') !== -1, 'late preview wait must derive from the user-configured starvation wait');
-  assert(viewport.indexOf('function getHeavyVisibleLateGraceMP()') !== -1, 'late visible preview grace must derive from the public visible MP budget');
-  assert(viewport.indexOf('function getVisiblePreviewLastChanceWaitMS()') !== -1, 'last-chance preview wait must derive from the user-configured starvation wait');
-  assert(viewport.indexOf('function getHeavyVisibleLastChanceMP()') !== -1, 'last-chance visible preview grace must derive from the public visible MP budget');
-  assert(viewport.indexOf('function getVisiblePreviewStarvationWaitMS') !== -1, 'starvation visible preview grace must read the configured wait');
-  assert(viewport.indexOf('settings.heavyPreviewStarvationWait') !== -1, 'starvation visible preview grace must use the settings schema value');
-  assert(viewport.indexOf('Math.max(0, seconds * 1000)') !== -1, 'configured starvation wait must not be raised by a hidden minimum');
-  assert(viewport.indexOf('function getVisiblePreviewStarvationMP') !== -1, 'starvation visible preview grace must read the configured MP cap');
-  assert(viewport.indexOf('settings.heavyPreviewStarvationMP') !== -1, 'starvation visible preview grace must use the configured MP cap');
-  assert(viewport.indexOf('return Math.max(0, mp);') !== -1, 'configured starvation MP must not be lowered by a hidden maximum');
-  assert(viewport.indexOf('HEAVY_VISIBLE_PREVIEW_STARVATION_MAX_MP') === -1, 'starvation MP must not retain the old hidden 2000MP cap');
-  assert(viewport.indexOf("!stats.heavyVisibleRestoring") !== -1, 'starvation visible preview grace must avoid stacking while a previous visible restore is still loading');
-  assert(viewport.indexOf('function getVisibleRenderPressureBudgetMP') !== -1, 'visible pressure must use a stable grace budget while previews are waiting');
-  assert(viewport.indexOf('HEAVY_RESTORE_ULTRA_DELAY = 900') !== -1, 'ultra-large heavy thumbnails must restore more slowly');
-  assert(viewport.indexOf('HEAVY_RESTORE_PRESSURE_DELAY = 900') !== -1, 'heavy thumbnail restore queue must slow down under decoded-pixel pressure');
-  assert(viewport.indexOf('function getHeavyRestoreDelayInfo') !== -1, 'heavy thumbnail restore delay diagnostics must expose the pressure level');
-  assert(viewport.indexOf('restorePressure') !== -1, 'heavy thumbnail restore logs must include pressure level');
-  assert(/function restoreHeavyImage\(wrapper, data\)[\s\S]*?ATPLoader\.acquireSlot\(data\.task\)/.test(viewport), 'heavy thumbnail restore requests must enter the unified image slot scheduler');
-  assert(viewport.indexOf('function releaseHeavyRestoreSlot(data)') !== -1, 'heavy thumbnail restores must release their unified slot on every terminal path');
-  assert(viewport.indexOf('releaseHeavyRestoreSlot(data);') !== -1, 'heavy thumbnail restore completion and cancellation must release active slot accounting');
-  assert(viewport.indexOf('ATPLoadPolicy.getHeavyDecodedBudgetMP(getCurrentSettings() || {})') !== -1, 'heavy thumbnail rendering must use the public decoded-pixel budget');
-  assert(viewport.indexOf('function reconcileHeavyRenderBudget') !== -1, 'heavy thumbnail rendering must reconcile loaded thumbnails against the render budget');
-  assert(viewport.indexOf('delay === undefined ? HEAVY_BUDGET_RECONCILE_DELAY : delay') !== -1, 'heavy budget reconcile scheduling must allow explicit 0ms coalescing delays');
-  assert(viewport.includes("scheduleHeavyBudgetReconcile('observer', isHeavyScrollActive() ? HEAVY_RESTORE_SCROLL_DELAY : 0)"), "heavy render observer must defer full budget reconciliation out of the observer callback");
-  assert(viewport.indexOf("reconcileHeavyRenderBudget('observer')") === -1, 'heavy render observer must not run full budget reconciliation synchronously');
-  assert(viewport.indexOf('var renderEntries = heavyRenderItems.entries();') !== -1, 'heavy render snapshot must iterate tracked items without Map.forEach callbacks');
-  assert(viewport.indexOf('while (!renderEntry.done)') !== -1, 'heavy render snapshot must consume tracked item iterator with a loop');
-  assert(viewport.indexOf('heavyRenderItems.forEach(function(data, wrapper) {\n      if (!data || !data.img || !document.contains(wrapper)) return;') === -1, 'heavy render snapshot must not allocate a Map.forEach callback');
-  assert(viewport.indexOf('var pendingEntries = pendingWrappers.entries();') !== -1, 'hidden pending loading must iterate pending wrappers with a breakable iterator');
-  assert(viewport.includes('if ((limit > 0 && started >= limit) || attempted >= attemptLimit) {'), "hidden pending loading must stop scanning after reaching the requested max loads");
-  assert(viewport.indexOf('pendingWrappers.forEach(function(data, wrapper) {\n        if (limit > 0 && started >= limit) return;') === -1, 'hidden pending loading must not keep scanning after max loads through Map.forEach');
-  assert(/retryVisiblePending: function\(actualOnly\) \{[\s\S]*?var totalStarted = 0;[\s\S]*?if \(isLoaderPaused\(\) \|\| shouldPausePendingRetryWhenHidden\(\)\) return totalStarted;[\s\S]*?prunePendingWrappers\(true, true\);[\s\S]*?var available = getAvailableSlotCount\(\);/.test(viewport), "scroll-idle visible pending retry must pause before pruning and scanning pending wrappers");
-  assert(viewport.indexOf('if (available <= 0) {\n        markVisiblePendingSlotRetries(PENDING_SLOT_RETRY_SCAN_LIMIT);\n        return totalStarted;\n      }') !== -1, 'scroll-idle visible pending retry must mark visible pending slot retries instead of dropping no-slot recovery scans');
-  assert(viewport.indexOf('var actualVisiblePendingWrappers = new Set();') !== -1, 'viewport retries must keep a direct zero-margin queue for actually visible pending wrappers');
-  assert(viewport.indexOf('var actualWrappers = actualVisiblePendingWrappers.values();') !== -1, 'visible retries must drain the direct actual-viewport queue before scanning near-viewport entries');
-  assert(viewport.indexOf('var pendingEntries = pendingWrappers.entries();') !== -1, 'scroll-idle visible pending retry must scan pending wrappers without Map.forEach callbacks');
-  assert(viewport.indexOf('var scanLimit = Math.max(1, Math.min(pendingWrappers.size, PENDING_SLOT_RETRY_SCAN_LIMIT));') !== -1, 'scroll-idle visible pending retry must bound scanned pending entries separately from attempts');
-  assert(viewport.includes('if (started >= available || attempted >= attemptLimit || scanned >= scanLimit) {'), "scroll-idle visible pending retry must stop scanning after slot, attempt, or scan limits");
-  assert(viewport.indexOf('if (!data || data.loaded || !refreshPendingViewportVisibility(wrapper, data)) continue;') !== -1, 'scroll-idle visible pending retry must preserve loaded guard and refresh current lazy-viewport geometry');
-  assert(viewport.indexOf('pendingVisibleRetryCursor = normalizePendingRetryCursor(nextCursor);') !== -1, 'scroll-idle visible pending retry must advance its rotation cursor');
-  assert(viewport.indexOf('pendingWrappers.forEach(function(data, wrapper) {\n        if (!data || data.loaded || !data.inViewport) return;') === -1, 'scroll-idle visible pending retry must not allocate a Map.forEach callback');
-  assert(viewport.indexOf('function schedulePendingSlotRetry(delay)') !== -1, 'viewport slot-pressure retries must be scheduled through the shared timer');
-  assert(viewport.indexOf('retryPendingSlotLoads: function(maxAttempts) {\n      var started = 0;\n      if (isLoaderPaused() || shouldPausePendingRetryWhenHidden()) return started;') !== -1, 'viewport slot-pressure retries must pause before scanning pending wrappers');
-  assert(viewport.indexOf('var scanLimit = Math.max(1, Math.min(pendingWrappers.size, attemptLimit));') !== -1, 'viewport slot-pressure retries must bound scanned pending entries separately from attempts');
-  assert(viewport.indexOf('if (!stillHiddenForced && !stillPreloadForced && !refreshPendingViewportVisibility(wrapper, data))') !== -1, 'viewport slot-pressure retries must refresh current lazy geometry before ordinary slot loads');
-  assert(viewport.indexOf('if (!wrappedHiddenForced && !wrappedPreloadForced && !refreshPendingViewportVisibility(wrappedWrapper, wrappedData))') !== -1, 'viewport wrapped slot-pressure retries must refresh current lazy geometry before ordinary slot loads');
-  assert(viewport.indexOf('if (!data.inViewport && !stillHiddenForced && !stillPreloadForced)') === -1, 'viewport slot-pressure retries must not rely on stale inViewport flags');
-  assert(viewport.indexOf('if (!wrappedData.inViewport && !wrappedHiddenForced && !wrappedPreloadForced)') === -1, 'viewport wrapped slot-pressure retries must not rely on stale inViewport flags');
-  assert(viewport.indexOf('markVisiblePendingSlotRetries(PENDING_SLOT_RETRY_SCAN_LIMIT);') !== -1, 'viewport no-slot visible retries must mark visible wrappers for release-driven wakes');
-  assert(viewport.indexOf('schedulePendingSlotRetry(250)') === -1, 'viewport no-slot retries must not poll every 250ms while all slots are full');
-  assert(viewport.indexOf('schedulePendingSlotRetry(started ? 100 : 250)') === -1, 'viewport slot-pressure retries must not restore fixed no-slot 250ms polling');
-  assert(viewport.indexOf('if (hasPendingSlotRetry() && !isLoaderPaused() && getAvailableSlotCount() > 0) schedulePendingSlotRetry(100);') !== -1, 'viewport slot-pressure retries may only reschedule immediately when capacity still exists and the loader is not paused');
-  assert(viewport.indexOf('pendingSlotRetryCursor = normalizePendingRetryCursor(nextCursor);') !== -1, 'viewport slot-pressure retries must advance their rotation cursor');
-  assert(viewport.indexOf('if (wrapperData.slotRetryPending) return false;') !== -1, 'viewport must not duplicate retry scheduling for the same wrapper');
-  assert(viewport.indexOf('function markPendingSlotRetry(data)') !== -1, 'viewport must define shared slot retry marking');
-  assert(viewport.indexOf('markPendingSlotRetry(wrapperData);') !== -1, 'viewport must mark wrappers for the shared slot retry scheduler');
-  assert(viewport.indexOf('schedulePendingSlotRetry(retryDelay);') !== -1, 'viewport must schedule marked wrappers through the shared slot retry scheduler');
-  assert(viewport.indexOf('var budgetItems = budget.snapshot.items || [];') !== -1, 'heavy render budget reconciliation must reuse one snapshot item array reference');
-  assert(viewport.indexOf('for (var bi = 0; bi < budgetItems.length; bi++)') !== -1, 'heavy render budget unload pass must iterate snapshot items with an index loop');
-  assert(viewport.indexOf('for (var qi = 0; qi < budgetItems.length; qi++)') !== -1, 'heavy render budget restore pass must iterate snapshot items with an index loop');
-  assert(viewport.indexOf('budget.snapshot.items.forEach(function(item)') === -1, 'heavy render budget reconciliation must not allocate forEach callbacks');
-  assert(viewport.indexOf('var candidates = [];\n    var sourceItems = items || [];') !== -1, 'heavy render budget selection must collect candidates in one pass');
-  assert(viewport.indexOf('var candidates = (items || []).filter') === -1, 'heavy render budget selection must not allocate a filter result before sorting');
-  assert(viewport.indexOf('function isVisibleRestoreBudgetAllowed') !== -1, 'visible heavy thumbnail restores must be checked against visible MP pressure');
-  assert(viewport.indexOf("'visible_mp_defer'") !== -1, 'visible heavy restore pressure deferrals must be visible in diagnostics');
-  assert(viewport.indexOf("return data && data.visiblePreviewSince ? 'visible_preview_defer' : 'visible_mp_defer'") !== -1, 'visible preview deferrals must be distinguishable from generic MP pressure');
-  assert(viewport.indexOf("scheduleHeavyBudgetReconcile('visible_preview_defer_retry', HEAVY_RESTORE_DEFER_RETRY_DELAY)") !== -1, 'visible preview deferrals must schedule a bounded retry');
-  assert(viewport.indexOf('function getVisiblePreviewGraceReason') !== -1, 'visible preview grace restores must be visible in diagnostics');
-  assert(viewport.indexOf('function reconcileVisiblePreviewRoom') !== -1, 'stuck visible previews must be reconciled without clearing visible thumbnails');
-  assert(viewport.indexOf('function reconcileVisiblePreviewRoom(snapshot)') !== -1, 'stuck visible preview reconciliation must accept a reused heavy render snapshot');
-  assert(viewport.includes('visiblePreviewStuck = reconcileVisiblePreviewRoom(budget.snapshot).stuck;'), "heavy render budget reconciliation must reuse the budget snapshot for visible preview room checks");
-  assert(viewport.includes('var items = snapshot.items || [];\n    var stuck = 0;'), "stuck visible preview reconciliation must collect candidates in one pass");
-  assert(viewport.indexOf('var stuckItems = (snapshot.items || []).filter') === -1, 'stuck visible preview reconciliation must not allocate a filter result before sorting');
-  assert(viewport.indexOf("'visible_preview_stable_grace'") !== -1, 'stable visible preview grace restores must be visible in diagnostics');
-  assert(viewport.indexOf("'visible_preview_late_grace'") !== -1, 'late visible preview grace restores must be visible in diagnostics');
-  assert(viewport.indexOf("'visible_preview_last_chance'") !== -1, 'last-chance visible preview grace restores must be visible in diagnostics');
-  assert(viewport.indexOf("'visible_preview_starvation_grace'") !== -1, 'starvation visible preview grace restores must be visible in diagnostics');
-  assert(viewport.indexOf("reason: 'visible_preview_rotate_unload'") === -1, 'visible preview recovery must not unload already clear visible thumbnails');
-  assert(viewport.indexOf('visiblePreviewHoldUntil') === -1, 'visible preview recovery must not hold rotated clear thumbnails');
-  assert(viewport.includes('function getHeavyRestoreDelayInfo(mp, stats, restoredVisibleMP, restoredRangeMP)'), "heavy thumbnail restore delay must adapt to MP pressure");
-  assert(viewport.indexOf("reason: 'budget_unload'") !== -1, 'heavy thumbnail render budget must release loaded thumbnails outside the selected budget');
-  assert(viewport.indexOf('getHeavyRenderStats: function()') !== -1, 'viewport diagnostics must expose heavy render budget stats');
-  assert(loader.indexOf('heavyVisibleMP: heavyRenderStats ? heavyRenderStats.heavyVisibleMP : 0') !== -1, 'scheduler diagnostics must include visible heavy decoded-pixel pressure');
-  assert(loader.indexOf("typeof fields === 'function' ? fields()") !== -1, 'throttled scheduler diagnostics must avoid expensive render stats until a log is emitted');
-  assert(viewport.indexOf('function queueHeavyRestore') !== -1, 'heavy thumbnail restore must use a queue instead of immediate bulk restore');
-  assert(viewport.indexOf('function isHeavyThumbnailLightweightMode') !== -1, 'heavy thumbnail rendering must expose lightweight-mode detection');
-  assert(viewport.indexOf('ATPLoadPolicy.getHeavyLightweightPreviewEdge(getCurrentSettings() || {})') !== -1, 'lightweight heavy thumbnail mode must use the public preview-edge setting');
-  assert(viewport.indexOf('HEAVY_LIGHTWEIGHT_PREVIEW_MAX_EDGE = 160') === -1, 'lightweight heavy thumbnail mode must not retain a fixed 160px edge');
-  assert(viewport.indexOf("'lightweight_mode_unload'") !== -1, 'lightweight heavy thumbnail mode must unload loaded clear thumbnails');
-  assert(viewport.indexOf("'lightweight_mode_hold'") !== -1, 'lightweight heavy thumbnail mode must hold previews out of the restore queue');
-  assert(viewport.includes('data.restoreQueued = false;\n        data.lightweightModeHold = true;'), "restore queue must clear flags and hold previews in lightweight mode");
-  assert(viewport.includes('if (isHeavyThumbnailLightweightMode()) {'), "heavy restore processing must enforce lightweight mode");
-  assert(content.includes("applyMode === 'hotReload' && previousSettings[item.key] !== nextSettings[item.key]") && settingsSchema.includes("key: 'heavyThumbnailClarity'"), "clarity setting changes must follow the schema hot-reload boundary");
-  assert(viewport.indexOf('heavyRestoreQueue.forEach(function(wrapper)') === -1, 'heavy thumbnail clarity queue cleanup must not allocate Array.forEach callbacks');
-  assert(viewport.indexOf('heavyRenderItems.forEach(function(data, wrapper) {\n          if (!data || !document.contains(wrapper)) return;\n          data.lightweightModeHold = true;') === -1, 'lightweight clarity changes must not allocate Map.forEach callbacks');
-  assert(viewport.indexOf('heavyRenderItems.forEach(function(data, wrapper) {\n        if (!data || !document.contains(wrapper)) return;\n        data.lightweightModeHold = false;') === -1, 'balanced clarity changes must not allocate Map.forEach callbacks');
-  assert(content.indexOf('reloadNeeded') !== -1, 'content must detect schema-driven settings that require thumbnail reloads');
-  assert(content.indexOf('nowEnabled && wasEnabled && reloadNeeded') !== -1, 'non-immediate settings changes must reload rendered thumbnails');
-  assert(content.indexOf('initialSettings: ATPConfig.settings') !== -1, 'content must pass already-loaded settings into the floating panel to avoid a duplicate startup storage read');
-  assert(floatingPanel.indexOf('_ensureSettingsRendered()') !== -1, 'floating panel must lazily render settings when the panel is opened');
-  assert(floatingPanel.indexOf('_ensureHelpRendered()') !== -1, 'floating panel must lazily render help only when help is opened');
-  assert(floatingPanel.indexOf("this._loadSettings().then(() => {\n        if (this._destroyed) return;\n        this._settingsReady = true;") !== -1, 'floating panel async settings load must defer rendering until the panel is opened');
-  assert(floatingPanel.indexOf("this._renderSettings();\n      this._renderHelp();") === -1, 'floating panel constructor must not render hidden settings and help content after settings load');
-  assert(loader.indexOf('heavyLightweightPreviewMaxEdge') !== -1, 'diagnostic summaries must expose the configured lightweight preview edge');
-  assert(loader.indexOf('function isLightweightHeavyThread') !== -1, 'loader must detect lightweight heavy threads for staged loading');
-  assert(loader.includes('isHeavyChannelTask: function(task) { return isHeavyChannelTask(task, ATPLoader.getSettings()); }'), "loader must expose shared heavy-channel classification");
-  assert(loader.indexOf('function getCandidateFallbackLimit') !== -1, 'loader must centralize fallback limits by task type');
-  assert(loader.indexOf('getLightweightHeavyBackgroundBatchSize') !== -1, 'lightweight heavy background loading must be batched by row');
-  assert(loader.indexOf("reason: 'lightweight_bg_batch'") !== -1, 'lightweight heavy staged batches must be visible in scheduler diagnostics');
-  assert(loader.indexOf('backgroundBatch: true') !== -1, 'background tasks must track staged batch completion');
-  assert(viewport.indexOf('function processHeavyRestoreQueue') !== -1, 'heavy thumbnail restore queue must have a batch processor');
-  assert(viewport.indexOf('var writeIndex = 0;\n    for (var readIndex = 0; readIndex < heavyRestoreQueue.length; readIndex++)') !== -1, 'heavy restore queue cleanup must compact the queue in place');
-  assert(viewport.indexOf('heavyRestoreQueue.length = writeIndex') !== -1, 'heavy restore queue cleanup must trim stale entries after in-place compaction');
-  assert(viewport.indexOf('heavyRestoreQueue = heavyRestoreQueue.filter') === -1, 'heavy restore queue cleanup must not rebuild the queue with filter');
-  assert(viewport.indexOf('var queuedIndex = heavyRestoreQueue.indexOf(wrapper)') !== -1, 'single heavy restore queue removals must avoid rebuilding the whole queue');
-  assert(viewport.indexOf('var consumeIndex = 0;\n    while (consumeIndex < heavyRestoreQueue.length && restored < batchLimit)') !== -1, 'heavy restore queue consumption must use an index cursor');
-  assert(viewport.indexOf('if (consumeIndex > 0) heavyRestoreQueue.splice(0, consumeIndex)') !== -1, 'heavy restore queue consumption must trim the consumed prefix once');
-  assert(viewport.indexOf('heavyRestoreQueue.shift()') === -1, 'heavy restore queue consumption must not shift each restored item');
-  assert(viewport.indexOf('heavyRestoreQueue.unshift(wrapper)') === -1, 'heavy restore queue consumption must leave lane-limited items in place instead of unshifting them');
-  assert(viewport.includes('var mpDiff = (restoreQueueMP.get(a) || 0) - (restoreQueueMP.get(b) || 0);'), "visible heavy restore queue must prefer lower-MP thumbnails first");
-  assert(viewport.indexOf("logHeavyRender('render_unload'") !== -1, 'heavy thumbnail release must emit render_unload diagnostics');
-  assert(viewport.indexOf("logHeavyRender('render_restore'") !== -1, 'heavy thumbnail restore must emit render_restore diagnostics');
-  assert(viewport.indexOf("data.img.removeAttribute('src')") !== -1, 'offscreen heavy thumbnails must release their image source');
-  assert(viewport.indexOf('function captureHeavyPreview') !== -1, 'released heavy thumbnails must keep a low-cost preview when possible');
-  assert(viewport.indexOf('function prewarmHeavyPreview') !== -1, 'heavy thumbnails must prepare previews before they are released');
-  assert(viewport.indexOf('function scheduleDeferredHeavyPreviewPrewarm(wrapper, data)') !== -1, 'balanced heavy thumbnails must be able to defer preview prewarming off the image onload path');
-  assert(viewport.includes('requestIdleCallback(run, { timeout: 200 })'), "balanced heavy preview prewarming must prefer idle time");
-  assert(viewport.indexOf('function clearDeferredHeavyPreviewPrewarm(data)') !== -1, 'deferred heavy preview prewarming must be cancellable during cleanup and pause');
-  assert(viewport.indexOf("var previewReady = prewarmHeavyPreview(wrapper, data);\n      if (isHeavyThumbnailLightweightMode())") === -1, 'balanced heavy monitor must not prewarm canvas before checking lightweight mode and render budget');
-  assert(/monitorLoadedHeavyImage:[\s\S]*?if \(isHeavyThumbnailLightweightMode\(\)\) \{\s+var previewReady = prewarmHeavyPreview\(wrapper, data\);[\s\S]*?reconcileHeavyRenderBudget\('monitor_loaded'\);\s+scheduleDeferredHeavyPreviewPrewarm\(wrapper, data\);/.test(viewport), 'loaded heavy monitor must keep immediate lightweight prewarm but defer balanced prewarm until after budget reconciliation');
-  assert(/if \(didLoad\) \{\s+data\.restoreRetryCount = 0;\s+if \(isHeavyThumbnailLightweightMode\(\)\) \{\s+var restoredPreviewReady = prewarmHeavyPreview\(wrapper, data, true\);[\s\S]*?if \(unloadHeavyImage\(wrapper, data,[\s\S]*?\)\) return;[\s\S]*?reconcileHeavyRenderBudget\('restore_loaded'\);\s+scheduleDeferredHeavyPreviewPrewarm\(wrapper, data\);/.test(viewport), 'restored heavy thumbnails must keep immediate lightweight prewarm, retain the source when preview capture fails, and defer balanced prewarm until after budget reconciliation');
-  assert(viewport.indexOf('HEAVY_PREVIEW_PREWARM_ENABLED = true') !== -1, 'heavy thumbnail preview prewarming must stay enabled');
-  assert(viewport.indexOf('(!data.unloaded && !data.restoreLoading)') !== -1, 'visible preview waiting must include restore-loading thumbnails');
-  assert(viewport.indexOf("logRenderStateThrottled(data, 'preview_prewarm'") !== -1, 'preview prewarm diagnostics must be available');
-  assert(viewport.indexOf("document.createElement('canvas')") !== -1, 'heavy thumbnail preview must use a tiny canvas instead of keeping the full image decoded');
-  assert(viewport.indexOf('previewKept') !== -1, 'heavy thumbnail release logs must report whether a preview was kept');
-  assert(viewport.indexOf('atp-heavy-preview-active') !== -1, 'heavy thumbnail preview visibility must be controlled by a stable class');
-  assert(contentCss.indexOf('.atp-heavy-preview-pending::before') !== -1, 'heavy thumbnails must have a low-cost placeholder before canvas previews are available');
-  assert(loader.indexOf("wrapper.classList.add('atp-heavy-preview-pending')") !== -1, 'initial heavy image loads must show the low-cost placeholder before the image finishes');
-  assert(loader.indexOf('var heavyTask = isHeavyChannelTask(task)') !== -1, 'direct heavy image loads must enter render budgeting before being revealed');
-  assert(viewport.indexOf('var heavyTask = !!(ATPLoader.isHeavyChannelTask') !== -1, 'viewport heavy image loads must enter render budgeting before being revealed');
-  const loaderHeavyPreviewClickHandlers = loader.match(/wrapper\.onclick = function\(evt\) \{[\s\S]*?openPreview\(true\);[\s\S]*?\};/g) || [];
-  assert(loader.indexOf('wrapper.onclick = openPreview') === -1 && loaderHeavyPreviewClickHandlers.length >= 2, 'heavy preview wrappers must remain clickable while requesting opener-first focus restore');
-  assert(viewport.indexOf("data.wrapper.classList.add('atp-heavy-preview-pending')") !== -1, 'delayed heavy restores must keep a fallback placeholder when no canvas preview is ready');
-  assert(viewport.indexOf('previewFallbackActive') !== -1, 'heavy render diagnostics must report fallback placeholder visibility');
-  assert(loader.indexOf('previewFallbackActive') !== -1, 'diagnostic summaries must count fallback placeholder visibility');
-  assert(loader.indexOf('maxVisiblePreviewWaitMS') !== -1, 'diagnostic summaries must expose visible preview wait time');
-  assert(loader.indexOf('visiblePreviewGrace') !== -1, 'diagnostic summaries must count visible preview grace restores');
-  assert(loader.indexOf('visiblePreviewStableGrace') !== -1, 'diagnostic summaries must count stable visible preview grace restores separately');
-  assert(loader.indexOf('visiblePreviewLateGrace') !== -1, 'diagnostic summaries must count late visible preview grace restores separately');
-  assert(loader.indexOf('visiblePreviewLastChance') !== -1, 'diagnostic summaries must count last-chance visible preview grace restores separately');
-  assert(loader.indexOf('visiblePreviewStarvation') !== -1, 'diagnostic summaries must count starvation visible preview grace restores separately');
-  assert(loader.indexOf('visiblePreviewDeferred') !== -1, 'diagnostic summaries must count visible preview deferrals');
-  assert(loader.includes('summary.visiblePreviewGrace++') && loader.includes('visiblePreviewStuck'), "diagnostic summaries must track preview grace and stuck previews");
-  assert(loader.indexOf('visiblePreviewStuck') !== -1, 'diagnostic summaries must expose stuck visible preview backlog');
-  assert(viewport.indexOf("logHeavyRender('render_restore_error'") !== -1, 'heavy thumbnail restore errors must keep diagnostics while preserving the preview fallback');
-  assert(viewport.indexOf('retryVisiblePending: function(actualOnly)') !== -1, 'viewport pending heavy loads must retry when scrolling goes idle');
-  assert(viewport.indexOf('HEAVY_LIGHTWEIGHT_PRELOAD_MARGIN_PX = 2400') !== -1, 'lightweight heavy viewport loads must prewarm before reaching the visible viewport');
-  assert(viewport.indexOf('HEAVY_LIGHTWEIGHT_PRELOAD_VIEWPORT_MULTIPLIER = 4') !== -1, 'lightweight heavy prewarm margin must scale with viewport height');
-  assert(viewport.indexOf('function getLightweightHeavyPreloadMarginPx') !== -1, 'lightweight heavy prewarm margin must be computed dynamically');
-  assert(viewport.indexOf('lightweightHeavyPreloadObserver') !== -1, 'lightweight heavy preloading must use a separate observer so ordinary images keep their lazy margin');
-  assert(viewport.indexOf('data.lightweightPreloadMarginPx = marginPx;\n        lightweightHeavyPreloadObserver.observe(wrapper);') !== -1, 'lightweight heavy preload observer must preserve pending margin and observation setup');
-  assert(viewport.indexOf('pendingWrappers.forEach(function(data, wrapper) {\n      if (data && !data.loaded && data.lightweightPreloadEligible)') === -1, 'lightweight heavy preload observer setup must not allocate a Map.forEach callback');
-  assert(viewport.indexOf("forceLoadReason = 'lightweight_preload'") !== -1, 'lightweight heavy preload starts must be diagnosable');
-  assert(viewport.indexOf('pendingCreatedDistancePx') !== -1, 'viewport diagnostics must record pending distance at creation time');
-  assert(viewport.indexOf('preloadMissReason') !== -1, 'viewport diagnostics must explain missed lightweight preload opportunities');
-  assert(viewport.indexOf('pendingAgeByQueueKind') !== -1, 'viewport diagnostics must group pending age by queue kind');
-  assert(viewport.indexOf('getPendingStats: function()') !== -1, 'viewport diagnostics must expose pending age and preload stats');
-  assert(/getPendingStats: function\(\) \{[\s\S]*?prunePendingWrappers\(true\);[\s\S]*?var now = Date\.now\(\);/.test(viewport), 'viewport pending diagnostics must prune stale entries and keep a single timestamp per stats pass');
-  assert(viewport.indexOf('var pendingEntries = pendingWrappers.entries();') !== -1, 'viewport pending diagnostics must scan pending wrappers without Map.forEach callbacks');
-  assert(/if \(!data\) continue;[\s\S]*?var age = data\.observedAt/.test(viewport), 'viewport pending diagnostics must preserve invalid item guards while using loop control');
-  assert(viewport.indexOf('actualVisiblePendingCount: actualVisiblePendingWrappers.size') !== -1, 'viewport diagnostics must expose the direct actual-visible pending queue size');
-  assert(viewport.indexOf('oldestVisiblePendingAgeMs') !== -1, 'viewport diagnostics must expose visible-to-request scheduling delay');
-  assert(viewport.indexOf('pendingWrappers.forEach(function(data, wrapper) {\n        if (!data) return;\n        var age = data.observedAt') === -1, 'viewport pending diagnostics must not allocate a Map.forEach callback');
-  assert(viewport.indexOf('getHeavyUnloadedCount: function()') !== -1, 'viewport diagnostics must expose the number of released heavy thumbnails');
-  assert(viewport.indexOf('getHeavyUnloadedCount: function() {\n      var count = 0;\n      var renderValues = heavyRenderItems.values();') !== -1, 'viewport heavy-unloaded diagnostics must scan tracked items without Map.forEach callbacks');
-  assert(viewport.indexOf('if (data && data.unloaded) count++;') !== -1, 'viewport heavy-unloaded diagnostics must preserve unloaded counting semantics');
-  assert(viewport.indexOf('heavyRenderItems.forEach(function(data) {\n        if (data && data.unloaded) count++;') === -1, 'viewport heavy-unloaded diagnostics must not allocate a Map.forEach callback');
-  assert(viewport.indexOf('heavyUnloaded: 0') !== -1, 'heavy render snapshots must include unloaded thumbnail counts');
-  assert(viewport.indexOf('if (data && data.unloaded) stats.heavyUnloaded++;') !== -1, 'heavy render snapshots must count unloaded thumbnails while scanning render items');
-  assert(viewport.indexOf('function getHeavyRenderLogFields(renderContext)') !== -1, 'heavy render log fields must accept a reusable snapshot or stats context');
-  assert(viewport.indexOf('stats = stats || getHeavyRenderSnapshot().stats;') !== -1, 'heavy render log fields must only build a fresh snapshot when no reusable context exists');
-  assert(viewport.indexOf('heavyUnloaded: stats.heavyUnloaded') !== -1, 'heavy render log fields must expose unloaded counts from the shared snapshot');
-  assert(/function logHeavyRender\(type, data, extra, renderContext\)[\s\S]*?var renderFields = getHeavyRenderLogFields\(renderContext\);[\s\S]*?ATPLoader\.logRenderEvent/.test(viewport), 'heavy render logs must reuse supplied heavy render fields context when available');
-  assert(!/function logHeavyRender\(type, data, extra, renderContext\)[\s\S]*?var renderFields = getHeavyRenderLogFields\(\);[\s\S]*?ATPLoader\.logRenderEvent/.test(viewport), 'heavy render logs must not unconditionally rebuild render snapshots');
-  assert(viewport.indexOf('}, restoreQueueBudget && restoreQueueBudget.snapshot);') !== -1, 'heavy restore batch logs must reuse the queue budget snapshot');
-  assert(viewport.indexOf('}, budgetSnapshot);') !== -1, 'heavy budget reconcile logs must reuse the budget snapshot');
-  assert(viewport.indexOf('unloadedCount: renderFields.heavyUnloaded') !== -1, 'heavy render logs must reuse the shared heavyUnloaded snapshot field');
-  assert(viewport.indexOf('unloadedCount: ATPViewport.getHeavyUnloadedCount()') === -1, 'heavy render logs must not rescan unloaded counts before building render fields');
-  assert(viewport.indexOf('getHeavyRestoreQueueCount: function()') !== -1, 'viewport diagnostics must expose queued heavy thumbnail restores');
-  assert(settingsSchema.indexOf("key: 'debugLogging'") !== -1 && settingsSchema.indexOf('default: false') !== -1, 'diagnostic logging must be a user-controlled setting that defaults off');
-  assert(logger.indexOf('var debugEnabled = false;') !== -1, 'content DEBUG logging must fail closed by default');
-  assert(logger.indexOf('if (!isEnabled(level)) return;') < logger.indexOf('var timestampDate = new Date();'), 'content DEBUG gate must run before timestamp and field work');
-  assert(logger.indexOf("buffer.length >= 20 || (level === 'WARN' && type !== 'image_failure') || level === 'ERROR'") !== -1,
-    'content WARN and ERROR logs must flush promptly while repeated image failures use the bounded batch');
-  assert(background.indexOf('var debugEnabled = false;') !== -1, 'background DEBUG logging must fail closed on worker startup');
-  assert(background.indexOf('if (!isEnabled(lv)) return;') < background.indexOf('var timestampDate = new Date();'), 'background DEBUG gate must run before serialization work');
-  assert(background.indexOf('function syncBackgroundDebugLogging(rawSettings)') !== -1, 'background must synchronize the persisted diagnostic setting on every worker start');
-  assert(background.indexOf("setInterval(flush, 5000)") === -1, 'background log correctness must not depend on an MV3 service-worker interval');
-  assert(content.indexOf('Logger.setDebugEnabled(nextSettings.debugLogging === true)') !== -1, 'content must apply live diagnostic setting changes');
-  assert(loader.indexOf('function isDiagnosticLoggingEnabled(level)') !== -1, 'loader must centralize diagnostic hot-path gating');
-  assert(loader.indexOf("if (!isDiagnosticLoggingEnabled(level || 'DEBUG')) return;") < loader.indexOf('var logFields = getTaskLogFields(task, fields);'), 'loader image diagnostics must gate before building task snapshots');
-  assert(loader.indexOf("if (!isDiagnosticLoggingEnabled('DEBUG')) return;\n    if (!isSummaryDiagnosticType(type)) return;") !== -1, 'loader diagnostic summaries must be disabled before aggregation work');
-  assert(viewport.indexOf("if (ATPLoader.isDiagnosticLoggingEnabled && !ATPLoader.isDiagnosticLoggingEnabled('DEBUG')) return;") !== -1, 'viewport heavy render diagnostics must gate before snapshot and metric work');
-  assert(logger.indexOf('function formatConsoleData') !== -1, 'content console diagnostics must print compact structured fields instead of opaque Object values');
-  assert(logger.indexOf('function formatLocalTimestamp') !== -1, 'content logs must format local timestamps explicitly');
-  assert(logger.indexOf('tsUtc: timestampDate.toISOString()') !== -1, 'content logs must retain UTC timestamps for timezone-safe diagnostics');
-  assert(logger.indexOf('timezoneOffsetMinutes') !== -1, 'content logs must retain timezone offset metadata');
-  assert(logger.indexOf('MAX_FIELD_KEYS = 80') !== -1, 'content render diagnostics must keep enough structured fields for heavy pressure analysis');
-  assert(logger.indexOf('PRIORITY_FIELD_KEYS') !== -1, 'content logger must keep fallback rescue diagnostics before lower-priority fields');
-  assert(logger.indexOf("'heavyHostState'") !== -1, 'content logger must preserve heavy host state transitions');
-  assert(logger.indexOf("'heavyHostConfiguredLimit'") !== -1, 'content logger must preserve the user-configured heavy ceiling');
-  assert(logger.indexOf("'heavyHostAdaptiveLimit'") !== -1, 'content logger must preserve the effective adaptive heavy ceiling');
-  assert(logger.indexOf("'heavyHostCooldownRemainingMs'") !== -1, 'content logger must preserve configured heavy cooldown diagnostics');
-  assert(logger.indexOf("'coolingTimeoutMode'") !== -1, 'content logger must preserve high-fanout timeout mode fields in structured entries');
-  assert(logger.indexOf("'lightweightPreloadTriggered'") !== -1, 'content logger must preserve lightweight heavy preload fields');
-  assert(logger.indexOf("'preloadMissReason'") !== -1, 'content logger must preserve lightweight preload miss reasons');
-  assert(logger.indexOf("'pendingAgeByQueueKind'") !== -1, 'content logger must preserve queue-kind pending diagnostics');
-  assert(logger.indexOf("'heavyOrdinaryPressureSoftened'") !== -1, 'content logger must preserve softened ordinary-pressure fields');
-  assert(logger.indexOf("'pickedIndex'") !== -1, 'content logger must preserve picked candidate indexes in fallback entries');
-  assert(logger.indexOf('MAX_ENTRIES = 800') !== -1, 'content logs must retain enough entries for heavy image tuning sessions');
-  assert(background.indexOf('function formatConsoleData') !== -1, 'background console diagnostics must print compact structured fields instead of opaque Object values');
-  assert(background.indexOf('function formatLocalTimestamp') !== -1, 'background logs must format local timestamps explicitly');
-  assert(background.indexOf('tsUtc: timestampDate.toISOString()') !== -1, 'background logs must retain UTC timestamps for timezone-safe diagnostics');
-  assert(background.indexOf('timezoneOffsetMinutes') !== -1, 'background logs must retain timezone offset metadata');
-  assert(background.indexOf('timezoneNameCache = null') !== -1, 'background logs must cache the service-worker timezone name instead of creating Intl formatters per log');
-  assert(background.indexOf('function flushSoon(delay)') !== -1, 'background logger must expose a coalesced delayed flush path for success logs');
-  assert(background.includes("BGLOG.debug('文章批量提取'"), "background article fetches must aggregate successful per-article diagnostics into chunk summaries");
-  assert(background.indexOf("BGLOG.info('响应'") === -1, 'background article fetches must not log successful responses per article');
-  assert(background.indexOf("BGLOG.info('HTML'") === -1, 'background article fetches must not log successful HTML sizes per article');
-  assert(background.indexOf("BGLOG.info('提取'") === -1, 'background article fetches must not log successful extraction totals per article');
-  assert(/function\(r\) \{ sendResponse\(Object\.assign\(deniedImageResponses, r \|\| \{\}\)\); BGLOG\.flushSoon\(\); \}/.test(background), 'background FETCH_IMAGES success path must merge denied URL responses and respond before scheduling log flush');
-  assert(background.indexOf('BGLOG.flush(); sendResponse(r);') === -1, 'background FETCH_IMAGES success path must not force a log storage write before responding');
-  assert(/sendResponse\(\{\s+resources: SharedUtils\.normalizeResources\(status\.resources\),\s+attemptedCount: status\.attemptedCount,\s+unresolvedCount: status\.unresolvedCount,\s+retryableCount: status\.retryableCount,\s+accessDeniedCount: status\.accessDeniedCount \|\| 0,\s+queueStatus: status\.queueStatus \|\| 'completed'\s+\}\);\n      BGLOG\.flushSoon\(\);/.test(background), 'background FETCH_TEXT_RESOURCES must respond with TXT and queue status before scheduling log flush');
-  assert(loader.indexOf('HEAVY_BG_STOP_LOSS_MIN_HOST_FAILURES') === -1, 'loader must not retain a hidden cooled background stop-loss threshold');
-  assert(loader.indexOf('function isHeavyCoolingBackgroundStopLossThread') === -1, 'loader must defer open-host background work instead of discarding it through stop-loss');
-  assert(loader.indexOf('LIGHTWEIGHT_HEAVY_ORDINARY_PRESSURE_LIMIT = 3') === -1, 'lightweight heavy mode must not retain the old hidden mixed-page limit of 3');
-  assert(loader.indexOf('function getHighFanoutSlotLimitForTask') !== -1, 'high-fanout limits must be task-aware for lightweight heavy tuning');
-  assert(loader.indexOf('heavyOrdinaryReservedSlots') !== -1, 'scheduler diagnostics must expose the user-configured ordinary slot reservation');
-  assert(loader.indexOf('maxPendingAgeByQueueKind') !== -1, 'aggregated diagnostics must expose queue-kind pending age peaks');
-  assert(loader.indexOf('preloadMissReasons') !== -1, 'aggregated diagnostics must expose lightweight preload miss reasons');
-  assert(loader.indexOf('sampleOffset: 0') !== -1, 'host timing diagnostics must track a fixed-size sample ring offset');
-  assert(loader.indexOf('stats.samples[stats.sampleOffset] = ms') !== -1, 'host timing diagnostics must overwrite old samples without shifting the array');
-  assert(loader.indexOf('stats.sampleOffset = (stats.sampleOffset + 1) % 80') !== -1, 'host timing diagnostics must advance the sample ring offset');
-  assert(loader.indexOf('stats.samples.shift()') === -1, 'host timing diagnostics must not shift samples on every overflow');
-  assert(loader.indexOf('var smallest = []') !== -1, 'host timing percentile must use bounded selection instead of copying and sorting samples');
-  assert(loader.indexOf('values.slice().sort(function(a, b)') === -1, 'host timing percentile must not allocate and sort a copied sample array');
-  assert(loader.indexOf('function collectTopKeys(map, limit, getCount)') !== -1, 'loader diagnostic top-N summaries must use bounded key collection');
-  assert(loader.indexOf('Object.keys(map || {}).sort') === -1, 'loader diagnostic count summaries must not sort all keys');
-  assert(loader.indexOf('Object.keys(summary.hostStats || {}).sort') === -1, 'loader host timing summaries must not sort all hosts');
-  assert(loader.indexOf('function applyHeavyBackgroundDeferred(ts, threadId, deferInfo)') !== -1, 'loader must defer open-host background queues without consuming candidates');
-  assert(loader.indexOf("reason: 'heavy_bg_deferred'") !== -1, 'loader diagnostics must expose resumable heavy background deferrals');
-  assert(loader.indexOf('DEFERRED_HEAVY_THREADS[threadId] = true') !== -1, 'loader must keep deferred heavy threads resumable after cooldown');
-  assert(popup.indexOf('/^(content_start|image_|render_|first_screen_timing|diagnostic_summary|schedule_state|thread_registered|scan_complete|fallback_|log_retention)/') !== -1, 'popup image log filter must include startup, first-screen timing, render diagnostics, summaries, fallback diagnostics, and retention status');
-  assert(popupHtml.indexOf('id="toggleHelp"') !== -1 && popupHtml.indexOf('aria-label="展开使用说明"') !== -1, 'popup help disclosure must start with a contextual aria-label');
-  assert(popupHtml.indexOf('id="toggleLogs"') !== -1 && popupHtml.indexOf('aria-label="展开诊断日志"') !== -1, 'popup log disclosure must start with a contextual aria-label');
-  assert(popup.indexOf('function setDisclosureState(button, panel, expanded)') !== -1, 'popup disclosure state must be centralized');
-  assert(popup.indexOf("var labelTarget = controls === 'helpPanel' ? '使用说明' : (controls === 'logPanel' ? '诊断日志' : '')") !== -1, 'popup disclosure labels must include the controlled panel context');
-  assert(popup.indexOf("el.setAttribute('aria-invalid', 'true')") !== -1, 'popup invalid numeric inputs must set aria-invalid');
-  assert(popup.indexOf("el.setAttribute('aria-describedby', 'popupStatus')") !== -1, 'popup invalid numeric inputs must point at the status live region');
-  assert(popup.indexOf("setPopupStatus('请输入' + item.label") !== -1, 'popup invalid numeric inputs must announce the valid range');
-  assert(popup.indexOf('if (!enabled) clearInputError(el);') !== -1, 'popup dependent disables must clear stale numeric error state');
-  assert(popup.indexOf('if (disabled && controls[i].matches && controls[i].matches(\'input[type="number"]\'))') !== -1, 'popup bulk disable must clear stale numeric error state');
-  assert(/function setUIValue\(key\)[\s\S]*?clearInputError\(el\);/.test(popup), 'popup programmatic setting redraws must clear stale numeric error state');
-  assert(/var key = btn\.getAttribute\('data-key'\);[\s\S]*?clearInputError\(el\);/.test(popup), 'popup reset buttons must clear stale numeric error state');
-  assert(contentCss.indexOf('.atp-heavy-thumbnail:hover .atp-thumbnail-img') !== -1, 'heavy thumbnails must avoid hover scale repaint cost');
-  assert(contentCss.indexOf('.atp-heavy-unloaded') !== -1, 'released heavy thumbnails must keep a stable placeholder style');
-  assert(contentCss.indexOf('.atp-heavy-preview-canvas') !== -1, 'released heavy thumbnails must display a low-cost preview layer');
-  assert(contentCss.indexOf('.atp-heavy-preview-lightweight .atp-heavy-preview-canvas') !== -1, 'lightweight heavy thumbnails must reduce preview blur styling');
-  assert(popupHtml.indexOf('id="logFilter"') !== -1, 'popup must provide log filter controls');
-  assert(popupHtml.indexOf('id="logSearch"') !== -1, 'popup must provide log search controls');
-  assert(popup.indexOf('function filterLogEntries(logs)') !== -1, 'popup must filter structured logs');
-  assert(popup.indexOf('var loadedLogEntries = null') !== -1, 'popup expanded log view must keep an in-memory loaded-log cache');
-  assert(popup.indexOf('var logLoadInFlight = false') !== -1, 'popup expanded log view must track in-flight log loads');
-  assert(popup.indexOf('var logCountSeq = 0') !== -1, 'popup folded log count refreshes must track async request order');
-  assert(/async function refreshLogCount\(\)[\s\S]*?var seq = \+\+logCountSeq;[\s\S]*?if \(seq !== logCountSeq\) return;[\s\S]*?els\.logCount\.textContent = logs\.length;/.test(popup), 'popup folded log count refresh must ignore stale async storage results');
-  assert(/function invalidateLogLoadState\(\)[\s\S]*?logLoadSeq\+\+;[\s\S]*?logCountSeq\+\+;/.test(popup), 'popup log clear paths must invalidate in-flight folded log count refreshes');
-  assert(popup.indexOf('function renderLoadedLogs(logs)') !== -1, 'popup log filter/search must be able to rerender cached logs without storage reads');
-  assert(popup.indexOf('function shouldFollowLogTail(viewer)') !== -1, 'popup log rendering must decide whether to keep following the newest logs before rerendering');
-  assert(popup.indexOf('var followTail = shouldFollowLogTail(els.logViewer);') !== -1, 'popup log rendering must capture scroll-follow state before replacing log HTML');
-  assert(popup.indexOf('if (followTail) els.logViewer.scrollTop = els.logViewer.scrollHeight;') !== -1, 'popup log rendering must not unconditionally jump to the newest logs');
-  assert(popup.indexOf('els.logViewer.scrollTop = els.logViewer.scrollHeight;') === popup.indexOf('if (followTail) els.logViewer.scrollTop = els.logViewer.scrollHeight;') + 'if (followTail) '.length, 'popup log rendering must not keep an unconditional scroll-to-bottom assignment');
-  assert(/function scheduleLogReload\(delay\)[\s\S]*?if \(loadedLogEntries\) \{[\s\S]*?renderLoadedLogs\(loadedLogEntries\);[\s\S]*?\} else if \(!logLoadInFlight\) \{[\s\S]*?loadLogs\(\{ allowDiscovery: false, prune: false \}\);/.test(popup), 'popup log search/filter rerenders must use loaded logs before falling back to a single storage read');
-  assert(popup.indexOf('loadedLogEntries = logs;\n      renderLoadedLogs(loadedLogEntries);') !== -1, 'popup full log loads must refresh the loaded-log cache before rendering');
-  assert(popup.indexOf('loadedLogEntries = null;\n      logLoadInFlight = false;\n      setLogViewerBusy(false);') !== -1, 'popup log collapse must invalidate the loaded-log cache and in-flight state so reopening refreshes storage');
-  assert(/if \(!els\.logPanel \|\| els\.logPanel\.classList\.contains\('hidden'\)\) \{[\s\S]*?els\.logCount\.textContent = logs\.length;[\s\S]*?\}/.test(popup), 'popup log export must only overwrite the count badge when the expanded log panel is hidden');
-  assert(popup.indexOf("if (filter === 'all' && !query) return logs;") !== -1, 'popup log filtering must reuse the original log array for the default all view');
-  assert(popup.indexOf("var latestSessionId = filter === 'session' ? getLatestSessionId(logs) : '';") !== -1, 'popup log filtering must compute latest session lazily');
-  assert(popup.indexOf('var filtered = [];\n    for (var i = 0; i < logs.length; i++)') !== -1, 'popup log filtering must collect matching entries in one pass');
-  assert(popup.indexOf('return logs.filter(function(e)') === -1, 'popup log filtering must not allocate a filter result for every load');
-  assert(popup.indexOf('function buildLogSummaryText(logs)') !== -1, 'popup log export must include a diagnostic summary');
-  assert(popup.indexOf('function buildLogSummaryStats(logs)') !== -1, 'popup log export summary must aggregate counters in one pass');
-  assert(popup.indexOf('function topCounts(logs') === -1, 'popup log export summary must not rescan logs separately for each counter');
-  assert(popup.indexOf('for (var i = 0; i < logs.length; i++)') !== -1, 'popup log export summary must scan logs without forEach callback allocation');
-  assert(popup.indexOf('logs.forEach(function(e)') === -1, 'popup log export summary must not allocate a forEach callback');
-  assert(popup.indexOf('var stats = buildLogSummaryStats(logs)') !== -1, 'popup log summary must reuse precomputed summary counters');
-  assert(popup.indexOf('function collectTopCountKeys(counts, limit)') !== -1, 'popup log summary counts must collect a bounded top count set');
-  assert(popup.indexOf('return Object.keys(counts).sort(function(a, b)') === -1, 'popup log summary counts must not sort all counter keys');
-  assert(popup.indexOf('}).slice(0, limit || 10).map(function(key)') === -1, 'popup log summary counts must not slice and map a sorted counter array');
-  assert(popup.indexOf('function getLogSortTimestamp') !== -1, 'popup log loading must sort by UTC timestamp when available');
-  assert(popup.indexOf('LOG_SEARCH_DEBOUNCE_MS = 180') !== -1, 'popup log search must debounce storage reloads while typing');
-  assert(popup.indexOf('function scheduleLogReload(delay)') !== -1, 'popup log reload scheduling must be centralized');
-  assert(popup.indexOf('scheduleLogReload(LOG_SEARCH_DEBOUNCE_MS)') !== -1, 'popup log search input must use debounced reload scheduling');
-  assert(popup.indexOf("if (!els.logPanel || els.logPanel.classList.contains('hidden')) return;") !== -1, 'popup scheduled log reloads must not run while the log panel is hidden');
-  assert(popup.indexOf('function appendUniqueKeys(out, keys, predicate)') !== -1, 'popup log index paths must share one-pass append/dedupe logic');
-  assert(popup.indexOf('for (var i = 0; i < LOG_KEYS.length; i++)') !== -1, 'popup log key discovery must seed fixed log keys without slice allocation');
-  assert(popup.indexOf('var keys = LOG_KEYS.slice();') === -1, 'popup log key discovery must not copy fixed log keys with slice');
-  assert(popup.indexOf('function collectUniqueKeys(groups, extraKey, predicate)') !== -1, 'popup maintenance actions must share one-pass grouped key dedupe');
-  assert(popup.indexOf('async function countExistingKeys(keys, action)') !== -1, 'popup maintenance count must be based on currently existing storage keys');
-  assert(popup.indexOf("return removeCacheKeys(keys);") !== -1, 'popup ordinary cache cleanup buttons must use removeCacheKeys returned counts');
-  assert(popup.indexOf('return collectUniqueKeys([indexedKeys, discoveredKeys]);') !== -1, 'popup cache key discovery must merge indexed and discovered keys without concat');
-  assert(popup.indexOf('var keys = collectUniqueKeys([cacheKeys, logKeys], LOG_KEY_INDEX);') !== -1, 'popup clear-all maintenance must merge cache and log keys without concat');
-  assert(popup.indexOf('var removedCount = countExistingKeysFromNames(keys, storageNames);') !== -1, 'popup clear-all maintenance must count existing keys before removal from the reused key set');
-  assert(popup.indexOf('return { count: removedCount, cacheIndexStatus: cacheIndexStatus };') !== -1, 'popup clear-all maintenance must report the actual existing-key removal count with cacheIndex status');
-  assert(popup.indexOf("var LOG_CLEARED_AT_KEY = 'atp_logs_cleared_at';") !== -1, 'popup log maintenance must keep a persistent clear marker for logger queues');
-  assert(popup.indexOf("var CACHE_GENERATION_KEY = (typeof SharedUtils !== 'undefined' && SharedUtils.CACHE_GENERATION_KEY) || 'atp_cache_generation_v1';") !== -1, 'popup cache maintenance must use the shared cache generation marker');
-  assert(popup.indexOf('async function markCacheGeneration()') !== -1, 'popup cache cleanup must centralize cache generation writes');
-  assert(popup.indexOf('async function clearCacheTypes(types)') !== -1, 'popup ordinary cache cleanup buttons must mark cache generation before key discovery');
-  assert(popup.indexOf('return clearCacheTypes([T.IMAGE, T.ARTICLE]);') !== -1, 'popup image/article cleanup must use the generation-aware cache cleanup path');
-  assert(popup.indexOf('await markCacheGeneration();\n    var T = SharedUtils.cacheIndex.TYPE;') !== -1, 'popup one-click cleanup must mark cache generation before discovering cache keys');
-  assert(popup.indexOf('async function removeKeysWithLogClearMarker(keys, action)') !== -1, 'popup log cleanup must wrap storage removal with a clear marker');
-  assert(popup.indexOf("await storageRemove(LOG_CLEARED_AT_KEY, '回滚日志清空标记');") !== -1, 'popup log cleanup must roll back the clear marker when storage removal fails');
-  assert(popup.indexOf("await removeKeysWithLogClearMarker(keys, '一键清空缓存');") !== -1, 'popup one-click cleanup must mark log clearing before removing storage keys');
-  assert(popup.indexOf("removeKeysWithLogClearMarker(collectUniqueKeys([logKeys], LOG_KEY_INDEX), '清空日志')") !== -1, 'popup clear-logs maintenance must append the log index key without concat and mark log clearing');
-  assert(popup.indexOf('filterLogsAfterClearedAt(logs, clearedAtMs)') !== -1, 'popup log reads must hide entries older than the latest clear marker');
-  assert(popup.indexOf('uniqueKeys(indexedKeys.concat(discoveredKeys))') === -1, 'popup cache key discovery must not concat indexed and discovered keys');
-  assert(popup.indexOf('cacheKeys.concat(logKeys).concat([LOG_KEY_INDEX])') === -1, 'popup clear-all maintenance must not concat cache and log key arrays');
-  assert(popup.indexOf('logKeys.concat([LOG_KEY_INDEX])') === -1, 'popup clear-logs maintenance must not concat log keys with the index key');
-  assert(popup.indexOf('for (var key in items)') !== -1, 'popup log key storage discovery must scan items without allocating Object.keys');
-  assert(popup.indexOf('Object.keys(items || {}).forEach(function(key)') === -1, 'popup log key storage discovery must not allocate a full item-key array');
-  assert(popup.includes('var merged = appendUniqueKeys([], keys, isContentLogKey);') && popup.includes('d[LOG_KEY_INDEX] = merged;'), "popup log index writes must filter and dedupe content log keys in one pass");
-  assert(popup.indexOf('var indexed = appendUniqueKeys([], keys, isContentLogKey);') !== -1, 'popup log key discovery must avoid a filter allocation for indexed content logs');
-  assert(popup.indexOf('appendUniqueKeys(keys, indexed, isLogKey);') !== -1, 'popup log index reads must append valid indexed log keys without concat/filter intermediates');
-  assert(popup.indexOf('uniqueKeys(keys).filter(isContentLogKey)') === -1, 'popup log index writes must not allocate unique keys before filtering content log keys');
-  assert(popup.indexOf('keys.filter(function(key) {\n      return isContentLogKey(key);') === -1, 'popup log key discovery must not allocate a filter result for content log keys');
-  assert(popup.indexOf('LOG_KEYS.concat(indexed.filter(isLogKey))') === -1, 'popup log index reads must not concat a filtered indexed-key array');
-  assert(popup.indexOf('function insertNewestContentLogKey(keys, key)') !== -1, 'popup content log pruning must maintain a bounded newest-key set');
-  assert(popup.indexOf('var contentKeys = (keys || []).filter(function(key)') === -1, 'popup content log pruning must not allocate a filtered content-key array');
-  assert(popup.indexOf('contentKeys.sort(function(a, b)') === -1, 'popup content log pruning must not sort all content log keys');
-  assert(popup.indexOf('return contentKeys.slice(MAX_CONTENT_LOG_KEYS)') === -1, 'popup content log pruning must not slice a sorted content-key array');
-  assert(popup.indexOf('var staleMap = {}') !== -1, 'popup content log pruning must build a stale-key map');
-  assert(popup.indexOf('for (var ki = 0; ki < (logKeys || []).length; ki++)') !== -1, 'popup content log pruning must keep live keys in one pass');
-  assert(popup.indexOf('stale.indexOf(key)') === -1, 'popup content log pruning must not do linear stale-key lookups for every log key');
-  assert(popup.indexOf('}).filter(function(key) {\n      return isContentLogKey(key);') === -1, 'popup content log pruning must not chain filters for kept log keys');
-  assert(popup.indexOf('var prunedLogKeyMap = {}') !== -1, 'popup log loading must build a stale-key map after pruning');
-  assert(popup.indexOf('var liveLogKeys = []') !== -1, 'popup log loading must rebuild live log keys in one pass after pruning');
-  assert(popup.indexOf('logKeys = logKeys.filter(function(key) { return staleLogKeys.indexOf(key) === -1; });') === -1, 'popup log loading must not filter pruned log keys with repeated indexOf lookups');
-  assert(popup.indexOf('var logLoadSeq = 0') !== -1, 'popup log loading must track async request order');
-  assert(popup.indexOf('var seq = ++logLoadSeq') !== -1, 'popup log loading must stamp each async read');
-  assert(popup.indexOf('if (seq !== logLoadSeq) return;') !== -1, 'popup log loading must ignore stale async results');
-  assert(popup.indexOf('function renderLogEntries(entries, startIndex)') !== -1, 'popup log rendering must use a centralized batch renderer');
-  assert(popup.indexOf('var renderStart = Math.max(0, filtered.length - LOG_RENDER_LIMIT);') !== -1, 'popup log rendering must compute the recent window without slicing');
-  assert(popup.indexOf('renderLogEntries(filtered, renderStart)') !== -1, 'popup log rendering must render from the filtered array directly');
-  assert(popup.indexOf('filtered.slice(-LOG_RENDER_LIMIT)') === -1, 'popup log rendering must not allocate a recent-log slice');
-  assert(popup.indexOf('recent.map(renderLogEntry).join') === -1, 'popup log rendering must avoid map/join intermediate arrays');
-  assert(popup.indexOf('function buildLogExportText(logs, version, exportDate, exportOffsetMinutes, exportTimezone)') !== -1, 'popup log export must use a centralized text builder');
-  assert(popup.indexOf("parts.push(formatLogLine(logs[i]), '\\n')") !== -1, 'popup log export must collect lines into an array before joining');
-  assert(popup.indexOf("return parts.join('');") !== -1, 'popup log export must join collected text once');
-  assert(popup.indexOf("text += formatLogLine(logs[i])") === -1, 'popup log export must not append exported lines by repeated string concatenation');
-  assert(popup.indexOf('var fields = getLogFields(e);') < popup.indexOf('if (e.data) return sanitizeLegacyLogDataText(e.data);'), 'popup log export must prefer structured fields over truncated data strings');
-  assert(popup.indexOf('function sanitizeLogExportFields(fields') !== -1, 'popup log export must sanitize legacy structured fields before display/export');
-  assert(popup.indexOf('var fieldCount = 0;\n    for (var key in fields)') !== -1, 'popup log export field sanitization must scan fields with a bounded loop');
-  assert(popup.indexOf('if (fieldCount++ >= 120) break;') !== -1, 'popup log export field sanitization must preserve the 120-field cap');
-  assert(popup.indexOf('Object.keys(fields).slice(0, 120)') === -1, 'popup log export field sanitization must not allocate sliced field-key arrays');
-  assert(popup.indexOf('var arrayLimit = Math.min(value.length, 50);') !== -1, 'popup log export array sanitization must preserve the 50-item cap');
-  assert(popup.indexOf('for (var i = 0; i < arrayLimit; i++)') !== -1, 'popup log export array sanitization must use a bounded loop');
-  assert(popup.indexOf('value.slice(0, 50).map') === -1, 'popup log export array sanitization must not allocate slice/map intermediate arrays');
-  assert(popup.indexOf('function hasLogFields(fields)') !== -1, 'popup log data text must check for fields without allocating keys');
-  assert(popup.indexOf('Object.keys(fields).length') === -1, 'popup log data text must not allocate keys just to test field presence');
-  assert(popup.indexOf('function sanitizeLegacyLogDataText(data)') !== -1, 'popup log export must sanitize legacy compact data strings before display/export');
-  assert(popup.indexOf('导出UTC') !== -1, 'popup log export must show UTC alongside local export time');
-  assert(popup.indexOf('formatLocalFilenameTimestamp') !== -1, 'popup log export filenames must use local time instead of UTC');
-  assert(popup.indexOf("line += ' | utc=' + sanitizeLogExportLabel(e.tsUtc)") !== -1, 'popup log export lines must keep sanitized per-entry UTC timestamps');
-  assert(popup.indexOf('LOG_VIEW_LIMIT = 1000') !== -1, 'popup must retain more recent logs for heavy image diagnostics');
-  assert(popup.indexOf('logs.splice(0, logs.length - LOG_VIEW_LIMIT)') !== -1, 'popup log loading must trim old log entries in place');
-  assert(popup.indexOf('logs = logs.slice(logs.length - LOG_VIEW_LIMIT)') === -1, 'popup log loading must not allocate a copied recent-log array');
-  assert(popup.indexOf('for (var key in entries)') !== -1, 'popup cache index scans must collect cache keys without allocating Object.keys');
-  assert(popup.indexOf('Object.keys(entries).forEach(function(key)') === -1, 'popup cache index scans must not allocate a full entry-key array');
-  assert(resourcePanel.indexOf('__atpResourcePanelBound') !== -1, 'resource panel must guard against duplicate panel event binding');
-  assert(resourcePanel.indexOf('var previousThread = panel.__atpResourceThread') !== -1, 'resource panel must keep state refs current when reusing panels');
-  assert(resourcePanel.indexOf('!hasResourcePayload(threadState.resources) && !hasPendingAttachments') !== -1, 'inline resource panel must render TXT parse action even before resources exist');
-  assert(resourcePanel.indexOf('function getCopyLabel(group)') !== -1, 'resource panel copy buttons must use contextual copy labels');
-  assert(resourcePanel.indexOf("aria-label=\"' + esc(getCopyLabel(groups[i])) + '\"") !== -1, 'resource panel copy buttons must expose contextual aria-labels');
-  assert(resourcePanel.indexOf('function getLiveRegionHtml(className)') !== -1, 'resource panel messages must be rendered through a live-region helper');
-  assert(resourcePanel.indexOf('function getStatusRegionHtml(tagName, className, text)') !== -1, 'resource panel sidebar TXT statuses must be rendered as live regions');
-  assert(resourcePanel.indexOf('function getPlainStatusHtml(tagName, className, text)') !== -1, 'resource panel inline empty status placeholders must have a non-live helper');
-  assert(resourcePanel.indexOf('role="status" aria-live="polite" aria-atomic="true"') !== -1, 'resource panel messages must start as polite live regions');
-  assert(resourcePanel.indexOf('<div class="atp-resource-empty" role="status" aria-live="polite" aria-atomic="true">聚焦或移到帖子缩略图区域查看资源链接</div>') !== -1, 'resource no-thread empty state must be announced as a polite live region');
-  assert(resourcePanel.indexOf('class="atp-resource-empty" role="status" aria-live="polite" aria-atomic="true"') !== -1, 'resource empty TXT status must be announced as a polite live region');
-  assert(resourcePanel.indexOf("getStatusRegionHtml('div', 'atp-resource-status', statusMessage)") !== -1, 'resource sidebar TXT status must be announced as a polite live region');
-  assert(resourcePanel.indexOf("getStatusRegionHtml('span', 'atp-resource-inline-status', statusMessage)") !== -1, 'resource inline persistent TXT status must announce non-empty status as a polite live region');
-  assert(resourcePanel.indexOf("getPlainStatusHtml('span', 'atp-resource-inline-status', '')") !== -1, 'resource inline empty TXT status placeholder must stay non-live');
-  assert(resourcePanel.indexOf("getPlainStatusHtml('span', 'atp-resource-inline-status', statusMessage)") === -1, 'resource inline non-empty TXT status must not stay a silent plain span');
-  assert(resourcePanel.indexOf('class="atp-resource-inline-msg" role="status" aria-live="polite" aria-atomic="true"') !== -1, 'resource inline user feedback must keep a polite live region');
-  assert(resourcePanel.indexOf("el.setAttribute('role', isError ? 'alert' : 'status')") !== -1, 'resource panel errors must switch message role to alert');
-  assert(resourcePanel.indexOf("el.setAttribute('aria-live', isError ? 'assertive' : 'polite')") !== -1, 'resource panel errors must switch live region politeness');
-  assert(resourcePanel.indexOf('function getResourceActionKey(btn)') !== -1, 'resource panel must capture focused action semantics before DOM replacement');
-  assert(resourcePanel.indexOf('function getFocusedResourceAction(root)') !== -1, 'resource panel must detect focused sidebar or inline action before rerender');
-  assert(resourcePanel.indexOf('function restoreResourceActionFocus(root, actionKey)') !== -1, 'resource panel must restore focus to the same semantic action after rerender');
-  assert(resourcePanel.indexOf('function restoreInlineResourceActionFocus(panel, actionKey)') !== -1, 'resource panel must map desktop sidebar actions back to inline actions');
-  assert(resourcePanel.indexOf("var attrs = [\n      'data-sidebar-pin-toggle',\n      'data-pin-toggle',\n      'data-copy-type',\n      'data-copy-all',\n      'data-copy-passwords',\n      'data-parse-txt'") !== -1, 'resource panel focus restore must cover pin, copy, password, and TXT actions');
-  assert(/var actionKey = getFocusedResourceAction\(el\);[\s\S]*?clearMessageTimers\(el\);[\s\S]*?el\.innerHTML = html;/.test(resourcePanel), 'resource sidebar rerender must capture focus and clear message timers before replacing innerHTML');
-  assert(resourcePanel.indexOf('function focusFirstResourceAction(root)') !== -1, 'resource sidebar rerender must have a fallback focus target when the previous action disappears');
-  assert(resourcePanel.indexOf('if (actionKey && !restoreResourceActionFocus(el, actionKey)) {\n      focusFirstResourceAction(el);\n    }') !== -1, 'resource sidebar rerender must move focus to a fallback action after replacing innerHTML');
-  assert(resourcePanel.indexOf('var inlineFocusKey = getFocusedResourceAction(old);') !== -1, 'resource inline rerender must capture focus before removing the old inline bar');
-  assert(resourcePanel.indexOf('if (inlineFocusKey && !restoreResourceActionFocus(box, inlineFocusKey))') !== -1, 'resource inline rerender must restore focus to the same action when possible');
-  assert(resourcePanel.indexOf('if (inlineFocusKey && !focusFirstInlineAction(panel)) releaseRemovedInlineFocus(panel);') !== -1, 'resource inline removal must move focus to a fallback action or release removed focus');
-  assert(resourcePanel.indexOf('var previousFocus = document.activeElement') !== -1, 'resource panel fallback copy must remember the trigger focus');
-  assert(resourcePanel.indexOf('function restoreFocus()') !== -1, 'resource panel fallback copy must restore focus after temporary textarea copy');
-  assert(resourcePanel.indexOf('restoreFocus();\n        if (ok) resolve();') !== -1, 'resource panel fallback copy must restore focus before reporting success');
-  assert(resourcePanel.indexOf('function getResourceTrigger(panel)') !== -1, 'resource panel must locate the real resource trigger button');
-  assert(resourcePanel.indexOf('function ensureResourceTrigger(panel, threadState)') !== -1, 'resource panel must create and maintain a real resource trigger button');
-  assert(resourcePanel.indexOf("panel.querySelector('[data-resource-trigger]')") !== -1, 'resource panel trigger must have a stable data selector');
-  assert(resourcePanel.indexOf("trigger.type = 'button';") !== -1, 'resource panel trigger must be a real non-submit button');
-  assert(resourcePanel.indexOf("trigger.className = 'atp-resource-trigger';") !== -1, 'resource panel trigger must have a dedicated style hook');
-  assert(resourcePanel.indexOf("trigger.setAttribute('data-resource-trigger', '1')") !== -1, 'resource panel trigger must expose a stable data attribute');
-  assert(resourcePanel.indexOf("trigger.setAttribute('aria-label'") !== -1, 'resource panel trigger must expose an accessible label');
-  assert(resourcePanel.indexOf('function removeResourceTrigger(panel)') !== -1, 'resource panel must remove the trigger when resource UI is disabled');
-  assert(resourcePanel.indexOf('function syncResourceTrigger(panel, threadState)') !== -1, 'resource panel must centralize trigger creation/removal behind settings state');
-  assert(resourcePanel.indexOf('if (isEnabled()) return ensureResourceTrigger(panel, threadState);') !== -1, 'resource panel trigger sync must only create the trigger while the resource panel is enabled');
-  assert(resourcePanel.indexOf('removeResourceTrigger(panel);') !== -1, 'resource panel trigger sync must remove stale triggers while disabled');
-  assert((resourcePanel.match(/syncResourceTrigger\(threadState\.panel, threadState\)/g) || []).length >= 1, 'resource panel updates must resync trigger visibility after settings changes');
-  assert((resourcePanel.match(/syncResourceTrigger\(panel, threadState\)/g) || []).length >= 1, 'resource panel attach must resync trigger visibility after reloads');
-  assert(resourcePanel.indexOf('panel.tabIndex = 0') === -1, 'resource panel container must not remain a keyboard trigger');
-  assert(resourcePanel.indexOf("sidebar.id = RESOURCE_SIDEBAR_ID") !== -1, 'resource sidebar must have a stable id for aria-controls');
-  assert(resourcePanel.indexOf("sidebar.setAttribute('role', 'region')") !== -1, 'resource sidebar must expose a labelled region');
-  assert(resourcePanel.indexOf("trigger.setAttribute('aria-controls', RESOURCE_SIDEBAR_ID)") !== -1, 'resource panel trigger button must point to the desktop sidebar');
-  assert(resourcePanel.indexOf("trigger.setAttribute('aria-expanded', currentThread === threadState && isSidebarVisible() ? 'true' : 'false')") !== -1, 'resource panel trigger button must expose only visible sidebar expansion state');
-  assert(/function isSidebarVisible\(\) \{[\s\S]*?var el = sidebar;[\s\S]*?if \(!el\) \{[\s\S]*?window\.matchMedia\(RESOURCE_NARROW_QUERY\)/.test(resourcePanel), 'resource sidebar visibility checks must not create an empty sidebar');
-  assert(!/function isSidebarVisible\(\) \{\s*var el = ensureSidebar\(\);/.test(resourcePanel), 'resource sidebar visibility checks must not call ensureSidebar as a side effect');
-  assert(resourcePanel.indexOf("panel.removeAttribute('aria-label')") !== -1, 'resource panel container must drop obsolete trigger aria-label');
-  assert(resourcePanel.indexOf("panel.removeAttribute('aria-controls')") !== -1, 'resource panel container must drop obsolete aria-controls');
-  assert(resourcePanel.indexOf("panel.removeAttribute('aria-expanded')") !== -1, 'resource panel container must drop obsolete aria-expanded');
-  assert(resourcePanel.indexOf("panel.removeAttribute('tabindex')") !== -1, 'resource panel container must drop obsolete tabindex');
-  assert(resourcePanel.indexOf("panel.setAttribute('aria-controls'") === -1, 'resource panel container must not own aria-controls');
-  assert(resourcePanel.indexOf("panel.setAttribute('aria-expanded'") === -1, 'resource panel container must not own aria-expanded');
-  assert(resourcePanel.indexOf('function updateThreadExpandedState(threadState, expanded)') !== -1, 'resource panel must centralize aria-expanded updates');
-  assert(resourcePanel.indexOf("if (trigger) trigger.setAttribute('aria-expanded', expanded ? 'true' : 'false');") !== -1, 'resource panel aria-expanded updates must target the trigger button');
-  assert(resourcePanel.indexOf('function updatePanelToggleState(panel, threadState)') !== -1, 'resource panel trigger must centralize pressed-state updates');
-  assert(resourcePanel.indexOf('function getPinToggleHtml(threadState, extraClass, dataAttr)') !== -1, 'resource panel pin toggles must share one markup helper');
-  assert(resourcePanel.indexOf('function getTextParseButtonHtml(threadState, compact)') !== -1, 'resource panel TXT parse buttons must share one markup helper');
-  assert(resourcePanel.indexOf('aria-disabled="true"') !== -1, 'resource panel TXT parse buttons must stay focusable but aria-disabled while loading');
-  assert(resourcePanel.indexOf('var sidebarRenderSignature =') !== -1, 'resource sidebar must keep a render signature to avoid unchanged re-renders');
-  assert(resourcePanel.indexOf('panel.__atpResourceInlineSignature') !== -1, 'resource inline panel must keep a per-panel render signature to avoid unchanged re-renders');
-  assert(resourcePanel.indexOf('function getSidebarRenderSignature(threadState, resources, groups, emptyMessage, statusMessage, hasPendingAttachments, showTextFallbackActions)') !== -1, 'resource sidebar render signature must include automatic and fallback TXT state');
-  assert(resourcePanel.indexOf('function getInlineRenderSignature(threadState, resources, groups, statusMessage, hasPendingAttachments, showTextFallbackActions)') !== -1, 'resource inline render signature must include automatic and fallback TXT state');
-  assert(resourcePanel.indexOf("parts.push('pw:' + resources.passwords[pi]);") !== -1, 'resource sidebar render signature must include password content, not just counts');
-  assert(resourcePanel.indexOf("parts.push((item.url || '') + ':' + (item.code || '') + ':' + (item.source || ''));") !== -1, 'resource sidebar render signature must include resource URL/code/source content');
-  assert(resourcePanel.indexOf('function setSidebarHtml(el, signature, html)') !== -1, 'resource sidebar rendering must centralize signature checks before innerHTML replacement');
-  assert(/function setSidebarHtml\(el, signature, html\)[\s\S]*?clearMessageTimers\(el\);[\s\S]*?el\.innerHTML = html;/.test(resourcePanel), 'resource sidebar rendering must clear live-region timers before replacing sidebar HTML');
-  assert(/if \(old\) \{[\s\S]*?clearMessageTimers\(old\);[\s\S]*?old\.remove\(\);/.test(resourcePanel), 'resource inline rendering must clear live-region timers before removing old inline DOM');
-  assert(resourcePanel.indexOf("sidebar.addEventListener('click', handleSidebarClick)") !== -1, 'resource sidebar actions must be handled through one delegated click listener');
-  assert(resourcePanel.indexOf('function handleSidebarClick(e)') !== -1, 'resource sidebar must expose a delegated click handler');
-  assert(resourcePanel.indexOf('function handleInlineClick(e, panel, threadState, box)') !== -1, 'resource inline panel must expose a delegated click handler');
-  assert(resourcePanel.indexOf('panel.__atpResourceInlineSignature === renderSignature') !== -1, 'resource inline rendering must skip unchanged DOM replacement');
-  assert(resourcePanel.indexOf("box.addEventListener('click', function(e)") !== -1, 'resource inline actions must be handled through one delegated click listener');
-  assert(resourcePanel.indexOf("var btn = panel.querySelector('[data-pin-toggle]')") !== -1, 'resource panel pinned state must target a real pin toggle button');
-  assert(resourcePanel.indexOf("getPinToggleHtml(threadState, 'atp-resource-sidebar-pin', 'data-sidebar-pin-toggle')") !== -1, 'resource sidebar must render a desktop-visible pin toggle button');
-  assert(resourcePanel.indexOf("btn.hasAttribute('data-sidebar-pin-toggle')") !== -1, 'resource sidebar delegated handler must route the sidebar pin toggle');
-  assert(resourcePanel.indexOf("btn.hasAttribute('data-copy-type')") !== -1, 'resource sidebar delegated handler must route per-type copy actions');
-  assert(resourcePanel.indexOf("btn.hasAttribute('data-copy-all')") !== -1, 'resource sidebar delegated handler must route copy-all actions');
-  assert(resourcePanel.indexOf("btn.hasAttribute('data-copy-passwords')") !== -1, 'resource sidebar delegated handler must route password-only copy actions');
-  assert(resourcePanel.indexOf("btn.hasAttribute('data-parse-txt')") !== -1, 'resource sidebar delegated handler must route TXT parse actions');
-  assert(resourcePanel.indexOf("getPinToggleHtml(threadState, '', 'data-pin-toggle')") !== -1, 'resource panel must render an inline pin toggle button');
-  assert(resourcePanel.indexOf("btn.setAttribute('aria-pressed', isPinned ? 'true' : 'false')") !== -1, 'resource panel pin toggle must expose pinned state');
-  assert(resourcePanel.indexOf("panel.setAttribute('role', 'button')") === -1, 'resource panel must not expose a nested-button container as a button');
-  assert(resourcePanel.indexOf("btn.hasAttribute('data-pin-toggle')") !== -1, 'resource panel inline delegated handler must route the pin toggle button');
-  assert(contentCss.indexOf('.atp-resource-sidebar-pin') !== -1, 'resource sidebar pin toggle must have visible desktop styling');
-  assert(resourcePanel.indexOf("trigger.addEventListener('click'") !== -1, 'resource panel trigger button must open through its native click activation');
-  assert(resourcePanel.indexOf('function openSidebarFromTrigger(panel)') !== -1, 'resource panel trigger open must focus the appropriate resource controls');
-  assert(resourcePanel.indexOf('openSidebarFromTrigger(panel);') !== -1, 'resource panel trigger click must route through the trigger open helper');
-  assert(resourcePanel.indexOf("trigger.addEventListener('keydown'") !== -1 && resourcePanel.indexOf("e.key !== 'Escape'") !== -1, 'resource panel trigger must support Escape dismissal without owning Enter or Space');
-  assert(resourcePanel.indexOf("panel.addEventListener('keydown'") === -1, 'resource panel container must not handle trigger keyboard events');
-  assert(resourcePanel.indexOf("e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar'") === -1, 'resource panel must rely on native button Enter and Space activation');
-  assert(resourcePanel.indexOf('function isSidebarVisible()') !== -1, 'resource panel keyboard open must detect when the desktop sidebar is hidden');
-  assert(resourcePanel.indexOf('var style = window.getComputedStyle(el);') !== -1, 'resource panel sidebar visibility must use computed style instead of viewport assumptions');
-  assert(resourcePanel.indexOf("var RESOURCE_NARROW_QUERY = '(max-width: 1024px)'") !== -1, 'resource panel responsive sync must use the CSS narrow breakpoint');
-  assert(resourcePanel.indexOf('function syncResourceLayoutForViewport()') !== -1, 'resource panel must sync desktop sidebar state after viewport changes');
-  assert(resourcePanel.indexOf('window.matchMedia(RESOURCE_NARROW_QUERY)') !== -1, 'resource panel must observe the narrow breakpoint with matchMedia');
-  assert(resourcePanel.indexOf("resourceLayoutMedia.addEventListener('change', syncResourceLayoutForViewport)") !== -1, 'resource panel must sync when the narrow media query changes');
-  assert(resourcePanel.indexOf("window.addEventListener('resize', syncResourceLayoutForViewport)") !== -1, 'resource panel must have a resize fallback for responsive sync');
-  assert(resourcePanel.indexOf('function unbindResourceLayoutListener()') !== -1, 'resource panel must remove responsive listeners on destroy');
-  assert(resourcePanel.indexOf('unbindResourceLayoutListener();') !== -1, 'resource panel destroy must unbind responsive listeners');
-  assert(resourcePanel.indexOf('updateDisplayedThreadExpandedState(false);') !== -1, 'resource panel narrow sync must collapse desktop aria-expanded state');
-  assert(resourcePanel.indexOf('function getDesktopFocusedThread()') !== -1, 'resource panel narrow sync must detect focus inside desktop-only controls');
-  assert(resourcePanel.indexOf('actionKey: getFocusedResourceAction(sidebar)') !== -1, 'resource panel narrow sync must preserve the focused sidebar action key');
-  assert(resourcePanel.indexOf('function releaseHiddenDesktopResourceFocus(threadState)') !== -1, 'resource panel narrow sync must release focus when no inline fallback exists');
-  assert(resourcePanel.indexOf('return document.activeElement === target;') !== -1, 'resource panel inline focus helper must report whether focus moved');
-  assert(resourcePanel.indexOf('if (focusThread && focusThread.panel && !focusInlineResourceAction(focusThread.panel, focusThread.actionKey))') !== -1, 'resource panel narrow sync must restore the same inline action before falling back');
-  assert(resourcePanel.indexOf('releaseHiddenDesktopResourceFocus(focusThread);') !== -1, 'resource panel narrow sync must blur hidden desktop focus after failed inline fallback');
-  assert(resourcePanel.indexOf('function getInlineFocusedThread()') !== -1, 'resource panel wide sync must detect focus inside mobile inline controls');
-  assert(resourcePanel.indexOf("active.closest('.atp-resource-inline')") !== -1, 'resource panel wide sync must locate the active inline resource row');
-  assert(resourcePanel.indexOf("inline.closest('.atp-thread-panel')") !== -1, 'resource panel wide sync must recover the owning thread panel from inline focus');
-  assert(resourcePanel.indexOf('function restoreDesktopResourceActionFocus(root, actionKey)') !== -1, 'resource panel wide sync must map inline actions to desktop actions');
-  assert(resourcePanel.indexOf("{ attr: 'data-sidebar-pin-toggle', value: actionKey.value }") !== -1, 'resource panel wide sync must map the inline pin action to the sidebar pin action');
-  assert(resourcePanel.indexOf("{ attr: 'data-pin-toggle', value: actionKey.value }") !== -1, 'resource panel narrow sync must map the sidebar pin action back to the inline pin action');
-  assert(resourcePanel.indexOf('function focusDesktopResourceAction(panel, actionKey)') !== -1, 'resource panel wide sync must move hidden inline focus to desktop resource controls');
-  assert(/function syncResourceLayoutForViewport\(\)[\s\S]*?if \(!isNarrowResourceLayout\(\)\) \{[\s\S]*?var inlineFocusThread = getInlineFocusedThread\(\);[\s\S]*?focusDesktopResourceAction\(inlineFocusThread\.panel, inlineFocusThread\.actionKey\)[\s\S]*?releaseHiddenInlineResourceFocus\(inlineFocusThread\);[\s\S]*?return;[\s\S]*?\}/.test(resourcePanel), 'resource panel wide sync must release hidden inline focus after resizing back to desktop layout');
-  assert(resourcePanel.indexOf('if (currentThread) updateThreadExpandedState(currentThread, isSidebarVisible());') !== -1, 'resource panel render must not mark hidden desktop sidebars as expanded');
-  assert(resourcePanel.indexOf('function focusFirstInlineAction(panel)') !== -1, 'resource panel keyboard open must provide an inline focus fallback for narrow screens');
-  assert(resourcePanel.indexOf('if (!target && !isNarrowResourceLayout()) target = getResourceTrigger(panel);') !== -1, 'resource panel narrow inline fallback must not focus hidden desktop triggers');
-  assert(resourcePanel.indexOf('if (isSidebarVisible())') !== -1, 'resource panel keyboard open must only focus the sidebar while it is visible');
-  assert(resourcePanel.indexOf('updateThreadExpandedState(panel && panel.__atpResourceThread, false);') !== -1, 'resource panel narrow keyboard open must not mark a hidden sidebar as expanded');
-  assert(resourcePanel.indexOf('focusFirstInlineAction(panel);') !== -1, 'resource panel narrow keyboard open must focus inline resource actions');
-  assert(resourcePanel.indexOf("e.key !== 'Escape'") !== -1, 'resource panel and sidebar must support Escape dismissal');
-  assert(resourcePanel.indexOf('closeTemporarySidebar') !== -1, 'resource panel must centralize temporary sidebar dismissal');
-  assert(resourcePanel.indexOf('var sidebarFocused = false') !== -1, 'resource sidebar must track focus independently from hover');
-  assert(resourcePanel.indexOf("sidebar.addEventListener('focusin'") !== -1, 'resource sidebar must stay open while keyboard focus is inside it');
-  assert(resourcePanel.indexOf("sidebar.addEventListener('focusout'") !== -1, 'resource sidebar must clear hover state only after focus leaves it');
-  assert(resourcePanel.indexOf('sidebarHovering || sidebarFocused || (sidebar && sidebar.contains(document.activeElement))') !== -1, 'resource sidebar delayed clear must respect focused sidebar controls');
-  assert(resourcePanel.indexOf('e.relatedTarget && sidebar && sidebar.contains(e.relatedTarget)') !== -1, 'resource panel focusout must not clear the sidebar while focus moves into it');
-  assert(resourcePanel.indexOf("panel.addEventListener('focusin'") !== -1, 'resource panel must show resources on keyboard focus');
-  assert(resourcePanel.indexOf("panel.addEventListener('focusout'") !== -1, 'resource panel must clear hover state after keyboard focus leaves');
-  assert(contentCss.indexOf('.atp-resource-sidebar {\n  position: fixed;') !== -1, 'resource sidebar must stay fixed to the viewport');
-  assert(contentCss.indexOf('.atp-resource-trigger:focus-visible') !== -1, 'resource trigger button must have a visible keyboard focus style');
-  assert(/\.atp-resource-copy,[\s\S]*?\.atp-resource-inline button\s*\{[\s\S]*?display: inline-flex;[\s\S]*?min-height: 24px;[\s\S]*?min-width: 24px;/.test(contentCss), 'resource action buttons must keep at least a 24px target');
-  assert(contentCss.indexOf('.atp-thread-panel:focus-visible') === -1, 'resource panel container must not advertise focus-visible styling after tabindex removal');
-  assert(contentCss.indexOf('@media (max-width: 1024px)') !== -1, 'resource panel CSS must keep a narrow-screen breakpoint');
-  assert(/@media \(max-width: 1024px\)[\s\S]*?\.atp-resource-sidebar\s*\{[\s\S]*?display: none;[\s\S]*?\.atp-resource-trigger\s*\{[\s\S]*?display: none;[\s\S]*?\.atp-resource-inline\s*\{[\s\S]*?display: flex;/.test(contentCss), 'resource panel narrow layout must hide the desktop sidebar and trigger while showing inline actions');
-  assert(contentCss.indexOf('.atp-resource-copy:focus-visible') !== -1, 'resource sidebar copy buttons must have visible keyboard focus styles');
-  assert(contentCss.indexOf('.atp-resource-parse-btn:focus-visible') !== -1, 'resource sidebar TXT parse button must have a visible keyboard focus style');
-  assert(contentCss.indexOf('.atp-resource-parse-btn:not([aria-disabled="true"]):hover') !== -1, 'resource TXT parse button hover styling must not apply while aria-disabled');
-  assert(contentCss.indexOf('.atp-resource-inline button:not([aria-disabled="true"]):hover') !== -1, 'resource inline button hover styling must not apply while aria-disabled');
-  assert(/\.atp-resource-parse-btn\[aria-disabled="true"\]\s*\{[\s\S]*?opacity:[\s\S]*?cursor: not-allowed;/.test(contentCss), 'resource TXT parse loading buttons must expose a visual disabled state');
-  assert(contentCss.indexOf('.atp-resource-parse-btn {\n  margin-top: 6px;') !== -1, 'resource TXT parse buttons must use shared CSS spacing instead of inline button styles');
-  assert(resourcePanel.indexOf('class="atp-resource-parse-btn" data-parse-txt="1" style=') === -1, 'resource TXT parse buttons must not regress to undersized inline styles');
-  assert(resourcePanel.indexOf('function releaseRemovedInlineFocus(panel)') !== -1, 'resource panel must explicitly recover focus after removing a focused inline resource row');
-  assert(resourcePanel.indexOf('if (inlineFocusKey && !focusFirstInlineAction(panel)) releaseRemovedInlineFocus(panel);') !== -1, 'resource panel inline removal must release focus when no inline action remains');
-  assert(resourcePanel.indexOf('var inlineResult = requestTextResourceManualLoad(threadState);') !== -1, 'inline TXT parse clicks must use the guarded manual scheduling helper');
-  assert(resourcePanel.indexOf('if (inlineResult.message) showMessage(inlineResult.message') !== -1, 'inline TXT parse clicks must announce either successful scheduling or local scheduling errors');
-  assert(resourcePanel.indexOf('var sidebarResult = requestTextResourceManualLoad(state);') !== -1, 'sidebar TXT parse clicks must use the guarded manual scheduling helper');
-  assert(resourcePanel.indexOf('if (sidebarResult.message) showMessage(sidebarResult.message') !== -1, 'sidebar TXT parse clicks must announce either successful scheduling or local scheduling errors');
-  var txtParseDisabledGuardCount = (resourcePanel.match(/if \(btn\.getAttribute && btn\.getAttribute\('aria-disabled'\) === 'true'\) return;/g) || []).length;
-  assert(txtParseDisabledGuardCount >= 2, 'resource panel sidebar and inline TXT parse handlers must ignore aria-disabled loading buttons');
-  assert(resourcePanel.indexOf("label += '（' + attachmentCount + '个附件）';") !== -1, 'TXT parse buttons must include attachment counts in their aria-labels');
-  assert(resourcePanel.indexOf('鼠标移到帖子缩略图区域查看资源链接') === -1, 'resource sidebar empty hint must not describe a mouse-only trigger');
-  assert(sharedUtils.indexOf('forEachResourceSourcePart: function(value, callback)') !== -1, 'shared utils must scan resource source parts without split allocation');
-  assert(sharedUtils.indexOf('hasResourceSource: function(value, sourceName)') !== -1, 'shared utils must expose source membership checks without split allocation');
-  assert(sharedUtils.indexOf("String(value || 'html').split('+').forEach") === -1, 'resource source merging must not allocate split source arrays');
-  assert(resourcePanel.indexOf("SharedUtils.hasResourceSource(items[i].source, 'txt')") !== -1, 'resource panel TXT source detection must reuse shared source scanning');
-  assert(resourcePanel.indexOf("split('+').indexOf('txt')") === -1, 'resource panel TXT source detection must not allocate split source arrays');
-  assert(resourcePanel.indexOf("sidebar.addEventListener('click', handleSidebarClick)") !== -1, 'resource panel sidebar copy buttons must use delegated click handling');
-  assert(resourcePanel.indexOf("box.addEventListener('click', function(e)") !== -1, 'resource panel inline copy buttons must use delegated click handling');
-  assert(resourcePanel.indexOf('for (var cb = 0; cb < copyButtons.length; cb++)') === -1, 'resource panel sidebar copy buttons must not be rebound after every render');
-  assert(resourcePanel.indexOf('for (var icb = 0; icb < inlineCopyButtons.length; icb++)') === -1, 'resource panel inline copy buttons must not be rebound after every render');
-  assert(resourcePanel.indexOf('function getGroupsFromNormalized(resources)') !== -1, 'resource panel rendering must support normalized group collection');
-  assert(resourcePanel.indexOf('function resourcesHaveTxtFromNormalized(resources)') !== -1, 'resource panel rendering must support normalized TXT source checks');
-  assert(resourcePanel.indexOf('var groups = getGroupsFromNormalized(resources);') !== -1, 'resource panel render paths must reuse normalized resources for groups');
-  assert(resourcePanel.indexOf('resourcesHaveTxtFromNormalized(resources)') !== -1, 'resource panel sidebar title must reuse normalized resources for TXT badges');
-  assert(resourcePanel.indexOf('var groups = getGroups(resources);') === -1, 'resource panel render paths must not renormalize resources after the render entry normalized them');
-  assert(resourcePanel.indexOf('resourcesHaveTxt(resources)) html +=') === -1, 'resource panel sidebar title must not renormalize resources for TXT badges');
-  assert(resourcePanel.indexOf("copyButtons.forEach(function(btn)") === -1, 'resource panel sidebar copy buttons must not use NodeList.forEach callbacks');
-  assert(resourcePanel.indexOf("var copyButtons = el.querySelectorAll('[data-copy-type]')") === -1, 'resource panel sidebar copy buttons must not be rebound after every render');
-  assert(resourcePanel.indexOf("var copyAll = el.querySelector('.atp-resource-copy-all')") === -1, 'resource panel sidebar copy-all button must not be rebound after every render');
-  assert(resourcePanel.indexOf("var parseBtn2 = el.querySelector('.atp-resource-parse-btn')") === -1, 'resource panel sidebar TXT parse button must not be rebound after every render');
-  assert(resourcePanel.indexOf("var inlineCopyButtons = box.querySelectorAll('[data-copy-type]')") === -1, 'resource panel inline copy buttons must not query and bind every button after render');
-  assert(resourcePanel.indexOf("box.querySelectorAll('[data-copy-type]').forEach") === -1, 'resource panel inline copy buttons must not use NodeList.forEach callbacks');
-  assert(resourcePanel.indexOf("var lines = ['[通用信息]', '解压密码:'];") !== -1, 'resource panel password copying must build password text in one pass');
-  assert(resourcePanel.indexOf('for (var i = 0; i < resources.passwords.length; i++)') !== -1, 'resource panel password copying must scan passwords without filter allocation');
-  assert(resourcePanel.indexOf('resources.passwords.filter(function') === -1, 'resource panel password copying must not allocate filtered password arrays');
-  assert(resourcePanel.indexOf('function formatGroupFromNormalized(resources, type)') !== -1, 'resource panel copy formatting must support normalized group formatting');
-  assert(resourcePanel.indexOf('function formatPasswordsFromNormalized(resources, force)') !== -1, 'resource panel copy formatting must support normalized password formatting');
-  assert(resourcePanel.indexOf('var group = formatGroupFromNormalized(resources, type);') !== -1, 'resource panel type copy must reuse a single normalized resource object');
-  assert(resourcePanel.indexOf('var section = formatGroupFromNormalized(resources, type);') !== -1, 'resource panel all-copy must reuse normalized resources across groups');
-  assert(resourcePanel.indexOf('var section = formatGroup(resources, type);') === -1, 'resource panel all-copy must not renormalize resources for every group');
-  assert(resourcePanel.indexOf('if (group && passwords) return group +') !== -1, 'resource panel single-type copy must join group and password text without filtering parts');
-  assert(resourcePanel.indexOf('parts.filter(Boolean).join') === -1, 'resource panel single-type copy must not allocate a filtered parts array');
+  assert(settingsSchema.indexOf("key: 'animatedThumbnailMode'") !== -1 &&
+    settingsSchema.indexOf("key: 'showFloatingLauncher'") !== -1 &&
+    settingsSchema.indexOf("key: 'autoLoadOffscreenFirstRowsEnabled'") !== -1,
+    'v1.19.0 settings schema must expose animatedThumbnailMode, showFloatingLauncher, and autoLoadOffscreenFirstRowsEnabled');
+
+  // 2. Scanner, Fetcher, Content & Page Bridge boundaries
+  assert(scanner.indexOf('var PRIMARY_THREAD_CONTAINER_SELECTORS = [') !== -1 &&
+    scanner.indexOf('var HIGH_CONFIDENCE_THREAD_CONTAINER_SELECTORS = [') !== -1 &&
+    scanner.indexOf('var BROAD_THREAD_CONTAINER_SELECTORS = [') !== -1,
+    'scanner thread root selection must separate primary, high-confidence, and candidate-probed broad containers');
+  assert(scanner.indexOf('var ARTICLE_SCAN_NODE_BUDGET = 120') !== -1, 'scanner candidate scans must have a bounded per-pass node budget');
+  assert(scanner.indexOf('function isDecoratedArticleContainer(container)') !== -1, 'scanner must centralize decorated article container detection');
+  assert(content.indexOf("window.addEventListener('beforeunload'") === -1 &&
+    logger.indexOf("window.addEventListener('beforeunload'") === -1,
+    'content scripts must never register destructive beforeunload listeners');
+  assert(content.indexOf("window.addEventListener('pagehide', handlePageHide)") !== -1 &&
+    content.indexOf("window.addEventListener('pageshow', handlePageShow)") !== -1,
+    'content must manage BFCache lifecycle through pagehide and pageshow');
+  assert(content.indexOf("suspendActiveImageSlotsForBfcache('bfcache_pagehide')") !== -1 &&
+    content.indexOf("recoverActiveImageLoads('bfcache_pageshow')") !== -1,
+    'content BFCache lifecycle must suspend and recover active image slots cleanly');
+  assert(fetcher.indexOf('SharedUtils.readResponseTextLimited(resp, SharedUtils.ARTICLE_HTML_MAX_BYTES)') !== -1 &&
+    fetcher.indexOf('SharedUtils.readResponseArrayBufferLimited(resp, TEXT_ATTACHMENT_MAX_BYTES)') !== -1,
+    'content fetcher must bound article HTML and TXT attachment response bytes');
+  assert(fetcher.indexOf('function isAllowedArticleFinalUrl(url)') !== -1 &&
+    fetcher.indexOf('function isAllowedTextAttachmentFinalUrl(url)') !== -1,
+    'content fetcher must validate final redirect URLs for both articles and TXT attachments');
+  assert(fetcher.indexOf('type: SharedUtils.MESSAGE_TYPES.FETCH_TEXT_ATTACHMENTS_FRESH') !== -1, 'cross-origin fresh TXT extraction must use its dedicated background message');
+  assert(Array.isArray(manifest.content_scripts) && manifest.content_scripts[0].world === 'MAIN', 'same-origin TXT page bridge must run in the page main world');
+  assertExactStringArray(manifest.content_scripts[0].js, ['page-fetch-bridge.js'], 'page bridge content script files');
+  assert(manifest.content_scripts[0].run_at === 'document_start', 'same-origin TXT page bridge must be ready before isolated content fetches');
+  assert(pageFetchBridge.indexOf('url.origin !== location.origin') !== -1, 'page TXT bridge must reject cross-origin requests');
+  assert(pageFetchBridge.indexOf('/\\/attachment\\.php$/i') !== -1 && pageFetchBridge.indexOf('/\\/misc\\.php$/i') !== -1 && pageFetchBridge.indexOf('mod=attachment') !== -1, 'page TXT bridge must restrict requests to attachment-shaped URLs');
+  assert(pageFetchBridge.indexOf('readResponseLimited(response, maxBytes)') !== -1, 'page TXT bridge must cap streamed response bytes');
+  assert(pageFetchBridge.indexOf("credentials: 'include'") !== -1, 'page TXT bridge must reuse the page same-origin session');
+  assert(pageFetchBridge.indexOf('window.postMessage(message, location.origin, transfer)') !== -1, 'page TXT bridge must transfer ArrayBuffers with zero-copy postMessage');
+
+  // 3. SharedUtils, HTML Extractors, Cache Index & Background safety
+  assert(sharedUtils.indexOf('isHttpLikeUrl: function(url, baseUrl)') !== -1, 'shared utils must expose an HTTP URL guard');
+  assert(sharedUtils.indexOf('javascript|mailto|tel') !== -1, 'shared URL resolution must reject non-fetchable protocols');
+  assert(sharedUtils.indexOf('SIGNED_TEXT_DOWNLOAD_HOSTS: Object.freeze(') !== -1 &&
+    sharedUtils.indexOf("BUILTIN_FORUM_ROOTS: Object.freeze(['sehuatang.org', 'sehuatang.net'])") !== -1 &&
+    sharedUtils.indexOf("TEXT_DIRECT_DOWNLOAD_HOSTS: Object.freeze(['dl.ldkms.la'])") !== -1,
+    'shared utils must enforce explicit forum and TXT download host allowlists');
+  assertExactStringArray(loadSharedUtils().SIGNED_TEXT_DOWNLOAD_HOSTS, ['xia.ewrewej.la', 'xia.djhdhs.us'], 'signed TXT download hosts');
+  assert(sharedUtils.indexOf("CACHE_GENERATION_KEY: 'atp_cache_generation_v1'") !== -1, 'shared utils must define one cache clear generation key');
+  assert(sharedUtils.indexOf('_backgroundOwner: false') !== -1 &&
+    sharedUtils.indexOf('type: SharedUtils.MESSAGE_TYPES.CACHE_INDEX_MUTATION') !== -1,
+    'cacheIndex mutations must proxy through the background owner');
+  assert(htmlExtractors.indexOf('extractImagesForSettingsInSlices') !== -1 &&
+    htmlExtractors.indexOf('collectAccessCodePairs') !== -1,
+    'html-extractors.js must provide sliced image extraction and access-code pairing');
+  assert(cache.indexOf('getArticleCacheState: function(url') !== -1 &&
+    cache.indexOf('var queryKeys = [articleKey, negativeKey, CACHE_GENERATION_KEY];') !== -1 &&
+    cache.indexOf('chrome.storage.local.get(queryKeys,') !== -1,
+    'article cache reads must fetch article, negative, and cache-generation keys in one storage read');
+  assert(cache.indexOf('function checkCacheWriteFreshFast(writeStartedAt, callback)') !== -1 &&
+    cache.indexOf('function verifyPostWriteGenerationFresh(writeStartedAt, callback)') !== -1 &&
+    cache.indexOf('function cacheWriteValueMatches(currentValue, writtenValue)') !== -1,
+    'content cache writes must verify cache generation freshness and value ownership');
+  assert(background.indexOf('SharedUtils.readResponseTextLimited(resp, SharedUtils.ARTICLE_HTML_MAX_BYTES)') !== -1 &&
+    background.indexOf('SharedUtils.readResponseArrayBufferLimited(resp, TEXT_ATTACHMENT_MAX_BYTES)') !== -1,
+    'background fetches must bound response bytes');
+  assert(background.indexOf('SharedUtils.cacheIndex._backgroundOwner = true;') !== -1, 'background service worker must own cacheIndex mutations');
+  assert(background.indexOf('if (msg.type === SharedUtils.MESSAGE_TYPES.SAVE_SETTINGS_PATCH)') !== -1 &&
+    background.indexOf('queueSettingsPatch(msg.settingsPatch || {})') !== -1,
+    'background must serialize settings patch writes');
+  assert(background.indexOf('function getSafeAttachmentReferrer(attachment)') !== -1 &&
+    background.indexOf("referrerUrl.search = '';") !== -1 &&
+    background.indexOf("referrerUrl.hash = '';") !== -1,
+    'background TXT fetches must strip referrer query and hash');
+  assert(background.indexOf("if (!msg || typeof msg !== 'object') return false;") !== -1 &&
+    background.indexOf("originAllowed((sender && sender.url) || '')") !== -1,
+    'background onMessage must guard non-object messages and missing senders');
+
+  // 4. v1.19.0 4-Tier Queue, 3-Band Static Viewport, Off-Main-Thread Heavy Budget & Image Engine
+  assert(viewportOnly.indexOf("BAND0_MARGIN = '0px'") !== -1 &&
+    viewportOnly.indexOf("BAND1_MARGIN = '240px 0px 240px 0px'") !== -1 &&
+    viewportOnly.indexOf("BAND2_MARGIN = '1000px 0px 1000px 0px'") !== -1,
+    'viewport-observer.js must maintain 3 persistent static IntersectionObserver bands');
+  assert(heavyBudget.indexOf('createImageBitmap') !== -1 &&
+    heavyBudget.indexOf('img.decode()') !== -1,
+    'heavy-budget.js must downscale heavy previews off-main-thread via createImageBitmap and async decode before reveal');
+  assert(loaderOnly.indexOf('tryPreemptP3ForUrgentTask') !== -1 &&
+    loadingPolicy.indexOf('getPreemptionMinAgeMs') !== -1,
+    'loader.js must support fast 250ms preemption of P3 background loads for P0/P1 urgent work');
+  assert(loaderOnly.indexOf('createDocumentFragment') !== -1 &&
+    loaderOnly.indexOf('ensureGridDelegation') !== -1,
+    'loader.js must batch DOM wrapper insertions via DocumentFragment and use container-level event delegation');
+  assert(loaderOnly.indexOf('freezeAnimatedThumbnail') !== -1 &&
+    loaderOnly.indexOf("'atp-gif-frozen'") !== -1,
+    'loader.js must freeze animated GIF thumbnails onto still canvases when not hovered');
+  assert(loader.indexOf('DOMAIN_CIRCUIT') === -1, 'loader must not retain any fixed-threshold ordinary domain circuit');
+  assert(hostHealth.indexOf('checkTaskAdmission') !== -1 &&
+    hostHealth.indexOf('isLargeLaneBlocked') !== -1,
+    'host-health.js must centralize host circuit health and adaptive GIF large-lane admission');
+  assert(imageRunner.indexOf('onSiblingFailover') !== -1 &&
+    imageRunner.indexOf('tryNoReferrerRetry') !== -1,
+    'image-runner.js must manage image attempt lifecycle, no-referrer retry, and sibling failover');
+
+  // 5. Renderer, Resource Panel, Previewer, Popup & Floating Panel UI/A11y
+  assert(renderer.indexOf('prioritizeLoadedCandidates: function(candidates, loadedUrls)') !== -1, 'renderer must prefer previously successful image candidates');
+  assert(renderer.indexOf('var AUTO_TEXT_RESOURCE_CONCURRENCY = 2;') !== -1, 'automatic TXT parsing must use an independent concurrency cap of two');
+  assert(renderer.indexOf('atp-more-overlay-badge') !== -1 &&
+    renderer.indexOf('unlockBackgroundImages') !== -1 &&
+    renderer.indexOf('overflow-y:hidden;') !== -1 &&
+    renderer.indexOf("addEventListener('wheel'") === -1,
+    'renderer must default multi-image galleries to collapsed overflow-hidden mode with +N badge and no wheel hijacking');
+  assert(resourcePanel.indexOf('HOVER_INTENT_DELAY_MS = 140') !== -1 &&
+    resourcePanel.indexOf("sidebar.addEventListener('click', handleSidebarClick)") !== -1 &&
+    resourcePanel.indexOf('data-import-txt="1"') !== -1,
+    'resource panel must enforce diagonal hover-intent delay, delegated click handling, and local TXT import fallback');
+  assert(previewer.indexOf("previewOverlay.setAttribute('role', 'dialog')") !== -1 &&
+    previewer.indexOf("previewOverlay.setAttribute('aria-modal', 'true')") !== -1 &&
+    previewer.indexOf('preloadAdjacentImages') !== -1 &&
+    previewer.indexOf('zoomToScale') !== -1,
+    'previewer must provide accessible modal semantics, neighbor preloading, and wheel-zoom/pan');
+  assert(popupHtml.indexOf('role="tablist"') !== -1 &&
+    popupCss.indexOf('prefers-color-scheme: dark') !== -1,
+    'popup must provide the 4-tab layout and automatic dark mode');
+  assert(popupOnly.indexOf('type: SharedUtils.MESSAGE_TYPES.SAVE_SETTINGS_PATCH') !== -1 &&
+    floatingPanelOnly.indexOf('type: SharedUtils.MESSAGE_TYPES.SAVE_SETTINGS_PATCH') !== -1,
+    'popup and floating panel must save settings through serialized patches');
+  assert(popupOnly.indexOf('async function storageGetKeys(action)') !== -1 &&
+    popupOnly.indexOf("typeof area.getKeys === 'function'") !== -1,
+    'popup storage discovery must prefer chrome.storage.local.getKeys() over full value reads');
+  assert(!/\binfinite\b|animation:\s*atp-shimmer|@keyframes atp-shimmer/.test(contentCss), 'thumbnail loading placeholders must stay static: no infinite or per-thumbnail animation');
+  assert(contentCss.indexOf('@media (prefers-reduced-motion: reduce)') !== -1 &&
+    popupCss.indexOf('@media (prefers-reduced-motion: reduce)') !== -1 &&
+    floatingPanelCss.indexOf('@media (prefers-reduced-motion: reduce)') !== -1,
+    'all stylesheets must honor prefers-reduced-motion');
+
+  // 6. Logger sanitization, on-demand debounced flushing & release/handoff self-verification
+  assert(sharedUtils.indexOf('CONTENT_LOG_TOTAL_BYTES: 2 * 1024 * 1024') !== -1, 'shared utils must define a content log total byte budget');
+  assert(sharedUtils.indexOf('CONTENT_LOG_KEY_BYTES: 160 * 1024') !== -1, 'shared utils must define a per-content-log-key byte budget');
+  assert(sharedUtils.indexOf('BACKGROUND_LOG_BYTES: 512 * 1024') !== -1, 'shared utils must define a background log byte budget');
+  assert(logger.indexOf('function sanitizeLogUrl(url)') !== -1 &&
+    logger.indexOf('function sanitizeLogText(text)') !== -1,
+    'logger must sanitize URLs in structured fields and plain text');
+  assert(logger.indexOf("'atp_logs_cleared_at'") !== -1 &&
+    logger.indexOf('chrome.storage.local.get(LOG_CLEARED_AT_KEY,') !== -1,
+    'logger must honor the log clear marker before storage writes');
+  assert(logger.indexOf('setInterval(') === -1 && background.indexOf('setInterval(flush, 5000)') === -1,
+    'neither content logger nor background logger may use a permanent setInterval timer');
+  assert(/Logger\.flush\(\);\s*Logger\.stopFlushTimer\(\);/.test(content), 'disabling the current page must flush logs before stopping the flush timer');
+  assert(content.indexOf('Logger.sanitizeUrl ? Logger.sanitizeUrl(location.href) : location.href') !== -1, 'content startup logs must use sanitized URLs');
+  assert(fetcher.indexOf('function logUrl(url)') !== -1, 'fetcher must sanitize URLs before ordinary debug/warn logging');
+
   if (gitignore !== null) {
     assert(gitignore.indexOf('.agents/') !== -1, '.agents local tooling must be ignored unless intentionally tracked');
     assert(gitignore.indexOf('.claude/') !== -1, '.claude local tooling must be ignored');
@@ -18405,7 +17861,7 @@ function checkCriticalStaticRules() {
   assert(maintainerPackage.indexOf("'.git', '.claude', '.agents', '.opencode', '.codex', 'node_modules', 'dist', 'logs'") !== -1, 'maintainer package must reject local metadata and generated directories');
   assert(maintainerPackage.indexOf('Assert-HandoffTreeBoundary -StageRoot $stageRoot') !== -1, 'maintainer package must validate its staged tree before archiving');
   assert(maintainerPackage.indexOf('Assert-HandoffArchive -ArchivePath $temporaryArchive') !== -1, 'maintainer package must validate its final archive');
-  assert(maintainerPackage.indexOf('sourceSnapshot = \'verified-current-worktree\'') !== -1, 'maintainer manifest must identify the current-worktree snapshot source');
+  assert(maintainerPackage.indexOf("sourceSnapshot = 'verified-current-worktree'") !== -1, 'maintainer manifest must identify the current-worktree snapshot source');
   assert(verify.indexOf('function assertReleaseDocAnchors(contents, version, label)') !== -1, 'verify must share fixed release document anchor checks');
   assert(verify.indexOf("const STAGED_RELEASE_EXTRA_FILES = ['tools/verify.js', 'tools/package-extension.ps1', 'tools/package-maintainer-handoff.ps1'];") !== -1, 'staged release verification must include repeatable release and handoff tools');
   assert(verify.indexOf('function getStagedReleaseFiles(manifest)') !== -1, 'staged release verification must build the staged file list from release references');
@@ -18448,157 +17904,6 @@ function checkCriticalStaticRules() {
   assert(verify.indexOf('function normalizeReleaseRef(ref, baseDir, label)') !== -1, 'release package verification must normalize manifest and popup references before filesystem checks');
   assert(verify.indexOf("refs.push(normalizeReleaseRef(ref, popupDir === '.' ? '' : popupDir, 'release popup reference'));") !== -1, 'release popup references must use guarded package-relative normalization');
   assert(verify.indexOf("return normalizeReleaseRef(ref, '', 'release manifest reference');") !== -1, 'release manifest references must use guarded package-relative normalization');
-  assert(sharedUtils.indexOf('CONTENT_LOG_TOTAL_BYTES: 2 * 1024 * 1024') !== -1, 'shared utils must define a content log total byte budget');
-  assert(sharedUtils.indexOf('CONTENT_LOG_KEY_BYTES: 160 * 1024') !== -1, 'shared utils must define a per-content-log-key byte budget');
-  assert(sharedUtils.indexOf('BACKGROUND_LOG_BYTES: 512 * 1024') !== -1, 'shared utils must define a background log byte budget');
-  assert(logger.indexOf('function sanitizeLogUrl(url)') !== -1, 'content logger must sanitize page URLs');
-  assert(logger.indexOf('function sanitizeLogText(text)') !== -1, 'content logger must sanitize URL substrings inside plain text logs');
-  assert(logger.indexOf('isUrlFieldKey(key) ? sanitizeLogUrl(value) : sanitizeLogText(value)') !== -1, 'content logger must sanitize structured URL-like fields by key');
-  assert(logger.indexOf('JSON.stringify(normalizedFields || normalizeFields(data))') !== -1, 'content logger must serialize sanitized object log fields');
-  assert(logger.indexOf('var normalizedFields;') !== -1, 'content logger must reuse normalized object log fields inside add');
-  assert(logger.indexOf("if (typeof data !== 'object') entry.data = stringifyData(data);") !== -1, 'content logger must avoid duplicating structured fields in stored data');
-  assert(logger.includes("typeof data === 'object' ? stringifyData(data, normalizedFields) : entry.data"), 'content logger must reuse normalized fields for console output');
-  assert(logger.indexOf('var arrayLimit = Math.min(value.length, 12);') !== -1, 'content logger array field sanitization must preserve the 12-item cap');
-  assert(logger.indexOf('for (var ai = 0; ai < arrayLimit; ai++)') !== -1, 'content logger array field sanitization must use a bounded loop');
-  assert(logger.indexOf('value.slice(0, 12).map') === -1, 'content logger array field sanitization must not allocate slice/map arrays');
-  assert(logger.indexOf('for (var key in fields)') !== -1, 'content logger field normalization must scan fields without Object.keys allocation');
-  assert(logger.indexOf('Object.keys(fields)') === -1, 'content logger field normalization must not allocate a full field-key array');
-  assert(logger.indexOf('keys = keys.slice(0, MAX_FIELD_KEYS)') === -1, 'content logger field normalization must not allocate a sliced key array');
-  assert(logger.indexOf('pageUrl: getPageUrl()') !== -1, 'content logger must keep page URL context through the sanitizer');
-  assert(logger.indexOf("var LOG_CLEARED_AT_KEY = 'atp_logs_cleared_at';") !== -1, 'content logger must read the log clear marker before storage writes');
-  assert(logger.indexOf("console.warn('[Logger] 清空标记读取失败:', chrome.runtime.lastError.message);") !== -1, 'content logger must fail closed when the log clear marker read fails');
-  assert(logger.indexOf('requeueBatch(batch, chrome.runtime.lastError.message);\n        finishLogWrite(false);') !== -1, 'content logger must requeue without writing storage when clear marker reads fail');
-  assert(logger.indexOf('filterLogsAfterClearedAt(merged, clearedAtMs)') !== -1, 'content logger must drop queued logs older than the clear marker');
-  assert(logger.indexOf('filterLogsAfterClearedAt(batch, clearedAtMs)') !== -1, 'content logger retry batches must drop logs older than the clear marker');
-  assert(logger.indexOf("chrome.storage.local.remove(LOG_KEY, function()") !== -1, 'content logger must remove its current shard when all queued logs predate the clear marker');
-  assert(logger.indexOf('var filtered = filterLogsAfterClearedAt(merged, clearedAtMs);') !== -1 &&
-    logger.indexOf('trimLogEntries(ordinary, MAX_ENTRIES - 1, MAX_LOG_KEY_BYTES - RETENTION_RESERVED_BYTES)') !== -1,
-    'content logger must filter cleared entries and reserve room for retention evidence before storage writes');
-  assert(logger.indexOf('function trimLogEntriesFrom(entries, start, maxBytes)') !== -1, 'content logger retry trimming must support start-offset trimming without pre-slicing');
-  assert(logger.includes('function estimateLogEntryBytes(entry)'), "content logger byte trimming must estimate retained windows through a helper");
-  assert(logger.includes('while (start < entries.length && totalBytes > maxBytes)'), "content logger byte trimming must avoid direct slice calls at the trim callsite");
-  assert(logger.indexOf('estimateLogBytes(entries.slice(start))') === -1, 'content logger byte trimming must not slice retained windows at the trim callsite');
-  assert(logger.indexOf('function copyLogEntriesFrom(entries, start)') !== -1, 'content logger trim must copy the retained window with a loop helper');
-  assert(logger.indexOf('var out = new Array(length);') !== -1, 'content logger trim must preallocate the retained log window');
-  assert(logger.indexOf('out[i] = entries[start + i]') !== -1, 'content logger trim must copy retained log entries by index');
-  assert(logger.indexOf('function mergeLogEntries(existing, batch)') !== -1, 'content logger storage writes must merge existing logs and batches with a loop');
-  assert(logger.indexOf('var merged = new Array(source.length + batch.length);') !== -1, 'content logger storage writes must preallocate merged log arrays');
-  assert(logger.indexOf('merged[writeIndex++] = source[i]') !== -1, 'content logger storage writes must copy existing logs by index');
-  assert(logger.indexOf('merged[writeIndex++] = batch[j]') !== -1, 'content logger storage writes must copy new log batches by index');
-  assert(logger.indexOf('merged.push(source[i])') === -1, 'content logger storage writes must not grow merged arrays with push');
-  assert(logger.indexOf('merged.push(batch[j])') === -1, 'content logger storage writes must not grow merged arrays with push');
-  assert(logger.indexOf('return trimLogEntriesFrom(entries, Math.max(0, entries.length - maxEntries), maxBytes);') !== -1, 'content logger trim must use a start cursor for the retained log window');
-  assert(logger.indexOf('entries = Array.isArray(entries) ? entries.slice() : []') === -1, 'content logger trim must not copy the full log array before trimming');
-  assert(logger.indexOf('if (entries.length > maxEntries) entries = entries.slice(entries.length - maxEntries)') === -1, 'content logger trim must not allocate a max-entry slice before byte trimming');
-  assert(logger.indexOf('return entries.slice(start);') === -1, 'content logger trim must not slice the retained log window');
-  assert(logger.indexOf('existing.concat(batch)') === -1, 'content logger storage writes must not concat existing logs and batches');
-  assert(logger.indexOf('merged.slice(Math.ceil(merged.length / 2))') === -1, 'content logger write retry must not slice the retained log array before trimming');
-  assert(logger.indexOf('planLogKeyPrune(keys, items') !== -1, 'content logger must prune old log keys by count and byte budget');
-  assert(logger.indexOf('function collectSortedContentLogKeys(keys, extraKey)') !== -1, 'content logger must collect indexed log keys in one filtered/deduped pass');
-  assert(logger.indexOf('function collectStoredContentLogKeys(callback)') !== -1, 'content logger must discover stored content log shards before rewriting the index');
-  assert(logger.indexOf('area.getKeys(function(keys)') !== -1, 'content logger must use storage.getKeys when available to recover sibling log shards');
-  assert(logger.indexOf('function removeStaleLogKeysThenWriteIndex(plan, callback)') !== -1, 'content logger must remove stale shards before rewriting the content log index');
-  assert(logger.indexOf('function keepStaleLogKeysOnRemoveFailure(plan)') !== -1, 'content logger must keep stale shards indexed when stale deletion fails');
-  assert(logger.indexOf('mergeSortedContentLogKeys(indexedKeys, discoveredKeys, LOG_KEY)') !== -1, 'content logger index writes must merge indexed, discovered, and current content log shards');
-  assert(logger.indexOf('uniqueKeys(keys).filter(isContentLogKey)') === -1, 'content logger prune must not allocate a filtered unique-key array');
-  assert(logger.indexOf('result[LOG_KEY_INDEX]) ? result[LOG_KEY_INDEX].filter(isContentLogKey)') === -1, 'content logger index reads must not allocate filtered index arrays');
-  assert(logger.indexOf('indexed.concat([LOG_KEY])') === -1, 'content logger index reads must not concat the current log key');
-  assert(logger.indexOf('var stale = keys.slice(MAX_LOG_KEYS)') === -1, 'content logger prune must not allocate stale key slices');
-  assert(logger.indexOf('var candidates = keys.slice(0, MAX_LOG_KEYS)') === -1, 'content logger prune must not allocate candidate key slices');
-  assert(logger.includes('chrome.storage.local.get(keys.slice(0, MAX_LOG_KEYS), function(items)'), "log quota recovery must bound the number of loaded shards");
-  assert(logger.indexOf('var retryBatch = null') !== -1, 'content logger retries must use a dedicated retry batch slot');
-  assert(logger.indexOf('retryBatch = batch;') !== -1, 'content logger retries must keep failed batches ahead of newer queue entries without unshift');
-  assert(logger.indexOf('if (retryBatch) {\n      for (var ri = 0; ri < retryBatch.length; ri++)') !== -1, 'content logger flush drain must copy retry batches before queued batches');
-  assert(logger.indexOf('flushQueue.unshift(batch)') === -1, 'content logger retries must not move queued batches with unshift');
-  assert(logger.indexOf('function drainFlushQueue()') !== -1, 'content logger must drain queued flush batches without shifting each batch');
-  assert(logger.indexOf('while (flushQueue.length) batch = batch.concat(flushQueue.shift())') === -1, 'content logger flush must not repeatedly concat shifted queue batches');
-  assert(logger.indexOf('sanitizeUrl: sanitizeLogUrl') !== -1, 'content logger must expose URL sanitization for structured startup logs');
-  assert(background.indexOf('BACKGROUND_LOG_BYTES') !== -1, 'background logger must use the shared background log byte budget');
-  assert(background.indexOf('trimLogEntries(filterLogsAfterClearedAt(entries, clearedAtMs), MAX, MAX_BYTES)') !== -1, 'background logger must filter cleared entries and trim by byte budget before storage writes');
-  assert(background.indexOf('function trimLogEntriesFrom(entries, start, maxBytes)') !== -1, 'background logger retry trimming must support start-offset trimming without pre-slicing');
-  assert(background.indexOf("var LOG_CLEARED_AT_KEY = 'atp_logs_cleared_at';") !== -1, 'background logger must read the log clear marker before storage writes');
-  assert(background.indexOf("console.warn('[BGLOG] 清空标记读取失败:', chrome.runtime.lastError.message);") !== -1, 'background logger must fail closed when the log clear marker read fails');
-  assert(background.indexOf('requeueBatch(batch, chrome.runtime.lastError.message);\n        finishLogWrite(false);') !== -1, 'background logger must requeue without writing storage when clear marker reads fail');
-  assert(background.indexOf('filterLogsAfterClearedAt(entries, clearedAtMs)') !== -1, 'background logger must drop queued logs older than the clear marker');
-  assert(background.indexOf('filterLogsAfterClearedAt(batch, clearedAtMs)') !== -1, 'background logger retry batches must drop logs older than the clear marker');
-  assert(background.indexOf("chrome.storage.local.remove(LOG_KEY, function()") !== -1, 'background logger must remove its shard when all queued logs predate the clear marker');
-  assert(background.indexOf('function estimateLogBytesFrom(entries, start)') !== -1, 'background logger byte trimming must estimate retained windows through a helper');
-  assert(background.indexOf('estimateLogBytesFrom(entries, start) > maxBytes') !== -1, 'background logger byte trimming must avoid direct slice calls at the trim callsite');
-  assert(background.indexOf('estimateLogBytes(entries.slice(start))') === -1, 'background logger byte trimming must not slice retained windows at the trim callsite');
-  assert(background.indexOf('function copyLogEntriesFrom(entries, start)') !== -1, 'background logger trim must copy the retained window with a loop helper');
-  assert(background.indexOf('var out = new Array(length);') !== -1, 'background logger trim must preallocate the retained log window');
-  assert(background.indexOf('out[i] = entries[start + i]') !== -1, 'background logger trim must copy retained log entries by index');
-  assert(background.indexOf('function mergeLogEntries(existing, batch)') !== -1, 'background logger storage writes must merge existing logs and batches with a loop');
-  assert(background.indexOf('var merged = new Array(source.length + batch.length);') !== -1, 'background logger storage writes must preallocate merged log arrays');
-  assert(background.indexOf('merged[writeIndex++] = source[i]') !== -1, 'background logger storage writes must copy existing logs by index');
-  assert(background.indexOf('merged[writeIndex++] = batch[j]') !== -1, 'background logger storage writes must copy new log batches by index');
-  assert(background.indexOf('merged.push(source[i])') === -1, 'background logger storage writes must not grow merged arrays with push');
-  assert(background.indexOf('merged.push(batch[j])') === -1, 'background logger storage writes must not grow merged arrays with push');
-  assert(background.indexOf('return trimLogEntriesFrom(entries, Math.max(0, entries.length - maxEntries), maxBytes);') !== -1, 'background logger trim must use a start cursor for the retained log window');
-  assert(background.indexOf('entries = Array.isArray(entries) ? entries.slice() : []') === -1, 'background logger trim must not copy the full log array before trimming');
-  assert(background.indexOf('if (entries.length > maxEntries) entries = entries.slice(entries.length - maxEntries)') === -1, 'background logger trim must not allocate a max-entry slice before byte trimming');
-  assert(background.indexOf('return entries.slice(start);') === -1, 'background logger trim must not slice the retained log window');
-  assert(background.indexOf('(r[LOG_KEY] || []).concat(b)') === -1, 'background logger storage writes must not concat existing logs and batches');
-  assert(background.indexOf('m.slice(Math.ceil(m.length / 2))') === -1, 'background logger write retry must not slice the retained log array before trimming');
-  assert(background.indexOf('function stringifyLogData(d)') !== -1, 'background logger must sanitize data before storing it');
-  assert(background.indexOf('var arrayLimit = Math.min(value.length, 12);') !== -1, 'background logger array sanitization must preserve the 12-item cap');
-  assert(background.indexOf('for (var ai = 0; ai < arrayLimit; ai++)') !== -1, 'background logger array sanitization must use a bounded loop');
-  assert(background.indexOf('value.slice(0, 12).map') === -1, 'background logger array sanitization must not allocate slice/map arrays');
-  assert(background.indexOf('var childCount = 0;') !== -1 && background.indexOf('if (childCount++ >= 40) break;') !== -1, 'background logger object sanitization must preserve the 40-field cap');
-  assert(background.indexOf('Object.keys(value).slice(0, 40).forEach') === -1, 'background logger object sanitization must not allocate sliced key arrays');
-  assert(background.indexOf('retryBatch = null') !== -1, 'background logger retries must use a dedicated retry batch slot');
-  assert(background.indexOf('retryBatch = batch;') !== -1, 'background logger retries must keep failed batches ahead of newer queue entries without unshift');
-  assert(background.indexOf('if (retryBatch) {\n      for (var ri = 0; ri < retryBatch.length; ri++)') !== -1, 'background logger flush drain must copy retry batches before queued batches');
-  assert(background.indexOf('flushQueue.unshift(batch)') === -1, 'background logger retries must not move queued batches with unshift');
-  assert(background.indexOf('function drainFlushQueue()') !== -1, 'background logger must drain queued flush batches without shifting each batch');
-  assert(background.indexOf('while (flushQueue.length) b = b.concat(flushQueue.shift())') === -1, 'background logger flush must not repeatedly concat shifted queue batches');
-  assert(background.indexOf('url.substring(') === -1, 'background logs must not truncate raw URLs before sanitizing them');
-  assert(background.indexOf('function getSafeAttachmentReferrer(attachment)') !== -1, 'background TXT fetches must use a safe referrer helper');
-  assert(background.indexOf("referrerUrl.search = '';") !== -1 && background.indexOf("referrerUrl.hash = '';") !== -1, 'background TXT fetches must strip same-origin referrer query and hash');
-  assert(background.indexOf('var safeReferrer = getSafeAttachmentReferrer(attachment);') !== -1, 'background TXT fetches must compute safe referrers before fetch');
-  assert(background.indexOf('fetchOptions.referrer = safeReferrer') !== -1, 'background TXT fetches must only set safe referrers');
-  assert(background.indexOf('fetchOptions.referrer = attachment.pageUrl') === -1, 'background TXT fetches must not pass attachment pageUrl directly as referrer');
-  assert(Array.isArray(manifest.content_scripts) && manifest.content_scripts[0].world === 'MAIN', 'same-origin TXT page bridge must run in the page main world');
-  assertExactStringArray(manifest.content_scripts[0].js, ['page-fetch-bridge.js'], 'page bridge content script files');
-  assert(manifest.content_scripts[0].run_at === 'document_start', 'same-origin TXT page bridge must be ready before isolated content fetches');
-  assert(pageFetchBridge.indexOf("url.origin !== location.origin") !== -1, 'page TXT bridge must reject cross-origin requests');
-  assert(pageFetchBridge.indexOf("/\\/attachment\\.php$/i") !== -1 && pageFetchBridge.indexOf("/\\/misc\\.php$/i") !== -1 && pageFetchBridge.indexOf("mod=attachment") !== -1, 'page TXT bridge must restrict requests to attachment-shaped URLs');
-  assert(pageFetchBridge.indexOf('readResponseLimited(response, maxBytes)') !== -1, 'page TXT bridge must cap streamed response bytes');
-  assert(pageFetchBridge.indexOf("credentials: 'include'") !== -1, 'page TXT bridge must reuse the page same-origin session');
-  assert(pageFetchBridge.indexOf("window.postMessage(message, location.origin)") !== -1, 'page TXT bridge responses must stay on the current origin');
-  assert(fetcher.indexOf('requestTextAttachmentFromPage(attachment, timeoutMs)') !== -1, 'TXT fetcher must request same-origin attachments through the page bridge');
-  assert(fetcher.indexOf('fetchTextAttachmentResourceViaPage(attachment, fetchTimeout, writeStartedAt, options)') !== -1, 'same-origin TXT fetches must try the page session before isolated/background fallback');
-  assert(fetcher.indexOf('ATPCache.setCachedTextResources(attachment.url, resources, writeStartedAt)') !== -1, 'page-session TXT results must populate the existing TXT cache');
-  assert(resourcePanel.indexOf("data-import-txt=\"1\"") !== -1, 'resource panel must offer a local downloaded TXT import fallback');
-  assert(resourcePanel.indexOf("input.accept = '.txt,text/plain'") !== -1, 'local TXT import must constrain the file picker to text files');
-  assert(resourcePanel.indexOf('file.size > SharedUtils.TEXT_ATTACHMENT_MAX_BYTES') !== -1, 'local TXT import must enforce the shared byte limit');
-  assert(resourcePanel.indexOf("SharedUtils.extractResources(text, location.href, 'txt')") !== -1, 'local TXT import must reuse the shared resource parser');
-  assert(renderer.indexOf('importTextResources: function(threadState, imports)') !== -1, 'renderer must integrate local TXT resources into live thread state');
-  assert(renderer.indexOf('ATPCache.setCachedTextResources(attachment.url, usable[ui].resources, writeStartedAt)') !== -1, 'local TXT imports must seed matching attachment caches');
-  assert(renderer.indexOf("threadState.textResourceMessage = '已从本地 TXT 导入 '") !== -1, 'local TXT imports must expose successful user feedback');
-  assert(contentCss.indexOf('.atp-resource-import-btn') !== -1, 'local TXT import must share visible resource action styling');
-  assert(background.indexOf("if (!msg || typeof msg !== 'object') return false;") !== -1, 'background onMessage must guard non-object messages');
-  assert(background.indexOf("originAllowed((sender && sender.url) || '')") !== -1, 'background onMessage must tolerate missing senders');
-  assert(background.indexOf('var deniedTextAttempted = Math.min(TEXT_ATTACHMENT_MAX_COUNT, Array.isArray(msg.attachments) ? msg.attachments.length : 0);') !== -1, 'background denied TXT requests must still return a complete retryable status contract');
-  assert(background.indexOf('sendResponse({});\n  return false;') !== -1, 'background unknown messages must respond safely and close synchronously');
-  assert(floatingPanel.indexOf('type: SharedUtils.MESSAGE_TYPES.SAVE_SETTINGS_PATCH') !== -1, 'floating panel default storage must route patch saves through the shared background writer contract');
-  assert(floatingPanel.indexOf('settingsPatch: s || {}') !== -1, 'floating panel default storage must avoid sending mutable full settings when saving patches');
-  assert(floatingPanel.indexOf('_cloneSettingsForSave(source, changedKeys)') !== -1, 'floating panel must clone schema save snapshots explicitly');
-  assert(floatingPanel.indexOf('const snapshot = this._cloneSettingsForSave(this.settings, patchKeys);') !== -1, 'floating panel save snapshots must be derived from changed keys');
-  assert(floatingPanel.indexOf('const snapshot = {};') !== -1, 'floating panel save snapshots must not start from default settings');
-  assert(floatingPanel.indexOf('siteConfigs = {}') === -1, 'floating panel save snapshots must not synthesize empty siteConfigs');
-  assert(floatingPanel.indexOf("if (saveSeq === this._saveStatusSeq) {\n        console.warn('[FloatingPanel] settings save failed:', e);") !== -1, 'floating panel stale save failures must not announce stale errors');
-  assert(floatingPanel.indexOf("_reportNumberInputError(el, item)") !== -1, 'floating panel numeric validation must report accessible errors');
-  assert(floatingPanel.indexOf("el.setAttribute('aria-invalid', 'true')") !== -1, 'floating panel invalid numeric inputs must set aria-invalid');
-  assert(floatingPanel.indexOf("el.setAttribute('aria-describedby', 'bfp-msg')") !== -1, 'floating panel invalid numeric inputs must point at the panel message live region');
-  assert(floatingPanel.indexOf("this.showMessage('请输入' + item.label") !== -1, 'floating panel invalid numeric inputs must announce the valid range');
-  assert(/setSettings\(rawSettings\)[\s\S]*?this\._clearInputError\(field\);/.test(floatingPanel), 'floating panel external settings redraws must clear stale numeric error state');
-  assert(/_refreshDependentFields\(\)[\s\S]*?this\._clearInputDirty\(item\.key\);[\s\S]*?this\._clearInputError\(field\);/.test(floatingPanel), 'floating panel dependent disables must clear stale dirty and numeric error state');
-  assert(/if \(!saved\)[\s\S]*?this\._clearInputError\(el\);[\s\S]*?this\.flashError\(el\);/.test(floatingPanel), 'floating panel save rollback must clear stale numeric error state before flashing the field');
-  assert(config.indexOf('ATPNormalizeSettings({ enabled: false })') !== -1, 'settings read failures must fail closed instead of default-enabling the extension');
-  assert(content.indexOf('Logger.flush();\n    Logger.stopFlushTimer();') !== -1, 'disabling the current page must flush logs before stopping the flush timer');
-  assert(content.indexOf('Logger.sanitizeUrl ? Logger.sanitizeUrl(location.href) : location.href') !== -1, 'content startup logs must use sanitized URLs');
-  assert(fetcher.indexOf('function logUrl(url)') !== -1, 'fetcher must sanitize URLs before ordinary debug/warn logging');
 }
 
 function checkLocalToolingNotTracked() {
@@ -19272,6 +18577,67 @@ async function checkArticleInterstitialIsRetryable() {
   assert(!shared0.isForumChallengePage(smallNotice), 'a small Discuz notice is not the challenge');
   const notice = shared0.classifyEmptyArticlePage(smallNotice);
   assert(notice && notice.reason === 'forum_message' && !shared0.isForumFloodReason(notice.reason), 'a Discuz notice must be retried as a thread answer, not treated as a flood');
+  for (const [html, reason] of [
+    ['<div id="messagetext">服务暂时不可用，请稍后再试。</div>', 'forum_message'],
+    ['<main>稍候再试</main>', 'unrecognized_page'],
+    ['<main>正在维护，请稍后再试。</main><script src="/site.js"></script>', 'unrecognized_page'],
+    ['<main>请稍后再试。</main><script>console.info("unavailable")</script>', 'unrecognized_page'],
+    ['<form id="challenge-form">访问验证，请稍后再试。</form><script src="/verify.js"></script>', 'challenge_page'],
+    ['<main>请稍后再试</main><script>location.reload()</script>', 'challenge_page'],
+    ['<div id="messagetext">访问频繁，请稍后再试。</div>', 'rate_limited'],
+    ['<main>Too many requests</main>', 'rate_limited']
+  ]) {
+    const result = shared0.classifyEmptyArticlePage(html);
+    assert(result && result.retryable && result.reason === reason, 'notice must be classified by its evidence: ' + html);
+  }
+  assert(shared0.isForumAgeGateTitle(' sehuatang.net ') && !shared0.isForumAgeGateTitle('SEHUATANG.ORG - Forum'), 'only the documented brand titles should match');
+  assert(shared0.isForumAgeGateLabel('If you are over 18, please click here', 'en') && !shared0.isForumAgeGateLabel('Please click here', 'en'), 'the English button must be an explicit age declaration');
+  const gateControls = '<div class="domain">SEHUATANG.ORG</div><div class="row down-content"><h3>警告 / WARNING</h3></div>' +
+    '<a class="enter-btn" href="/">满18岁，请点此进入</a><a href="/" class="enter-btn">If you are over 18，please click here</a><iframe></iframe>';
+  const gatePage = '<html><head><title>SEHUATANG.ORG</title><script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script></head><body>' + gateControls + '</body></html>';
+  const gateWithMedia = gatePage.replace('</body>', '<img src="/entry-cover.jpg"><a href="/files/entry.txt">entry.txt</a></body>');
+  assert(!shared0.isForumChallengePage(gatePage) && !shared0.isForumFloodReason(shared0.classifyEmptyArticlePage(gatePage).reason), 'the scripted age notice must not pause the forum');
+  const activeChallenge = gatePage.replace('</body>', '<form id="challenge-form"><div class="cf-turnstile"></div></form></body>');
+  assert(shared0.isForumFloodReason(shared0.classifyEmptyArticlePage(activeChallenge).reason), 'a live verification form must retain challenge backoff even with branded entry links');
+  const quotedGate = gatePage.replace(gateControls, '<div id="postlist"><div id="postmessage_1">' + gateControls + '</div></div>');
+  assert(!shared0.isBlockedPage(quotedGate) && !shared0.classifyEmptyArticlePage(quotedGate), 'a real thread quoting the notice must still be parsed');
+
+  let worker = loadBackgroundSandbox();
+  const gateFetcher = loadFetcherSandbox();
+  const positiveWrites = [], outcomes = [], requests = [];
+  gateFetcher.ATPCache.setCachedArticleData = function(url) { positiveWrites.push(url); };
+  gateFetcher.Logger.isEnabled = function() { return false; };
+  gateFetcher.setTimeout = setTimeout;
+  gateFetcher.clearTimeout = clearTimeout;
+  gateFetcher.ATPForumPacer = { acquire: async function() { return { waitMs: 0, done: function(outcome) { outcomes.push(outcome); } }; } };
+  gateFetcher.chrome.runtime.sendMessage = function(message, done) {
+    return worker.__onMessage(message, { url: 'https://www.sehuatang.org/forum-1-1.html' }, done);
+  };
+  const articleUrl = 'https://www.sehuatang.org/thread-120-1-1.html';
+  for (const html of [gatePage, gateWithMedia]) {
+    gateFetcher.fetch = worker.fetch = async function(url) {
+      requests.push(url);
+      return makeHtmlResponse(html, { url: 'https://www.sehuatang.org/', redirected: true });
+    };
+    for (const readArticle of ['fetchArticleData', 'fetchArticleDataByBackground']) {
+      const entry = await gateFetcher.ATPFetcher[readArticle](articleUrl);
+      assert(entry && entry.retryableEmpty && entry.emptyReason === 'blocked' && !(entry.images || []).length && !(entry.textAttachments || []).length,
+        readArticle + ' must return the entry as unavailable, including when it carries preview media');
+    }
+    assert(await gateFetcher.ATPFetcher.fetchTextAttachmentsFresh(articleUrl) === null, 'same-origin TXT re-extraction must leave the gate retryable');
+    assert(await gateFetcher.ATPFetcher.fetchTextAttachmentsFreshByBackground(articleUrl) === null, 'worker TXT re-extraction must leave the gate retryable');
+  }
+  assert(outcomes.length === 8 && outcomes.every(function(outcome) { return outcome === ''; }), 'entry responses must leave the forum pacing level untouched');
+  assert(requests.length === 8 && requests.every(function(url) { return url === articleUrl; }), 'article readers must never follow the age confirmation links');
+  assert(!positiveWrites.length && !gateFetcher.__negativeWrites.length, 'neither cache may store an age-entry response');
+  for (const [extra, reason] of [['<form id="challenge-form"><div class="cf-turnstile"></div></form>', 'challenge_page'], ['<p>请求次数过多，请稍后再试</p>', 'rate_limited']]) {
+    worker = loadBackgroundSandbox();
+    gateFetcher.fetch = worker.fetch = async function(url) { return makeHtmlResponse(gateWithMedia.replace('</body>', extra + '</body>'), { url: url }); };
+    for (const readArticle of ['fetchArticleData', 'fetchArticleDataByBackground']) {
+      const result = await gateFetcher.ATPFetcher[readArticle](articleUrl);
+      assert(result.retryableEmpty && result.emptyReason === reason && outcomes[outcomes.length - 1] === 'flood', readArticle + ' must retain active pushback on the branded page: ' + reason);
+    }
+  }
   assert(!shared0.isForumFloodReason('unrecognized_page'), 'an unrecognized page alone must not pause the whole forum');
   const cfTitleThread = '<html><head><title>Just a Moment 中文字幕 - 色花堂</title><script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script></head>' +
     '<body><div id="postlist"><div id="post_1"><td class="t_f" id="postmessage_1"><img src="https://img.example/1.jpg"></td></div></div></body></html>';
@@ -19301,6 +18667,50 @@ async function checkContentArticleFloodBackoff() {
     return { link: { href: href }, container: { getBoundingClientRect: function() { return { top: 10, bottom: 100 }; } } };
   };
   const viewport = function(offsetMs) { return { now: Date.now() + offsetMs, viewportTop: -2000, viewportBottom: 2800 }; };
+  const connection = loadContentRetryableEmptySandbox({ withDom: true });
+  connection.navigator = { onLine: false };
+  const connectionScan = connection.window.__ATP_VERIFY_CONTENT_INTERNALS;
+  const offlineUrl = 'https://www.sehuatang.org/thread-80-1-1.html';
+  const genericUrl = 'https://www.sehuatang.org/thread-81-1-1.html';
+  const serverUrl = 'https://www.sehuatang.org/thread-82-1-1.html';
+  const targetUntil = Date.now() + 120000;
+  connectionScan.rememberRetryableEmpty(offlineUrl, { reason: 'offline' });
+  connectionScan.rememberRetryableEmpty(genericUrl, { reason: 'transient_exception' });
+  connectionScan.rememberRetryableEmpty(serverUrl, { reason: 'forum_cooldown', retryAfter: targetUntil });
+  const connectionState = connectionScan.getRetryableEmptyState();
+  const genericDue = connectionState.retryAfter[genericUrl];
+  assert(!connectionScan.isProcessCandidate(liveEntry(offlineUrl), viewport(60000)) &&
+      connectionState.attempts[offlineUrl] === undefined && connectionState.attempts[serverUrl] === undefined,
+    'confirmed offline jobs and requests held by a target must stay retryable without consuming an attempt');
+  connection.navigator.onLine = true;
+  connection.__windowEvents.online();
+  assert(connectionScan.getRetryableEmptyState().retryScanDueAt <= Date.now() + 200 &&
+      connectionScan.isProcessCandidate(liveEntry(offlineUrl), viewport(0)) &&
+      connectionState.retryAfter[genericUrl] === genericDue &&
+      connectionState.retryAfter[serverUrl] === targetUntil,
+    'the online event must immediately release only confirmed offline rows and preserve forum and general backoff');
+  connectionScan.clearThumbnailDom();
+  connectionScan.rememberRetryableEmpty(offlineUrl, { reason: 'offline' });
+  assert(connectionScan.getRetryableEmptyState().retryScanDueAt <= Date.now() + 200 &&
+      connectionScan.isProcessCandidate(liveEntry(offlineUrl), viewport(0)),
+    'an in-flight offline result delivered after reconnect must also be due promptly');
+
+  const hidden = loadContentRetryableEmptySandbox({ withDom: true });
+  hidden.navigator = { onLine: false };
+  const hiddenScan = hidden.window.__ATP_VERIFY_CONTENT_INTERNALS;
+  hiddenScan.rememberRetryableEmpty(offlineUrl, { reason: 'offline' });
+  hidden.document.visibilityState = 'hidden';
+  hidden.navigator.onLine = true;
+  hidden.__windowEvents.online();
+  assert(hidden.__timers.length === 0 && hiddenScan.isProcessCandidate(liveEntry(offlineUrl), viewport(0)),
+    'a hidden tab must consider offline work ready on return without starting a scan while hidden');
+  hidden.navigator.onLine = false;
+  hiddenScan.rememberRetryableEmpty(offlineUrl, { reason: 'offline' });
+  hiddenScan.clearThumbnailDom();
+  hidden.document.visibilityState = 'visible';
+  hidden.navigator.onLine = true;
+  hidden.__windowEvents.online();
+  assert(hidden.__timers.length === 0, 'cleaning the thumbnail DOM must discard its previous offline retry work');
   const floodUrl = 'https://www.sehuatang.org/thread-45-1-1.html';
   assert(internals.rememberRetryableEmpty(floodUrl, { reason: 'challenge_page', retryAfter: 0 }) === true, 'a first challenge must schedule a retry');
   assert(internals.isProcessCandidate(liveEntry(floodUrl), viewport(16000)) === false, 'a challenged thread must not retry before the pacer pause ends');
@@ -19354,7 +18764,7 @@ async function checkContentArticleFloodBackoff() {
   for (let a = 0; a < 4; a++) mixed.push(internals.rememberRetryableEmpty(url, { reason: 'challenge_page', retryAfter: 0 }));
   mixed.push(internals.rememberRetryableEmpty(url, { reason: 'unrecognized_page', retryAfter: 0 }));
   assert(mixed.every(Boolean), 'challenges must not use up the retry allowance of a later page answer: ' + mixed.join(','));
-  ['login_page', 'permission_page', 'download_blocked', 'purchase_page'].forEach(function(reason) {
+  ['login_redirect', 'http_401', 'http_403', 'login_page', 'permission_page', 'download_blocked', 'purchase_page'].forEach(function(reason) {
     internals.clearRetryableEmpty(url);
     const answers = [];
     for (let a = 0; a < 5; a++) answers.push(internals.rememberRetryableEmpty(url, { reason: reason, retryAfter: 0 }));
@@ -19365,7 +18775,6 @@ async function checkContentArticleFloodBackoff() {
   // The row says what is going on: queued behind the pause, retrying, given
   // up; and the note goes away once thumbnails arrive.
   let respond = null;
-  const heldNotes = [];
   const noteSandbox = loadContentRetryableEmptySandbox({
     withPacer: true,
     withDom: true,
@@ -19390,24 +18799,101 @@ async function checkContentArticleFloodBackoff() {
       getBoundingClientRect: function() { return { top: 20, bottom: 100 }; }
     }
   };
-  respond = function(articleUrl, paceOptions) {
-    assert(paceOptions && typeof paceOptions.isCancelled === 'function' && typeof paceOptions.getPriority === 'function',
-      'article fetches must hand the pacer their priority and cancellation');
-    assert(paceOptions.getPriority() === noteSandbox.window.ATPForumPacer.PRIORITY_VISIBLE, 'a thread on screen must queue with visible priority');
-    paceOptions.onHeld();
-    heldNotes.push(link.nextElementSibling && link.nextElementSibling.textContent);
-    return Promise.resolve({ images: [], retryableEmpty: true, emptyReason: 'challenge_page' });
-  };
-  await noteInternals.processContainers([entry], noteInternals.getScanGeneration());
-  assert(heldNotes[0] === '论坛限流，排队中', 'a thread held by the forum pause must say it is queued: ' + heldNotes[0]);
-  assert(link.nextElementSibling && link.nextElementSibling.textContent === '论坛限流，稍后自动重试',
-    'a challenged thread must say it will retry by itself');
+  function makeNoteEntry(href, titleLink) {
+    const rowLink = titleLink || createVerifyThreadLink(href);
+    return { link: rowLink, container: { tagName: 'TR', classList: createVerifyClassList([]),
+      contains: node => rowLink === node, getBoundingClientRect: () => ({ top: 20, bottom: 100 }) } };
+  }
+  function startPendingRequest(entries) {
+    let complete;
+    const started = new Promise(resolve => {
+      respond = (url, options) => new Promise(finish => { complete = finish; resolve(options); });
+    });
+    const processed = noteInternals.processContainers(entries, noteInternals.getScanGeneration());
+    return started.then(options => ({ options, finish: async function(data) { complete(data); await processed; } }));
+  }
+  const retryData = reason => ({ images: [], retryableEmpty: true, emptyReason: reason });
+  const duplicate = makeNoteEntry(threadUrl);
+  const initial = await startPendingRequest([entry, duplicate]);
+  assert(typeof initial.options.isCancelled === 'function' && initial.options.getPriority() === noteSandbox.window.ATPForumPacer.PRIORITY_VISIBLE,
+    'article fetches must hand the pacer cancellation and the current visible priority');
+  initial.options.onHeld();
+  assert(link.nextElementSibling.textContent === '正文请求排队中' && duplicate.link.nextElementSibling.textContent === '正文请求排队中' &&
+    !link.nextElementSibling.title.includes('验证页'), 'every title waiting on the shared ticket must describe its queue without inventing a server response');
+  initial.options.onGranted(2500);
+  assert(link.nextElementSibling === null && duplicate.link.nextElementSibling === null && !noteSandbox.__injected.length,
+    'admitting the article request must clear all its wait notes before either the body or thumbnails arrive');
+  initial.options.onHeld();
+  assert(link.nextElementSibling === null, 'a stale held notification after admission must not recreate the note');
+  await initial.finish(retryData('challenge_page'));
+  assert(link.nextElementSibling.textContent === '论坛验证，稍后自动重试' && link.nextElementSibling.title.includes('验证页') &&
+    duplicate.link.nextElementSibling.title === link.nextElementSibling.title, 'a subsequent challenge must put the actual retry state back on every matching title');
   assert(link.nextElementSibling.className === 'atp-forum-wait', 'the wait note must carry its own class');
   assert(iconLink.nextElementSibling === null, 'the wait note must not go into the icon cell');
   noteInternals.clearRetryableEmpty(threadUrl);
-  respond = function() { return Promise.resolve({ images: [{ src: 'https://img.example/42.jpg' }], resources: {}, textAttachments: [] }); };
-  await noteInternals.processContainers([entry], noteInternals.getScanGeneration());
+  const retry = await startPendingRequest([entry, duplicate]);
+  retry.options.onGranted(0);
+  assert(link.nextElementSibling === null && duplicate.link.nextElementSibling === null,
+    'a retry admitted immediately must clear a previous retry message without requiring another hold notification');
+  await retry.finish({ images: [{ src: 'https://img.example/42.jpg' }], resources: {}, textAttachments: [] });
   assert(noteSandbox.__injected.indexOf(threadUrl) !== -1 && link.nextElementSibling === null, 'the wait note must go away when the thread loads');
+
+  // Reused titles and an independent pending request make stale grants and
+  // results observable before the current network request settles.
+  const sharedRow = makeNoteEntry('https://www.sehuatang.org/thread-4201-1-1.html');
+  const otherRow = makeNoteEntry('https://other.example/thread-4202-1-1.html');
+  noteSandbox.ATPFetcher.fetchArticleDataByBackground = async (url, options) => noteSandbox.ATPCache.normalizeArticleData(await respond(url, options));
+  const other = await startPendingRequest([otherRow]);
+  other.options.onHeld();
+  const previous = await startPendingRequest([sharedRow]);
+  previous.options.onHeld();
+  const replacedRow = makeNoteEntry(sharedRow.link.href, sharedRow.link);
+  const current = await startPendingRequest([replacedRow]);
+  current.options.onGranted(0);
+  assert(sharedRow.link.nextElementSibling === null && otherRow.link.nextElementSibling.textContent === '正文请求排队中',
+    'granting a request for a reused title must preserve another thread’s queue note');
+  previous.options.onHeld();
+  assert(sharedRow.link.nextElementSibling === null, 'a superseded ticket must not restore an old message to a reused title');
+  await current.finish(retryData('http_503'));
+  const unavailable = sharedRow.link.nextElementSibling;
+  assert(unavailable.textContent === '论坛服务暂不可用，稍后自动重试' && unavailable.title.includes('HTTP 503') &&
+    !/限流|验证/.test(unavailable.title), 'a plain HTTP 503 must explain service unavailability without claiming rate limiting or a challenge');
+  previous.options.onGranted(3000);
+  await previous.finish(retryData('login_redirect'));
+  assert(sharedRow.link.nextElementSibling === unavailable, 'an older grant and subsequent non-flood result must preserve the newer HTTP 503 retry note');
+  other.options.onGranted(1200);
+  assert(otherRow.link.nextElementSibling === null && sharedRow.link.nextElementSibling === unavailable,
+    'the background article bridge must clear its own title immediately on admission');
+  await other.finish(retryData('http_429'));
+  assert(otherRow.link.nextElementSibling.textContent.includes('论坛限流') && otherRow.link.nextElementSibling.title.includes('HTTP 429') &&
+    !otherRow.link.nextElementSibling.title.includes('验证页'), 'HTTP 429 must describe the request rate and preserve the real cause');
+  const reusedNote = otherRow.link.nextElementSibling;
+  const nextHold = await startPendingRequest([otherRow]);
+  nextHold.options.onHeld();
+  assert(otherRow.link.nextElementSibling === reusedNote && reusedNote.textContent === '正文请求排队中' && !reusedNote.title.includes('429'),
+    'a new hold must update the visible text and tooltip of the existing retry note together');
+  await nextHold.finish(retryData('rate_limited'));
+  assert(otherRow.link.nextElementSibling === reusedNote && reusedNote.title.includes('请求过于频繁') && !reusedNote.title.includes('429'),
+    'an HTML rate-limit notice must have its own explanation when the same span is reused');
+
+  const lateUrl = 'https://www.sehuatang.org/thread-4204-1-1.html';
+  const firstRow = makeNoteEntry(lateUrl);
+  const lateRow = makeNoteEntry(lateUrl);
+  const savedScan = noteSandbox.ATPScanner.detectArticleContainers;
+  const savedConcurrency = noteSandbox.ATPConfig.settings.articleFetchConcurrency;
+  noteSandbox.ATPConfig.settings.articleFetchConcurrency = 1;
+  const grouped = await startPendingRequest([firstRow]);
+  grouped.options.onHeld();
+  noteSandbox.ATPScanner.detectArticleContainers = options => options.seekViewportStart && options.accept(lateRow) ? [lateRow] : [];
+  noteInternals.requestArticleVisibleBoost();
+  assert(lateRow.link.nextElementSibling && lateRow.link.nextElementSibling.textContent === '正文请求排队中',
+    'a matching title discovered during a held request must join its current queue state');
+  grouped.options.onGranted(1000);
+  assert(firstRow.link.nextElementSibling === null && lateRow.link.nextElementSibling === null,
+    'admission must also clear titles attached after the initial hold');
+  await grouped.finish({ images: [], resources: {}, textAttachments: [] });
+  noteSandbox.ATPScanner.detectArticleContainers = savedScan;
+  noteSandbox.ATPConfig.settings.articleFetchConcurrency = savedConcurrency;
 
   const tiredUrl = 'https://www.sehuatang.org/thread-43-1-1.html';
   const tiredLink = createVerifyThreadLink(tiredUrl);
@@ -19422,8 +18908,25 @@ async function checkContentArticleFloodBackoff() {
       getBoundingClientRect: function() { return { top: 20, bottom: 100 }; }
     }
   }], noteInternals.getScanGeneration());
-  assert(tiredLink.nextElementSibling && tiredLink.nextElementSibling.textContent === '论坛限流未加载，刷新页面可重试',
-    'a thread that used up its retries must point to reloading the page');
+  assert(tiredLink.nextElementSibling.textContent === '正文未加载，刷新页面可重试' &&
+    tiredLink.nextElementSibling.title.includes('本页已停止自动重试') && !tiredLink.nextElementSibling.title.includes('稍后会自动重试'),
+    'the exhausted note and its tooltip must agree that a manual page refresh is needed');
+
+  const cleanupEntry = makeNoteEntry('https://www.sehuatang.org/thread-4203-1-1.html');
+  const beforeCleanup = await startPendingRequest([cleanupEntry]);
+  beforeCleanup.options.onHeld();
+  noteInternals.clearThumbnailDom();
+  assert(cleanupEntry.link.nextElementSibling === null, 'cleanup must remove the current queue note');
+  beforeCleanup.options.onHeld();
+  beforeCleanup.options.onGranted(1000);
+  await beforeCleanup.finish(retryData('http_503'));
+  assert(cleanupEntry.link.nextElementSibling === null, 'late wait, grant, and flood results from before cleanup must leave the DOM clean');
+  const afterCleanup = await startPendingRequest([cleanupEntry]);
+  afterCleanup.options.onHeld();
+  afterCleanup.options.onGranted(100);
+  await afterCleanup.finish(retryData('cloudflare'));
+  assert(cleanupEntry.link.nextElementSibling.title.includes('Cloudflare 验证页'),
+    'a fresh job after cleanup can report a verified Cloudflare challenge normally');
 
   // During a real pause no worker parks: the thread is deferred to the end of
   // the pause without using one of its attempts.
@@ -19456,7 +18959,7 @@ async function checkContentArticleFloodBackoff() {
     link: { href: deferUrl },
     container: { getBoundingClientRect: function() { return { top: 10, bottom: 100 }; } }
   }, { now: Date.now() + 5000, viewportTop: -2000, viewportBottom: 2800 }) === false, 'a deferred thread must come back only when the pause ends');
-  assert(deferLink.nextElementSibling && deferLink.nextElementSibling.textContent === '论坛限流，排队中', 'a deferred thread must say it is queued');
+  assert(deferLink.nextElementSibling && deferLink.nextElementSibling.textContent === '正文请求排队中', 'a deferred thread must say it is queued');
   deferInternals.clearThumbnailDom();
   assert(deferLink.nextElementSibling === null, 'clearing the thumbnails (disable, reload) must remove the wait notes');
 }
@@ -19469,6 +18972,13 @@ async function checkContentArticleDispatch() {
   async function settle(times) {
     for (let i = 0; i < (times || 30); i++) await Promise.resolve();
   }
+  function flushCommits(sandbox, maximumDelay = 100) {
+    sandbox.__timers.forEach(function(timer) {
+      if (timer.ran || timer.delay > maximumDelay) return;
+      timer.ran = true;
+      timer.fn();
+    });
+  }
   // Runs the sandbox's short timers (commit flushes), not the gate's
   // one-second recheck, until the scan finishes.
   async function drive(sandbox, promise) {
@@ -19476,11 +18986,7 @@ async function checkContentArticleDispatch() {
     promise.then(function() { finished = true; });
     for (let round = 0; round < 200 && !finished; round++) {
       await settle();
-      sandbox.__timers.forEach(function(timer) {
-        if (timer.ran || timer.delay > 100) return;
-        timer.ran = true;
-        timer.fn();
-      });
+      flushCommits(sandbox);
     }
     assert(finished, 'the article scan must finish');
   }
@@ -19499,6 +19005,25 @@ async function checkContentArticleDispatch() {
   }
   const offscreen = function() { return { top: 3000, bottom: 3100 }; };
   const onScreen = function() { return { top: 20, bottom: 120 }; };
+
+  for (const visibleBeforeCommit of [false, true]) {
+    const url = 'https://www.sehuatang.org/thread-208-1-1.html';
+    const canonical = makeEntry(url, visibleBeforeCommit ? onScreen : offscreen);
+    const duplicate = makeEntry(url, visibleBeforeCommit ? offscreen : onScreen);
+    duplicate.container.tagName = 'DIV';
+    const run = loadContentRetryableEmptySandbox({ withDom: true, settings: { pauseWhenHidden: false },
+      fetchArticleData: function() {
+        run.document.visibilityState = 'hidden';
+        return Promise.resolve({ images: [{ src: 'https://img.example/208.jpg' }], resources: {}, textAttachments: [] });
+      }
+    });
+    let committed;
+    run.ATPRenderer.injectThumbnails = (container, data, link, startedAt, wasVisible) => { committed = { container, wasVisible }; };
+    const jobs = run.window.__ATP_VERIFY_CONTENT_INTERNALS;
+    await drive(run, jobs.processContainers([duplicate, canonical], jobs.getScanGeneration()));
+    assert(committed && committed.container === canonical.container && committed.wasVisible === visibleBeforeCommit,
+      'hidden commits of grouped thread links must carry the selected row\'s last foreground measurement');
+  }
 
   // Visible first: with requests available, the on-screen thread is fetched
   // first even though it is last in page order.
@@ -19554,8 +19079,10 @@ async function checkContentArticleDispatch() {
     }
   });
   late.ATPCache.getArticleCacheState = function(url) {
-    return Promise.resolve(url === cachedUrl ? { cached: { images: [] }, negative: false } : { cached: null, negative: false });
+    const cached = url === cachedUrl ? late.ATPCache.normalizeArticleData({ images: [{ src: 'https://img.example/cached.jpg' }] }) : null;
+    return Promise.resolve({ cached: cached, negative: false });
   };
+  late.ATPCache.getCachedArticleData = async function(url) { return (await late.ATPCache.getArticleCacheState(url)).cached; };
   const lateInternals = late.window.__ATP_VERIFY_CONTENT_INTERNALS;
   const latePacer = late.window.ATPForumPacer;
   for (let i = 0; i < 10; i++) (await latePacer.acquire({ priority: latePacer.PRIORITY_VISIBLE })).done('ok');
@@ -19569,18 +19096,124 @@ async function checkContentArticleDispatch() {
     makeEntry('https://www.sehuatang.org/thread-213-1-1.html', function() { return comesOnScreen ? onScreen() : offscreen(); })
   ], lateInternals.getScanGeneration());
   await settle();
-  assert(started.join(',') === '211,214', 'only one offscreen thread may wait for the pacer, and a cached thread must not wait at all: ' + started.join(','));
+  flushCommits(late);
+  assert(started.join(',') === '211' && late.__injected.includes(cachedUrl),
+    'only one offscreen thread may wait for the pacer, and an offscreen cache hit must render without a fetch: ' + started.join(','));
   comesOnScreen = true;
   lateInternals.requestArticleVisibleBoost();
   await settle();
-  assert(started.join(',') === '211,214,213', 'a thread that comes on screen must take the next turn ahead of queued offscreen threads: ' + started.join(','));
+  assert(started.join(',') === '211,213', 'a thread that comes on screen must take the next turn ahead of queued offscreen threads: ' + started.join(','));
   Object.keys(pending).forEach(function(id) { pending[id]({ images: [{ src: 'https://img.example/' + id + '.jpg' }], resources: {}, textAttachments: [] }); });
   await settle();
-  assert(started.join(',') === '211,214,213,212', 'a finished offscreen thread must let the next one wait for the pacer: ' + started.join(','));
+  assert(started.join(',') === '211,213,212', 'a finished offscreen thread must let the next one wait for the pacer: ' + started.join(','));
   pending['212']({ images: [{ src: 'https://img.example/212.jpg' }], resources: {}, textAttachments: [] });
   await drive(late, lateRun);
   assert(['211', '212', '213', '214'].every(function(id) { return late.__injected.indexOf('https://www.sehuatang.org/thread-' + id + '-1-1.html') !== -1; }),
     'every thread must still be committed');
+
+  const warm = loadContentRetryableEmptySandbox({ settings: { articleFetchConcurrency: 2 }, fetchArticleData(url) {
+    requested.push(url);
+    return new Promise(resolve => { finishSlow = resolve; });
+  } });
+  const slowUrl = 'https://www.sehuatang.org/thread-215-1-1.html';
+  const warmLocal = 'https://www.sehuatang.org/thread-216-1-1.html';
+  const warmRemote = 'https://www.sehuatang.net/thread-217-1-1.html';
+  const negativeUrl = 'https://www.sehuatang.net/thread-218-1-1.html';
+  const longData = warm.ATPCache.normalizeArticleData({
+    images: Array.from({ length: 5000 }, (_, index) => ({ src: 'https://img.example/warm/' + index + '.jpg' }))
+  });
+  const cacheExpiry = Date.now() + 60000;
+  const requested = [], cacheReads = [], committed = [];
+  let finishSlow;
+  let finishGallery;
+  warm.ATPCache.getArticleCacheState = async function(url) {
+    cacheReads.push(url);
+    return { cached: url === warmLocal || url === warmRemote ? longData : null, negative: url === negativeUrl, negativeExpiresAt: cacheExpiry };
+  };
+  warm.ATPRenderer.prepareArticleGallery = data => data === longData && !finishGallery
+    ? new Promise(resolve => { finishGallery = resolve; }) : null;
+  warm.ATPRenderer.injectThumbnails = (container, data, link, time, visible, plan) => committed.push({ url: link.href, data, plan });
+  const warmInternals = warm.window.__ATP_VERIFY_CONTENT_INTERNALS;
+  const warmScan = warmInternals.processContainers([makeEntry(slowUrl, onScreen), makeEntry(warmLocal, offscreen),
+    makeEntry(warmRemote, offscreen), makeEntry(negativeUrl, offscreen)], warmInternals.getScanGeneration());
+  await settle(100);
+  flushCommits(warm);
+  assertExactStringArray(requested, [slowUrl], 'admitted warm jobs must not start requests, regardless of origin');
+  assertExactStringArray(cacheReads.slice().sort(), [slowUrl, warmLocal, warmRemote, negativeUrl].sort(),
+    'admitted jobs must reuse the same combined cache snapshot');
+  assert(committed.length === 1 && committed[0].url === warmRemote && committed[0].data === longData,
+    'another ready gallery must commit while the first gallery is still being prepared');
+  assert(warmInternals.getRetryableEmptyState().retryAfter[negativeUrl] === cacheExpiry,
+    'a cached cross-origin failure must retain its original expiration');
+  const plan = { data: longData };
+  finishGallery(plan);
+  finishSlow({ images: [{ src: 'https://img.example/slow.jpg' }] });
+  await drive(warm, warmScan);
+  const warmResult = committed.find(item => item.url === warmLocal);
+  assert(warmResult && warmResult.data === longData && warmResult.plan === plan,
+    'a prepared gallery must reach commit with the exact cached article and prepared plan');
+
+  for (const reason of ['cache_clear', 'hidden', 'bfcache', 'plan_cancelled']) {
+    const linkUrl = 'https://www.sehuatang.org/thread-219-1-1.html';
+    const row = makeEntry(linkUrl, onScreen);
+    const run = loadContentRetryableEmptySandbox({ withDom: true, settings: { pauseWhenHidden: reason !== 'bfcache' },
+      fetchArticleData: () => ({ images: [{ src: 'https://img.example/fresh-219.jpg' }] }) });
+    const internals = run.window.__ATP_VERIFY_CONTENT_INTERNALS;
+    const snapshot = { cached: longData, negative: false };
+    let readCurrent = true, galleryIsCurrent, finishOldGallery, preparationStarted = false;
+    let commits = [];
+    run.window.__bfpPanel = {};
+    run.ATPScanner.isDecoratedArticleContainer = el => el.classList.contains('atp-processed');
+    run.ATPScanner.detectArticleContainers = ({ accept, scanState }) => {
+      if (scanState.visited) return [];
+      scanState.visited = scanState.exhausted = true;
+      return accept(row) ? [row] : [];
+    };
+    run.ATPCache.getArticleCacheState = async () => readCurrent ? snapshot : { cached: null, negative: false };
+    run.ATPCache.isArticleCacheReadCurrent = data => readCurrent || (data !== snapshot && data !== snapshot.cached);
+    run.ATPRenderer.prepareArticleGallery = (data, isCurrent) => {
+      if (data !== longData) return null;
+      if (preparationStarted) return Promise.resolve(plan);
+      preparationStarted = true;
+      galleryIsCurrent = isCurrent;
+      return new Promise(resolve => { finishOldGallery = resolve; });
+    };
+    run.ATPRenderer.injectThumbnails = (el, data, link, startedAt, visible, gallery) => {
+      commits.push({ data, gallery });
+      el.classList.add('atp-processed');
+    };
+    internals.setInitialized();
+    internals.detectAndProcess(true, true);
+    flushCommits(run);
+    await settle(100);
+    assert(preparationStarted && galleryIsCurrent(), reason + ': the original gallery must be preparing');
+    if (reason === 'cache_clear') readCurrent = false;
+    if (reason === 'hidden') {
+      run.document.visibilityState = 'hidden';
+      internals.handleVisibilityChange();
+    }
+    if (reason === 'bfcache') {
+      const oldGeneration = internals.getScanGeneration();
+      run.__windowEvents.pagehide({ persisted: true });
+      run.__windowEvents.pageshow({ persisted: true });
+      assert(internals.getScanGeneration() !== oldGeneration, 'BFCache must retire the old article scan while keeping rendered DOM');
+    }
+    assert(galleryIsCurrent() === (reason === 'plan_cancelled'),
+      reason + ': the gallery must distinguish an invalidated row from an expired plan');
+    finishOldGallery(null);
+    await settle(100);
+    assert(!commits.length, reason + ': null preparation must not start a synchronous render');
+    if (reason === 'hidden') {
+      run.document.visibilityState = 'visible';
+      internals.handleVisibilityChange();
+    }
+    for (let round = 0; round < 20 && !commits.length; round++) {
+      flushCommits(run, 150);
+      await settle(100);
+    }
+    assert(commits.length === 1 && (reason === 'cache_clear' ? commits[0].data !== longData : commits[0].gallery === plan),
+      reason + ': the live row must render exactly once after a fresh scan');
+  }
 
   function makeDispatchRun(concurrency, fetchArticleData) {
     const run = loadContentRetryableEmptySandbox({ withPacer: true, withDom: true, settings: { articleFetchConcurrency: concurrency }, fetchArticleData: fetchArticleData });
@@ -19759,6 +19392,7 @@ function loadForumPacerSandbox(options) {
     console: console,
     Math: Math,
     Promise: Promise,
+    SharedUtils: loadSharedUtils(),
     Date: { now: function() { return options.sharedClock ? sharedClock.now : clock; } },
     setTimeout: function(fn, delay) {
       const id = ++timerSeq;
@@ -19940,12 +19574,19 @@ async function checkForumPacerBehavior() {
   assert(Math.abs(order.pacer.getState().tokens - (beforeRefund + 1)) < 0.02, 'an unused ticket must return its allowance: ' + beforeRefund + ' -> ' + order.pacer.getState().tokens);
 
   const retry = loadForumPacerSandbox();
-  (await retry.pacer.acquire(ON_SCREEN)).done('flood', retry.now() + 90000);
+  const shortRetry = await retry.pacer.acquire(ON_SCREEN);
+  const longRetry = await retry.pacer.acquire(ON_SCREEN);
+  shortRetry.done('flood', retry.now() + 90000);
   assert(retry.pacer.getState().pausedMs === 90000, 'Retry-After must extend the pause');
-  (await retry.pacer.acquire({ manual: true })).done('flood', retry.now() + 3600000);
-  assert(retry.pacer.getState().pausedMs === 300000, 'a huge Retry-After must be capped at five minutes');
-  const manual = await retry.pacer.acquire({ manual: true });
-  assert(manual, 'an explicit user retry must go out even during a pause');
+  longRetry.done('flood', retry.now() + 3600000);
+  const retryState = retry.pacer.getState();
+  assert(retryState.pausedMs === 3600000 && retryState.retryAfterUntil === retry.now() + 3600000,
+    'a longer Retry-After from the same burst must keep its full duration');
+  assert(await retry.pacer.acquire({ manual: true }) === null, 'manual requests must honor a server Retry-After');
+  const heuristicPause = loadForumPacerSandbox();
+  (await heuristicPause.pacer.acquire(ON_SCREEN)).done('flood');
+  const manual = await heuristicPause.pacer.acquire({ manual: true });
+  assert(manual, 'an explicit user retry must still be available during a learned pause');
   manual.done('');
 
   // The reader's manual reset (popup): the pace learned from challenges and
@@ -20003,10 +19644,10 @@ async function checkForumPacerBehavior() {
   function makeExtensionStorage() {
     const store = {};
     const listeners = [];
-    const statusWrites = [];
+    const statusReports = [];
     return {
       store: store,
-      statusWrites: statusWrites,
+      statusReports: statusReports,
       fire: function(value) {
         store.atp_forum_pacer_reset_at = value;
         listeners.forEach(function(listener) { listener({ atp_forum_pacer_reset_at: { newValue: value } }, 'local'); });
@@ -20014,17 +19655,22 @@ async function checkForumPacerBehavior() {
       chrome: {
         storage: {
           local: {
-            get: function(key, callback) {
+            get: function(keys, callback) {
               const out = {};
-              if (Object.prototype.hasOwnProperty.call(store, key)) out[key] = JSON.parse(JSON.stringify(store[key]));
+              for (const key of (Array.isArray(keys) ? keys : [keys])) {
+                if (Object.hasOwn(store, key)) out[key] = JSON.parse(JSON.stringify(store[key]));
+              }
               callback(out);
-            },
-            set: function(items) {
-              Object.assign(store, JSON.parse(JSON.stringify(items)));
-              if (items.atp_forum_pacer_status_v1) statusWrites.push(JSON.parse(JSON.stringify(items.atp_forum_pacer_status_v1)));
             }
           },
           onChanged: { addListener: function(listener) { listeners.push(listener); } }
+        },
+        runtime: {
+          sendMessage: function(message, callback) {
+            assert(message.type === 'REPORT_FORUM_PACER_STATUS', 'a forum tab must publish pace status through the background');
+            statusReports.push(JSON.parse(JSON.stringify(message)));
+            callback({ ok: true });
+          }
         }
       }
     };
@@ -20036,11 +19682,12 @@ async function checkForumPacerBehavior() {
   await openPage.advance(20000);
   (await openPage.pacer.acquire(ON_SCREEN)).done('flood');
   assert(openPage.pacer.getState().burst === 4, 'the marker test must start from a slowed pace');
-  const lastStatus = function() { return extStore.statusWrites[extStore.statusWrites.length - 1]; };
-  assert(lastStatus() && lastStatus()['www.sehuatang.org'].burst === 4 && lastStatus()['www.sehuatang.org'].pauseUntil > 0,
+  const lastReport = function() { return extStore.statusReports.at(-1); };
+  const lastStatus = function() { return lastReport() && lastReport().entry; };
+  assert(lastStatus() && lastStatus().burst === 4 && lastStatus().pauseUntil > 0 && lastReport().resetMarker === 0,
     'a forum page must report its slowed pace for the popup: ' + JSON.stringify(lastStatus()));
-  assert(lastStatus()['www.sehuatang.org'].limitsUntil === openPage.now() + 24 * 60 * 60 * 1000 &&
-    lastStatus()['www.sehuatang.org'].idleUntil === lastStatus()['www.sehuatang.org'].pauseUntil + 300000,
+  assert(lastStatus().limitsUntil === openPage.now() + 24 * 60 * 60 * 1000 &&
+    lastStatus().idleUntil === lastStatus().pauseUntil + 300000,
     'the report must say when the learned pace lapses and when an unused host is forgotten: ' + JSON.stringify(lastStatus()));
   let heldForMarker = null;
   openPage.pacer.acquire(ON_SCREEN).then(function(ticket) { heldForMarker = ticket; });
@@ -20053,7 +19700,8 @@ async function checkForumPacerBehavior() {
   assert(heldForMarker, 'a request held by the pause must go right after a reset from the popup');
   heldForMarker.done('ok');
   assert(openPageStorage.getItem('atp.forumPacer.limits.v1') === null, 'a reset from the popup must forget the learned pace in the page store');
-  assert(lastStatus()['www.sehuatang.org'].burst === 10 && lastStatus()['www.sehuatang.org'].pauseUntil === 0, 'the page must report the normal pace after a reset');
+  assert(lastStatus().burst === 10 && lastStatus().pauseUntil === 0 && lastReport().resetMarker === openPage.now(),
+    'the page must report the normal pace and the applied marker after a reset');
   assert(openPage.logs.some(function(line) { return line.indexOf('info:论坛节流已按弹窗重置') === 0; }), 'a reset from the popup must be logged');
   await openPage.advance(1000);
   (await openPage.pacer.acquire(ON_SCREEN)).done('flood');
@@ -20085,20 +19733,20 @@ async function checkForumPacerBehavior() {
   const staleAfter = staleTab.pacer.getState();
   assert(staleAfter.burst === 10 && staleAfter.refillMs === 2000 && staleAfter.learnedBurst === 10,
     'a reset must bring back the normal pace when the challenge was long ago: ' + JSON.stringify(staleAfter));
-  const staleStatus = staleExt.statusWrites[staleExt.statusWrites.length - 1]['www.sehuatang.org'];
+  const staleStatus = staleExt.statusReports.at(-1).entry;
   assert(staleStatus.burst === 10 && staleStatus.refillMs === 2000, 'the page must report the normal pace after that reset: ' + JSON.stringify(staleStatus));
   assert(staleTab.logs.some(function(line) { return line.indexOf('info:论坛节流已按弹窗重置') === 0; }), 'that reset must be logged');
   const staleNext = loadForumPacerSandbox({ chrome: staleExt.chrome, location: { hostname: 'www.sehuatang.org' }, localStorage: staleStorage, forumPage: true, clock: staleTab.now() + 1000 });
   assert(staleNext.pacer.getState().burst === 10 && staleNext.pacer.getState().refillMs === 2000,
     'a page opened after that reset must keep the normal pace: ' + JSON.stringify(staleNext.pacer.getState()));
   // A tab at work refreshes its report once a minute and not on every request.
-  const writesBeforeWork = staleExt.statusWrites.length;
+  const reportsBeforeWork = staleExt.statusReports.length;
   (await staleNext.pacer.acquire(ON_SCREEN)).done('ok');
-  assert(staleExt.statusWrites.length === writesBeforeWork, 'an unchanged pace must not be reported again right away');
+  assert(staleExt.statusReports.length === reportsBeforeWork, 'an unchanged pace must not be reported again right away');
   await staleNext.advance(61000);
   (await staleNext.pacer.acquire(ON_SCREEN)).done('ok');
-  assert(staleExt.statusWrites.length === writesBeforeWork + 1 &&
-    staleExt.statusWrites[staleExt.statusWrites.length - 1]['www.sehuatang.org'].at === staleNext.now(),
+  assert(staleExt.statusReports.length === reportsBeforeWork + 1 &&
+    staleExt.statusReports.at(-1).entry.at === staleNext.now(),
     'a tab at work must refresh its report after a minute');
 
   // A reset is applied once: a clock that steps back afterwards must not
@@ -20268,6 +19916,54 @@ async function checkForumPacerBehavior() {
   assert(lost && !next, 'probe mode must hold the second request while the first is in flight');
   await stale.advance(91000);
   assert(next, 'an unsettled ticket must stop counting after its maximum age');
+
+  await checkForumPacerStatusPublication();
+}
+
+async function checkForumPacerStatusPublication() {
+  const worker = loadBackgroundSandbox({ enableDebug: false });
+  const storage = worker.chrome.storage.local;
+  const readLocal = storage.get;
+  const writeLocal = storage.set;
+  storage.get = function(keys, callback) {
+    readLocal(keys, function(items) {
+      const snapshot = structuredClone(items);
+      setImmediate(function() { callback(snapshot); });
+    });
+  };
+  storage.set = function(items, callback) {
+    setImmediate(function() { writeLocal(structuredClone(items), callback); });
+  };
+  const org = 'www.sehuatang.org';
+  const net = 'www.sehuatang.net';
+  const now = Date.now();
+  const retryAfterUntil = now + 600000;
+  function publish(host, entry, resetMarker) {
+    return new Promise(function(resolve) {
+      worker.__onMessage({ type: 'REPORT_FORUM_PACER_STATUS', entry, resetMarker },
+        { url: 'https://' + host + '/forum-95-1.html', tab: { id: 4 } }, resolve);
+    });
+  }
+  const statuses = () => worker.__storage.atp_forum_pacer_status_v1;
+  const reports = await Promise.all([
+    publish(org, { at: now, burst: 5, level: 1, pauseUntil: retryAfterUntil, retryAfterUntil }, 0),
+    publish(net, { at: now, burst: 7, level: 1, pauseUntil: now + 20000 }, 0)
+  ]);
+  assert(reports.every(report => report.ok) && statuses()[org].burst === 5 && statuses()[net].burst === 7,
+    'two hosts reporting together must both be kept in the popup status');
+
+  const resetMarker = Date.now();
+  worker.__storage.atp_forum_pacer_reset_at = resetMarker;
+  worker.__storageChangeListener({ atp_forum_pacer_reset_at: { newValue: resetMarker } }, 'local');
+  await publish(org, { at: Date.now(), burst: 4, level: 2, pauseUntil: now + 1200000 }, 0);
+  assert(statuses()[org].resetMarker === resetMarker && statuses()[org].burst === 10 &&
+    statuses()[org].pauseUntil === retryAfterUntil && statuses()[net].pauseUntil === 0,
+    'reset must preserve a server deadline and discard a report collected before the reset');
+  await publish(org, { at: Date.now(), burst: 10, level: 0, pauseUntil: 0 }, resetMarker);
+  assert(statuses()[org].retryAfterUntil === retryAfterUntil && statuses()[org].pauseUntil === retryAfterUntil,
+    'a report from another tab must not clear the active server deadline');
+  const denied = await publish('example.test', { at: now, burst: 8 }, resetMarker);
+  assert(!denied.ok && !statuses()['example.test'], 'a page outside the allowed forum origins cannot publish a status');
 }
 
 async function checkForumPacerSharedProbeLease() {
@@ -20340,6 +20036,30 @@ async function checkForumPacerSharedProbeLease() {
   second.done('');
   await flush();
 
+  const manualWait = pair(makeLocks());
+  const automaticProbe = await manualWait.a.pacer.acquire({ priority: 0 });
+  let manualProbe;
+  manualWait.b.pacer.acquire({ manual: true, deadline: manualWait.clock.now + 1500 })
+    .then(function(ticket) { manualProbe = ticket; });
+  await flush();
+  assert(manualProbe === undefined, 'manual TXT must wait for an automatic probe in another tab');
+  automaticProbe.done('');
+  await flush();
+  await manualWait.b.advance(500);
+  assert(manualProbe && !manualWait.a.pacer.canStartNow(0),
+    'manual TXT must claim the same shared lease when the previous probe settles');
+  const manualDeadline = manualWait.a.pacer.acquire({ manual: true, deadline: manualWait.clock.now + 1000 });
+  let boundedManual;
+  manualWait.a.pacer.acquire({ manual: true }).then(function(ticket) { boundedManual = ticket; });
+  await manualWait.a.advance(1000);
+  assert(await manualDeadline === null && boundedManual === undefined,
+    'the caller deadline must end a manual wait for a busy probe');
+  await manualWait.a.advance(9000);
+  assert(boundedManual === null && !manualWait.a.pacer.canStartNow(0),
+    'manual retries without a caller deadline must also stop waiting without releasing the active probe');
+  manualProbe.done('');
+  await flush();
+
   const cancelled = pair(makeLocks());
   let cancel = false, cancelledResult;
   cancelled.a.pacer.acquire({ priority: 0, isCancelled: function() { return cancel; } }).then(function(ticket) { cancelledResult = ticket; });
@@ -20400,13 +20120,26 @@ async function checkForumPacerSharedProbeLease() {
 async function checkFetcherForumPacing() {
   const challengeHtml = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>泰戈尔</title><script>var a=1;</script></head><body><p>' +
     '生如夏花之绚烂，死如秋叶之静美。'.repeat(20) + '</p></body></html>';
-  function loadFetcherPacerSandbox() {
+  function loadFetcherPacerSandbox(usePageBridge) {
     const sandbox = loadFetcherSandbox();
     sandbox.setTimeout = setTimeout;
     sandbox.clearTimeout = clearTimeout;
     sandbox.Logger.info = function() {};
     sandbox.Logger.isEnabled = function() { return false; };
     vm.runInContext(read('forum-pacer.js'), sandbox, { filename: 'forum-pacer.js' });
+    if (usePageBridge) {
+      sandbox.btoa = btoa;
+      sandbox.atob = atob;
+      vm.runInContext(`{
+        const listeners = new Set();
+        window.addEventListener = (type, callback) => { if (type === 'message') listeners.add(callback); };
+        window.removeEventListener = (type, callback) => { if (type === 'message') listeners.delete(callback); };
+        window.postMessage = (data, origin) => {
+          for (const callback of listeners) callback({ source: window, origin, data });
+        };
+      }`, sandbox);
+      vm.runInContext(read('page-fetch-bridge.js'), sandbox, { filename: 'page-fetch-bridge.js' });
+    }
     return sandbox;
   }
   const sandbox = loadFetcherPacerSandbox();
@@ -20436,7 +20169,8 @@ async function checkFetcherForumPacing() {
     return makeHtmlResponse('<html><head><title>提示信息 - 色花堂 - Powered by Discuz!</title></head><body><div id="wp"><div id="messagetext" class="alert_error"><p>抱歉，本帖要求阅读权限高于 50 才能浏览</p></div></div>' + 'x'.repeat(9000) + '</body></html>', { url: url });
   };
   const locked = await neutral.ATPFetcher.fetchArticleData('https://www.sehuatang.org/thread-73-1-1.html');
-  assert(locked.retryableEmpty === true && locked.emptyReason === 'blocked', 'a read-permission thread must come back as blocked');
+  assert(locked.retryableEmpty === true && locked.emptyReason === 'permission_page',
+    'a read-permission thread must keep its specific retryable reason');
   assert(neutral.ATPForumPacer.getState().level === 0, 'a read-permission thread must not pause or slow the forum pacer');
 
   const cf = loadFetcherPacerSandbox();
@@ -20507,6 +20241,252 @@ async function checkFetcherForumPacing() {
   assert(Date.now() - nestedStarted < 3000, 'following a download link after a challenge must not stall until the TXT deadline: ' + (Date.now() - nestedStarted) + 'ms');
   assert(nestedFetches.length === 2 && nestedResources.groups.magnet.length === 1, 'the linked TXT must still be read: ' + nestedFetches.join(' '));
 
+  const redirectedSuccess = loadFetcherPacerSandbox();
+  const successfulOutcomes = [];
+  redirectedSuccess.ATPForumPacer.acquire = async () => ({
+    done: outcome => { successfulOutcomes.push(outcome); }
+  });
+  redirectedSuccess.fetch = async url => url.endsWith('.txt')
+    ? makeHtmlResponse('https://pan.quark.cn/s/localtest', { url: 'https://www.sehuatang.net/response.txt', contentType: 'text/plain' })
+    : makeHtmlResponse('<html><body><div id="postmessage_77">正文</div></body></html>', {
+      url: 'https://www.sehuatang.net/thread-77-1-1.html'
+    });
+  const directSuccess = await redirectedSuccess.ATPFetcher.fetchArticleData('https://www.sehuatang.org/thread-77-1-1.html');
+  const freshSuccess = await redirectedSuccess.ATPFetcher.fetchTextAttachmentsFresh('https://www.sehuatang.org/thread-78-1-1.html');
+  const textSuccess = await redirectedSuccess.ATPFetcher.fetchTextAttachmentResourcesWithStatus(
+    [{ url: 'https://www.sehuatang.org/response.txt' }], { manualRetry: true });
+  assert(!directSuccess.retryableEmpty && Array.isArray(freshSuccess) && textSuccess.resources.groups.quark.length === 1,
+    'valid responses from a permitted redirected origin must still deliver their content');
+  assert(successfulOutcomes.length >= 3 && successfulOutcomes.every(outcome => outcome === ''),
+    'successful responses from another origin must not count as successful local recovery probes');
+
+  const retryDate = new Date(Date.now() + 3600000).toUTCString();
+  const retryUntil = Date.parse(retryDate);
+  function limitedResponse(url, status) {
+    return makeHtmlResponse('', { url, ok: false, status, retryAfter: retryDate });
+  }
+  function assertServerDeadline(sandbox, label) {
+    const state = sandbox.ATPForumPacer.getState();
+    assert(state.level === 1 && state.retryAfterUntil === retryUntil,
+      label + ' must preserve the server Retry-After: ' + JSON.stringify(state));
+  }
+  function assertNoLocalCooldown(sandbox, label) {
+    const state = sandbox.ATPForumPacer.getState();
+    assert(state.level === 0 && state.retryAfterUntil === 0, label + ' must leave the page origin available: ' + JSON.stringify(state));
+  }
+  const challengeReads = [
+    ['direct TXT', fetcher => fetcher.fetchTextAttachmentResourcesWithStatus([
+      { url: 'https://www.sehuatang.org/forum.php?mod=attachment&aid=503', name: 'list.txt' }
+    ], { manualRetry: true })],
+    ['direct thread refresh', fetcher => fetcher.fetchTextAttachmentsFresh('https://www.sehuatang.org/thread-75-1-1.html')]
+  ];
+  for (const [label, read] of challengeReads) {
+    const limited = loadFetcherPacerSandbox();
+    limited.fetch = async url => {
+      const response = limitedResponse(url, 503);
+      const getHeader = response.headers.get;
+      response.headers.get = name => name.toLowerCase() === 'cf-mitigated' ? 'challenge' : getHeader(name);
+      return response;
+    };
+    await read(limited.ATPFetcher);
+    assertServerDeadline(limited, label + ' with a Cloudflare 503');
+  }
+
+  const rateNotice = '<div id="messagetext" class="alert_info">您的请求过于频繁，请稍后再试。</div>';
+  const refusalCases = {
+    'Discuz HTTP 200': url => makeHtmlResponse('<html><body>' + rateNotice + '</body></html>', { url, retryAfter: retryDate }),
+    'Discuz notice fragment': url => makeHtmlResponse(rateNotice, { url, contentType: 'application/octet-stream', retryAfter: retryDate }),
+    'Cloudflare HTTP 403': url => {
+      const response = limitedResponse(url, 403);
+      const getHeader = response.headers.get;
+      response.headers.get = name => name.toLowerCase() === 'cf-mitigated' ? 'challenge' : getHeader(name);
+      return response;
+    }
+  };
+  const neutralCases = [
+    ['ordinary maintenance', url => makeHtmlResponse('<html><body><div id="messagetext">系统维护，稍后再试</div></body></html>', { url }), false, false],
+    ['ordinary permission notice', url => makeHtmlResponse(
+      '<html><body><div id="messagetext">您没有权限，此限制和“访问过于频繁”无关。</div></body></html>', { url }), false, false],
+    ['ordinary HTTP 403', url => limitedResponse(url, 403), false, true],
+    ['thread wording', url => makeHtmlResponse('<html><body id="postmessage_1">' + rateNotice + '</body></html>', { url }), false, false],
+    ['plain TXT wording', url => makeHtmlResponse(
+      '示例：请求过于频繁\nhttps://pan.quark.cn/s/healthyfixture', { url, contentType: 'text/plain' }), true, false]
+  ];
+  for (const route of ['bridge', 'direct', 'worker']) {
+    function makeReader(respond) {
+      const page = loadFetcherPacerSandbox(route === 'bridge');
+      const worker = route === 'worker' ? loadBackgroundSandbox() : null;
+      const attachment = { url: 'https://www.sehuatang.org/refusal-fixture.txt' };
+      let requests = 0;
+      const source = worker || page;
+      source.fetch = async url => { requests++; return respond(url); };
+      if (worker) {
+        page.chrome.runtime.sendMessage = (message, callback) => worker.__onMessage(message, { url: page.location.href }, callback);
+      }
+      return {
+        page,
+        read: () => route === 'worker'
+          ? page.ATPFetcher.fetchTextAttachmentResourcesByBackgroundWithStatus([attachment], { manualRetry: true })
+          : page.ATPFetcher.fetchTextAttachmentResourcesWithStatus([attachment], { manualRetry: true }),
+        sends: () => requests
+      };
+    }
+    for (const [name, respond] of Object.entries(refusalCases)) {
+      const reader = makeReader(respond);
+      const result = await reader.read();
+      assert(result.retryableCount === 1 && !result.accessDeniedCount && reader.sends() === 1 &&
+          !reader.page.__backgroundCalls.some(call => call.type === 'FETCH_TEXT_RESOURCES'),
+        route + ' must recognize ' + name + ' without permission caching or duplicate fallback');
+      assertServerDeadline(reader.page, route + ' ' + name);
+      assert((await reader.read()).retryableCount === 1 && reader.sends() === 1,
+        route + ' manual retries must wait for the explicit deadline from ' + name);
+    }
+    for (const [name, respond, useful, denied] of neutralCases) {
+      const reader = makeReader(respond);
+      const result = await reader.read();
+      assert((result.resources.groups.quark.length === 1) === useful && Boolean(result.accessDeniedCount) === denied,
+        route + ' must preserve resource and permission results for ' + name);
+      assertNoLocalCooldown(reader.page, route + ' ' + name);
+    }
+  }
+
+  for (const code of [429, 503]) {
+    const localAttachment = { url: 'https://www.sehuatang.org/forum.php?mod=attachment&aid=' + code, name: 'list.txt' };
+    for (const usePageBridge of [true, false]) {
+      const local = loadFetcherPacerSandbox(usePageBridge);
+      const path = usePageBridge ? 'page bridge' : 'direct fetch';
+      let localRequests = 0;
+      local.fetch = async url => {
+        localRequests++;
+        return limitedResponse(url, code);
+      };
+      const firstLocal = await local.ATPFetcher.fetchTextAttachmentResourcesWithStatus([localAttachment], { manualRetry: true });
+      assert(firstLocal.retryableCount === 1 && localRequests === 1 && !local.__backgroundCalls.some(call => call.type === 'FETCH_TEXT_RESOURCES'),
+        path + ' must make at most one network request after HTTP ' + code);
+      assertServerDeadline(local, path + ' HTTP ' + code);
+      const whilePaused = await local.ATPFetcher.fetchTextAttachmentResourcesWithStatus([localAttachment], { manualRetry: true });
+      assert(whilePaused.retryableCount === 1 && localRequests === 1, path + ' manual retry must wait out HTTP ' + code);
+    }
+
+    const redirected = loadFetcherPacerSandbox();
+    const redirectedThread = 'https://www.sehuatang.net/thread-750-1-1.html';
+    redirected.fetch = async url => limitedResponse(url.endsWith('.txt') ? 'https://www.sehuatang.net/redirected.txt' : redirectedThread, code);
+    const redirectedArticle = await redirected.ATPFetcher.fetchArticleData('https://www.sehuatang.org/thread-750-1-1.html');
+    assert(redirectedArticle.retryableEmpty && redirectedArticle.retryAfter === retryUntil,
+      'a redirected thread must retain the failure and server deadline for that thread');
+    assert(await redirected.ATPFetcher.fetchTextAttachmentsFresh('https://www.sehuatang.org/thread-751-1-1.html') === null,
+      'a redirected TXT refresh must stay retryable');
+    const redirectedText = await redirected.ATPFetcher.fetchTextAttachmentResourcesWithStatus(
+      [{ url: 'https://www.sehuatang.org/redirected.txt' }], { manualRetry: true });
+    assert(redirectedText.retryableCount === 1, 'a redirected TXT download must stay retryable');
+    assertNoLocalCooldown(redirected, 'direct redirects to a different forum origin');
+
+    const paced = loadFetcherPacerSandbox();
+    paced.location.hostname = 'www.sehuatang.org';
+    const sessionData = {};
+    const sessionStore = {
+      get: async key => ({ [key]: structuredClone(sessionData[key]) }),
+      set: async items => Object.assign(sessionData, structuredClone(items))
+    };
+    const sender = { url: 'https://www.sehuatang.org/forum-2-1.html', tab: { id: 4 } };
+    let worker = loadBackgroundSandbox({ enableDebug: false });
+    worker.chrome.storage.session = sessionStore;
+    paced.chrome.runtime.sendMessage = (message, callback) => worker.__onMessage(message, sender, callback);
+    const arrivals = [];
+    const healthyThread = 'https://www.sehuatang.org/thread-76-1-1.html';
+    function serveText(url) {
+      arrivals.push(url);
+      if (url === healthyThread) return makeHtmlResponse('<html><body><div id="postlist"><td id="postmessage_1">正文</td></div></body></html>', { url });
+      if (url.endsWith('/ok.txt')) return makeHtmlResponse('https://pan.quark.cn/s/localtest', { url, contentType: 'text/plain' });
+      if (url.endsWith('/return-to-forum.txt')) return limitedResponse('https://www.sehuatang.net/from-relay.txt', code);
+      if (url.endsWith('/return-to-page-forum.txt')) return limitedResponse('https://www.sehuatang.org/from-relay.txt', code);
+      return limitedResponse(url, code);
+    }
+    worker.fetch = async url => serveText(url);
+    const forumFiles = ['a', 'b', 'c'].map(name => ({ url: 'https://www.sehuatang.net/' + name + '-' + code + '.txt', name: name + '.txt' }));
+    const relay = { url: 'https://dl.ldkms.la/ok.txt', name: 'ok.txt' };
+    const mixed = await paced.ATPFetcher.fetchTextAttachmentResourcesWithStatus(forumFiles.slice(0, 2).concat(relay), {});
+    assertExactStringArray(arrivals.slice().sort(), [forumFiles[0].url, relay.url].sort(), 'requests after first forum HTTP ' + code);
+    assert(mixed.unresolvedCount === 2 && mixed.retryableCount === 2 && mixed.resources.groups.quark.length === 1,
+      'all deferred attachments stay retryable alongside successful links');
+    assertExactStringArray(Array.from(mixed.resolvedAttachments, item => item.url), [relay.url], 'attachment which supplied a resource');
+    assertNoLocalCooldown(paced, 'cross-origin forum HTTP ' + code);
+
+    const attemptsBeforeRetry = arrivals.length;
+    const deferred = await paced.ATPFetcher.fetchTextAttachmentResourcesWithStatus(forumFiles, { manualRetry: true });
+    assert(arrivals.length === attemptsBeforeRetry && deferred.retryableCount === 3,
+      'another batch during the cooldown must stay retryable without a new request');
+    assertNoLocalCooldown(paced, 'another batch during a target cooldown');
+    const requestWorker = attachments => new Promise(resolve => {
+      worker.__onMessage({ type: 'FETCH_TEXT_RESOURCES', attachments, manualRetry: true }, sender, resolve);
+    });
+    worker = loadBackgroundSandbox({ enableDebug: false });
+    worker.chrome.storage.session = sessionStore;
+    worker.fetch = async url => serveText(url);
+    const afterWorkerWake = await requestWorker(forumFiles);
+    assert(arrivals.length === attemptsBeforeRetry && afterWorkerWake.retryableCount === 3 && afterWorkerWake.forumCooldown.retryAfter === retryUntil,
+      'a restarted worker must enforce its stored forum Retry-After independently of the page');
+    worker.__storageChangeListener({ atp_forum_pacer_reset_at: { newValue: Date.now() } }, 'local');
+    paced.ATPForumPacer.reset();
+    const nextBatch = await requestWorker(forumFiles);
+    assert(arrivals.length === attemptsBeforeRetry && nextBatch.retryableCount === 3 && nextBatch.forumCooldown.retryAfter === retryUntil,
+      'a manual reset must preserve the worker Retry-After');
+    assertNoLocalCooldown(paced, 'page reset during a target cooldown');
+
+    const freshCrossOrigin = loadFetcherPacerSandbox();
+    freshCrossOrigin.chrome.runtime.sendMessage = paced.chrome.runtime.sendMessage;
+    const crossThread = 'https://www.sehuatang.net/thread-75-1-1.html';
+    const unusedBefore = freshCrossOrigin.ATPForumPacer.getState().tokens;
+    assert(await freshCrossOrigin.ATPFetcher.fetchTextAttachmentsFresh(crossThread) === null,
+      'a limited background thread refresh must stay retryable');
+    const deferredArticle = await freshCrossOrigin.ATPFetcher.fetchArticleDataByBackground(crossThread);
+    const noNetworkBatch = await freshCrossOrigin.ATPFetcher.fetchTextAttachmentResourcesByBackgroundWithStatus(forumFiles);
+    const unusedAfter = freshCrossOrigin.ATPForumPacer.getState();
+    assert(deferredArticle.emptyReason === 'forum_cooldown' && deferredArticle.retryAfter === retryUntil &&
+        noNetworkBatch.forumCooldown.deferredWithoutRequest && arrivals.length === attemptsBeforeRetry &&
+        unusedAfter.tokens === unusedBefore && unusedAfter.level === 0,
+      'target deferrals must use the stored deadline and refund tickets without being counted as new floods');
+
+    const healthyForumFile = { url: 'https://files.sehuatang.org/ok.txt', name: 'ok.txt' };
+    const mixedTargets = await paced.ATPFetcher.fetchTextAttachmentResourcesWithStatus(
+      [healthyForumFile, forumFiles[0]], { manualRetry: true });
+    assertExactStringArray(arrivals.slice(attemptsBeforeRetry), [healthyForumFile.url], 'a mixed batch must send only to its available target');
+    assert(mixedTargets.retryableCount === 1 && mixedTargets.resources.groups.quark.length === 1,
+      'a deferred target must stay retryable alongside the healthy response');
+    assertNoLocalCooldown(paced, 'a healthy request mixed with a deferred target');
+    const healthyArticle = await paced.ATPFetcher.fetchArticleDataByBackground(healthyThread);
+    assert(arrivals[arrivals.length - 1] === healthyThread && healthyArticle && !healthyArticle.retryableEmpty,
+      'the healthy origin must still be available through the worker after the mixed batch');
+
+    const otherArticle = 'https://articles.sehuatang.net/thread-81-1-1.html';
+    const articleRefusal = await paced.ATPFetcher.fetchArticleDataByBackground(otherArticle);
+    assert(articleRefusal.emptyReason === 'http_' + code && articleRefusal.retryAfter === retryUntil,
+      'the worker must return an actual article refusal for the target');
+    assertNoLocalCooldown(paced, 'a different origin returning a background article refusal');
+    const otherFresh = 'https://attachments.sehuatang.net/thread-82-1-1.html';
+    assert(await paced.ATPFetcher.fetchTextAttachmentsFresh(otherFresh) === null,
+      'a real TXT refresh refusal must stay retryable');
+    assertNoLocalCooldown(paced, 'a different origin returning a background TXT refusal');
+    assert((await paced.ATPFetcher.fetchArticleDataByBackground(otherFresh)).emptyReason === 'forum_cooldown',
+      'an actual refusal from the fresh TXT route must still protect that target');
+
+    const downloadOnly = loadFetcherPacerSandbox();
+    downloadOnly.chrome.runtime.sendMessage = paced.chrome.runtime.sendMessage;
+    await downloadOnly.ATPFetcher.fetchTextAttachmentResourcesWithStatus([{ url: 'https://dl.ldkms.la/busy.txt' }], {});
+    assert(downloadOnly.ATPForumPacer.getState().level === 0, 'an independent download host error must not pause the forum');
+    await downloadOnly.ATPFetcher.fetchTextAttachmentResourcesWithStatus([{ url: 'https://dl.ldkms.la/return-to-forum.txt' }], {});
+    assertNoLocalCooldown(downloadOnly, 'an unpaced relay that returns to another limited forum');
+    if (code === 429) {
+      await downloadOnly.ATPFetcher.fetchTextAttachmentResourcesWithStatus([{ url: 'https://dl.ldkms.la/return-to-page-forum.txt' }], {});
+      assertServerDeadline(downloadOnly, 'an unpaced relay that returns to the same forum');
+    } else {
+      await paced.ATPFetcher.fetchTextAttachmentResourcesByBackgroundWithStatus([
+        { url: 'https://www.sehuatang.org/local.txt' }, forumFiles[0]
+      ], {});
+      assertServerDeadline(paced, 'a real same-origin refusal mixed with an existing target cooldown');
+    }
+  }
+
   const batch = loadFetcherPacerSandbox();
   const before = batch.ATPForumPacer.getState().tokens;
   await batch.ATPFetcher.fetchTextAttachmentResourcesByBackgroundWithStatus([
@@ -20519,7 +20499,7 @@ async function checkFetcherForumPacing() {
 }
 
 function checkViewportPageProximityGate() {
-  const run = createViewportRetrySandbox({ availableSlots: 4 });
+  const run = createViewportRetrySandbox({ availableSlots: 4, startSucceeds: true });
   function makeRoot(top) {
     return {
       top: top,
@@ -20551,15 +20531,16 @@ function checkViewportPageProximityGate() {
   observeIn(nearRoot, 50, 'near');
   run.sandbox.ATPViewport.retryVisiblePending();
   assert(run.getAcquireMarkers().join(',') === 'near', 'parked thumbnails must load only when their post is near the page viewport, not merely inside their own scroll box: ' + run.getAcquireMarkers().join(','));
-  const farBoxObserver = run.observers.find(function(observer) { return observer.options && observer.options.root === farRoot; });
-  farBoxObserver.callback([{ target: farWrapper, isIntersecting: true, boundingClientRect: farWrapper.getBoundingClientRect() }]);
-  assert(run.getAcquireMarkers().join(',') === 'near', 'an inner-box intersection far below the page must not start a load');
   const proximity = run.observers.find(function(observer) {
     return observer.options && observer.options.root === null && observer.options.rootMargin === '1000px 0px 1000px 0px';
   });
-  assert(proximity && proximity.targets.indexOf(farRoot) !== -1, 'post scroll boxes must be watched against the page viewport with a one-screen lookahead');
+  assert(proximity && proximity.targets.indexOf(farWrapper) !== -1, 'thumbnails must be watched against the page viewport with a 1000px one-screen lookahead');
+  proximity.callback([{ target: farWrapper, isIntersecting: false }]);
+  run.sandbox.ATPViewport.retryVisiblePending();
+  assert(run.getAcquireMarkers().join(',') === 'near', 'thumbnails far below the page lookahead must stay parked');
   farRoot.top = 1200;
-  proximity.callback([{ target: farRoot, isIntersecting: true }]);
+  proximity.callback([{ target: farWrapper, isIntersecting: true }]);
+  run.sandbox.ATPViewport.retryVisiblePending();
   assert(run.getAcquireMarkers().join(',') === 'near,far', 'a post coming near the page viewport must load its parked thumbnails');
 }
 
@@ -20616,6 +20597,10 @@ async function main() {
   checkCacheIndexWriteFailureSelfHealing();
   await checkArticleNegativeCacheState();
   await checkArticleCachePartialWriteSafety();
+  await checkArticleWritesAcrossTabs();
+  await checkLoadedUrlBatches();
+  await checkLegacyArticleImageRevalidation();
+  await checkSlicedArticleCacheRead();
   await checkContentCacheClearGenerationBoundary();
   await checkArticleCachePositiveWriteClearsNegative();
   await checkContentCacheIndexRemoveFailureRebuildsAfterStorageRemove();
@@ -20628,7 +20613,10 @@ async function main() {
   await checkLogExportFlushesActiveTab();
   checkContentLoggerTimezoneCache();
   checkContentLoggerIndexDiscovery();
+  checkContentLoggerMeasuresShardsWithoutReadingValues();
+  checkContentLoggerFallsBackSafelyForFailedSizeReads();
   checkContentLoggerPruneRemoveFailureKeepsRetryIndex();
+  checkContentLoggerQuotaRetryUsesShardSizes();
   checkBackgroundLogSanitization();
   checkLogClearGenerationBoundary();
   await checkBackgroundMessageSafety();
@@ -20652,7 +20640,11 @@ async function main() {
   await checkTextResourcePartialSuccessStatus();
   await checkArticleRetryableEmptyBehavior();
   await checkSameOriginArticleParseQueue();
+  await checkFetcherPreparedArticleHandoff();
   await checkArticleRetryAfterBehavior();
+  await checkForumServerWaitPublication();
+  await checkBackgroundRedirectRecovery();
+  await checkCrossOriginTextYield();
   await checkArticleInterstitialIsRetryable();
   await checkContentArticleFloodBackoff();
   await checkContentArticleDispatch();
@@ -20686,7 +20678,10 @@ async function main() {
   checkLoaderViewportImagePriority();
   checkLoaderVisibleOrdinaryAdmission();
   checkLoaderFallbackUsesDisplaySrc();
-  checkViewportCompletedImageRecoverBehavior();
+  checkLoaderPreviewLabelGalleryCost();
+  await checkViewportCompletedImageRecoverBehavior();
+  await checkHeavyRestoreRetryBackoff();
+  checkViewportHiddenImageTimeout();
   checkLoaderNestedScrollListener();
   checkLoaderViewportSlotWake();
   checkLoaderViewportFirstTaskPriority();
@@ -20699,7 +20694,7 @@ async function main() {
   checkLoaderOrdinaryBackgroundBatchRefill();
   checkLoaderBackgroundIdleCleanup();
   checkViewportPausedLoadGuard();
-  checkViewportHeavyObserverBudgetBatching();
+  await checkViewportHeavyObserverBudgetBatching();
   checkViewportPendingRetryBounds();
   checkViewportAdaptivePreloadAndShimmer();
   checkLoaderViewportPressureIntegration();
@@ -20723,6 +20718,7 @@ async function main() {
   await checkPopupActiveTabQueryFailureFeedback();
   await checkPopupSaveRefreshFailureFeedback();
   await checkPopupForumPacerReset();
+  await checkPopupForumPacerCountdown();
   await checkBackgroundMarksStore();
   await checkMarksHandOutRaces();
   await checkPopupMarksClearConfirmation();
@@ -20736,6 +20732,7 @@ async function main() {
   checkRendererDecoratedParentGuard();
   checkRendererZeroGridGap();
   checkRendererImageOrder();
+  await checkPreparedGalleryFrames();
   await checkFloatingPanelPartialSettingsSave();
   checkFloatingPanelA11yBehavior();
   await checkContentTextAttachmentSharedDeadline();

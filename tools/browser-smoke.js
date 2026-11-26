@@ -12,13 +12,15 @@ const PROJECT_ROOT = path.resolve(__dirname, '..');
 const EXTENSION_DIR = path.resolve(process.env.ATP_EXTENSION_DIR || path.join(PROJECT_ROOT, 'dist', 'chrome-unpacked'));
 const EXPECTED_VERSION = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, 'manifest.json'), 'utf8')).version;
 const SMOKE_HOST = 'smoke.sehuatang.org';
+const AGE_ENTRY_HOST = 'www.sehuatang.org';
 const CROSS_HOST = 'other.sehuatang.org';
 const SIGNED_RELAY_HOST = 'xia.djhdhs.us';
+const TXT_DOWNLOAD_HOST = 'dl.ldkms.la';
 const PACER_HOST = 'pacer.sehuatang.org';
 const HEAVY_HOST = 'image.imx.to';
 const HOT_IMAGE_HOST = 'hot.sehuatang.org';
-const ATTACHMENT_LIVE_HOST = 'tu.live.example';
-const ATTACHMENT_DEAD_HOST = 'tu.dead.example';
+const ATTACHMENT_LIVE_HOST = 'tu.djhdhs.us';
+const ATTACHMENT_DEAD_HOST = 'tu.w4kmzkm.com';
 const MIRROR_ROOT = 'smoke-mirror.test';
 const MIRROR_HOST = 'www.' + MIRROR_ROOT;
 const MIRROR_PATTERN = 'https://*.' + MIRROR_ROOT + '/*';
@@ -97,6 +99,7 @@ function createCertificate(pfxPath) {
     "$request = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new('CN=smoke.sehuatang.org', $rsa, [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)",
     '$san = [System.Security.Cryptography.X509Certificates.SubjectAlternativeNameBuilder]::new()',
     "$san.AddDnsName('smoke.sehuatang.org')",
+    "$san.AddDnsName('www.sehuatang.org')",
     "$san.AddDnsName('other.sehuatang.org')",
     "$san.AddDnsName('pacer.sehuatang.org')",
     "$san.AddDnsName('hot.sehuatang.org')",
@@ -130,7 +133,62 @@ function htmlPage(body, title) {
     '</head><body>' + body + '</body></html>';
 }
 
+function ageNoticeMarkup(url, mode) {
+  const href = mode === 'other-origin' ? 'https://' + TXT_DOWNLOAD_HOST + ':' + url.port + '/' : url.origin + '/';
+  const attributes = ' class="enter-btn" href="' + href + '"' + (mode === 'hidden' ? ' hidden' : '');
+  const english = '<a' + attributes + '>If you are over 18，please click here</a>';
+  return '<div class="domain">SEHUATANG.ORG</div><div class="row down-content"><h3>警告 / WARNING</h3></div>' +
+    '<a' + attributes + '>满18岁，请点此进入</a>' +
+    (mode === 'delayed' ? '<template id="pending-age-link">' + english + '</template>' : english) + '<iframe title="empty"></iframe>';
+}
+
+function serveAgeEntry(req, res, url, scenario, pixel) {
+  const route = url.pathname + url.search;
+  const topLevel = req.headers['sec-fetch-dest'] === 'document';
+  if (topLevel) scenario.navigations.push(route);
+  const finalResponse = topLevel && route === scenario.responsePath;
+  const status = finalResponse ? scenario.status : 200;
+  const rateNotice = finalResponse && scenario.rateNotice ? '<p id="messagetext">请求过于频繁，请稍后再试。</p>' : '';
+  const forumHeader = '<div id="hd"><div id="nv">Forum</div></div>';
+  const listing = '<div id="wp"><div id="ct"><div id="threadlist"><table><tbody id="normalthread_740"><tr><th>' +
+    '<a class="xst" href="/thread-740-1-1.html">Synthetic post</a></th></tr></tbody></table></div></div></div>';
+  const post = '<div id="wp"><div id="ct"><div id="postlist"><div id="postmessage_740">' +
+    '<img src="/age-preview.png"></div></div></div></div>';
+  let kind = 'gate', title = 'SEHUATANG.ORG', body = ageNoticeMarkup(url, scenario.mode) + rateNotice;
+  if (route === '/age-preview.png') {
+    res.writeHead(200, { 'content-type': 'image/png' });
+    res.end(pixel);
+    return;
+  }
+  if (route === '/favicon.ico') { res.writeHead(204); res.end(); return; }
+  if (scenario.navigations.length > 5) {
+    kind = 'loop-detected'; body = '<p>Navigation loop detected in the fixture</p>';
+  } else if (scenario.mode === 'post-copy') {
+    kind = 'post-copy'; body = forumHeader + '<div id="wp"><div id="postlist"><article id="postmessage_740">' + body + '</article></div></div>';
+  } else if (scenario.mode === 'challenge') {
+    kind = 'challenge'; body += '<form id="challenge-form" action="/cdn-cgi/challenge-platform/"><div class="cf-turnstile"></div></form>';
+  } else if (scenario.mode === 'embedded' && route !== '/embedded-notice.html') {
+    kind = 'embedded'; body = forumHeader + '<div id="wp"><div id="ct"><iframe src="/embedded-notice.html" title="quoted notice"></iframe></div></div>';
+  } else if (topLevel && route === '/' && scenario.mode !== 'persistent' && !(scenario.mode === 'root-only' && scenario.navigations.length === 1)) {
+    scenario.admitted = true;
+    kind = 'landing'; title = 'Fixture forum'; body = forumHeader + '<div id="wp"><div id="ct">' + (rateNotice || 'Forum home') + '</div></div>';
+  } else if (scenario.admitted && scenario.mode !== 'restored-gate') {
+    kind = route === '/forum-95-1.html' || (url.pathname === '/forum.php' && url.searchParams.get('mod') === 'forumdisplay') ? 'forum' : 'post';
+    title = 'Fixture ' + kind;
+    body = forumHeader + (kind === 'forum' ? listing : post);
+  }
+  if (kind === 'landing' && status >= 400) {
+    title = 'SEHUATANG.ORG'; body += ageNoticeMarkup(url, scenario.mode);
+  }
+  const instrumentation = '<script>document.body.dataset.ageFixture=' + JSON.stringify(kind) + ';document.body.dataset.ageNavigation=' + scenario.navigations.length + ';' +
+    'document.addEventListener("click", e => { if(e.target.closest("a.enter-btn")) {' +
+    'const key="smokeAgeClicks"; sessionStorage.setItem(key, String(Number(sessionStorage.getItem(key)) + 1)); } },true);</script>';
+  res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+  res.end(htmlPage(body + instrumentation, title));
+}
+
 function forumPage(port, mode) {
+  const row = id => '<tbody id="normalthread_' + id + '"><tr><th><a class="xst" href="/thread-' + id + '-1-1.html">Post ' + id + '</a></th></tr></tbody>';
   var rows;
   if (mode === 'heavy') {
     rows = '<tbody id="normalthread_300"><tr><th><a class="xst" href="https://' + SMOKE_HOST + ':' + port + '/thread-300-1-1.html">Heavy gallery</a></th></tr></tbody>';
@@ -144,6 +202,23 @@ function forumPage(port, mode) {
     rows = '<tbody id="normalthread_402"><tr><th><a class="xst" href="https://' + SMOKE_HOST + ':' + port + '/thread-402-1-1.html">Host limit gallery</a></th></tr></tbody>';
   } else if (mode === 'ready-queue') {
     rows = '<tbody id="normalthread_404"><tr><th><a class="xst" href="/thread-404-1-1.html">Ready queue gallery</a></th></tr></tbody>';
+  } else if (mode === 'long-gallery') {
+    rows = '<tbody id="normalthread_409"><tr><th><a class="xst" href="/thread-409-1-1.html">Long gallery</a></th></tr></tbody>';
+  } else if (mode === 'cached-row') {
+    return htmlPage('<div id="threadlist"><table id="threadlisttable">' + row(410) + row(411) + '</table><div style="height:5000px"></div>' +
+      '<table>' + row(412) + '</table></div><div class="smoke-note"></div>', 'Cached post with pending requests');
+  } else if (mode === 'cold-scroll') {
+    return htmlPage('<div style="height:1300px"></div><div id="threadlist"><table id="threadlisttable">' + row(413) + row(414) +
+      '</table><div style="height:5000px"></div><table>' + row(415) + '</table></div><div class="smoke-note"></div>', 'Cold post with offscreen requests');
+  } else if (mode === 'auth-retry') {
+    rows = row(416) + row(417) + row(418);
+  } else if (mode === 'offline-recovery') {
+    rows = '';
+  } else if (mode === 'scroll-priority') {
+    return htmlPage('<div id="threadlist"><table id="threadlisttable"><tbody id="normalthread_407"><tr><th>' +
+      '<a class="xst" href="/thread-407-1-1.html">Slow gallery</a></th></tr></tbody></table><div style="height:5000px"></div>' +
+      '<table><tbody id="normalthread_408"><tr><th><a class="xst" href="/thread-408-1-1.html">Newly visible gallery</a>' +
+      '</th></tr></tbody></table></div><div class="smoke-note"></div>', 'Scroll priority');
   } else if (mode === 'attachment-recovery') {
     rows = '<tbody id="normalthread_405"><tr><th><a class="xst" href="/thread-405-1-1.html">Attachment recovery gallery</a></th></tr></tbody>';
   } else if (mode === 'txt-retry') {
@@ -207,6 +282,12 @@ function mirrorThread(port) {
 
 function createFixtureServer(pfxPath) {
   var pixel = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
+  var pausedScrollImages = new Set();
+  var pausedMixedImages = new Set();
+  var heldResponses = new Map();
+  var scrollImagesReleased = false;
+  var holdMixedImages = false;
+  var ageEntry = { mode: '', admitted: false, navigations: [] };
   var metrics = {
     requestCount: 0,
     requestPaths: [],
@@ -219,6 +300,8 @@ function createFixtureServer(pfxPath) {
     activeImages: 0,
     activeAttachmentImages: 0,
     maxAttachmentImages: 0,
+    activeScrollImages: 0,
+    maxScrollImages: 0,
     maxOrdinaryImages: 0,
     maxHostLimitImages: 0,
     maxFarImages: 0,
@@ -234,8 +317,14 @@ function createFixtureServer(pfxPath) {
     metrics.requestsByHost[host] = (metrics.requestsByHost[host] || 0) + 1;
     metrics.requestsByPath[pathname] = (metrics.requestsByPath[pathname] || 0) + 1;
 
-    if (/^\/tupian\/forum\/202611\/17\/00000[0-3]abcdefghijklmnop\.jpg$/.test(pathname)) {
+    if (host === AGE_ENTRY_HOST) {
+      serveAgeEntry(req, res, requestUrl, ageEntry, pixel);
+      return;
+    }
+
+    if (/^\/tupian\/forum\/202611\/17\/00000[0-5]abcdefghijklmnop\.jpg$/.test(pathname)) {
       if (host !== ATTACHMENT_LIVE_HOST) {
+        if (pathname === attachmentPath(5) && metrics.activeAttachmentImages > 0) metrics.mixedFailedWhileLive = true;
         res.writeHead(404, { 'cache-control': 'no-store' });
         res.end();
         return;
@@ -252,7 +341,7 @@ function createFixtureServer(pfxPath) {
         if (attachmentSettled || res.destroyed) return;
         res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'no-store' });
         res.end(pixel);
-      }, pathname === attachmentPath(2) ? 1200 : IMAGE_DELAY_MS);
+      }, pathname === attachmentPath(2) || pathname === attachmentPath(4) ? 1200 : IMAGE_DELAY_MS);
       return;
     }
 
@@ -262,6 +351,38 @@ function createFixtureServer(pfxPath) {
       return;
     }
 
+    if (pathname === '/mixed-forum.txt') {
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('https://pan.baidu.com/s/1AtpForumFirst');
+      return;
+    }
+    if (host === PACER_HOST && pathname === '/manual-probe.txt') {
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+      res.end('https://pan.baidu.com/s/1AtpManualProbe');
+      return;
+    }
+    if (/^\/thread-41[01348]-1-1\.html$/.test(pathname) || pathname === '/mixed-download.txt') {
+      heldResponses.set(pathname, () => {
+        const isText = pathname.endsWith('.txt');
+        res.writeHead(200, { 'content-type': isText ? 'text/plain' : 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+        res.end(isText ? 'https://pan.quark.cn/s/AtpMixedDownload' : htmlPage('<a href="https://pan.quark.cn/s/AtpCompletedPost">Post link</a>', 'Completed post'));
+      });
+      res.on('close', () => heldResponses.delete(pathname));
+      return;
+    }
+    if (/^\/thread-41[5679]-1-1\.html$/.test(pathname)) {
+      const firstRequest = metrics.requestsByPath[pathname] === 1;
+      const permission = pathname.startsWith('/thread-417-') && firstRequest;
+      const unauthorized = pathname.startsWith('/thread-416-') && firstRequest;
+      res.writeHead(unauthorized ? 403 : 200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+      if (permission) {
+        res.end(htmlPage('<div id="messagetext" class="alert_error"><p>抱歉，本帖要求阅读权限高于 50 才能浏览</p></div>', '提示信息'));
+      } else {
+        res.end(htmlPage(unauthorized ? '<p>Forbidden</p>' :
+          '<div id="postmessage_1"><img src="/img/access-or-scroll-' + pathname.slice(8, 11) + '.jpg"></div>', 'Recovered post'));
+      }
+      return;
+    }
     if (pathname === '/bridge-redirect.txt') {
       var redirectTarget = requestUrl.searchParams.get('target');
       var redirectHost = redirectTarget === 'cross' ? CROSS_HOST : (redirectTarget === 'self' ? host : SMOKE_HOST);
@@ -319,6 +440,11 @@ function createFixtureServer(pfxPath) {
     }
     if (pathname === '/forbidden-txt-fixture.txt') {
       res.writeHead(403);
+      res.end();
+      return;
+    }
+    if (/^\/throttled-forum-[123]\.txt$/.test(pathname)) {
+      res.writeHead(429, { 'retry-after': '120', 'cache-control': 'no-store' });
       res.end();
       return;
     }
@@ -395,6 +521,54 @@ function createFixtureServer(pfxPath) {
         imageMarkup(SMOKE_HOST, server.address().port, 'ready-queue', 5) + '</div>', 'Ready queue thread'));
       return;
     }
+    if (pathname === '/thread-407-1-1.html' || pathname === '/thread-408-1-1.html') {
+      var files = pathname.includes('407') ? ['slow-1.gif', 'slow-2.gif', 'slow-3.webp'] : ['visible-1.jpg', 'visible-2.jpg'];
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(htmlPage('<div id="postmessage_1">' + files.map(file => '<img src="https://' + HOT_IMAGE_HOST + ':' +
+        server.address().port + '/scroll-images/' + file + '">').join('') + '</div>', 'Scroll priority gallery'));
+      return;
+    }
+    if (pathname === '/thread-409-1-1.html') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(htmlPage('<div id="postmessage_409">' + imageMarkup(HOT_IMAGE_HOST, server.address().port, 'long-gallery', 5000) + '</div>', '5,000 images'));
+      return;
+    }
+    if (pathname.startsWith('/scroll-images/')) {
+      metrics.activeScrollImages++;
+      metrics.maxScrollImages = Math.max(metrics.maxScrollImages, metrics.activeScrollImages);
+      const slow = pathname.includes('/slow-') && !scrollImagesReleased;
+      const socket = req.socket;
+      let settled = false;
+      const send = function() {
+        if (settled || res.destroyed || res.writableEnded) return;
+        res.writeHead(200, { 'content-type': 'image/png', 'content-length': pixel.length, 'cache-control': 'no-store' });
+        res.end(pixel);
+      };
+      const timer = setTimeout(send, slow ? 11000 : 50);
+      if (slow) pausedScrollImages.add(send);
+      function settle() {
+        if (settled) return;
+        settled = true;
+        socket.removeListener('end', settle);
+        clearTimeout(timer);
+        pausedScrollImages.delete(send);
+        metrics.activeScrollImages--;
+      }
+      // Count live responses. A cancelled image can close its socket before
+      // Node emits the response's close event, and keep-alive sockets can outlive a response.
+      socket.once('end', settle);
+      res.once('finish', settle);
+      res.once('close', settle);
+      return;
+    }
+    if (pathname === '/thread-406-1-1.html') {
+      var port = server.address().port;
+      var mixedImages = '<img src="https://' + ATTACHMENT_LIVE_HOST + ':' + port + attachmentPath(4) + '">' +
+        '<img src="https://' + ATTACHMENT_DEAD_HOST + ':' + port + attachmentPath(5) + '">' + imageMarkup(HEAVY_HOST, port, 'heavy-mixed', 3);
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(htmlPage('<div id="postmessage_406">' + mixedImages + '</div>', 'Mixed attachment recovery'));
+      return;
+    }
     if (pathname === '/thread-405-1-1.html') {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       res.end(htmlPage('<div id="postmessage_1">' + [0, 1].map(function(index) {
@@ -443,20 +617,40 @@ function createFixtureServer(pfxPath) {
         res.once('close', function() { metrics.readyHangClosed = (metrics.readyHangClosed || 0) + 1; });
         return;
       }
-      setTimeout(function() {
+      function sendImage() {
         if (!res.destroyed) {
           res.writeHead(200, { 'content-type': 'image/png', 'content-length': pixel.length });
           res.end(pixel, settleImage);
         } else {
           settleImage();
         }
-      }, pathname.indexOf('/img/host-limit-') === 0 ? 650 : IMAGE_DELAY_MS);
+      }
+      if (holdMixedImages && /^\/img\/(?:ordinary|heavy)-\d+\.jpg$/.test(pathname)) {
+        pausedMixedImages.add(sendImage);
+        res.once('close', () => pausedMixedImages.delete(sendImage));
+      } else {
+        setTimeout(sendImage, pathname === '/img/long-gallery-0.jpg' ? 1500 : (hostLimitImage ? 650 : IMAGE_DELAY_MS));
+      }
       return;
     }
     res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
     res.end('not found');
   });
-  return { server: server, metrics: metrics };
+  return {
+    server, metrics, ageEntry, heldResponses,
+    releaseScrollImages() {
+      scrollImagesReleased = true;
+      pausedScrollImages.forEach(send => send());
+    },
+    holdMixedImages() {
+      holdMixedImages = true;
+    },
+    releaseMixedImages() {
+      holdMixedImages = false;
+      pausedMixedImages.forEach(send => send());
+      pausedMixedImages.clear();
+    }
+  };
 }
 
 class CdpConnection {
@@ -570,8 +764,8 @@ async function closeTarget(devtoolsPort, targetId) {
   } catch (error) {}
 }
 
-async function createPageSession(devtoolsPort) {
-  var target = await createTarget(devtoolsPort, 'about:blank');
+async function createPageSession(devtoolsPort, existingTarget) {
+  var target = existingTarget || await createTarget(devtoolsPort, 'about:blank');
   var cdp = await new CdpConnection(target.webSocketDebuggerUrl).connect();
   var contexts = new Map();
   var errors = [];
@@ -891,7 +1085,624 @@ async function runMirrorScenario(browserPath, runRoot, fixture, fixturePort) {
   }
 }
 
-async function checkCrossTabProbe(devtoolsPort, extensionId, fixturePort, sessions) {
+async function checkScrollPriority(page, extensionId, fixturePort, fixture) {
+  const inFlight = new Set();
+  const imagePrefix = 'https://' + HOT_IMAGE_HOST + ':' + fixturePort + '/scroll-images/';
+  let maxBrowserInFlight = 0;
+  let cancelled = 0;
+  const listeners = [
+    page.cdp.on('Network.requestWillBeSent', ({ request, requestId }) => {
+      if (!request.url.startsWith(imagePrefix)) return;
+      inFlight.add(requestId);
+      maxBrowserInFlight = Math.max(maxBrowserInFlight, inFlight.size);
+    }),
+    page.cdp.on('Network.loadingFinished', ({ requestId }) => inFlight.delete(requestId)),
+    page.cdp.on('Network.loadingFailed', ({ requestId, canceled }) => {
+      if (inFlight.delete(requestId) && canceled) cancelled++;
+    })
+  ];
+  try {
+    await page.cdp.send('Network.enable');
+    await navigate(page, 'https://' + CROSS_HOST + ':' + fixturePort + '/forum.php?mode=scroll-priority');
+    const context = await waitForExtensionContext(page, extensionId);
+    await waitFor('three original same-host images in flight', () => fixture.metrics.activeScrollImages === 3 && inFlight.size === 3);
+    assert.strictEqual(fixture.metrics.requestsByPath['/scroll-images/visible-1.jpg'] || 0, 0);
+    const started = Date.now();
+    await evaluate(page, `document.querySelector('#normalthread_408').scrollIntoView({ block: 'center' })`);
+    function threadProgress(id) {
+      return evaluate(page, `(() => {
+        const t = Object.values(ATPState.threads).find(item => item.link.includes('/thread-${id}-'));
+        if (!t) return null;
+        return { loaded: t.loaded, failed: t.failedCount, cells: t.grid.children.length,
+          displayed: [...t.grid.querySelectorAll('.atp-thumbnail-img')].filter(img => img.complete && img.naturalWidth > 0).length };
+      })()`, context.id);
+    }
+    const firstVisible = await waitFor('newly visible image under same-host pressure', async function() {
+      const progress = await threadProgress(408);
+      return progress && progress.displayed > 0 ? Date.now() - started : null;
+    }, 18000, 20);
+    assert(firstVisible < 4000, 'newly visible image waited ' + firstVisible + 'ms behind old offscreen requests');
+    await waitFor('both newly visible thumbnails before releasing the slow responses', async function() {
+      const progress = await threadProgress(408);
+      return progress && progress.displayed === 2 && progress.failed === 0 && progress.cells === 2;
+    }, 3000, 20);
+    fixture.releaseScrollImages();
+    await evaluate(page, `document.querySelector('#normalthread_407').scrollIntoView({ block: 'center' })`);
+    await waitFor('original cells resume after scrolling back', async function() {
+      const progress = await threadProgress(407);
+      return progress && progress.loaded === 3 && progress.failed === 0 && progress.cells === 3 && progress.displayed === 3;
+    });
+    const slowAttempts = Object.entries(fixture.metrics.requestsByPath).filter(([name]) => name.startsWith('/scroll-images/slow-'))
+      .map(([, count]) => count);
+    assert(slowAttempts.every(count => count <= 2), 'a slow image must not be repeatedly cancelled and restarted');
+    assert.strictEqual(cancelled, 1, 'Chromium must cancel exactly one displaced image request');
+    assert.strictEqual(maxBrowserInFlight, 3, 'Chromium must cancel the old request before spending its image slot on a new request');
+    assert.strictEqual(fixture.metrics.maxScrollImages, 3, 'old and new images must share the same three live responses');
+    return { firstVisibleMs: firstVisible, maxConcurrent: fixture.metrics.maxScrollImages, maxBrowserInFlight,
+      restoredImages: 3, restartedRequests: slowAttempts.reduce((total, count) => total + count - 1, 0) };
+  } finally {
+    listeners.forEach(remove => remove());
+    await page.cdp.send('Network.disable');
+  }
+}
+
+async function checkLongGallery(page, extensionId, fixturePort, fixture) {
+  const listing = 'https://' + CROSS_HOST + ':' + fixturePort + '/forum.php?mode=long-gallery';
+  await navigate(page, listing);
+  const context = await waitForExtensionContext(page, extensionId);
+  await waitFor('first image occupies the only connection in a 5,000-image gallery', () => fixture.metrics.requestsByPath['/img/long-gallery-0.jpg'] === 1);
+  const click = await evaluate(page, `(() => {
+    const gallery = Object.values(ATPState.threads).find(t => t.link.includes('/thread-409-'));
+    const button = gallery.panel.querySelector('.atp-thumbnail-expand');
+    const started = performance.now();
+    button.click();
+    const measured = { clickMs: Math.round((performance.now() - started) * 10) / 10,
+      candidates: gallery.candidates.length, requestedLimit: gallery.readyImageLimit, prepared: gallery.readyImageIndexed };
+    button.click();
+    return measured;
+  })()`, context.id);
+  assert.strictEqual(click.candidates, 5000);
+  assert.strictEqual(click.requestedLimit, 5000);
+  assert(click.prepared < click.candidates, 'an expand click prepared all ' + click.prepared + ' images synchronously, taking ' + click.clickMs + 'ms');
+  const cached = await waitFor('all 5,000 extracted images are saved as a complete article', () => evaluate(page, `(async () => {
+    const gallery = Object.values(ATPState.threads).find(t => t.link.includes('/thread-409-'));
+    const data = await ATPCache.getCachedArticleData(gallery.link);
+    return data && { count: data.images.length, partial: data.partial,
+      currentExtraction: data.imageExtractionVersion === SharedUtils.ARTICLE_IMAGE_EXTRACTION_VERSION };
+  })()`, context.id));
+  assert.deepStrictEqual(cached, { count: 5000, partial: false, currentExtraction: true });
+  await waitFor('collapse still lets the original thumbnail finish', () => evaluate(page, `(() => {
+    const t = Object.values(ATPState.threads).find(t => t.link.includes('/thread-409-'));
+    return t.loaded === 1 && t.grid.children.length === 1 && t.readyImageLimit === 1;
+  })()`, context.id));
+  assert.strictEqual(Object.keys(fixture.metrics.requestsByPath).filter(p => p.startsWith('/img/long-gallery-')).length, 1,
+    'collapsed rows must not start queued downloads');
+
+  const articleRequests = fixture.metrics.requestsByPath['/thread-409-1-1.html'];
+  const script = await page.cdp.send('Page.addScriptToEvaluateOnNewDocument', {source: `(() => {
+    const timing = window.atpGalleryTiming = { frames: 0, longTasks: [] };
+    function frame() {
+      timing.frames++;
+      if (!timing.finished) requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+    const observer = new PerformanceObserver(list => {
+      for (const item of list.getEntries()) timing.longTasks.push(Math.round(item.duration));
+    });
+    observer.observe({ type: 'longtask', buffered: true });
+    timing.finish = () => {
+      timing.finished = true;
+      observer.disconnect();
+    };
+  })()`});
+  try {
+    await navigate(page, listing + '&warm=1');
+    const warmContext = await waitForExtensionContext(page, extensionId);
+    const warm = await waitFor('the warm gallery restores its complete ordered list and one thumbnail', () => evaluate(page, `(() => {
+      const gallery = Object.values(ATPState.threads).find(t => t.link.includes('/thread-409-'));
+      if (!gallery || gallery.loaded !== 1) return null;
+      return {
+        candidates: gallery.candidates.length,
+        last: new URL(gallery.candidates.at(-1).src).pathname,
+        firstScreen: gallery.firstScreenOk,
+        partial: gallery.partial
+      };
+    })()`, warmContext.id));
+    assert.deepStrictEqual(warm, {
+      candidates: 5000, last: '/img/long-gallery-4999.jpg', firstScreen: 1, partial: false
+    });
+    assert.strictEqual(fixture.metrics.requestsByPath['/thread-409-1-1.html'], articleRequests,
+      'a warmed gallery must commit from cache without another article request');
+    const timing = await evaluate(page, `(() => {
+      const timing = window.atpGalleryTiming;
+      timing.finish();
+      return { frames: timing.frames, maxLongTaskMs: Math.max(0, ...timing.longTasks) };
+    })()`);
+    return { ...click, cachedImages: cached.count, warm: { ...warm, ...timing, articleRequests: 0 } };
+  } finally {
+    await page.cdp.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: script.identifier });
+  }
+}
+
+async function checkAgeEntry(devtoolsPort, extensionId, manifest, port, fixture, sessions, completedSessions) {
+  const forum = '/forum-95-1.html';
+  const post = '/thread-740-1-1.html';
+  const phpPost = '/forum.php?mod=viewthread&tid=740&page=2';
+  const phpForum = '/forum.php?mod=forumdisplay&fid=95&page=2';
+  const typeFilter = phpForum + '&filter=typeid&typeid=4';
+  const sortFilter = phpForum + '&filter=sortid&sortid=6';
+  const writeAction = '/forum.php?mod=post&action=newthread&fid=95';
+  const origin = 'https://' + AGE_ENTRY_HOST + ':' + port;
+  const cases = [
+    { name: 'list', kind: 'forum', steps: [forum, '/', forum], clicks: 1 },
+    { name: 'delayed', kind: 'forum', steps: [forum, '/', forum], clicks: 1 },
+    { name: 'thread', kind: 'post', steps: [post, '/', post], clicks: 1 },
+    { name: 'php-thread', kind: 'post', steps: [phpPost, '/', phpPost], clicks: 1 },
+    { name: 'php-extra', kind: 'post', steps: [phpPost + '&extra=page%3D1', '/', phpPost], clicks: 1 },
+    { name: 'php-type-filter', kind: 'forum', steps: [typeFilter, '/', typeFilter], clicks: 1 },
+    { name: 'php-sort-filter', kind: 'forum', steps: [sortFilter + '&action=ignored', '/', sortFilter], clicks: 1 },
+    { name: 'php-duplicate-filter-id', kind: 'forum', steps: [typeFilter + '&typeid=9', '/', phpForum], clicks: 1 },
+    { name: 'root-only', kind: 'landing', steps: ['/', '/'], clicks: 1 },
+    { name: 'write-action', kind: 'landing', steps: [writeAction, '/'], clicks: 1 },
+    { name: 'persistent', kind: 'gate', steps: [forum, '/'], clicks: 1 },
+    { name: 'restored-gate', kind: 'gate', steps: [post, '/', post], clicks: 1 },
+    { name: 'post-copy', kind: 'post-copy', steps: [post], clicks: 0 },
+    { name: 'challenge', kind: 'challenge', steps: [forum], clicks: 0 },
+    { name: 'entry-429', kind: 'gate', steps: [forum], clicks: 0, status: 429, testManual: true },
+    { name: 'entry-503', kind: 'gate', steps: [forum], clicks: 0, status: 503, testManual: true },
+    { name: 'landing-429', kind: 'landing', steps: [forum, '/'], clicks: 1, status: 429 },
+    { name: 'landing-503', kind: 'landing', steps: [forum, '/'], clicks: 1, status: 503 },
+    { name: 'entry-rate-text', kind: 'gate', steps: [forum], clicks: 0, rateNotice: true, testManual: true },
+    { name: 'landing-rate-text', kind: 'landing', steps: [forum, '/'], clicks: 1, rateNotice: true },
+    { name: 'embedded', kind: 'embedded', steps: [forum], clicks: 0 },
+    { name: 'hidden', kind: 'gate', steps: [forum], clicks: 0 },
+    { name: 'other-origin', kind: 'gate', steps: [forum], clicks: 0 },
+    { name: 'option-off', kind: 'gate', steps: [forum], clicks: 0, settings: { autoEnterAgeGate: false } },
+    { name: 'site-off', kind: 'gate', steps: [forum], clicks: 0, settings: { siteConfigs: { 'sehuatang.org': { disabled: true } } } },
+    { name: 'extension-off', kind: 'gate', steps: [forum], clicks: 0, settings: { enabled: false } }
+  ];
+  const previous = await evaluateInWorker(devtoolsPort, manifest, 'chrome.storage.local.get("settings")');
+  const report = {};
+  try {
+    for (const sample of cases) {
+      const settings = Object.assign({}, previous.settings, sample.settings);
+      await evaluateInWorker(devtoolsPort, manifest, `chrome.storage.local.set({settings:${JSON.stringify(settings)}})`);
+      Object.assign(fixture.ageEntry, { mode: sample.name, admitted: false, navigations: [],
+        responsePath: sample.steps.at(-1), status: sample.status || 200, rateNotice: sample.rateNotice });
+      const page = await createPageSession(devtoolsPort);
+      sessions.push(page);
+      const pageIds = () => listTargets(devtoolsPort).then(all => all.filter(item => item.type === 'page').map(item => item.id).sort());
+      const tabsBefore = await pageIds();
+      const finalUrl = origin + sample.steps.at(-1);
+      async function waitForPage(kind, documentNumber, url = finalUrl) {
+        await waitFor('age entry ' + sample.name + ' reaches ' + kind + ' in the original tab', async () => {
+          const ctx = findExtensionContext(page, extensionId);
+          return ctx && evaluate(page, `location.href === ${JSON.stringify(url)} && document.readyState === 'complete' &&
+            document.body.dataset.ageFixture === ${JSON.stringify(kind)} && Number(document.body.dataset.ageNavigation) === ${documentNumber} &&
+            window.ATPConfig?.loaded === true`, ctx.id);
+        }, 6000, 25);
+        await evaluate(page, 'new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))');
+      }
+      try {
+        await navigate(page, origin + sample.steps[0]);
+        if (sample.name === 'delayed') {
+          await waitForPage('gate', 1);
+          assert.strictEqual(await evaluate(page, 'document.querySelectorAll("body > a.enter-btn").length'), 1);
+          assert.strictEqual(await evaluate(page, 'Number(sessionStorage.getItem("smokeAgeClicks"))'), 0);
+          await evaluate(page, `(() => { const pending = document.querySelector('#pending-age-link'); pending.replaceWith(pending.content); })()`);
+        }
+        await waitForPage(sample.kind, sample.steps.length);
+        if (sample.status || sample.rateNotice) {
+          assert.strictEqual(await evaluate(page, 'performance.getEntriesByType("navigation")[0].responseStatus'), sample.status || 200,
+            sample.name + ' must expose the real top-level HTTP status');
+        }
+        if (sample.rateNotice) {
+          assert.match(await evaluate(page, 'document.querySelector("#messagetext").innerText'), /请求过于频繁/);
+        }
+        if (sample.steps.length === 3 && sample.steps[1] === '/') {
+          const history = await page.cdp.send('Page.getNavigationHistory');
+          assert(history.entries.every(entry => entry.url !== origin + '/'), 'restoring the original page must replace the temporary forum home in history');
+        }
+        if (sample.kind === 'forum') {
+          await waitFor('restored list renders the article thumbnail', () => evaluate(page,
+            '!!document.querySelector("#normalthread_740 .atp-thumbnail-img")?.naturalWidth'), 6000, 40);
+        }
+        if (sample.name === 'embedded') {
+          assert.strictEqual(await evaluate(page, `document.querySelector('iframe').contentDocument.body.dataset.ageFixture`), 'gate',
+            'the iframe must actually contain the age notice');
+        }
+        const failedEntry = sample.name === 'persistent' || sample.name === 'restored-gate';
+        if (failedEntry) {
+          await page.cdp.send('Page.reload', { ignoreCache: true });
+          await waitForPage('gate', sample.steps.length + 1);
+          assert.strictEqual(await evaluate(page, `document.querySelector('body > a.enter-btn')?.getBoundingClientRect().width > 0`), true,
+            'a notice the site keeps returning must retain its visible manual entry');
+        }
+        const expected = failedEntry ? sample.steps.concat(sample.steps.at(-1)) : sample.steps;
+        assert.deepStrictEqual(fixture.ageEntry.navigations, expected, sample.name + ' top-level HTTP requests');
+        const clicks = await evaluate(page, 'Number(sessionStorage.getItem("smokeAgeClicks"))');
+        assert.strictEqual(clicks, sample.clicks, sample.name + ' native entry activations');
+        report[sample.name] = { clicks, navigations: expected.length };
+        if (sample.status) report[sample.name].responseStatus = sample.status;
+        if (failedEntry || sample.testManual) {
+          const center = await evaluate(page, `(() => { const rect = document.querySelector('body > a.enter-btn').getBoundingClientRect();
+            return {x: rect.x + rect.width / 2, y: rect.y + rect.height / 2}; })()`);
+          for (const type of ['mousePressed', 'mouseReleased']) {
+            await page.cdp.send('Input.dispatchMouseEvent', { type, ...center, button: 'left', clickCount: 1 });
+          }
+          await waitForPage(sample.name === 'persistent' ? 'gate' : 'landing', expected.length + 1, origin + '/');
+          assert.strictEqual(await evaluate(page, 'Number(sessionStorage.getItem("smokeAgeClicks"))'), clicks + 1);
+          assert.deepStrictEqual(fixture.ageEntry.navigations, expected.concat('/'), 'manual entry must still reach the native root');
+          report[sample.name].manualEntry = true;
+        }
+        assert.deepStrictEqual(await pageIds(), tabsBefore, sample.name + ' must preserve the original browser tabs');
+      } catch (error) {
+        const state = await evaluate(page, '({ url: location.href, title: document.title, fixture: document.body?.dataset.ageFixture, clicks: sessionStorage.getItem("smokeAgeClicks") })').catch(() => null);
+        error.message += ' ' + JSON.stringify({ page: state, navigations: fixture.ageEntry.navigations });
+        throw error;
+      } finally {
+        page.cdp.close();
+        await closeTarget(devtoolsPort, page.target.id);
+        sessions.splice(sessions.indexOf(page), 1);
+        completedSessions.push(page);
+      }
+    }
+  } finally {
+    await evaluateInWorker(devtoolsPort, manifest, previous.settings ? `chrome.storage.local.set(${JSON.stringify(previous)})` : 'chrome.storage.local.remove("settings")');
+  }
+  return report;
+}
+
+async function checkCachedRowAndTextProgress(page, extensionId, port, fixture) {
+  const seed = await waitForExtensionContext(page, extensionId);
+  const cachedUrl = 'https://' + CROSS_HOST + ':' + port + '/thread-412-1-1.html';
+  const cached = await evaluate(page, `ATPCache.setCachedArticleData(${JSON.stringify(cachedUrl)}, {
+    textAttachments: [{url:location.origin + '/mixed-forum.txt', name:'forum.txt'},
+      {url:'https://${TXT_DOWNLOAD_HOST}:${port}/mixed-download.txt', name:'download.txt'}]
+  }, true)`, seed.id);
+  assert(cached, 'the post used for the busy-worker check must be in storage');
+  await navigate(page, 'https://' + CROSS_HOST + ':' + port + '/forum.php?mode=cached-row');
+  const context = await waitForExtensionContext(page, extensionId);
+  const slow = ['/thread-410-1-1.html', '/thread-411-1-1.html'];
+  await waitFor('two unfinished article requests', () => slow.every(path => fixture.heldResponses.has(path)));
+  await evaluate(page, `document.querySelector('#normalthread_412').scrollIntoView({block:'center'})`);
+  const state = `Object.values(ATPState.threads).find(t => t.link.includes('/thread-412-'))`;
+  await waitFor('the cached post renders with both article workers occupied', () => evaluate(page, `!!(${state})?.panel?.isConnected`, context.id), 6000, 25);
+  assert(slow.every(path => fixture.heldResponses.has(path)), 'article workers must still be occupied when the cache hit is displayed');
+  assert.strictEqual(fixture.metrics.requestsByPath['/thread-412-1-1.html'] || 0, 0);
+  slow.forEach(path => fixture.heldResponses.get(path)());
+
+  await waitFor('one usable copy button while the download site is pending', () => fixture.heldResponses.has('/mixed-download.txt') &&
+    evaluate(page, `((t) => t.textResourcesLoading && t.textResolvedAttachmentIds?.length === 1 &&
+      !!t.panel.querySelector('[data-copy-type="baidu"]'))(${state})`, context.id), 7000, 25);
+  fixture.heldResponses.get('/mixed-download.txt')();
+  await waitFor('both TXT resources become usable', () => evaluate(page, `((t) => t.textResourcesDone &&
+    t.textResolvedAttachmentIds.length === 2 && !!t.panel.querySelector('[data-copy-type="quark"]'))(${state})`, context.id));
+  assert.strictEqual(fixture.metrics.requestsByPath['/mixed-forum.txt'], 1);
+  assert.strictEqual(fixture.metrics.requestsByPath['/mixed-download.txt'], 1);
+  return { busyArticleWorkers: 2, cachedPostNetworkRequests: 0, copyButtonsBeforeDownload: 1, completedAttachments: 2 };
+}
+
+async function checkColdScrollAndArticleRetry(page, extensionId, port, fixture) {
+  const origin = 'https://' + SMOKE_HOST + ':' + port;
+  await page.cdp.send('Page.bringToFront');
+  await navigate(page, origin + '/forum.php?mode=cold-scroll');
+  let context = await waitForExtensionContext(page, extensionId);
+  const slow = ['/thread-413-1-1.html', '/thread-414-1-1.html'];
+  await waitFor('initial offscreen request', () => slow.some(route => fixture.heldResponses.has(route)));
+  const started = Date.now();
+  await evaluate(page, `document.querySelector('#normalthread_415').scrollIntoView({block:'center'})`);
+  const firstImage = await waitFor('new visible post loads before the offscreen response', async () =>
+    await evaluate(page, `document.querySelector('#normalthread_415 .atp-thumbnail-img')?.naturalWidth > 0`, context.id)
+      ? Date.now() - started : null, 6000, 25);
+  assert.strictEqual(slow.filter(route => fixture.heldResponses.has(route)).length, 1,
+    'offscreen requests must leave a worker for a cold visible row');
+  assert.strictEqual(fixture.metrics.requestsByPath['/thread-415-1-1.html'], 1);
+  slow.forEach(route => fixture.heldResponses.get(route)?.());
+
+  await navigate(page, origin + '/forum.php?mode=auth-retry');
+  context = await waitForExtensionContext(page, extensionId);
+  const notes = await waitFor('distinct login and permission messages', () => evaluate(page, `(() => {
+    const forbidden = document.querySelector('#normalthread_416 .atp-forum-wait');
+    const permission = document.querySelector('#normalthread_417 .atp-forum-wait');
+    return forbidden?.querySelector('button') && permission?.querySelector('button')
+      ? { forbidden: forbidden.textContent, permission: permission.textContent } : null;
+  })()`, context.id));
+  assert.match(notes.forbidden, /正文访问受限/);
+  assert.match(notes.permission, /阅读权限不足/);
+  const unrelated = '/thread-418-1-1.html';
+  await waitFor('unrelated article remains in flight during a manual retry', () => fixture.heldResponses.has(unrelated));
+  assert(await evaluate(page, `(() => {
+    const button = document.querySelector('#normalthread_416 .atp-forum-retry');
+    window.__atpManualRetry = [];
+    document.addEventListener('click', event => {
+      if (event.isTrusted && event.target.matches('.atp-forum-retry')) {
+        window.__atpManualRetry.push(event.target.closest('tbody').id);
+      }
+    }, true);
+    button.focus();
+    return document.activeElement === button;
+  })()`, context.id), 'the configured retry button must receive focus');
+  await page.cdp.send('Input.dispatchKeyEvent', {
+    type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r', unmodifiedText: '\r'
+  });
+  await page.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+  const recovered = (id, checkFocus) => evaluate(page, `(() => {
+    const row = document.querySelector('#normalthread_${id}');
+    return row.querySelector('.atp-thumbnail-img')?.naturalWidth > 0 &&
+      !row.querySelector('.atp-forum-wait') && (!${checkFocus} || document.activeElement === row.querySelector('.xst'));
+  })()`, context.id);
+  await waitFor('keyboard retry recovers the post before automatic retry', () => recovered(416, true), 5000, 25);
+  assert.strictEqual(fixture.metrics.requestsByPath['/thread-416-1-1.html'], 2);
+  assert.strictEqual(fixture.metrics.requestsByPath['/thread-417-1-1.html'], 1, 'retry must reload only the selected post');
+
+  const center = await evaluate(page, `(() => {
+    const button = document.querySelector('#normalthread_417 .atp-forum-retry');
+    button.scrollIntoView({ block:'center' });
+    const rect = button.getBoundingClientRect();
+    return { x:rect.left + rect.width / 2, y:rect.top + rect.height / 2 };
+  })()`, context.id);
+  for (const type of ['mousePressed', 'mouseReleased']) {
+    await page.cdp.send('Input.dispatchMouseEvent', { type, ...center, button: 'left', clickCount: 1 });
+  }
+  await waitFor('pointer retry recovers the permission post', () => recovered(417, false), 5000, 25);
+  assert.deepStrictEqual(await evaluate(page, 'window.__atpManualRetry', context.id), ['normalthread_416', 'normalthread_417']);
+  assert.strictEqual(fixture.metrics.requestsByPath['/thread-417-1-1.html'], 2);
+  assert(fixture.heldResponses.has(unrelated), 'manual retries must finish while the unrelated article remains in flight');
+  fixture.heldResponses.get(unrelated)();
+  return { coldPostFirstImageMs: firstImage, recoveredByKeyboard: true, recoveredByClick: true, unrelatedRequestStillPending: true };
+}
+
+async function checkOfflineArticleRecovery(page, extensionId, port, fixture) {
+  const route = '/thread-419-1-1.html';
+  await navigate(page, 'https://' + SMOKE_HOST + ':' + port + '/forum.php?mode=offline-recovery');
+  const context = await waitForExtensionContext(page, extensionId);
+  await waitFor('settings on the empty list', () => evaluate(page, 'ATPConfig.loaded', context.id));
+  await page.cdp.send('Network.enable');
+  const setOffline = offline => page.cdp.send('Network.emulateNetworkConditions', {
+    offline, latency: 0, downloadThroughput: -1, uploadThroughput: -1
+  });
+  try {
+    await setOffline(true);
+    await waitFor('browser offline state', () => evaluate(page, 'navigator.onLine === false'));
+    await evaluate(page, `document.querySelector('#threadlisttable').insertAdjacentHTML('beforeend',
+      '<tbody id="normalthread_419"><tr><th><a class="xst" href="${route}">Offline post</a></th></tr></tbody>')`);
+    await waitFor('offline notice on the new post', () => evaluate(page,
+      `document.querySelector('#normalthread_419 .atp-forum-wait')?.textContent.includes('网络已断开')`), 7000, 25);
+    assert.strictEqual(fixture.metrics.requestsByPath[route] || 0, 0);
+  } finally {
+    await setOffline(false);
+  }
+  try {
+    const started = Date.now();
+    await waitFor('post resumes when the browser reconnects', () => evaluate(page, `(() => {
+      const row = document.querySelector('#normalthread_419');
+      return navigator.onLine && row.querySelector('.atp-thumbnail-img')?.naturalWidth > 0 &&
+        !row.querySelector('.atp-forum-wait');
+    })()`), 7000, 25);
+    assert.strictEqual(fixture.metrics.requestsByPath[route], 1);
+    return { offlineRequests: 0, recoveredRequests: 1, reconnectToImageMs: Date.now() - started };
+  } finally {
+    await page.cdp.send('Network.disable');
+  }
+}
+
+async function checkDynamicListPreview(page, contextId) {
+  await waitFor('clickable thumbnail in the original list', function() {
+    return evaluate(page, `(() => {
+      const img = document.querySelector('#normalthread_400 .atp-thumbnail-wrapper[role=button] .atp-thumbnail-img');
+      if (!img || !img.complete || !img.naturalWidth) return false;
+      window.__atpOriginalThumb = img;
+      return true;
+    })()`, contextId);
+  });
+  const result = await evaluate(page, `(async () => {
+    const img = window.__atpOriginalThumb;
+    const list = document.querySelector('#threadlist');
+    const previewOpen = () => document.querySelector('.atp-preview-overlay')?.style.display === 'flex';
+    img.click();
+    const before = previewOpen();
+    document.querySelector('.atp-preview-close').click();
+    const sibling = document.createElement('a');
+    sibling.href = '/thread-98765-1-1.html';
+    sibling.className = 'xst';
+    sibling.textContent = 'Additional fixture thread';
+    list.after(sibling);
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    img.click();
+    const after = previewOpen();
+    if (after) document.querySelector('.atp-preview-close').click();
+    sibling.remove();
+    return { before, after, sameRoot: list === document.querySelector('#threadlist'), visible: img.getBoundingClientRect().width > 0 };
+  })()`, contextId);
+  assert.deepStrictEqual(result, { before: true, after: true, sameRoot: true, visible: true });
+  return result;
+}
+
+async function checkResourcePanelThreadSelection(page, contextId) {
+  const selection = await evaluate(page, `(async () => {
+    const threads = Object.values(ATPState.threads);
+    const pinned = threads.find(item => item.link.includes('/thread-100-1-1.html'));
+    const selected = threads.find(item => item.link.includes('/thread-200-1-1.html'));
+    const sidebar = document.querySelector('#atp-resource-sidebar');
+    pinned.panel.querySelector('[data-resource-trigger]').click();
+    sidebar.querySelector('[data-sidebar-pin-toggle]').click();
+    selected.panel.querySelector('[data-resource-trigger]').click();
+    const copy = sidebar.querySelector('[data-copy-all]');
+    copy.focus();
+    const keepsSelection = () => document.activeElement === copy &&
+      sidebar.querySelector('.atp-resource-thread-title').textContent.includes(selected.title);
+
+    const originalMessage = pinned.textResourceMessage;
+    pinned.textResourceMessage = 'TXT ready in the pinned thread';
+    ATPResourcePanel.updateThread(pinned);
+    const afterUpdate = keepsSelection();
+    pinned.textResourceMessage = originalMessage;
+    ATPResourcePanel.updateThread(pinned);
+    pinned.panel.dispatchEvent(new MouseEvent('mouseenter'));
+    const afterHover = keepsSelection();
+
+    // Capture the exact payload without changing the system clipboard.
+    let copied = '';
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true, value: { writeText: async text => { copied = text; } }
+    });
+    try {
+      copy.click();
+    } finally {
+      delete navigator.clipboard;
+    }
+    return { afterUpdate, afterHover, copied };
+  })()`, contextId);
+  assert(selection.afterUpdate && selection.afterHover, 'another thread must leave the active sidebar and focused copy action intact');
+  assert(selection.copied.includes('AtpCrossMain') && !selection.copied.includes('1AtpSmokeMain'),
+    'copying from the active sidebar must use the selected thread, including while another thread is pinned');
+
+  const dismissalState = `(() => {
+    const sidebar = document.querySelector('#atp-resource-sidebar');
+    const pinned = document.querySelector('#normalthread_100 [data-resource-trigger]');
+    const selected = document.querySelector('#normalthread_200 [data-resource-trigger]');
+    return {
+      expandedPinned: pinned.getAttribute('aria-expanded'),
+      expandedSelected: selected.getAttribute('aria-expanded'),
+      pinnedShown: !!sidebar.querySelector('.atp-resource-pin-badge'),
+      empty: !sidebar.querySelector('.atp-resource-thread-title'),
+      restoredFocus: document.activeElement === selected
+    };
+  })()`;
+  await pressSmokeKey(page, 'Escape', 'Escape', 27);
+  assert.deepStrictEqual(await evaluate(page, dismissalState, contextId), {
+    expandedPinned: 'true', expandedSelected: 'false', pinnedShown: true, empty: false, restoredFocus: true
+  }, 'Escape must return to the pinned thread and restore focus without reopening the dismissed thread');
+  await pressSmokeKey(page, 'Enter', 'Enter', 13);
+  assert.strictEqual((await evaluate(page, dismissalState, contextId)).expandedSelected, 'true',
+    'Enter must reopen the resource sidebar from the restored trigger');
+
+  await evaluate(page, `(() => {
+    document.querySelector('#normalthread_100 [data-resource-trigger]').click();
+    document.querySelector('#atp-resource-sidebar [data-sidebar-pin-toggle]').click();
+    document.querySelector('#normalthread_200 [data-resource-trigger]').click();
+  })()`, contextId);
+  await pressSmokeKey(page, 'Escape', 'Escape', 27);
+  assert.deepStrictEqual(await evaluate(page, dismissalState, contextId), {
+    expandedPinned: 'false', expandedSelected: 'false', pinnedShown: false, empty: true, restoredFocus: true
+  }, 'Escape must leave the sidebar empty when no other thread is pinned');
+  await pressSmokeKey(page, 'Enter', 'Enter', 13);
+  await evaluate(page, `document.querySelector('#atp-resource-sidebar [data-copy-all]').focus()`, contextId);
+}
+
+async function pressSmokeKey(page, key, code, keyCode) {
+  const event = { key, code, windowsVirtualKeyCode: keyCode };
+  const keyDown = key === 'Enter' ? { type: 'keyDown', text: '\r' } : { type: 'rawKeyDown' };
+  await page.cdp.send('Input.dispatchKeyEvent', { ...event, ...keyDown });
+  await page.cdp.send('Input.dispatchKeyEvent', { ...event, type: 'keyUp' });
+}
+
+async function checkPreviewKeyboardRetry(page, contextId) {
+  await page.cdp.send('Page.bringToFront');
+  await evaluate(page, `(() => {
+    const opener = document.querySelector('#normalthread_100 .atp-thumbnail-wrapper[role="button"]');
+    opener.focus();
+    ATPPreviewer.open(['data:image/png;base64,aW52YWxpZA=='], 0, { opener, preferOpenerFocus: true });
+  })()`, contextId);
+  const failedPreview = `document.querySelector('.atp-preview-counter')?.textContent === '加载失败 (1 / 1)'`;
+  await waitFor('single-image preview failure', () => evaluate(page, failedPreview, contextId));
+  await pressSmokeKey(page, 'Tab', 'Tab', 9);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    assert(await evaluate(page, `(() => {
+      const retry = document.querySelector('.atp-preview-retry');
+      window.__atpSmokeFailedPreview = document.querySelector('.atp-preview-img');
+      return retry === document.activeElement && !retry.hidden && !retry.disabled;
+    })()`, contextId), 'each failed manual preview must leave the retry button focused');
+    await pressSmokeKey(page, ' ', 'Space', 32);
+    await waitFor('keyboard preview retry fails and becomes actionable', () => evaluate(page, `${failedPreview} &&
+      document.querySelector('.atp-preview-img') !== window.__atpSmokeFailedPreview &&
+      document.activeElement === document.querySelector('.atp-preview-retry')`, contextId));
+  }
+  await pressSmokeKey(page, 'Escape', 'Escape', 27);
+  assert(await evaluate(page, `!ATPPreviewer.isOpen() &&
+    document.activeElement === document.querySelector('#normalthread_100 .atp-thumbnail-wrapper[role="button"]')`, contextId),
+  'closing a failed preview must return focus to its thumbnail');
+}
+
+async function checkPopupNumberValidation(popup) {
+  await popup.cdp.send('Page.bringToFront');
+  await waitFor('popup numeric settings ready', () => evaluate(popup, `document.querySelector('#gridCols')?.disabled === false`));
+  const before = await evaluate(popup, `chrome.storage.local.get('settings').then(({ settings }) => settings?.gridCols ?? null)`);
+  await evaluate(popup, `(() => {
+    const field = document.querySelector('#gridCols');
+    field.focus();
+    field.select();
+  })()`);
+  await popup.cdp.send('Input.insertText', { text: '1e2' });
+  await pressSmokeKey(popup, 'Tab', 'Tab', 9);
+  const error = await evaluate(popup, `(async () => {
+    const field = document.querySelector('#gridCols');
+    const description = document.getElementById(field.getAttribute('aria-describedby'));
+    const { settings } = await chrome.storage.local.get('settings');
+    return {
+      text: description?.textContent || '',
+      inline: description?.parentElement === field.closest('.setting-row'),
+      invalid: field.getAttribute('aria-invalid'),
+      value: field.value,
+      stored: settings?.gridCols ?? null
+    };
+  })()`);
+  assert(error.inline && error.invalid === 'true' && error.value === '1e2' && /1 至 32/.test(error.text),
+    'a typed invalid exponent must explain the range beside its field: ' + JSON.stringify(error));
+  assert.strictEqual(error.stored, before, 'invalid numeric input must not reach stored settings');
+}
+
+async function checkConcurrentArticleCache(pages) {
+  const read = pages.map(item => expression => evaluate(item.page, expression, item.contextId));
+  for (const run of read) {
+    await run(`(() => {
+      window.__article = new URL('/thread-977321-1-1.html', location.href).href;
+      window.__image = new URL('/img/fixture.jpg', location.href).href;
+      window.__attachment = { url: new URL('/fixture.txt', location.href).href, name: 'fixture.txt' };
+      return true;
+    })()`);
+  }
+  const [a, b] = read;
+  await a(`ATPCache.setCachedArticleData(__article, { images: [{src: __image}], textAttachments: [__attachment], textAttachmentCount: 1 }, true)`);
+  const inspect = `ATPCache.getCachedArticleData(__article).then(data => data && ({
+    links: SharedUtils.countResources(data.resources), imported: !!data.textResourcesImported,
+    complete: !!data.textResourcesComplete, imagesLoaded: data.loadedUrls.length
+  }))`;
+  await waitFor('shared article cache seed', () => a(inspect));
+
+  // Delay a tab-local article read after Chrome has taken its snapshot. This
+  // reproduces the historical race without delaying the worker or editing storage.
+  await b(`(() => {
+    const area = chrome.storage.local, get = area.get.bind(area);
+    const key = ATPCache.ARTICLE_CACHE_PREFIX + SharedUtils.normalizeArticleUrl(__article);
+    area.get = function(keys, callback) {
+      if (keys !== key || typeof callback !== 'function') return get(...arguments);
+      area.get = get;
+      return get(keys, value => { window.__releaseOldRead = () => callback(value); });
+    };
+    window.__restoreArticleGet = () => { area.get = get; };
+    ATPCache.updateArticleLoadedUrls(__article, [__image], true);
+    return true;
+  })()`);
+  await waitFor('image progress committed or a tab holding its previous read', async () =>
+    (await b('!!window.__releaseOldRead')) || (await a(inspect))?.imagesLoaded === 1);
+  const accepted = await a(`ATPRenderer.importTextResources({ link: __article, candidates: [{src: __image}], textAttachments: [__attachment],
+    textAttachmentCount: 1, loaded: 0, nextIdx: 0, failedCount: 0 }, [{ name: 'fixture.txt', resources: {
+      groups: {magnet: ['magnet:?xt=urn:btih:0123456789012345678901234567890123456789']}
+    } }])`);
+  assert(accepted, 'the TXT import must be accepted by the normal renderer');
+  await waitFor('TXT import persisted in Chrome', async () => (await a(inspect))?.imported);
+  await b('window.__restoreArticleGet(); window.__releaseOldRead?.()');
+  const result = await waitFor('saved image progress read in the other tab', async () => {
+    const state = await b(inspect);
+    return state?.imagesLoaded === 1 ? state : null;
+  });
+  assert.deepStrictEqual(result, { links: 1, imported: true, complete: true, imagesLoaded: 1 });
+  return result;
+}
+
+async function checkCrossTabProbe(devtoolsPort, extensionId, fixturePort, sessions, completedSessions, fixture) {
   var pages = [];
   for (var i = 0; i < 2; i++) {
     var page = await createPageSession(devtoolsPort);
@@ -985,13 +1796,53 @@ async function checkCrossTabProbe(devtoolsPort, extensionId, fixturePort, sessio
   await waitFor('probe lease removed after settlement', function() {
     return evaluate(pages[0].page, "!localStorage.getItem('atp.forumPacer.probe.v1')", pages[0].contextId);
   });
+  const [automatic, manual] = pages;
+  await evaluate(automatic.page, `(async () => {
+    localStorage.setItem('atp.forumPacer.retryAfter.v1', String(Date.now() - 1));
+    window.__atpSmokeAutomaticTicket = await ATPForumPacer.acquire({ priority:0, deadline:Date.now() + 5000 });
+    return !!window.__atpSmokeAutomaticTicket;
+  })()`, automatic.contextId).then(ticket => assert(ticket, 'the first tab must hold a recovery ticket'));
+  const manualPath = '/manual-probe.txt';
+  await evaluate(manual.page, `(() => {
+    window.__atpSmokeManualResult = null;
+    ATPFetcher.fetchTextAttachmentResourcesWithStatus([{url:location.origin + ${JSON.stringify(manualPath)}}],
+      {manualRetry:true, deadline:Date.now() + 7000}).then(status => {
+        window.__atpSmokeManualResult = {unresolved:status.unresolvedCount, resources:SharedUtils.countResources(status.resources)};
+      });
+  })()`, manual.contextId);
+  await waitFor('manual TXT waits in the second tab', () => evaluate(manual.page, `ATPForumPacer.getState().waiting === 1`, manual.contextId), 3000, 25);
+  assert.strictEqual(fixture.metrics.requestsByPath[manualPath] || 0, 0, 'manual TXT must preserve the in-flight recovery lease');
+  await evaluate(automatic.page, `window.__atpSmokeAutomaticTicket.done('')`, automatic.contextId);
+  const manualRecovery = await waitFor('manual TXT claims the next recovery slot', () =>
+    evaluate(manual.page, 'window.__atpSmokeManualResult', manual.contextId), 5000, 25);
+  assert.deepStrictEqual(manualRecovery, { unresolved: 0, resources: 1 });
+  assert.strictEqual(fixture.metrics.requestsByPath[manualPath], 1);
+
+  const sharedArticle = await checkConcurrentArticleCache(pages);
+  const articlePath = '/thread-419-1-1.html';
+  const articleRequestsBeforeLimit = fixture.metrics.requestsByPath[articlePath] || 0;
+  const forumLimit = await evaluate(pages[0].page, `(async () => {
+    const target = 'https://${CROSS_HOST}:${fixturePort}';
+    const path = ${JSON.stringify(articlePath)};
+    const files = [1, 2, 3].map(id => ({ url: target + '/throttled-forum-' + id + '.txt' }));
+    const status = await ATPFetcher.fetchTextAttachmentResourcesWithStatus(files, { manualRetry: true });
+    const source = await ATPFetcher.fetchArticleDataByBackground(location.origin + path);
+    const limited = await ATPFetcher.fetchArticleDataByBackground(target + path);
+    return { retryable: status.retryableCount, sourcePaused: ATPForumPacer.getState().pausedMs > 0,
+      sourceLoaded: source?.images?.length > 0, targetHeld: limited?.emptyReason === 'forum_cooldown' &&
+        limited.retryAfter > Date.now() + 110000 };
+  })()`, pages[0].contextId);
+  assert.deepStrictEqual(forumLimit, { retryable: 3, sourcePaused: false, sourceLoaded: true, targetHeld: true });
+  assert.deepStrictEqual([1, 2, 3].map(id => fixture.metrics.requestsByPath['/throttled-forum-' + id + '.txt'] || 0), [1, 0, 0]);
+  assert.strictEqual(fixture.metrics.requestsByPath[articlePath], articleRequestsBeforeLimit + 1,
+    'Only the healthy origin should receive the article request');
   for (var item of pages) {
-    assert.strictEqual(item.page.errors.length, 0, 'Probe pages must have no runtime exceptions');
     item.page.cdp.close();
     await closeTarget(devtoolsPort, item.page.target.id);
     sessions.splice(sessions.indexOf(item.page), 1);
+    completedSessions.push(item.page);
   }
-  return true;
+  return { nativeProbe: true, manualRecovery, sharedArticle, forumLimit };
 }
 
 async function main() {
@@ -1006,6 +1857,7 @@ async function main() {
   var fixture = null;
   var browser = null;
   var sessions = [];
+  var completedSessions = [];
   var browserConnection = null;
   var smokeFailure = null;
   try {
@@ -1018,7 +1870,7 @@ async function main() {
     });
     var fixturePort = fixture.server.address().port;
     browser = spawnSmokeBrowser(browserPath, profileDir, EXTENSION_DIR,
-      [SMOKE_HOST, CROSS_HOST, PACER_HOST, HOT_IMAGE_HOST, HEAVY_HOST, SIGNED_RELAY_HOST,
+      [SMOKE_HOST, AGE_ENTRY_HOST, CROSS_HOST, PACER_HOST, HOT_IMAGE_HOST, HEAVY_HOST, SIGNED_RELAY_HOST, TXT_DOWNLOAD_HOST,
         ATTACHMENT_LIVE_HOST, ATTACHMENT_DEAD_HOST]);
     var devtoolsPort = await waitForDevtoolsPort(profileDir, browser);
 
@@ -1029,6 +1881,27 @@ async function main() {
     var extensionMatch = /^chrome-extension:\/\/([a-p]{32})/.exec(extensionTarget.url || '');
     assert(extensionMatch, 'Could not read the unpacked extension id from ' + extensionTarget.url);
     var extensionId = extensionMatch[1];
+
+    var ageEntry = await checkAgeEntry(devtoolsPort, extensionId, packagedManifest, fixturePort, fixture, sessions, completedSessions);
+
+    await evaluateInWorker(devtoolsPort, packagedManifest, `chrome.storage.local.set({settings:{
+      gridCols:5, visibleRows:2, firstScreenConcurrency:3, backgroundConcurrency:1, ordinaryHostConcurrency:6,
+      globalImageConcurrency:5, imageTimeout:15000, imageTaskDeadline:0, maxRetryPerImage:0, autoLoadOffscreenFirstRowsEnabled:false
+    }}).then(() => true)`);
+    var scrollPage = await createPageSession(devtoolsPort);
+    sessions.push(scrollPage);
+    var scrollPriority = await checkScrollPriority(scrollPage, extensionId, fixturePort, fixture);
+    await evaluateInWorker(devtoolsPort, packagedManifest, `chrome.storage.local.set({settings:{
+      gridCols:1, visibleRows:1, firstScreenConcurrency:1, globalImageConcurrency:1, maxImagesPerPost:5000, maxDisplayPerPost:5000, articleFetchConcurrency:2
+    }}).then(() => true)`);
+    var longGallery = await checkLongGallery(scrollPage, extensionId, fixturePort, fixture);
+    var cachedRowAndText = await checkCachedRowAndTextProgress(scrollPage, extensionId, fixturePort, fixture);
+    var coldScrollAndArticleRetry = await checkColdScrollAndArticleRetry(scrollPage, extensionId, fixturePort, fixture);
+    var offlineArticleRecovery = await checkOfflineArticleRecovery(scrollPage, extensionId, fixturePort, fixture);
+    scrollPage.cdp.close();
+    await closeTarget(devtoolsPort, scrollPage.target.id);
+    sessions.splice(sessions.indexOf(scrollPage), 1);
+    completedSessions.push(scrollPage);
 
     var legacyWorker = await new CdpConnection(extensionTarget.webSocketDebuggerUrl).connect();
     try {
@@ -1059,9 +1932,11 @@ async function main() {
     })`, defaultDistanceContext.id);
     assert(distantDefaultState.enabled === false && distantDefaultState.farRegistered === false,
       'Default settings must leave a distant thread unregistered until the user scrolls');
+    var dynamicListPreview = await checkDynamicListPreview(defaultDistancePage, defaultDistanceContext.id);
     defaultDistancePage.cdp.close();
     await closeTarget(devtoolsPort, defaultDistancePage.target.id);
     sessions.splice(sessions.indexOf(defaultDistancePage), 1);
+    completedSessions.push(defaultDistancePage);
 
     var setupWorker = await new CdpConnection(extensionTarget.webSocketDebuggerUrl).connect();
     try {
@@ -1079,6 +1954,9 @@ async function main() {
     var pageOne = await createPageSession(devtoolsPort);
     sessions.push(pageOne);
     var forumUrl = 'https://' + SMOKE_HOST + ':' + fixturePort + '/forum.php?mode=mixed';
+    // Body fetches can start on different forum pacing ticks. Hold fixture
+    // images until both image lanes have sent requests.
+    fixture.holdMixedImages();
     await navigate(pageOne, forumUrl);
     await waitFor('floating panel injection', async function() {
       return evaluate(pageOne, 'document.querySelectorAll("#bfp-root").length === 1');
@@ -1109,12 +1987,9 @@ async function main() {
     await waitFor('three rendered thread panels', async function() {
       return evaluate(pageOne, 'document.querySelectorAll(".atp-thread-panel").length === 3');
     });
-    await waitFor('ordinary images to start loading', async function() {
-      return fixture.metrics.maxOrdinaryImages >= 2;
-    });
     await waitFor('mixed ordinary and heavy channel overlap', async function() {
-      return fixture.metrics.maxOrdinaryImages >= 2 && fixture.metrics.maxHeavyImages >= 1 && fixture.metrics.maxCombinedImages >= 4;
-    });
+      return fixture.metrics.activeOrdinaryImages >= 2 && fixture.metrics.activeHeavyImages >= 1 && fixture.metrics.activeImages >= 4;
+    }).finally(fixture.releaseMixedImages);
 
     var ordinaryFirstScreen = await waitFor('ordinary first screen completion', async function() {
       var progress = await evaluate(pageOne, `(() => {
@@ -1148,23 +2023,22 @@ async function main() {
     assert(timing.requestTotalMs > 0, 'Browser image requests must contribute measured processing time');
     assert.strictEqual(firstScreenTiming.logged.requestMeasurement, timing.requestMeasurement,
       'Exported timing log must preserve the request-time measurement description');
-    var scrolledOrdinaryViewport = await evaluate(pageOne, `(() => {
+    var expandedOrdinaryViewport = await evaluate(pageOne, `(() => {
       const thread = Object.values(window.ATPState.threads).find((item) => item.link.includes('/thread-100-1-1.html'));
-      const viewport = thread && thread.panel && thread.panel.querySelector('.atp-scroll-viewport');
-      if (!viewport) return false;
-      viewport.scrollTop = viewport.scrollHeight;
-      viewport.dispatchEvent(new Event('scroll', { bubbles: true }));
+      const expandBtn = thread && thread.panel && (thread.panel.querySelector('.atp-more-overlay-badge') || thread.panel.querySelector('.atp-thumbnail-expand'));
+      if (!expandBtn) return false;
+      expandBtn.click();
       return true;
     })()`, pageOneContext.id);
-    assert(scrolledOrdinaryViewport, 'Ordinary thumbnail viewport was not available for background progression');
-    var ordinaryBackgroundProgress = await waitFor('one additional row after scrolling inside the gallery', async function() {
+    assert(expandedOrdinaryViewport, 'Ordinary thumbnail expand control was not available for background progression');
+    var ordinaryBackgroundProgress = await waitFor('additional rows after expanding the collapsed gallery', async function() {
       var progress = await evaluate(pageOne, `(() => {
         const thread = Object.values(window.ATPState.threads).find((item) => item.link.includes('/thread-100-1-1.html'));
         return thread ? { firstScreenTotal: thread.firstScreenTotal, nextIdx: thread.nextIdx, loaded: thread.loaded } : null;
       })()`, pageOneContext.id);
       return progress && progress.loaded >= 15 ? progress : null;
     });
-    assert.strictEqual(ordinaryBackgroundProgress.nextIdx, 15, 'a single inner scroll must request just one extra row');
+    assert(ordinaryBackgroundProgress.nextIdx >= 15, 'expanding the collapsed gallery must unlock and progress remaining rows');
 
     var initialThreads = await evaluate(pageOne, `(() => Object.values(window.ATPState.threads).map((thread) => ({
       link: thread.link,
@@ -1337,6 +2211,7 @@ async function main() {
     retryPage.cdp.close();
     await closeTarget(devtoolsPort, retryPage.target.id);
     sessions.splice(sessions.indexOf(retryPage), 1);
+    completedSessions.push(retryPage);
     await pageOne.cdp.send('Page.bringToFront');
 
     var openedResourcePanel = await evaluate(pageOne, `(() => {
@@ -1368,6 +2243,80 @@ async function main() {
       hasEd2kCopy: !!document.querySelector('#atp-resource-sidebar [data-copy-type="ed2k"]')
     }))()`, pageOneContext.id);
     assert(automaticTxtUi && !automaticTxtUi.hasFallback && automaticTxtUi.hasEd2kCopy, 'Successful automatic 86-byte ED2K TXT extraction must show a copy action without manual fallback buttons');
+
+    var listingTableStyle = await evaluate(pageOne, 'document.querySelector("#threadlisttable").style.cssText');
+    try {
+      await pageOne.cdp.send('Emulation.setDeviceMetricsOverride', {
+        width: 1366, height: 780, deviceScaleFactor: 1, mobile: false
+      });
+      const hasInlineActions = `(() => {
+        const inline = document.querySelector('#normalthread_200 .atp-resource-inline');
+        const sidebar = document.querySelector('#atp-resource-sidebar');
+        return getComputedStyle(inline).display === 'flex' && getComputedStyle(sidebar).display === 'none' &&
+          document.activeElement === inline.querySelector('[data-copy-all]');
+      })()`;
+      const hasDesktopFocus = `(() => {
+        const sidebar = document.querySelector('#atp-resource-sidebar');
+        return getComputedStyle(sidebar).display !== 'none' &&
+          sidebar.querySelector('.atp-resource-thread-title').textContent.includes('Cross-origin resources') &&
+          document.activeElement === sidebar.querySelector('[data-copy-all]');
+      })()`;
+      await waitFor('desktop sidebar before moving the listing', () =>
+        evaluate(pageOne, `getComputedStyle(document.querySelector('#atp-resource-sidebar')).display !== 'none'`));
+      await checkResourcePanelThreadSelection(pageOne, pageOneContext.id);
+      await evaluate(pageOne, `document.querySelector('#threadlisttable').style.transform = 'translateX(250px)'`);
+      await waitFor('inline copy focus after a position-only listing shift', () => evaluate(pageOne, hasInlineActions));
+      await evaluate(pageOne, `document.querySelector('#threadlisttable').style.transform = ''`);
+      await waitFor('sidebar copy focus after the listing moves back', () => evaluate(pageOne, hasDesktopFocus));
+      await pageOne.cdp.send('Emulation.setDeviceMetricsOverride', {
+        width: 920, height: 700, deviceScaleFactor: 1, mobile: false
+      });
+      await waitFor('inline copy focus below the narrow breakpoint', () => evaluate(pageOne, hasInlineActions));
+      await pageOne.cdp.send('Emulation.setDeviceMetricsOverride', {
+        width: 1366, height: 780, deviceScaleFactor: 1, mobile: false
+      });
+      await waitFor('sidebar copy focus after widening the viewport', () => evaluate(pageOne, hasDesktopFocus));
+      await pageOne.cdp.send('Emulation.setDeviceMetricsOverride', {
+        width: 1100, height: 700, deviceScaleFactor: 1, mobile: false
+      });
+      await waitFor('resource actions move inline when the list fills the sidebar gutter', function() {
+        return evaluate(pageOne, `(() => {
+          const panel = document.querySelector('#normalthread_200 .atp-thread-panel');
+          const inline = panel && panel.querySelector('.atp-resource-inline');
+          const mark = panel && panel.querySelector('.atp-mark-toggle');
+          const sidebar = document.querySelector('#atp-resource-sidebar');
+          return innerWidth === 1100 && inline && getComputedStyle(inline).display === 'flex' &&
+            mark && getComputedStyle(mark).display !== 'none' &&
+            (!sidebar || getComputedStyle(sidebar).display === 'none');
+        })()`);
+      });
+      await pageOne.cdp.send('Emulation.setDeviceMetricsOverride', {
+        width: 390, height: 700, deviceScaleFactor: 1, mobile: false
+      });
+      var narrowGallery = await evaluate(pageOne, `(() => {
+        const table = document.querySelector('#threadlisttable');
+        table.style.width = '100%';
+        table.style.tableLayout = 'fixed';
+        const panel = document.querySelector('#normalthread_100 .atp-thread-panel');
+        const button = panel.querySelector('.atp-thumbnail-expand');
+        if (button.getAttribute('aria-expanded') === 'true') button.click();
+        const viewport = panel.querySelector('.atp-scroll-viewport');
+        viewport.scrollTop = 0;
+        const secondRowCell = viewport.querySelector('.atp-thumbnail-wrapper[style*="grid-row-start: 2"]');
+        return {
+          horizontalOverflow: viewport.scrollWidth > viewport.clientWidth,
+          secondRowFullyVisible: secondRowCell.getBoundingClientRect().bottom <=
+            viewport.getBoundingClientRect().top + viewport.clientHeight + 0.5
+        };
+      })()`);
+      assert.deepStrictEqual(narrowGallery, { horizontalOverflow: true, secondRowFullyVisible: true },
+        'horizontal scrolling must leave the entire second thumbnail row visible in the collapsed gallery');
+    } finally {
+      await pageOne.cdp.send('Emulation.clearDeviceMetricsOverride');
+      await evaluate(pageOne, 'document.querySelector("#threadlisttable").style.cssText = ' + JSON.stringify(listingTableStyle));
+    }
+    await checkPreviewKeyboardRetry(pageOne, pageOneContext.id);
+
     assert((fixture.metrics.requestsByPath['/forum.php'] || 0) >= 2, 'TXT attachment fetch was not observed');
 
     var pageTwo = await createPageSession(devtoolsPort);
@@ -1402,10 +2351,10 @@ async function main() {
       };
     })()`, pageTwoContext.id);
     assert(heavyState.heavyMode && heavyState.sourceCandidates === 20, 'Heavy article was not classified with all source candidates');
-    assert.strictEqual(heavyState.configuredHeavyConcurrency, 2, 'Heavy concurrency default changed unexpectedly');
-    assert.strictEqual(heavyState.configuredOrdinaryConcurrency, 1, 'Ordinary background concurrency default changed unexpectedly');
-    assert(fixture.metrics.maxHeavyImages <= 2, 'Heavy browser requests exceeded the configured concurrency');
-    assert(fixture.metrics.maxOrdinaryImages <= 3, 'Ordinary first-screen requests exceeded the configured concurrency');
+    assert.strictEqual(heavyState.configuredHeavyConcurrency, 3, 'Heavy concurrency default changed unexpectedly');
+    assert.strictEqual(heavyState.configuredOrdinaryConcurrency, 2, 'Ordinary background concurrency default changed unexpectedly');
+    assert(fixture.metrics.maxHeavyImages <= 3, 'Heavy browser requests exceeded the configured concurrency');
+    assert(fixture.metrics.maxOrdinaryImages <= 8, 'Ordinary first-screen requests exceeded the configured concurrency');
 
     var pageOneRootCount = await evaluate(pageOne, 'document.querySelectorAll("#bfp-root").length');
     var pageTwoRootCount = await evaluate(pageTwo, 'document.querySelectorAll("#bfp-root").length');
@@ -1430,10 +2379,10 @@ async function main() {
       'Far thread must load exactly the configured 5x2 first rows without page scrolling');
     assert(farFirstRows.nextIdx === 10 && farFirstRows.bgQueued === false && farFirstRows.backgroundUnlocked === false,
       'Far thread must leave extra images out of the background queue until interaction');
-    // Defaults: 3 ordinary slots minus the 2 reserved for visible images.
+    // v1.19.0 defaults: 8 ordinary slots minus 4 reserved for visible images, capped at 3 offscreen lanes.
     var offscreenMaxFarImages = fixture.metrics.maxFarImages;
-    assert.strictEqual(offscreenMaxFarImages, 1,
-      'Far first-row images must keep the visible-slot reserve inside the ordinary pool (3 - 2 = 1 lane)');
+    assert(offscreenMaxFarImages >= 1 && offscreenMaxFarImages <= 3,
+      'Far first-row images must keep the visible-slot reserve inside the ordinary pool (<= 3 lanes)');
     assert(fixture.metrics.requestPaths.indexOf('/img/near-0.jpg') !== -1 &&
       fixture.metrics.requestPaths.indexOf('/img/near-0.jpg') < fixture.metrics.requestPaths.indexOf('/img/far-0.jpg'),
       'Near thread images must start before far thread images');
@@ -1467,7 +2416,7 @@ async function main() {
       })()`, hostLimitContext.id);
     });
     var hostLimitObserved = fixture.metrics.maxHostLimitImages;
-    assert(hostLimitObserved <= 6, 'automatic loading must cap one ordinary image host at six concurrent requests');
+    assert(hostLimitObserved <= 8, 'automatic loading must cap one ordinary image host at eight concurrent requests');
 
     var popup = await createPageSession(devtoolsPort);
     sessions.push(popup);
@@ -1475,6 +2424,7 @@ async function main() {
     await waitFor('popup settings UI', async function() {
       return evaluate(popup, 'document.querySelector("#settingsContainer").children.length > 0 && document.querySelector("#versionFooter").textContent.includes("' + EXPECTED_VERSION + '")');
     });
+    await checkPopupNumberValidation(popup);
     var markedFromPanel = await evaluate(pageOne, `(() => {
       const thread = Object.values(window.ATPState.threads).find((item) => item.link.includes('/thread-100-1-1.html'));
       const button = thread && thread.panel && thread.panel.querySelector('[data-mark-toggle]');
@@ -1483,10 +2433,36 @@ async function main() {
       return true;
     })()`, pageOneContext.id);
     assert(markedFromPanel, 'Ordinary thread must expose its mark button');
+    await evaluate(popup, `document.querySelector('#tabBtnMarks')?.click()`);
     await waitFor('marked thread in popup', async function() {
       return evaluate(popup, `document.querySelector('#marksCount').textContent === '1' &&
         document.querySelector('#marksList').textContent.includes('Ordinary gallery')`);
     });
+    const markFocused = await evaluate(popup, `(() => {
+      document.querySelector('#backupSection').open = true;
+      window.__atpFocusedMark = document.querySelector('#marksList [data-mark-remove]');
+      window.__atpOldBackup = document.querySelector('#backupList').textContent;
+      window.__atpFocusedMark.focus();
+      return document.activeElement === window.__atpFocusedMark;
+    })()`);
+    assert(markFocused, 'the fixture must focus a marked-thread action');
+    await evaluate(pageOne, `(() => {
+      const copy = document.querySelector('#normalthread_100 .atp-resource-inline [data-copy-all]');
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true, value: { writeText: async () => {} }
+      });
+      try {
+        copy.click();
+      } finally {
+        delete navigator.clipboard;
+      }
+    })()`, pageOneContext.id);
+    await waitFor('popup refresh after a copy in another tab', () => evaluate(popup,
+      `document.querySelector('#backupList').textContent !== window.__atpOldBackup`));
+    assert(await evaluate(popup, `document.activeElement === window.__atpFocusedMark &&
+      window.__atpFocusedMark === document.querySelector('#marksList [data-mark-remove]')`),
+    'a daily backup update must keep a focused mark and its action node intact');
+
     var downloadDir = path.join(runRoot, 'downloads');
     fs.mkdirSync(downloadDir);
     await popup.cdp.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: downloadDir });
@@ -1495,6 +2471,9 @@ async function main() {
       return evaluate(popup, `document.querySelector('#marksSummary').textContent.includes('均已导出') &&
         document.querySelector('#backupCount').textContent === '1'`);
     });
+    assert(await evaluate(popup, `document.activeElement.getAttribute('data-mark-remove') ===
+      window.__atpFocusedMark.getAttribute('data-mark-remove')`),
+    'updating a visible mark must restore focus to the corresponding action');
     var markedDownload = await waitFor('marked resources download', function() {
       return fs.readdirSync(downloadDir).find(function(name) {
         return /^thumbnail-preview-marked-.*\.txt$/.test(name);
@@ -1503,12 +2482,16 @@ async function main() {
     var markedText = fs.readFileSync(path.join(downloadDir, markedDownload), 'utf8');
     assert(markedText.includes('Ordinary gallery') && markedText.includes('1AtpSmokeMain') && markedText.includes('abcd'),
       'Exported TXT must contain the marked thread and its paired share code');
-    await evaluate(popup, `document.querySelector('#clearExportedMarks').click();
+    await evaluate(popup, `window.__atpBackupAction = document.querySelector('#backupList [data-backup-day]');
+      document.querySelector('#clearExportedMarks').click();
       document.querySelector('#clearExportedMarks').click()`);
     await waitFor('exported mark cleared but backup retained', async function() {
       return evaluate(popup, `document.querySelector('#marksCount').textContent === '0' &&
         document.querySelector('#backupCount').textContent === '1'`);
     });
+    assert(await evaluate(popup, `document.activeElement === document.querySelector('#marksHeading') &&
+      window.__atpBackupAction === document.querySelector('#backupList [data-backup-day]')`),
+    'removing the focused mark must return to the marks heading and keep the backup action');
     await evaluate(popup, `document.querySelector('#downloadAllBackups').click()`);
     var backupDownload = await waitFor('daily backup download', function() {
       return fs.readdirSync(downloadDir).find(function(name) {
@@ -1525,11 +2508,10 @@ async function main() {
         return target.url === 'chrome-extension://' + extensionId + '/popup.html' && target.id !== popup.target.id;
       });
     });
-    var actionPopup = { target: actionTarget, cdp: await new CdpConnection(actionTarget.webSocketDebuggerUrl).connect() };
+    var actionPopup = await createPageSession(devtoolsPort, actionTarget);
     sessions.push(actionPopup);
-    await actionPopup.cdp.send('Runtime.enable');
     await waitFor('native popup settings layout', async function() {
-      return evaluate(actionPopup, 'document.querySelector("#settingsContainer").children.length > 0 && document.body.getBoundingClientRect().width === 320');
+      return evaluate(actionPopup, 'document.querySelector("#settingsContainer").children.length > 0 && document.body.getBoundingClientRect().width === 368');
     });
     await sleep(300);
     var actionPopupSizes = [];
@@ -1537,11 +2519,12 @@ async function main() {
       actionPopupSizes.push(await evaluate(actionPopup, '({ viewport: innerWidth, body: document.body.getBoundingClientRect().width })'));
       await sleep(100);
     }
-    assert(actionPopupSizes.every(function(size) { return size.body === 320 && size.viewport === actionPopupSizes[0].viewport; }),
-      'Native popup must keep a stable 320px layout without user input: ' + JSON.stringify(actionPopupSizes));
+    assert(actionPopupSizes.every(function(size) { return size.body === 368 && size.viewport === actionPopupSizes[0].viewport; }),
+      'Native popup must keep a stable 368px layout without user input: ' + JSON.stringify(actionPopupSizes));
     actionPopup.cdp.close();
     await closeTarget(devtoolsPort, actionTarget.id);
     sessions.splice(sessions.indexOf(actionPopup), 1);
+    completedSessions.push(actionPopup);
     var messageResult = await evaluate(popup, `new Promise((resolve) => {
       chrome.runtime.sendMessage({ type: 'SAVE_SETTINGS_PATCH', settingsPatch: { debugLogging: false } }, (response) => {
         resolve({ response, error: chrome.runtime.lastError && chrome.runtime.lastError.message });
@@ -1601,21 +2584,19 @@ async function main() {
     }, 6000, 25);
     assert.deepStrictEqual(readyDefault, { nextIdx: 2, expanded: 'false' },
       'the collapsed gallery must load only the configured rows until the reader acts');
-    assert(!fixture.metrics.requestsByPath['/img/ready-queue-1.jpg'], 'the next row must make no request before scrolling');
+    assert(!fixture.metrics.requestsByPath['/img/ready-queue-1.jpg'], 'the next row must make no request before explicit expansion');
     assert(await evaluate(readyPage, `(() => {
-      const viewport = document.querySelector('.atp-scroll-viewport');
-      viewport.scrollTop = viewport.scrollHeight;
-      viewport.dispatchEvent(new Event('scroll'));
-      return viewport.scrollTop > 0;
-    })()`, readyContext.id), 'the reserved row must make the gallery scrollable');
+      const expand = document.querySelector('.atp-thumbnail-expand');
+      if (!expand) return false;
+      expand.click();
+      return expand.getAttribute('aria-expanded') === 'true';
+    })()`, readyContext.id), 'the collapsed gallery must expand on explicit reader action');
     var readyBeforeDeadline = await waitFor('later image rendered before the stuck first image settles', async function() {
       return evaluate(readyPage, `(() => {
         const thread = Object.values(ATPState.threads).find(item => item.link.includes('/thread-404-1-1.html'));
         if (!thread || thread.firstScreenDone || thread.failedCount) return null;
         const image = thread.grid.querySelector('img[src*="/img/ready-queue-1.jpg"]');
         if (!image || !image.complete || !image.naturalWidth) return null;
-        const viewport = thread.panel.querySelector('.atp-scroll-viewport');
-        if (viewport.style.maxHeight === 'none') return null;
         return { firstBatch: thread.firstScreenTotal, readyImageLoaded: thread.loaded,
           row: image.parentElement.style.gridRowStart, column: image.parentElement.style.gridColumnStart };
       })()`, readyContext.id);
@@ -1626,19 +2607,17 @@ async function main() {
       if (!fixture.metrics.readyHangClosed) return null;
       return evaluate(readyPage, `(() => {
         const thread = Object.values(ATPState.threads).find(item => item.link.includes('/thread-404-1-1.html'));
-        if (!thread || thread.loaded !== 3 || thread.failedCount !== 1) return null;
+        if (!thread || thread.loaded !== 5 || thread.failedCount !== 1) return null;
         return { loaded: thread.loaded, failed: thread.failedCount,
           placeholders: thread.grid.querySelectorAll('.atp-thumbnail-failed').length };
       })()`, readyContext.id);
     }, 7000, 25);
     assert.strictEqual(readyAfterDeadline.placeholders, 1, 'terminal failure must leave one manually retryable cell');
     assert.strictEqual(fixture.metrics.requestsByPath['/img/ready-hang.gif'], 1, 'timeout must release the request without retrying in place');
-    assert(!fixture.metrics.requestsByPath['/img/ready-queue-3.jpg'], 'a single inner scroll must leave further rows out of the queue');
     await evaluate(readyPage, `(() => {
       const failed = document.querySelector('.atp-thumbnail-failed');
       failed.click();
       failed.click();
-      document.querySelector('.atp-thumbnail-expand').click();
     })()`, readyContext.id);
     await waitFor('remaining rows after explicit expansion', async function() {
       return evaluate(readyPage, `(() => {
@@ -1703,14 +2682,35 @@ async function main() {
     assert.strictEqual(fixture.metrics.requestsByHost[ATTACHMENT_DEAD_HOST], 2,
       'the failed attachment must get one original and one no-referrer attempt without a retry loop');
 
-    var pageErrors = [pageOne, pageTwo, offscreenPage, hostLimitPage, readyPage, recoveryPage, popup].map(summarizeErrors);
+    fixture.metrics.maxAttachmentImages = 0;
+    await evaluate(recoveryPage, `(() => {
+      Object.assign(ATPState.settings, { gridCols: 5, heavyImageOptimization: true, heavyThumbnailClarity: 'lightweight' });
+      const row = document.createElement('tbody');
+      row.id = 'normalthread_406';
+      row.innerHTML = '<tr><th><a class="xst" href="/thread-406-1-1.html">Mixed attachment recovery</a></th></tr>';
+      document.querySelector('#threadlisttable').prepend(row);
+      return true;
+    })()`, recoveryContext.id);
+    var mixedRecovery = await waitFor('mixed gallery retries into the busy destination host', function() {
+      return evaluate(recoveryPage, `(() => {
+        const t = Object.values(ATPState.threads).find(it => it.link.includes('/thread-406-1-1.html'));
+        if (!t || t.loaded + t.failedCount < 5) return null;
+        return { heavyMode: t.heavyMode, loaded: t.loaded, failed: t.failedCount, cells: t.grid.children.length };
+      })()`, recoveryContext.id);
+    }, 10000, 25);
+    assert.deepStrictEqual(mixedRecovery, { heavyMode: true, loaded: 5, failed: 0, cells: 5 });
+    assert.strictEqual(fixture.metrics.mixedFailedWhileLive, true, 'the destination must already be serving another image when the source fails');
+    mixedRecovery.maxHostRequests = fixture.metrics.maxAttachmentImages;
+    assert.strictEqual(mixedRecovery.maxHostRequests, 1, 'mixed-mode retries must re-enter the destination host limit');
+
+    var crossTabChecks = await checkCrossTabProbe(devtoolsPort, extensionId, fixturePort, sessions, completedSessions, fixture);
+    var pageErrors = completedSessions.concat(sessions).map(summarizeErrors);
     var allExceptions = [].concat.apply([], pageErrors.map(function(item) { return item.exceptions; }));
     var extensionConsoleErrors = [].concat.apply([], pageErrors.map(function(item) { return item.consoleErrors; }))
       .filter(function(text) { return /chrome-extension|ATP|bfp|Uncaught|TypeError|ReferenceError/i.test(text); });
     assert.strictEqual(allExceptions.length, 0, 'Browser runtime exceptions: ' + JSON.stringify(allExceptions));
     assert.strictEqual(extensionConsoleErrors.length, 0, 'Extension console errors: ' + JSON.stringify(extensionConsoleErrors));
 
-    var crossTabProbe = await checkCrossTabProbe(devtoolsPort, extensionId, fixturePort, sessions);
     var mirrorReport = await runMirrorScenario(browserPath, runRoot, fixture, fixturePort);
 
     var report = {
@@ -1726,7 +2726,12 @@ async function main() {
         loadingPolicy: sha256File(path.join(EXTENSION_DIR, 'loading-policy.js'))
       },
       isolatedWorld: true,
+      ageEntry: ageEntry,
       attachmentRecovery: attachmentRecovery,
+      mixedAttachmentRecovery: mixedRecovery,
+      scrollPriority: scrollPriority,
+      longGallery: longGallery,
+      cachedRowAndText: cachedRowAndText,
       pageOne: {
         rootCount: pageOneRootCount,
         threadCount: initialThreads.length,
@@ -1751,12 +2756,15 @@ async function main() {
       hostLimitObservedMax: hostLimitObserved,
       concurrency: {
         ordinaryObservedMax: fixture.metrics.maxOrdinaryImages,
-        ordinaryConfiguredFirstScreen: 3,
+        ordinaryConfiguredFirstScreen: 8,
         heavyObservedMax: fixture.metrics.maxHeavyImages,
-        heavyConfigured: 2,
+        heavyConfigured: 3,
         combinedObservedMax: fixture.metrics.maxCombinedImages
       },
       popupBackgroundMessage: true,
+      resourcePanelThreadAndFocus: true,
+      previewKeyboardRetry: true,
+      popupNumberValidation: true,
       markExportAndBackup: true,
       pageBridgeRedirectBoundary: true,
       oneUseTxtRelay: true,
@@ -1765,11 +2773,17 @@ async function main() {
         cancelledRequests: fixture.metrics.readyHangClosed },
       manualTxtRetry: true,
       signedImageUrlParity: true,
-      nativePopupStableWidth: 320,
+      nativePopupStableWidth: 368,
       admittedOffscreenRequest: true,
       syntheticPageFixtureCount: pageCases.length + 1,
       multiTab: true,
-      crossTabRecoveryProbe: crossTabProbe,
+      crossTabRecoveryProbe: crossTabChecks.nativeProbe,
+      manualTxtRecoveryProbe: crossTabChecks.manualRecovery,
+      crossTabArticleCache: crossTabChecks.sharedArticle,
+      crossOriginForumLimit: crossTabChecks.forumLimit,
+      coldScrollAndArticleRetry,
+      offlineArticleRecovery,
+      dynamicListPreview: dynamicListPreview,
       firstScreenTiming: {
         wallClockMs: timing.wallClockMs,
         queueWaitTotalMs: timing.queueWaitTotalMs,

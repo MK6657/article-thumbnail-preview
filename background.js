@@ -2,327 +2,68 @@
  * Background Service Worker
  */
 
-importScripts('settings-schema.js');
-importScripts('defaults.js');
-importScripts('shared-utils.js');
-importScripts('resource-marks.js');
-importScripts('loading-policy.js');
+importScripts('settings-schema.js', 'defaults.js', 'shared-utils.js', 'html-extractors.js', 'logger.js', 'cache.js', 'resource-marks.js', 'loading-policy.js');
 
 if (typeof SharedUtils !== 'undefined' && SharedUtils.cacheIndex) {
   SharedUtils.cacheIndex._backgroundOwner = true;
 }
 
-const BGLOG = (function() {
-  'use strict';
-  var LOG_KEY = 'atp_logs_bg', MAX = 500, buf = [], flushQueue = [], retryBatch = null, flushing = false, flushTimer = null;
-  var LOG_CLEARED_AT_KEY = 'atp_logs_cleared_at';
-  var MAX_BYTES = (typeof SharedUtils !== 'undefined' && SharedUtils.BACKGROUND_LOG_BYTES) || (512 * 1024);
-  var flushErrorCount = 0, MAX_FLUSH_RETRIES = 3, timezoneNameCache = null;
-  var debugEnabled = false;
-  function isEnabled(level) {
-    return String(level || 'DEBUG').toUpperCase() !== 'DEBUG' || debugEnabled;
-  }
-  function setDebugEnabled(enabled) {
-    debugEnabled = enabled === true;
-  }
-  function padNumber(value, width) {
-    value = String(value);
-    while (value.length < width) value = '0' + value;
-    return value;
-  }
-  function formatLocalTimestamp(date) {
-    date = date || new Date();
-    return date.getFullYear() + '-' +
-      padNumber(date.getMonth() + 1, 2) + '-' +
-      padNumber(date.getDate(), 2) + ' ' +
-      padNumber(date.getHours(), 2) + ':' +
-      padNumber(date.getMinutes(), 2) + ':' +
-      padNumber(date.getSeconds(), 2) + '.' +
-      padNumber(date.getMilliseconds(), 3);
-  }
-  function getTimezoneOffsetMinutes(date) {
-    return -(date || new Date()).getTimezoneOffset();
-  }
-  function getTimezoneName() {
-    if (timezoneNameCache !== null) return timezoneNameCache;
-    try {
-      timezoneNameCache = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
-    } catch (e) {
-      timezoneNameCache = '';
-    }
-    return timezoneNameCache;
-  }
-  function isUrlFieldKey(key) {
-    return /(?:url|urls|uri|uris|href|src|link|links|referrer|referer)$/i.test(String(key || ''));
-  }
-  function isLogUrlLikeKey(key) {
-    var raw = String(key || '');
-    return /^(?:https?:)?\/\//i.test(raw) ||
-      /\b(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?(?:\/|[?#]|$)/i.test(raw);
-  }
-  function isSensitiveLogFieldKey(key) {
-    if (isLogUrlLikeKey(key)) return false;
-    var compact = String(key || '').replace(/[\s_.:-]+/g, '').toLowerCase();
-    return compact === 'auth' ||
-      /(?:accesstoken|refreshtoken|idtoken|authtoken|authorization|setcookie|cookie|token|secret|signature|password|passwd|pwd|credential|apikey|clientsecret|csrf|xsrf|jwt|bearer)/.test(compact);
-  }
-  function sanitizeLogText(text) {
-    function replaceLogUrl(raw) {
-      var trailing = '';
-      while (/[),.;，。！？!?]$/.test(raw)) {
-        trailing = raw.slice(-1) + trailing;
-        raw = raw.slice(0, -1);
-      }
-      return shortUrl(raw) + trailing;
-    }
-    return String(text === null || text === undefined ? '' : text)
-      .replace(/(?:https?:)?\/\/[^\s"'<>]+/gi, replaceLogUrl)
-      .replace(/\b(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?(?:\/[^\s"'<>]*)?[?#][^\s"'<>]+/gi, replaceLogUrl);
-  }
-  function sanitizeLogKey(key, existing) {
-    var base = sanitizeLogText(key).substring(0, 120) || '[empty]';
-    var safe = base;
-    var n = 2;
-    while (existing && Object.prototype.hasOwnProperty.call(existing, safe)) {
-      var suffix = '_' + n++;
-      safe = base.substring(0, Math.max(1, 120 - suffix.length)) + suffix;
-    }
-    return safe;
-  }
-  function sanitizeLogValue(value, key, seenObjects) {
-    if (value === null || value === undefined) return value;
-    if (isSensitiveLogFieldKey(key)) return '[redacted]';
-    if (typeof value === 'number' || typeof value === 'boolean') return value;
-    if (Array.isArray(value)) {
-      if (seenObjects && seenObjects.has(value)) return '[Circular]';
-      if (seenObjects) seenObjects.add(value);
-      var arr = [];
-      var arrayLimit = Math.min(value.length, 12);
-      for (var ai = 0; ai < arrayLimit; ai++) {
-        arr.push(sanitizeLogValue(value[ai], key, seenObjects));
-      }
-      if (seenObjects) seenObjects.delete(value);
-      return arr;
-    }
-    if (typeof value === 'object') {
-      seenObjects = seenObjects || (typeof WeakSet !== 'undefined' ? new WeakSet() : null);
-      if (seenObjects && seenObjects.has(value)) return '[Circular]';
-      if (seenObjects) seenObjects.add(value);
-      var out = {};
-      var childCount = 0;
-      for (var childKey in value) {
-        if (!Object.prototype.hasOwnProperty.call(value, childKey)) continue;
-        if (childCount++ >= 40) break;
-        var outputKey = sanitizeLogKey(childKey, out);
-        try {
-          out[outputKey] = sanitizeLogValue(value[childKey], childKey, seenObjects);
-        } catch (e) {
-          out[outputKey] = '[Unserializable]';
-        }
-      }
-      if (seenObjects) seenObjects.delete(value);
-      return out;
-    }
-    return (isUrlFieldKey(key) ? shortUrl(value) : sanitizeLogText(value)).substring(0, 500);
-  }
-  function stringifyLogData(d) {
-    if (d === undefined) return '';
-    if (typeof d === 'object') {
-      try { return JSON.stringify(sanitizeLogValue(d, '')).substring(0, 500); } catch (ex) { return sanitizeLogText(d).substring(0, 500); }
-    }
-    return sanitizeLogText(d).substring(0, 500);
-  }
-  function formatConsoleData(d) {
-    return stringifyLogData(d);
-  }
-  function estimateLogBytes(value) {
-    try { return JSON.stringify(value || []).length; } catch (e) { return String(value || '').length; }
-  }
-  function trimLogEntries(entries, maxEntries, maxBytes) {
-    if (!Array.isArray(entries) || !entries.length) return [];
-    return trimLogEntriesFrom(entries, Math.max(0, entries.length - maxEntries), maxBytes);
-  }
-  function trimLogEntriesFrom(entries, start, maxBytes) {
-    start = Math.max(0, Number(start) || 0);
-    while (start < entries.length && estimateLogBytesFrom(entries, start) > maxBytes) {
-      var remaining = entries.length - start;
-      start += Math.max(1, Math.ceil(remaining * 0.1));
-    }
-    return copyLogEntriesFrom(entries, start);
-  }
-  function estimateLogBytesFrom(entries, start) {
-    return estimateLogBytes(copyLogEntriesFrom(entries, start));
-  }
-  function copyLogEntriesFrom(entries, start) {
-    var length = Math.max(0, entries.length - start);
-    var out = new Array(length);
-    for (var i = 0; i < length; i++) out[i] = entries[start + i];
-    return out;
-  }
-  function mergeLogEntries(existing, batch) {
-    var source = Array.isArray(existing) ? existing : [];
-    var merged = new Array(source.length + batch.length);
-    var writeIndex = 0;
-    for (var i = 0; i < source.length; i++) merged[writeIndex++] = source[i];
-    for (var j = 0; j < batch.length; j++) merged[writeIndex++] = batch[j];
-    return merged;
-  }
-  function getLogClearedAtMs(value) {
-    var ms = Date.parse(value || '');
-    return isNaN(ms) ? 0 : ms;
-  }
-  function getLogEntryTimeMs(entry) {
-    if (!entry || typeof entry !== 'object') return 0;
-    var ms = Date.parse(entry.tsUtc || '');
-    if (!isNaN(ms)) return ms;
-    return Date.parse(entry.ts || '') || 0;
-  }
-  function filterLogsAfterClearedAt(entries, clearedAtMs) {
-    if (!clearedAtMs || !Array.isArray(entries) || !entries.length) return entries || [];
-    var out = [];
-    for (var i = 0; i < entries.length; i++) {
-      if (getLogEntryTimeMs(entries[i]) > clearedAtMs) out.push(entries[i]);
-    }
-    return out;
-  }
-  function finishLogWrite(success) {
-    if (success) flushErrorCount = 0;
-    flushing = false;
-    if (buf.length || retryBatch || flushQueue.length) flush();
-  }
-  function writeLogs(entries, batch, retried) {
-    chrome.storage.local.get(LOG_CLEARED_AT_KEY, function(clearResult) {
-      if (chrome.runtime.lastError) {
-        console.warn('[BGLOG] 清空标记读取失败:', chrome.runtime.lastError.message);
-        requeueBatch(batch, chrome.runtime.lastError.message);
-        finishLogWrite(false);
-        return;
-      }
-      var clearedAtMs = getLogClearedAtMs(clearResult && clearResult[LOG_CLEARED_AT_KEY]);
-      var filteredBatch = filterLogsAfterClearedAt(batch, clearedAtMs);
-      var m = trimLogEntries(filterLogsAfterClearedAt(entries, clearedAtMs), MAX, MAX_BYTES);
-      if (!m.length) {
-        chrome.storage.local.remove(LOG_KEY, function() {
-          if (chrome.runtime.lastError) {
-            console.warn('[BGLOG] 清空前日志移除失败:', chrome.runtime.lastError.message);
-          }
-          finishLogWrite(true);
-        });
-        return;
-      }
-      var d = {}; d[LOG_KEY] = m;
-      chrome.storage.local.set(d, function() {
-        if (chrome.runtime.lastError) {
-          console.warn('[BGLOG] storage写入失败:', chrome.runtime.lastError.message);
-          if (!retried) {
-            writeLogs(trimLogEntriesFrom(m, Math.ceil(m.length / 2), MAX_BYTES), filteredBatch, true);
-            return;
-          }
-          requeueBatch(filteredBatch, chrome.runtime.lastError.message);
-        }
-        finishLogWrite(!chrome.runtime.lastError);
-      });
-    });
-  }
-  function add(lv, msg, d) {
-    if (!isEnabled(lv)) return;
-    var timestampDate = new Date();
-    var safeMsg = sanitizeLogText(msg).substring(0, 160);
-    var e = {
-      ts: formatLocalTimestamp(timestampDate),
-      tsUtc: timestampDate.toISOString(),
-      timezoneOffsetMinutes: getTimezoneOffsetMinutes(timestampDate),
-      timezone: getTimezoneName(),
-      lv: lv,
-      src: 'BACKGROUND',
-      msg: safeMsg
-    };
-    if (d !== undefined) { try { e.data = stringifyLogData(d); } catch (ex) { /* circular ref or serialization error, skip */ } }
-    buf.push(e);
-    var consoleData = formatConsoleData(d);
-    var consoleLine = '[BG:' + lv + '] ' + safeMsg + (consoleData ? ' ' + consoleData : '');
-    if (lv === 'ERROR') console.error(consoleLine);
-    else if (lv === 'WARN') console.warn(consoleLine);
-    else console.log(consoleLine);
-    if (lv === 'WARN' || lv === 'ERROR' || buf.length >= 10) flush();
-    else flushSoon();
-  }
-  function drainFlushQueue() {
-    var batch = [];
-    if (retryBatch) {
-      for (var ri = 0; ri < retryBatch.length; ri++) {
-        batch.push(retryBatch[ri]);
-      }
-      retryBatch = null;
-    }
-    for (var qi = 0; qi < flushQueue.length; qi++) {
-      var queued = flushQueue[qi];
-      for (var bi = 0; bi < queued.length; bi++) {
-        batch.push(queued[bi]);
-      }
-    }
-    flushQueue.length = 0;
-    return batch;
-  }
-  function flush() {
-    if (flushTimer) {
-      clearTimeout(flushTimer);
-      flushTimer = null;
-    }
-    if (buf.length) flushQueue.push(buf.splice(0));
-    if (flushing || (!retryBatch && !flushQueue.length)) return;
-    flushing = true;
-    var b = drainFlushQueue();
-    chrome.storage.local.get(LOG_KEY, function(r) {
-      if (chrome.runtime.lastError) {
-        console.warn('[BGLOG] storage读取失败:', chrome.runtime.lastError.message);
-        requeueBatch(b, chrome.runtime.lastError.message);
-        flushing = false;
-        if (buf.length || retryBatch || flushQueue.length) flush();
-        return;
-      }
-      writeLogs(mergeLogEntries(r[LOG_KEY], b), b, false);
-    });
-  }
-  function flushSoon(delay) {
-    if (flushTimer) return;
-    flushTimer = setTimeout(function() {
-      flushTimer = null;
-      flush();
-    }, Math.max(0, Number(delay) || 250));
-  }
-  function requeueBatch(batch, reason) {
-    if (!batch || !batch.length) return;
-    flushErrorCount++;
-    if (flushErrorCount > MAX_FLUSH_RETRIES) {
-      console.warn('[BGLOG] storage连续失败，丢弃日志批次:', reason || '');
-      flushErrorCount = 0;
-      return;
-    }
-    retryBatch = batch;
-  }
-  return {
-    debug: function(m, d) { add('DEBUG', m, d); },
-    info: function(m, d) { add('INFO', m, d); },
-    warn: function(m, d) { add('WARN', m, d); },
-    error: function(m, d) { add('ERROR', m, d); },
-    isEnabled: isEnabled,
-    setDebugEnabled: setDebugEnabled,
-    flush: flush,
-    flushSoon: flushSoon
-  };
-})();
+const BGLOG = ATPCreateLogger({
+  storageKey: 'atp_logs_bg',
+  maxEntries: 500,
+  maxBytes: (typeof SharedUtils !== 'undefined' && SharedUtils.BACKGROUND_LOG_BYTES) || (512 * 1024),
+  source: 'bg'
+});
 
-var bgCacheTtlMs = 30 * 60 * 1000;
-
-function syncBackgroundDebugLogging(rawSettings) {
-  var normalized = ATPNormalizeSettings(rawSettings);
-  BGLOG.setDebugEnabled(normalized.debugLogging === true);
-  bgCacheTtlMs = (Number(normalized.cacheTTL) || 30) * 60 * 1000;
+if (typeof globalThis !== 'undefined') {
+  globalThis.BGLOG = BGLOG;
 }
 
-// Entries past the cache TTL go first (oldest first): they can never be read
-// again, yet type priority alone evicted every live article before them.
+var bgNormalizedSettings = ATPNormalizeSettings(null);
+if (typeof globalThis !== 'undefined') {
+  globalThis.ATPBackgroundSettings = bgNormalizedSettings;
+}
+var bgCacheTtlMs = (Number(bgNormalizedSettings.cacheTTL) || 30) * 60 * 1000;
+var settingsLoaded = false;
+
+function syncBackgroundDebugLogging(rawSettings) {
+  bgNormalizedSettings = ATPNormalizeSettings(rawSettings);
+  if (typeof globalThis !== 'undefined') {
+    globalThis.ATPBackgroundSettings = bgNormalizedSettings;
+  }
+  BGLOG.setDebugEnabled(bgNormalizedSettings.debugLogging === true);
+  bgCacheTtlMs = (Number(bgNormalizedSettings.cacheTTL) || 30) * 60 * 1000;
+}
+
+var settingsReady = (function() {
+  try {
+    return new Promise(function(resolve) {
+      chrome.storage.local.get('settings', function(result) {
+        settingsLoaded = true;
+        if (typeof globalThis !== 'undefined') {
+          globalThis.ATPSettingsReady = null;
+        }
+        if (chrome.runtime.lastError) {
+          BGLOG.setDebugEnabled(false);
+          resolve(bgNormalizedSettings);
+          return;
+        }
+        syncBackgroundDebugLogging(result && result.settings);
+        resolve(bgNormalizedSettings);
+      });
+    });
+  } catch (e) {
+    settingsLoaded = true;
+    BGLOG.setDebugEnabled(false);
+    return Promise.resolve(bgNormalizedSettings);
+  }
+})();
+
+if (!settingsLoaded && typeof globalThis !== 'undefined') {
+  globalThis.ATPSettingsReady = settingsReady;
+}
+
+// Entries past the cache TTL go first (oldest first)
 function compareEvictionOrder(a, b, expiredBefore) {
   var aExpired = a.ts < expiredBefore;
   var bExpired = b.ts < expiredBefore;
@@ -331,27 +72,28 @@ function compareEvictionOrder(a, b, expiredBefore) {
   return a.ts - b.ts;
 }
 
-try {
-  chrome.storage.local.get('settings', function(result) {
-    if (chrome.runtime.lastError) {
-      BGLOG.setDebugEnabled(false);
-      return;
-    }
-    syncBackgroundDebugLogging(result && result.settings);
-  });
-} catch (e) {
-  BGLOG.setDebugEnabled(false);
-}
-
 if (chrome.storage.onChanged && typeof chrome.storage.onChanged.addListener === 'function') {
   chrome.storage.onChanged.addListener(function(changes, areaName) {
-    if (areaName !== 'local') return;
+    if (areaName !== 'local' || !changes) return;
+    if (changes.atp_forum_pacer_reset_at) {
+      resetTextForumCooldowns();
+      resetForumPacerStatuses(changes.atp_forum_pacer_reset_at.newValue).catch(function(error) {
+        BGLOG.warn('重置论坛节流显示失败', error.message);
+      });
+    }
     if (changes.settings) {
+      settingsLoaded = true;
+      if (typeof globalThis !== 'undefined') {
+        globalThis.ATPSettingsReady = null;
+      }
       syncBackgroundDebugLogging(changes.settings.newValue);
     }
-    var generationKey = (typeof SharedUtils !== 'undefined' && SharedUtils.CACHE_GENERATION_KEY) || 'atp_cache_generation_v1';
+    var generationKey = SharedUtils.CACHE_GENERATION_KEY || 'atp_cache_generation_v1';
     if (changes[generationKey]) {
-      cachedCacheGeneration = getCacheGeneration(changes[generationKey].newValue);
+      ATPCache._rememberCacheGeneration(changes[generationKey].newValue);
+    }
+    if (changes[SharedUtils.CACHE_INDEX_KEY] && changes[SharedUtils.CACHE_INDEX_KEY].newValue === undefined) {
+      SharedUtils.cacheIndex.resetMemory();
     }
   });
 }
@@ -367,6 +109,16 @@ function originAllowed(url) {
   } catch (e) { return false; }
 }
 
+function isBuiltinForumSender(sender) {
+  if (!sender || typeof sender.url !== 'string') return false;
+  try {
+    var u = new URL(sender.url);
+    return u.protocol === 'https:' && SharedUtils.isBuiltinForumHost(u.hostname);
+  } catch (e) {
+    return false;
+  }
+}
+
 function textAttachmentAllowed(url) {
   return SharedUtils.isAllowedTextAttachmentUrl(url);
 }
@@ -375,7 +127,6 @@ function textAttachmentAllowedInZone(url, zone) {
   return SharedUtils.isTextAttachmentUrlAllowedInZone(url, zone);
 }
 
-// The zone of the forum page that sent a message; '' for anything else.
 function getSenderForumZone(sender) {
   var url = (sender && sender.url) || '';
   return originAllowed(url) ? SharedUtils.getForumUrlZone(url) : '';
@@ -385,11 +136,117 @@ function forumUrlAllowedInZone(url, zone) {
   return !!zone && originAllowed(url) && SharedUtils.getForumUrlZone(url) === zone;
 }
 
+// ---- Forum pacer shared status ----
+const FORUM_PACER_STATUS_KEY = 'atp_forum_pacer_status_v1';
+const FORUM_PACER_RESET_KEY = 'atp_forum_pacer_reset_at';
+const FORUM_SERVER_WAIT_KEY = 'atp_forum_server_wait_v1';
+var forumPacerStatusWrites = Promise.resolve();
+
+function updateForumPacerStatuses(update, serverWait) {
+  var run = forumPacerStatusWrites.then(function() {
+    return new Promise(function(resolve, reject) {
+      var keys = [FORUM_PACER_STATUS_KEY, FORUM_PACER_RESET_KEY];
+      if (serverWait) keys.push(FORUM_SERVER_WAIT_KEY);
+      chrome.storage.local.get(keys, function(items) {
+        if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+        var stored = items && items[FORUM_PACER_STATUS_KEY];
+        var statuses = stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
+        var resetMarker = Number(items && items[FORUM_PACER_RESET_KEY]) || 0;
+        var changes = {};
+        if (update(statuses, resetMarker)) {
+          var hosts = Object.keys(statuses).sort(function(a, b) {
+            return ((statuses[b] && statuses[b].at) || 0) - ((statuses[a] && statuses[a].at) || 0);
+          });
+          for (var i = 10; i < hosts.length; i++) delete statuses[hosts[i]];
+          changes[FORUM_PACER_STATUS_KEY] = statuses;
+        }
+        if (serverWait) {
+          var savedWaits = items && items[FORUM_SERVER_WAIT_KEY] || {};
+          var currentWait = savedWaits[serverWait.origin];
+          if (!currentWait || serverWait.until > currentWait.until) {
+            var now = Date.now();
+            var waits = {};
+            Object.keys(savedWaits).forEach(function(origin) {
+              var wait = savedWaits[origin];
+              if (wait && wait.until + FORUM_RECOVERY_IDLE_MS > now) waits[origin] = wait;
+            });
+            waits[serverWait.origin] = { at: serverWait.at, until: serverWait.until };
+            changes[FORUM_SERVER_WAIT_KEY] = waits;
+          }
+        }
+        if (!Object.keys(changes).length) return resolve();
+        chrome.storage.local.set(changes, function() {
+          if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+          resolve();
+        });
+      });
+    });
+  });
+  forumPacerStatusWrites = run.catch(function() {});
+  return run;
+}
+
+function recordForumPacerStatus(host, entry, marker) {
+  return updateForumPacerStatuses(function(statuses, resetMarker) {
+    if (marker !== resetMarker) return false;
+    var current = statuses[host];
+    if (current && current.resetMarker === marker && current.at > entry.at && current.at <= Date.now()) return false;
+    var snapshot = { resetMarker: marker };
+    ['at', 'burst', 'refillMs', 'learnedBurst', 'learnedRefillMs', 'level', 'pauseUntil',
+      'retryAfterUntil', 'limitsUntil', 'idleUntil'].forEach(function(key) {
+      snapshot[key] = Number.isFinite(entry[key]) && entry[key] >= 0 ? entry[key] : 0;
+    });
+    if (current && current.retryAfterUntil > Date.now() && current.retryAfterUntil > snapshot.retryAfterUntil) {
+      snapshot.retryAfterUntil = current.retryAfterUntil;
+      snapshot.pauseUntil = Math.max(snapshot.pauseUntil, current.retryAfterUntil);
+      snapshot.idleUntil = Math.max(snapshot.idleUntil, current.retryAfterUntil + 300000);
+    }
+    statuses[host] = snapshot;
+    return true;
+  });
+}
+
+function recordBackgroundForumRetryAfter(origin, at, until) {
+  var host = new URL(origin).hostname;
+  return updateForumPacerStatuses(function(statuses, resetMarker) {
+    var now = Date.now();
+    var current = statuses[host] || {};
+    if (until <= Math.max(now, Number(current.retryAfterUntil) || 0)) return false;
+    statuses[host] = Object.assign({
+      burst: 10, refillMs: 2000, learnedBurst: 10, learnedRefillMs: 2000, limitsUntil: 0
+    }, current, {
+      at: now,
+      resetMarker: resetMarker,
+      level: Math.max(1, Number(current.level) || 0),
+      pauseUntil: Math.max(until, Number(current.pauseUntil) || 0),
+      retryAfterUntil: until,
+      idleUntil: Math.max(until + FORUM_RECOVERY_IDLE_MS, Number(current.idleUntil) || 0)
+    });
+    return true;
+  }, { origin: origin, at: at, until: until });
+}
+
+function resetForumPacerStatuses(marker) {
+  return updateForumPacerStatuses(function(statuses, resetMarker) {
+    if (!resetMarker || marker !== resetMarker) return false;
+    var now = Date.now();
+    var changed = false;
+    Object.keys(statuses).forEach(function(host) {
+      var current = statuses[host] || {};
+      if (current.resetMarker === marker) return;
+      var retryAfterUntil = Number(current.retryAfterUntil) > now ? current.retryAfterUntil : 0;
+      statuses[host] = {
+        burst: 10, refillMs: 2000, learnedBurst: 10, learnedRefillMs: 2000, level: retryAfterUntil ? 1 : 0,
+        pauseUntil: retryAfterUntil, retryAfterUntil: retryAfterUntil, limitsUntil: 0,
+        idleUntil: Math.max(now, retryAfterUntil) + 300000, at: now, resetMarker: marker
+      };
+      changed = true;
+    });
+    return changed;
+  });
+}
+
 // ---- Forum mirror sites ----
-// Mirrors are optional host permissions granted from the popup prompt or the
-// browser's site-access settings. Chrome's grant list is the only source of
-// truth: the worker mirrors it into SharedUtils for host checks, stores it
-// for content scripts, and registers the manifest content scripts on it.
 const MIRROR_CONTENT_SCRIPT_ID_PREFIX = 'atp-mirror-';
 var mirrorSitesLoaded = !canManageMirrorSites();
 var mirrorSitesChain = Promise.resolve();
@@ -447,8 +304,6 @@ function getMirrorSitePatternKey(sites) {
   return sites.map(function(site) { return site.pattern; }).join('\n');
 }
 
-// One dynamic script per manifest content_scripts entry, so mirrors always
-// get the exact files, order, world and timing the built-in sites get.
 function buildMirrorContentScripts(patterns) {
   var manifest = chrome.runtime.getManifest();
   return (manifest.content_scripts || []).map(function(script, index) {
@@ -486,9 +341,6 @@ async function syncMirrorContentScripts(sites) {
   return true;
 }
 
-// force: re-apply registrations even when the grant list is unchanged
-// (install, update, browser start, permission events). A plain worker wake
-// compares against the stored list and the last successful registration.
 function refreshMirrorSites(reason, force) {
   var run = mirrorSitesChain.then(async function() {
     var sites = SharedUtils.getMirrorSitesFromOrigins(await getGrantedPermissionOrigins());
@@ -498,9 +350,6 @@ function refreshMirrorSites(reason, force) {
     var changed = !stored || getMirrorSitePatternKey(stored.sites) !== getMirrorSitePatternKey(sites);
     var registered = true;
     if (changed || force || !stored.scriptsRegistered) {
-      // Persist pending before touching registrations. A failed registration
-      // (or a worker stopped between awaits) must retry on the next wake,
-      // including forced updates whose permission list did not change.
       await storeMirrorSites(sites, false);
       try {
         registered = await syncMirrorContentScripts(sites);
@@ -509,7 +358,7 @@ function refreshMirrorSites(reason, force) {
         registered = false;
         BGLOG.warn('镜像站点脚本注册失败', e && e.message ? e.message : String(e));
       }
-      if (changed) BGLOG.info('镜像站点', reason + ' ' + sites.length + '个');
+      if (changed) BGLOG.debug('镜像站点', reason + ' ' + sites.length + '个');
     }
     return { sites: sites, registered: registered };
   });
@@ -550,8 +399,6 @@ function isExtensionPageSender(sender) {
 
 var floatingPanelCssPromise = null;
 
-// Mirror pages cannot load the web-accessible stylesheet (its matches stay
-// limited to the built-in sites), so the panel asks the worker for the text.
 function getFloatingPanelCss() {
   if (!floatingPanelCssPromise) {
     floatingPanelCssPromise = fetch(chrome.runtime.getURL('floating-panel.css')).then(function(resp) {
@@ -612,16 +459,24 @@ var bgTextDiagnosticSequence = 0;
 function withBackgroundTextDiagnosticId(attachment) {
   if (!attachment || !attachment.url) return attachment;
   if (/^txt_[a-z0-9_]{1,64}$/.test(attachment.diagnosticId || '')) return attachment;
-  return Object.assign({}, attachment, { diagnosticId: 'txt_bg_' + Date.now().toString(36) + '_' +
-    (++bgTextDiagnosticSequence).toString(36) + '_' + Math.random().toString(36).slice(2, 10) });
+  return Object.assign({}, attachment, {
+    diagnosticId: 'txt_bg_' + Date.now().toString(36) + '_' +
+      (++bgTextDiagnosticSequence).toString(36) + '_' + Math.random().toString(36).slice(2, 10)
+  });
 }
 
 function logBackgroundTextDiagnostic(attachment, outcome, failureClass, deadline, details) {
   if (!attachment || !/^txt_[a-z0-9_]{1,64}$/.test(attachment.diagnosticId || '')) return;
   if (BGLOG.isEnabled && !BGLOG.isEnabled('DEBUG')) return;
-  var fields = { attachmentId: attachment.diagnosticId, stage: 'background_fetch', outcome: outcome,
-    failureClass: failureClass || '', remainingMs: Number.isFinite(Number(deadline)) && Number(deadline) > 0
-      ? Math.max(0, Math.min(100000000, Math.round(deadline - Date.now()))) : null };
+  var fields = {
+    attachmentId: attachment.diagnosticId,
+    stage: 'background_fetch',
+    outcome: outcome,
+    failureClass: failureClass || '',
+    remainingMs: Number.isFinite(Number(deadline)) && Number(deadline) > 0
+      ? Math.max(0, Math.min(100000000, Math.round(deadline - Date.now())))
+      : null
+  };
   if (/^t_[0-9]{1,20}_[A-Za-z0-9]{1,24}$/.test(attachment.diagnosticThreadId || '') &&
       Number.isSafeInteger(attachment.diagnosticRunId) && attachment.diagnosticRunId > 0) {
     fields.threadId = attachment.diagnosticThreadId;
@@ -646,18 +501,26 @@ function backgroundTextFailureClass(error, status) {
 const TEXT_ATTACHMENT_MAX_COUNT = SharedUtils.TEXT_ATTACHMENT_MAX_COUNT;
 const TEXT_ATTACHMENT_MAX_BYTES = SharedUtils.TEXT_ATTACHMENT_MAX_BYTES;
 const TEXT_ATTACHMENT_TIMEOUT = SharedUtils.TEXT_ATTACHMENT_TIMEOUT;
-const TEXT_RESOURCE_CACHE_PREFIX = SharedUtils.CACHE_PREFIXES.TEXT_RESOURCE;
-const TEXT_FAIL_CACHE_PREFIX = SharedUtils.CACHE_PREFIXES.TEXT_FAIL;
-const CACHE_GENERATION_KEY = SharedUtils.CACHE_GENERATION_KEY || 'atp_cache_generation_v1';
-const TEXT_FAIL_TTL_MS = 5 * 60 * 1000;
 const TEXT_RESOURCE_MESSAGE_CONCURRENCY = 2;
 const TEXT_RESOURCE_QUEUE_LIMIT = 32;
 const TEXT_RESOURCE_QUEUE_PER_OWNER = 4;
 const TEXT_RESOURCE_QUEUE_MAX_WAIT_MS = 30000;
+const BG_QUOTA_BYTES = SharedUtils.DEFAULT_CACHE_QUOTA_BYTES || (32 * 1024 * 1024);
+const BG_HIGH_WATERMARK = Math.floor(BG_QUOTA_BYTES * 0.85);
+const BG_TARGET_WATERMARK = Math.floor(BG_QUOTA_BYTES * 0.75);
+const DAILY_BACKUP_RETENTION_DAYS = 90;
+const MARK_TOUCH_THROTTLE_MS = 3600000;
+
 var SETTINGS_WRITE_CHAIN = Promise.resolve();
 var ARTICLE_FETCH_IN_FLIGHT = {};
 var textResourceMessageQueue = [];
 var textResourceMessageActive = 0;
+var TEXT_FORUM_COOLDOWNS_KEY = 'atp_text_forum_cooldowns_v1';
+const FORUM_RECOVERY_IDLE_MS = 5 * 60 * 1000;
+var textForumCooldowns = new Map();
+var textForumCooldownsReady;
+var textForumCooldownWrite = Promise.resolve();
+var recoveringForumProbes = new Map();
 
 function makeQueuedTextResourceStatus(attachments, reason) {
   var count = attachments.length;
@@ -702,7 +565,6 @@ function enqueueTextResourceMessage(attachments, deadline, options) {
   return new Promise(function(resolve, reject) {
     options = options || {};
     var now = Date.now();
-    // Evict expired jobs before admission; do not wait for a throttled timer.
     textResourceMessageQueue.slice().forEach(function(job) {
       if (job.expiresAt <= now) expireQueuedTextResourceJob(job);
     });
@@ -717,8 +579,10 @@ function enqueueTextResourceMessage(attachments, deadline, options) {
       resolve(makeQueuedTextResourceStatus(attachments, expiresAt <= now ? 'expired' : 'empty'));
       return;
     }
-    var job = { attachments: attachments, deadline: deadline, options: options, owner: owner,
-      expiresAt: expiresAt, resolve: resolve, reject: reject, timer: null };
+    var job = {
+      attachments: attachments, deadline: deadline, options: options, owner: owner,
+      expiresAt: expiresAt, resolve: resolve, reject: reject, timer: null
+    };
     var firstAutomatic = options.manualRetry
       ? textResourceMessageQueue.findIndex(function(queued) { return !queued.options.manualRetry; })
       : -1;
@@ -741,11 +605,7 @@ function getDeadlineFetchTimeout(deadline, fallbackMs) {
   return Math.max(0, Math.min(fallbackMs, remaining === Infinity ? fallbackMs : remaining));
 }
 
-function getArticleFetchAbortAt(deadline, articleSettings) {
-  return Date.now() + getDeadlineFetchTimeout(deadline, ATPLoadPolicy.getArticleTimeout(articleSettings || {}));
-}
-
-function scheduleArticleFetchAbort(control) {
+function scheduleAbortControl(control) {
   if (!control) return 0;
   if (control.timer) {
     clearTimeout(control.timer);
@@ -760,13 +620,17 @@ function scheduleArticleFetchAbort(control) {
   return remaining;
 }
 
+function getArticleFetchAbortAt(deadline, articleSettings) {
+  return Date.now() + getDeadlineFetchTimeout(deadline, ATPLoadPolicy.getArticleTimeout(articleSettings || {}));
+}
+
 function createArticleFetchControl(deadline, articleSettings) {
   var control = {
     abortAt: getArticleFetchAbortAt(deadline, articleSettings),
     controller: new AbortController(),
     timer: 0
   };
-  scheduleArticleFetchAbort(control);
+  scheduleAbortControl(control);
   return control;
 }
 
@@ -775,7 +639,7 @@ function extendArticleFetchControl(control, deadline, articleSettings) {
   var abortAt = getArticleFetchAbortAt(deadline, articleSettings);
   if (abortAt > control.abortAt && !control.controller.signal.aborted) {
     control.abortAt = abortAt;
-    scheduleArticleFetchAbort(control);
+    scheduleAbortControl(control);
   }
 }
 
@@ -786,12 +650,24 @@ function clearArticleFetchControl(control) {
   }
 }
 
-// storage.local is 10 MB from Chrome 114 but 5 MB on 111-113.
-const BG_QUOTA_BYTES = (chrome.storage && chrome.storage.local && chrome.storage.local.QUOTA_BYTES) || 10485760;
-const BG_HIGH_WATERMARK = Math.floor(BG_QUOTA_BYTES * 0.85);
-const BG_TARGET_WATERMARK = Math.floor(BG_QUOTA_BYTES * 0.75);
-var bgEvictionCheckTimer = null;
-var bgCacheIndexRepairInFlight = false;
+function createTextFetchControl(deadline) {
+  var control = {
+    abortAt: Date.now() + getDeadlineFetchTimeout(deadline, TEXT_ATTACHMENT_TIMEOUT),
+    controller: new AbortController(),
+    timer: 0
+  };
+  scheduleAbortControl(control);
+  return control;
+}
+
+function extendTextFetchControl(control, deadline) {
+  if (!control) return;
+  var abortAt = Date.now() + getDeadlineFetchTimeout(deadline, TEXT_ATTACHMENT_TIMEOUT);
+  if (abortAt > control.abortAt && !control.controller.signal.aborted) {
+    control.abortAt = abortAt;
+    scheduleAbortControl(control);
+  }
+}
 
 function consumeStorageError(action) {
   if (!chrome.runtime.lastError) return false;
@@ -799,22 +675,7 @@ function consumeStorageError(action) {
   return true;
 }
 
-function isValidSiteConfigHost(host) {
-  return typeof host === 'string' &&
-    host.length > 0 &&
-    host.length <= 253 &&
-    /^[a-z0-9.-]+$/i.test(host) &&
-    host.indexOf('..') === -1 &&
-    host.charAt(0) !== '.' &&
-    host.charAt(host.length - 1) !== '.';
-}
-
-function normalizeBooleanSetting(value, fallback) {
-  if (value === false || value === 'false' || value === 0) return false;
-  if (value === true || value === 'true' || value === 1) return true;
-  return fallback;
-}
-
+// ---- Settings patch handling (reusing defaults.js normalization) ----
 function isAllowedSettingsPatchKey(key) {
   if (key === 'enabled' || key === 'siteConfigs') return true;
   var schema = typeof SETTINGS_SCHEMA !== 'undefined' ? SETTINGS_SCHEMA : [];
@@ -828,21 +689,9 @@ function cloneSettingsPatch(patch) {
   var source = patch && typeof patch === 'object' && !Array.isArray(patch) ? patch : {};
   var out = {};
   for (var key in source) {
-    if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
-    if (!isAllowedSettingsPatchKey(key)) continue;
+    if (!Object.prototype.hasOwnProperty.call(source, key) || !isAllowedSettingsPatchKey(key)) continue;
     if (key === 'siteConfigs') {
-      var rawSiteConfigs = source.siteConfigs;
-      var siteConfigs = {};
-      if (rawSiteConfigs && typeof rawSiteConfigs === 'object' && !Array.isArray(rawSiteConfigs)) {
-        for (var host in rawSiteConfigs) {
-          if (!Object.prototype.hasOwnProperty.call(rawSiteConfigs, host) || !isValidSiteConfigHost(host)) continue;
-          var siteConfig = rawSiteConfigs[host];
-          if (!siteConfig || typeof siteConfig !== 'object' || Array.isArray(siteConfig)) continue;
-          if (!Object.prototype.hasOwnProperty.call(siteConfig, 'disabled')) continue;
-          siteConfigs[host] = { disabled: normalizeBooleanSetting(siteConfig.disabled, false) };
-        }
-      }
-      out.siteConfigs = siteConfigs;
+      out.siteConfigs = ATPNormalizeSettings({ siteConfigs: source.siteConfigs }).siteConfigs;
     } else {
       out[key] = source[key];
     }
@@ -858,39 +707,23 @@ function applySettingsPatch(patch) {
         reject(new Error(chrome.runtime.lastError.message));
         return;
       }
-      var current = result.settings && typeof result.settings === 'object' && !Array.isArray(result.settings)
-        ? result.settings
-        : {};
-      current = ATPNormalizeSettings(current);
+      var current = ATPNormalizeSettings(result && result.settings);
       var merged = Object.assign({}, current, stablePatch);
       if (Object.prototype.hasOwnProperty.call(stablePatch, 'siteConfigs')) {
-        var mergedSiteConfigs = {};
-        var currentSiteConfigs = current.siteConfigs;
-        if (currentSiteConfigs && typeof currentSiteConfigs === 'object' && !Array.isArray(currentSiteConfigs)) {
-          for (var currentHost in currentSiteConfigs) {
-            if (!Object.prototype.hasOwnProperty.call(currentSiteConfigs, currentHost)) continue;
-            var currentConfig = currentSiteConfigs[currentHost];
-            mergedSiteConfigs[currentHost] = currentConfig && typeof currentConfig === 'object' && !Array.isArray(currentConfig)
-              ? Object.assign({}, currentConfig)
-              : currentConfig;
+        var mergedSites = {};
+        var curSites = current.siteConfigs || {};
+        for (var ch in curSites) {
+          if (Object.prototype.hasOwnProperty.call(curSites, ch)) {
+            mergedSites[ch] = Object.assign({}, curSites[ch]);
           }
         }
-        var patchSiteConfigs = stablePatch.siteConfigs;
-        for (var patchHost in patchSiteConfigs) {
-          if (!Object.prototype.hasOwnProperty.call(patchSiteConfigs, patchHost)) continue;
-          var patchConfig = patchSiteConfigs[patchHost];
-          if (patchConfig && typeof patchConfig === 'object' && !Array.isArray(patchConfig)) {
-            var baseConfig = mergedSiteConfigs[patchHost];
-            mergedSiteConfigs[patchHost] = Object.assign(
-              {},
-              baseConfig && typeof baseConfig === 'object' && !Array.isArray(baseConfig) ? baseConfig : {},
-              patchConfig
-            );
-          } else {
-            mergedSiteConfigs[patchHost] = patchConfig;
+        var patchSites = stablePatch.siteConfigs || {};
+        for (var ph in patchSites) {
+          if (Object.prototype.hasOwnProperty.call(patchSites, ph)) {
+            mergedSites[ph] = Object.assign({}, mergedSites[ph] || {}, patchSites[ph]);
           }
         }
-        merged.siteConfigs = mergedSiteConfigs;
+        merged.siteConfigs = mergedSites;
       }
       var next = ATPNormalizeSettings(merged);
       chrome.storage.local.set({ settings: next }, function() {
@@ -898,6 +731,11 @@ function applySettingsPatch(patch) {
           reject(new Error(chrome.runtime.lastError.message));
           return;
         }
+        settingsLoaded = true;
+        if (typeof globalThis !== 'undefined') {
+          globalThis.ATPSettingsReady = null;
+        }
+        syncBackgroundDebugLogging(next);
         resolve(next);
       });
     });
@@ -911,11 +749,7 @@ function queueSettingsPatch(patch) {
   return SETTINGS_WRITE_CHAIN;
 }
 
-// ---- Marked resources and the daily backup ----
-// The worker is the only writer. Marks from forum pages and the popup's
-// export and clear actions run here one at a time, so two tabs never
-// overwrite each other. A page may only mark threads of its own site; the
-// popup may export, copy, remove and clear, never add.
+// ---- Marked resources and daily backup ----
 var MARKS_WRITE_CHAIN = Promise.resolve();
 var MARKS_COPY_SCOPE_RE = /^(?:all|passwords|type:[a-z0-9]{1,16})$/;
 
@@ -1003,20 +837,26 @@ async function saveMarkSnapshot(op, snapshot, now) {
   var key = ATPMarks.itemKey(snapshot.id);
   var stored = await marksStorageGet([INDEX, key]);
   var index = ATPMarks.readIndex(stored[INDEX]);
-  var existing = stored[key] && typeof stored[key] === 'object' ? stored[key] : null;
-  if (op === 'update' && !existing) return { ok: true, marked: false };
-  if (!existing && index.items.length >= ATPMarks.LIMITS.MARKS) throw marksError('limit_count');
+  var listed = index.items.some(function(item) { return item.id === snapshot.id; });
+  if (op === 'update' && !listed) return { ok: true, marked: false };
+  if (!listed && index.items.length >= ATPMarks.LIMITS.MARKS) throw marksError('limit_count');
+  var existing = listed && stored[key] && typeof stored[key] === 'object' ? stored[key] : null;
   var merged = ATPMarks.mergeRecord(existing, snapshot, now);
   if (existing && !merged.changed) return { ok: true, marked: true, unchanged: true };
   var record = merged.record;
-  var bytes = JSON.stringify(record).length;
   if (existing && !merged.contentChanged) {
-    // Only the read times moved: keep them, and the mark stays exported.
+    // Avoid redundant storage writes when only readAt moved within the last 1h
+    var prevReadAt = Number(existing.readAt) || 0;
+    var nextReadAt = Number(record.readAt) || 0;
+    if (prevReadAt > 0 && nextReadAt >= prevReadAt && (nextReadAt - prevReadAt) < MARK_TOUCH_THROTTLE_MS) {
+      return { ok: true, marked: true, unchanged: true };
+    }
     var touched = {};
     touched[key] = record;
     await marksStorageSet(touched);
     return { ok: true, marked: true, unchanged: true };
   }
+  var bytes = SharedUtils.utf8ByteLength(JSON.stringify(record));
   var totalBytes = bytes;
   index.items.forEach(function(item) {
     if (item.id !== record.id) totalBytes += Number(item.bytes) || 0;
@@ -1029,7 +869,7 @@ async function saveMarkSnapshot(op, snapshot, now) {
   out[INDEX] = index;
   await marksStorageSet(out);
   updateMarksBadge(index);
-  return { ok: true, marked: true, created: !existing, links: ATPMarks.makeIndexEntry(record).links };
+  return { ok: true, marked: true, created: !listed, links: ATPMarks.makeIndexEntry(record).links };
 }
 
 async function removeMarks(filter, expectedRev) {
@@ -1047,32 +887,53 @@ async function removeMarks(filter, expectedRev) {
   index.rev++;
   var out = {};
   out[INDEX] = index;
+  var detailKeys = removed.map(ATPMarks.itemKey);
+  detailKeys.forEach(function(key) { out[key] = null; });
   await marksStorageSet(out);
-  await marksStorageRemove(removed.map(ATPMarks.itemKey)).catch(function() {});
+  try {
+    await marksStorageRemove(detailKeys);
+  } catch (error) {
+    await marksStorageRemove(detailKeys).catch(function() { BGLOG.warn('清理空标记键失败', detailKeys.length); });
+  }
   updateMarksBadge(index);
   return { ok: true, removed: removed.length };
 }
 
 async function addToDailyBackup(snapshots, event, extraItems) {
   if (!snapshots.length) return { ok: true, added: 0 };
-  var date = ATPMarks.formatDate(event.at);
+  var nowMs = Number(event.at) || Date.now();
+  var date = ATPMarks.formatDate(nowMs);
   var DAYS = ATPMarks.KEYS.DAYS;
   var dayKey = ATPMarks.dayKey(date);
   var stored = await marksStorageGet([DAYS, dayKey]);
   var day = ATPMarks.readDay(stored[dayKey], date);
   var days = ATPMarks.readDays(stored[DAYS]);
   snapshots.forEach(function(snapshot) { ATPMarks.addToDay(day, snapshot, event); });
-  days.days[date] = Object.assign({ updatedAt: event.at }, ATPMarks.summarizeDay(day));
+  days.days[date] = Object.assign({ updatedAt: nowMs }, ATPMarks.summarizeDay(day));
+
+  // Prune daily backups older than 90 days
+  var cutoffDate = ATPMarks.formatDate(nowMs - DAILY_BACKUP_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+  var staleDayKeys = [];
+  for (var existingDate in days.days) {
+    if (!Object.prototype.hasOwnProperty.call(days.days, existingDate)) continue;
+    if (existingDate !== date && /^\d{4}-\d{2}-\d{2}$/.test(existingDate) && existingDate < cutoffDate) {
+      delete days.days[existingDate];
+      staleDayKeys.push(ATPMarks.dayKey(existingDate));
+    }
+  }
+
   var out = Object.assign({}, extraItems || {});
   out[dayKey] = day;
   out[DAYS] = days;
   await marksStorageSet(out);
+  if (staleDayKeys.length) {
+    await marksStorageRemove(staleDayKeys).catch(function() {
+      BGLOG.warn('清理过期每日备份失败', staleDayKeys.length);
+    });
+  }
   return { ok: true, added: snapshots.length, date: date };
 }
 
-// Back up exactly what the popup handed out, even if its mark was removed
-// or changed while the clipboard/download operation was in progress.
-// A surviving mark unchanged since that read also counts as exported.
 async function recordMarksHandedOut(seen, kind) {
   var INDEX = ATPMarks.KEYS.INDEX;
   var now = Date.now();
@@ -1100,7 +961,7 @@ async function recordMarksHandedOut(seen, kind) {
         index.items.some(function(item) { return item.id === id; })) {
       record = Object.assign({}, record, { exportedAt: now });
       out[ATPMarks.itemKey(id)] = record;
-      putMarksIndexEntry(index, record, JSON.stringify(record).length);
+      putMarksIndexEntry(index, record, SharedUtils.utf8ByteLength(JSON.stringify(record)));
       exported++;
     }
   });
@@ -1108,14 +969,11 @@ async function recordMarksHandedOut(seen, kind) {
     index.rev++;
     out[INDEX] = index;
   }
-  // Commit the backup and export state together: a failed backup must not
-  // leave marks eligible for "clear exported".
   var backup = await addToDailyBackup(snapshots, { at: now, kind: kind, scope: kind === 'copy' ? 'marks' : 'all' }, out);
   if (exported) updateMarksBadge(index);
   return { ok: true, exported: exported, backedUp: backup.added, date: backup.date || '' };
 }
 
-// The popup, or the popup page opened in a tab: this extension's own page.
 function isOwnExtensionPageSender(sender) {
   if (!sender || typeof sender.url !== 'string') return false;
   if (sender.id && chrome.runtime.id && sender.id !== chrome.runtime.id) return false;
@@ -1169,393 +1027,47 @@ function handleMarksMutation(msg, sender) {
 
 refreshMarksBadge();
 
+// ---- Shared Cache & Eviction wrappers (delegating to cross-context ATPCache) ----
+function updateIndexForWrite(d) {
+  return ATPCache._updateIndexForWrite(d);
+}
+
+function setStorageWithEviction(d, warnMsg, onDone, writeStartedAt) {
+  return ATPCache._setStorageWithEviction(d, warnMsg, onDone, writeStartedAt);
+}
+
 function removeCacheIndexEntriesAfterStorageRemove(keys, action, callback) {
-  SharedUtils.cacheIndex.removeEntries(keys, function(success) {
-    if (success === false) {
-      BGLOG.warn(action, '索引删除失败，尝试重建');
-      SharedUtils.cacheIndex.rebuild(function(entries) {
-        if (!entries) BGLOG.warn(action, '索引重建失败');
-        if (callback) callback(!!entries, true);
-      });
-      return;
-    }
-    if (callback) callback(true, false);
-  });
-}
-
-function getTextCacheKeys(prefix, url) {
-  return SharedUtils.getTextAttachmentCacheKeys(prefix, url);
-}
-
-function cleanupInvalidTextCacheKeys(keys, action) {
-  if (!keys || !keys.length) return;
-  chrome.storage.local.remove(keys, function() {
-    if (consumeStorageError(action + '清除失败')) return;
-    removeCacheIndexEntriesAfterStorageRemove(keys, action + '索引清理');
-  });
-}
-
-function cleanupLegacyTextCacheKeys(keys, keepKey, action) {
-  var removeKeys = [];
-  for (var i = 0; i < keys.length; i++) {
-    if (keys[i] && keys[i] !== keepKey) removeKeys.push(keys[i]);
-  }
-  if (!removeKeys.length) return;
-  chrome.storage.local.remove(removeKeys, function() {
-    if (consumeStorageError(action + '清除失败')) return;
-    removeCacheIndexEntriesAfterStorageRemove(removeKeys, action + '索引清理');
-  });
-}
-
-function getValidTextResourceEntry(result, keys, ttlMs, now) {
-  var invalidKeys = [];
-  for (var i = 0; i < keys.length; i++) {
-    var key = keys[i];
-    if (!Object.prototype.hasOwnProperty.call(result || {}, key) || result[key] === undefined) continue;
-    var cached = result[key];
-    var ts = cached && typeof cached === 'object' ? Number(cached.ts) : NaN;
-    if (cached && isFinite(ts) && now - ts < ttlMs && cached.resources) {
-      var normalizedResources = SharedUtils.normalizeResources(cached.resources);
-      if (SharedUtils.hasResourcePayload(normalizedResources)) {
-        return { key: key, value: cached, resources: normalizedResources, invalidKeys: invalidKeys };
-      }
-    }
-    invalidKeys.push(key);
-  }
-  return { key: '', value: null, resources: null, invalidKeys: invalidKeys };
-}
-
-function getValidTextFailEntry(result, keys, ttlMs, now) {
-  var invalidKeys = [];
-  for (var i = 0; i < keys.length; i++) {
-    var key = keys[i];
-    if (!Object.prototype.hasOwnProperty.call(result || {}, key) || result[key] === undefined) continue;
-    var ts = result[key];
-    if (typeof ts === 'number' && isFinite(ts) && now - ts < ttlMs) {
-      return { key: key, value: ts, invalidKeys: invalidKeys };
-    }
-    invalidKeys.push(key);
-  }
-  return { key: '', value: 0, invalidKeys: invalidKeys };
-}
-
-function cleanupStoredLegacyTextCacheKeys(result, keys, keepKey, action) {
-  var removeKeys = [];
-  for (var i = 0; i < keys.length; i++) {
-    if (keys[i] && keys[i] !== keepKey && Object.prototype.hasOwnProperty.call(result || {}, keys[i]) && result[keys[i]] !== undefined) {
-      removeKeys.push(keys[i]);
-    }
-  }
-  if (!removeKeys.length) return;
-  chrome.storage.local.remove(removeKeys, function() {
-    if (consumeStorageError(action + '清除失败')) return;
-    removeCacheIndexEntriesAfterStorageRemove(removeKeys, action + '索引清理');
-  });
+  return ATPCache._removeCacheIndexEntriesAfterStorageRemove(keys, action, callback);
 }
 
 function getCachedTextResources(url) {
-  var readStartedAt = Date.now();
-  return new Promise(function(resolve) {
-    var keys = getTextCacheKeys(TEXT_RESOURCE_CACHE_PREFIX, url);
-    if (!keys.length) { resolve(null); return; }
-    var primaryKey = keys[0];
-    var readKeys = keys.slice();
-    readKeys.push('settings');
-    chrome.storage.local.get(readKeys, function(result) {
-      if (consumeStorageError('TXT缓存读取失败')) {
-        resolve(null);
-        return;
-      }
-      var settings = result.settings || {};
-      var ttlMs = ((settings && settings.cacheTTL) || 30) * 60 * 1000;
-      var entry = getValidTextResourceEntry(result, keys, ttlMs, Date.now());
-      if (entry && entry.key) {
-        if (entry.key !== primaryKey) {
-          var d = {};
-          d[primaryKey] = entry.value;
-          stampCacheWrite(d, readStartedAt);
-          setStorageWithEviction(d, 'TXT缓存迁移写入失败', function() {
-            cleanupLegacyTextCacheKeys(keys, primaryKey, '旧TXT资源缓存');
-          });
-        } else {
-          cleanupStoredLegacyTextCacheKeys(result, keys, primaryKey, '旧TXT资源缓存');
-        }
-        resolve(entry.resources);
-        return;
-      }
-      if (entry.invalidKeys.length) cleanupInvalidTextCacheKeys(entry.invalidKeys, '无效TXT资源缓存');
-      resolve(null);
-    });
-  });
+  return ATPCache.getCachedTextResources(url);
 }
 
-function estimateWriteBatchBytes(d) {
-  return SharedUtils.utf8ByteLength(JSON.stringify(d));
-}
-
-function getCacheWriteStartedAt(value) {
-  return (typeof value === 'number' && isFinite(value) && value > 0) ? value : Date.now();
-}
-
-function getCacheGeneration(value) {
-  var n = Number(value || 0);
-  return isFinite(n) && n > 0 ? n : 0;
-}
-
-function isCacheWriteStale(writeStartedAt, generation) {
-  return !!(generation && writeStartedAt <= generation);
-}
-
-// 代数值仅在用户手动清缓存时变化：写前用内存缓存值快速判断，写后仍做权威读取兜底
-var cachedCacheGeneration = null;
-
-function checkCacheWriteFreshFast(writeStartedAt, callback) {
-  if (cachedCacheGeneration !== null) {
-    callback(!isCacheWriteStale(writeStartedAt, cachedCacheGeneration));
-    return;
-  }
-  checkCacheWriteFresh(writeStartedAt, callback);
-}
-
-function checkCacheWriteFresh(writeStartedAt, callback) {
-  chrome.storage.local.get(CACHE_GENERATION_KEY, function(result) {
-    if (consumeStorageError('cache generation read failed')) {
-      callback(false);
-      return;
-    }
-    var generation = getCacheGeneration(result[CACHE_GENERATION_KEY]);
-    cachedCacheGeneration = generation;
-    callback(!isCacheWriteStale(writeStartedAt, generation));
-  });
-}
-
-function getWriteKeys(d) {
-  var keys = [];
-  for (var dk in d) {
-    if (Object.prototype.hasOwnProperty.call(d, dk)) keys.push(dk);
-  }
-  return keys;
-}
-
-function stampCacheWrite(d, writeStartedAt) {
-  Object.defineProperty(d, '__atpWriteStartedAt', {
-    value: getCacheWriteStartedAt(writeStartedAt),
-    enumerable: false,
-    configurable: true
-  });
-  return d;
-}
-
-function cacheWriteValueMatches(currentValue, writtenValue) {
-  if (currentValue === writtenValue) return true;
-  if (!currentValue || !writtenValue || typeof currentValue !== 'object' || typeof writtenValue !== 'object') return false;
-  try {
-    return JSON.stringify(currentValue) === JSON.stringify(writtenValue);
-  } catch (e) {
-    return false;
-  }
-}
-
-function removeStaleCacheWrite(d, callback) {
-  var keys = getWriteKeys(d);
-  if (!keys.length) {
-    if (callback) callback();
-    return;
-  }
-  chrome.storage.local.get(keys, function(result) {
-    if (consumeStorageError('stale cache write cleanup read failed')) {
-      if (callback) callback();
-      return;
-    }
-    var ownedKeys = [];
-    for (var i = 0; i < keys.length; i++) {
-      var key = keys[i];
-      if (
-        Object.prototype.hasOwnProperty.call(result, key) &&
-        cacheWriteValueMatches(result[key], d[key])
-      ) {
-        ownedKeys.push(key);
-      }
-    }
-    if (!ownedKeys.length) {
-      if (callback) callback();
-      return;
-    }
-    chrome.storage.local.remove(ownedKeys, function() {
-      consumeStorageError('stale cache write cleanup failed');
-      if (callback) callback();
-    });
-  });
-}
-
-function repairCacheIndexAfterWriteFailure() {
-  if (bgCacheIndexRepairInFlight) return;
-  bgCacheIndexRepairInFlight = true;
-  try {
-    SharedUtils.cacheIndex.rebuild(function(entries) {
-      bgCacheIndexRepairInFlight = false;
-      if (!entries) BGLOG.warn('缓存索引自愈失败', 'cacheIndex rebuild failed');
-    });
-  } catch (e) {
-    bgCacheIndexRepairInFlight = false;
-    BGLOG.warn('缓存索引自愈异常', e && e.message ? e.message : String(e));
-  }
-}
-
-function updateIndexForWrite(d) {
-  var _P = SharedUtils.CACHE_PREFIXES;
-  var updates = {};
-  var hasUpdates = false;
-  for (var dk in d) {
-    if (!Object.prototype.hasOwnProperty.call(d, dk)) continue;
-    var type;
-    if (dk.indexOf(_P.IMAGE) === 0) type = 0;
-    else if (SharedUtils.isHashedTextAttachmentCacheKey(dk, _P.TEXT_RESOURCE)) type = 1;
-    else if (SharedUtils.isHashedTextAttachmentCacheKey(dk, _P.TEXT_FAIL)) type = 4;
-    else if (dk.indexOf(_P.ARTICLE) === 0) type = 2;
-    else if (dk.indexOf(_P.NEGATIVE) === 0) type = 3;
-    else continue;
-    var val = d[dk];
-    var ts = (typeof val === 'object' && val !== null) ? (val.ts || Date.now()) : Date.now();
-    var valLen = SharedUtils.utf8ByteLength(
-      (typeof val === 'object' && val !== null) ? JSON.stringify(val) : String(val)
-    );
-    updates[dk] = { t: type, ts: ts, b: dk.length + valLen };
-    hasUpdates = true;
-  }
-  if (hasUpdates) {
-    SharedUtils.cacheIndex.updateEntries(updates, function(success) {
-      if (success === false) repairCacheIndexAfterWriteFailure();
-    });
-  }
-}
-
-function setStorageWithEviction(d, warnMsg, onSuccess, writeStartedAt) {
-  if (writeStartedAt === undefined && d && d.__atpWriteStartedAt) {
-    writeStartedAt = d.__atpWriteStartedAt;
-  }
-  writeStartedAt = getCacheWriteStartedAt(writeStartedAt);
-  function finishSuccessfulSet() {
-    checkCacheWriteFresh(writeStartedAt, function(fresh) {
-      if (!fresh) {
-        removeStaleCacheWrite(d);
-        return;
-      }
-      updateIndexForWrite(d);
-      scheduleBgEvictionCheck();
-      if (onSuccess) onSuccess();
-    });
-  }
-  function attemptSet() {
-    checkCacheWriteFreshFast(writeStartedAt, function(fresh) {
-      if (!fresh) return;
-  chrome.storage.local.set(d, function() {
-    if (chrome.runtime.lastError) {
-      console.warn('[BGLOG] ' + warnMsg + '，尝试淘汰后重试:', chrome.runtime.lastError.message);
-      SharedUtils.getCacheBytesInUse(function(bytesUsed) {
-        if (consumeStorageError('storage用量读取失败')) return;
-        var baseline = bytesUsed + estimateWriteBatchBytes(d);
-        checkAndEvict(function() {
-          checkCacheWriteFreshFast(writeStartedAt, function(retryFresh) {
-            if (!retryFresh) return;
-          chrome.storage.local.set(d, function() {
-            if (chrome.runtime.lastError) {
-              console.warn('[BGLOG] 淘汰后重试仍失败:', chrome.runtime.lastError.message);
-            } else {
-              finishSuccessfulSet();
-            }
-          });
-          });
-        }, baseline);
-      });
-      return;
-    }
-    finishSuccessfulSet();
-  });
-    });
-  }
-  attemptSet();
-}
-
-function scheduleBgEvictionCheck() {
-  if (bgEvictionCheckTimer) return;
-  bgEvictionCheckTimer = setTimeout(function() {
-    bgEvictionCheckTimer = null;
-    checkAndEvict();
-  }, 500);
-}
-
-// Discuz attachment URLs carry a per-render aid token, so an entry keyed by one
-// is never read again; the article cache keeps those threads' TXT results.
 function setCachedTextResources(url, resources, writeStartedAt) {
-  if (SharedUtils.isDiscuzAttachmentUrl(url, url)) return;
-  var keys = getTextCacheKeys(TEXT_RESOURCE_CACHE_PREFIX, url);
-  if (!keys.length) return;
-  var primaryKey = keys[0];
-  var normalizedResources = SharedUtils.normalizeResources(resources);
-  var d = {};
-  d[primaryKey] = {
-    resources: normalizedResources,
-    ts: Date.now()
-  };
-  stampCacheWrite(d, writeStartedAt);
-  setStorageWithEviction(d, 'TXT缓存写入失败', function() {
-    cleanupLegacyTextCacheKeys(keys, primaryKey, '旧TXT资源缓存');
-  });
+  return ATPCache.setCachedTextResources(url, resources, writeStartedAt);
 }
 
 function getTextFailCache(url) {
-  var readStartedAt = Date.now();
-  return new Promise(function(resolve) {
-    var keys = getTextCacheKeys(TEXT_FAIL_CACHE_PREFIX, url);
-    if (!keys.length) { resolve(false); return; }
-    var primaryKey = keys[0];
-    chrome.storage.local.get(keys, function(result) {
-      if (consumeStorageError('TXT失败缓存读取失败')) {
-        resolve(false);
-        return;
-      }
-      var entry = getValidTextFailEntry(result, keys, TEXT_FAIL_TTL_MS, Date.now());
-      if (entry && entry.key) {
-        if (entry.key !== primaryKey) {
-          var d = {};
-          d[primaryKey] = entry.value;
-          stampCacheWrite(d, readStartedAt);
-          setStorageWithEviction(d, 'TXT失败缓存迁移写入失败', function() {
-            cleanupLegacyTextCacheKeys(keys, primaryKey, '旧TXT失败缓存');
-          });
-        } else {
-          cleanupStoredLegacyTextCacheKeys(result, keys, primaryKey, '旧TXT失败缓存');
-        }
-        resolve(true);
-        return;
-      }
-      if (entry.invalidKeys.length) cleanupInvalidTextCacheKeys(entry.invalidKeys, '无效TXT失败缓存');
-      resolve(false);
-    });
-  });
+  return ATPCache.getTextFailCache(url);
 }
 
 function setTextFailCache(url, writeStartedAt) {
-  if (SharedUtils.isDiscuzAttachmentUrl(url, url)) return;
-  var keys = getTextCacheKeys(TEXT_FAIL_CACHE_PREFIX, url);
-  if (!keys.length) return;
-  var primaryKey = keys[0];
-  var d = {};
-  d[primaryKey] = Date.now();
-  stampCacheWrite(d, writeStartedAt);
-  setStorageWithEviction(d, 'TXT失败缓存写入失败', function() {
-    cleanupLegacyTextCacheKeys(keys, primaryKey, '旧TXT失败缓存');
-  });
+  return ATPCache.setTextFailCache(url, writeStartedAt);
 }
 
 function clearTextFailCache(url) {
-  var keys = getTextCacheKeys(TEXT_FAIL_CACHE_PREFIX, url);
-  if (!keys.length) return;
-  chrome.storage.local.remove(keys, function() {
-    if (consumeStorageError('TXT失败缓存清除失败')) return;
-    removeCacheIndexEntriesAfterStorageRemove(keys, 'TXT失败缓存索引清理');
-  });
+  return ATPCache.clearTextFailCache(url);
+}
+
+function runBackgroundEviction(callback, triggerBytes) {
+  if (triggerBytes < BG_HIGH_WATERMARK) {
+    if (callback) callback();
+    return;
+  }
+  // Evicts directly from in-memory cacheIndex entries without calling get(null),
+  // falling back to rebuild() only if atp_cache_index_v1 is missing or corrupt.
+  ATPCache.evictLRU(callback, triggerBytes);
 }
 
 function checkAndEvict(callback, baselineBytes) {
@@ -1572,109 +1084,360 @@ function checkAndEvict(callback, baselineBytes) {
   });
 }
 
-function runBackgroundEviction(callback, triggerBytes) {
-  if (triggerBytes < BG_HIGH_WATERMARK) {
-    if (callback) callback();
-    return;
-  }
-  SharedUtils.cacheIndex.rebuild(function(entries) {
-    if (!entries) {
-      BGLOG.warn('LRU淘汰跳过', '缓存索引重建失败');
-      if (callback) callback();
-      return;
-    }
-    _bgEvictFromEntries(entries, callback, triggerBytes);
-  });
+// ---- Forum cooldown & non-contending recovery probe queueing ----
+function textForumOrigin(url) {
+  return SharedUtils.getForumUrlZone(url) ? new URL(url).origin : '';
 }
 
-function _bgEvictFromEntries(entries, callback, baseline) {
-  var cacheEntries = [];
-  for (var key in entries) {
-    var e = entries[key];
-    cacheEntries.push({ key: key, ts: e.ts, priority: e.t, estimatedBytes: e.b });
-  }
-  if (baseline <= BG_TARGET_WATERMARK) {
-    if (callback) callback();
-    return;
-  }
-  var expiredBefore = Date.now() - bgCacheTtlMs;
-  cacheEntries.sort(function(a, b) {
-    return compareEvictionOrder(a, b, expiredBefore);
-  });
-  var removeKeys = [];
-  var freed = 0;
-  for (var i = 0; i < cacheEntries.length; i++) {
-    if (baseline - freed <= BG_TARGET_WATERMARK) break;
-    removeKeys.push(cacheEntries[i].key);
-    freed += cacheEntries[i].estimatedBytes;
-  }
-  if (removeKeys.length > 0) {
-    chrome.storage.local.remove(removeKeys, function() {
-      if (consumeStorageError('LRU淘汰失败')) {
-        if (callback) callback();
-        return;
-      }
-      removeCacheIndexEntriesAfterStorageRemove(removeKeys, 'LRU淘汰索引清理', function(indexOk) {
-        if (indexOk) {
-          BGLOG.info('LRU淘汰', removeKeys.length + '条缓存');
+function restoreTextForumCooldowns() {
+  if (!textForumCooldownsReady) {
+    var session = chrome.storage.session;
+    var sessionRead = session ? session.get(TEXT_FORUM_COOLDOWNS_KEY).catch(function(error) {
+      BGLOG.warn('读取论坛限流期限失败', error.message);
+      return {};
+    }) : Promise.resolve({});
+    var localRead = new Promise(function(resolve) {
+      chrome.storage.local.get(FORUM_SERVER_WAIT_KEY, function(items) {
+        if (chrome.runtime.lastError) {
+          BGLOG.warn('读取论坛服务端等待时间失败', chrome.runtime.lastError.message);
+          resolve({});
         } else {
-          BGLOG.warn('LRU淘汰索引清理失败', removeKeys.length + '条缓存已删除，索引未确认');
+          resolve(items && items[FORUM_SERVER_WAIT_KEY] || {});
         }
-        if (callback) callback();
       });
     });
-  } else {
-    if (callback) callback();
+    textForumCooldownsReady = Promise.all([sessionRead, localRead]).then(function(results) {
+      var saved = results[0][TEXT_FORUM_COOLDOWNS_KEY] || {};
+      var now = Date.now();
+      Object.keys(saved).forEach(function(origin) {
+        var limit = saved[origin];
+        if (limit && Number.isFinite(limit.at) && Number.isFinite(limit.until) && limit.until + FORUM_RECOVERY_IDLE_MS > now) {
+          limit.retryAfter = Number.isFinite(limit.retryAfter) ? limit.retryAfter : limit.until;
+          textForumCooldowns.set(origin, limit);
+        }
+      });
+      var waits = results[1];
+      Object.keys(waits).forEach(function(origin) {
+        var wait = waits[origin];
+        if (!wait || !Number.isFinite(wait.at) || !Number.isFinite(wait.until) || wait.until <= now) return;
+        var current = textForumCooldowns.get(origin);
+        if (!current || wait.until > current.retryAfter) {
+          storeBackgroundForumCooldown(origin, origin, wait.at, wait.until, wait.until);
+        }
+      });
+    });
+  }
+  return textForumCooldownsReady;
+}
+
+function saveTextForumCooldowns() {
+  var now = Date.now();
+  textForumCooldowns.forEach(function(limit, origin) {
+    if (limit.until + FORUM_RECOVERY_IDLE_MS <= now && !recoveringForumProbes.has(limit.origin || origin)) {
+      textForumCooldowns.delete(origin);
+    }
+  });
+  if (!chrome.storage.session) return;
+  textForumCooldownWrite = textForumCooldownWrite.then(function() {
+    return chrome.storage.session.set({ [TEXT_FORUM_COOLDOWNS_KEY]: Object.fromEntries(textForumCooldowns) });
+  }).catch(function(error) { BGLOG.warn('保存论坛限流期限失败', error.message); });
+  return textForumCooldownWrite;
+}
+
+async function resetTextForumCooldowns() {
+  await restoreTextForumCooldowns();
+  var now = Date.now();
+  textForumCooldowns.forEach(function(limit, origin) {
+    if (limit.retryAfter && limit.retryAfter + FORUM_RECOVERY_IDLE_MS > now) {
+      textForumCooldowns.set(origin, Object.assign({}, limit, { until: limit.retryAfter }));
+    } else {
+      textForumCooldowns.delete(origin);
+    }
+  });
+  await saveTextForumCooldowns();
+}
+
+function reportTextForumCooldown(batch, cooldown, observed) {
+  if (!batch) return;
+  if (!batch.cooldown || cooldown.until > batch.cooldown.until) batch.cooldown = cooldown;
+  batch.retryAfter = Math.max(batch.retryAfter || 0, cooldown.retryAfter);
+  if (observed) {
+    if (!batch.observedForumCooldowns) batch.observedForumCooldowns = new Map();
+    batch.observedForumCooldowns.set(cooldown.origin, cooldown);
   }
 }
 
-async function fetchTextAttachmentResource(attachment, depth, deadline, options) {
-  options = options || {};
-  attachment = withBackgroundTextDiagnosticId(attachment);
+function storeBackgroundForumCooldown(origin, finalOrigin, at, until, retryAfter) {
+  var prior = textForumCooldowns.get(finalOrigin);
+  var redirectedPrior = origin !== finalOrigin && textForumCooldowns.get(origin);
+  retryAfter = Math.max(retryAfter, prior ? prior.retryAfter : 0, redirectedPrior ? redirectedPrior.retryAfter : 0);
+  var cooldown = {
+    origin: finalOrigin,
+    at: at,
+    until: Math.max(until, retryAfter, prior ? prior.until : 0, redirectedPrior ? redirectedPrior.until : 0),
+    retryAfter: retryAfter
+  };
+  textForumCooldowns.set(finalOrigin, cooldown);
+  if (origin && origin !== finalOrigin) textForumCooldowns.set(origin, cooldown);
+  return cooldown;
+}
+
+async function noteReportedForumRetryAfter(origin, entry) {
+  var retryAfter = entry.retryAfterUntil;
+  if (!Number.isFinite(retryAfter) || retryAfter <= Date.now()) return;
+  await restoreTextForumCooldowns();
+  var current = textForumCooldowns.get(origin);
+  if (current && current.retryAfter >= retryAfter) return;
+  storeBackgroundForumCooldown(origin, origin, entry.at, retryAfter, retryAfter);
+  await saveTextForumCooldowns();
+}
+
+async function noteBackgroundForumCooldown(origin, finalOrigin, retryAfter, batch) {
+  var at = Date.now();
+  retryAfter = Number.isFinite(retryAfter) && retryAfter > at ? retryAfter : 0;
+  var cooldown = storeBackgroundForumCooldown(origin, finalOrigin, at, at + SharedUtils.FORUM_BASE_PAUSE_MS, retryAfter);
+  reportTextForumCooldown(batch, cooldown, true);
+  var saved = saveTextForumCooldowns();
+  if (retryAfter) {
+    await recordBackgroundForumRetryAfter(finalOrigin, at, retryAfter).catch(function(error) {
+      BGLOG.warn('发布论坛服务端等待时间失败', error.message);
+    });
+  }
+  await saved;
+}
+
+function noteTextForumCooldown(origin, finalOrigin, headers, batch) {
+  return noteBackgroundForumCooldown(origin, finalOrigin, SharedUtils.parseRetryAfterHeader(headers), batch);
+}
+
+var recoveringForumOrigins = new Set();
+
+function getBackgroundForumTurn(origin) {
+  if (!origin) return null;
+  var cooldown = textForumCooldowns.get(origin);
+  if (!cooldown) return null;
+  var now = Date.now();
+  if (cooldown.until > now) return { wait: cooldown };
+  var probeOrigin = cooldown.origin || origin;
+  if (recoveringForumOrigins.has(probeOrigin)) {
+    return { wait: Object.assign({}, cooldown, { until: now + 1000 }) };
+  }
+  if (cooldown.until + FORUM_RECOVERY_IDLE_MS <= now) {
+    textForumCooldowns.delete(origin);
+    return null;
+  }
+  recoveringForumOrigins.add(probeOrigin);
+  return { probeOrigin: probeOrigin, cooldown: cooldown };
+}
+
+function finishBackgroundForumTurn(turn, servedOrigin) {
+  if (!turn || !turn.probeOrigin) return;
+  recoveringForumOrigins.delete(turn.probeOrigin);
+  if (servedOrigin === turn.probeOrigin) {
+    var cleared = false;
+    textForumCooldowns.forEach(function(limit, origin) {
+      if ((limit.origin || origin) === turn.probeOrigin && limit.at <= turn.cooldown.at && limit.until <= turn.cooldown.until) {
+        textForumCooldowns.delete(origin);
+        cleared = true;
+      }
+    });
+    if (cleared) saveTextForumCooldowns();
+  }
+}
+
+// ---- TXT Attachment Fetching with TEXT_FETCH_IN_FLIGHT deduplication ----
+var TEXT_FETCH_IN_FLIGHT = new Map();
+
+function getRemainingTextDeadlineMs(deadline) {
+  if (!deadline) return Infinity;
+  var remaining = Number(deadline) - Date.now();
+  return isFinite(remaining) ? remaining : Infinity;
+}
+
+function scheduleTextAbortControl(control) {
+  if (!control) return 0;
+  if (control.timer) {
+    clearTimeout(control.timer);
+    control.timer = 0;
+  }
+  var remaining = Math.max(0, control.abortAt - Date.now());
+  if (remaining <= 0) {
+    control.controller.abort();
+    return 0;
+  }
+  control.timer = setTimeout(function() { control.controller.abort(); }, remaining);
+  return remaining;
+}
+
+function clearTextFetchControl(control) {
+  if (control && control.timer) {
+    clearTimeout(control.timer);
+    control.timer = 0;
+  }
+}
+
+function createTextFetchControl(deadline) {
+  var control = {
+    abortAt: Date.now() + getDeadlineFetchTimeout(deadline, TEXT_ATTACHMENT_TIMEOUT),
+    controller: new AbortController(),
+    timer: 0
+  };
+  scheduleTextAbortControl(control);
+  return control;
+}
+
+function extendTextFetchControl(control, deadline) {
+  if (!control) return;
+  var abortAt = Date.now() + getDeadlineFetchTimeout(deadline, TEXT_ATTACHMENT_TIMEOUT);
+  if (abortAt > control.abortAt && !control.controller.signal.aborted) {
+    control.abortAt = abortAt;
+    scheduleTextAbortControl(control);
+  }
+}
+
+function getTextFetchInflightKey(url, zone, manualRetry, depth) {
+  var norm = SharedUtils.normalizeTextAttachmentUrl(url);
+  if (!norm) return '';
+  return [zone || '', norm, manualRetry ? '1' : '0', depth || 0].join('|');
+}
+
+function waitForTextFetchDeadline(promise, deadline) {
+  var remaining = getRemainingTextDeadlineMs(deadline);
+  if (remaining === Infinity) return promise;
+  if (remaining <= 0) {
+    return Promise.resolve({
+      resources: SharedUtils.emptyResources(),
+      outcome: 'skipped',
+      failure: 'deadline',
+      status: 0,
+      count: 0,
+      accessDenied: false,
+      forumRequestSent: false,
+      cooldown: null,
+      observedCooldowns: null
+    });
+  }
+  return new Promise(function(resolve) {
+    var settled = false;
+    var timer = setTimeout(function() {
+      if (settled) return;
+      settled = true;
+      resolve({
+        resources: SharedUtils.emptyResources(),
+        outcome: 'skipped',
+        failure: 'deadline',
+        status: 0,
+        count: 0,
+        accessDenied: false,
+        forumRequestSent: false,
+        cooldown: null,
+        observedCooldowns: null
+      });
+    }, remaining);
+    promise.then(function(res) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (getRemainingTextDeadlineMs(deadline) <= 0) {
+        resolve({
+          resources: SharedUtils.emptyResources(),
+          outcome: 'skipped',
+          failure: 'deadline',
+          status: 0,
+          count: 0,
+          accessDenied: false,
+          forumRequestSent: false,
+          cooldown: null,
+          observedCooldowns: null
+        });
+      } else {
+        resolve(res);
+      }
+    });
+  });
+}
+
+async function executeSingleTextAttachmentFetch(attachment, depth, deadline, options, control) {
   var writeStartedAt = Date.now();
   var manualRetry = !!(options.manualRetry || options.force);
-  depth = depth || 0;
+  var localBatch = {};
+  var localOutcome = { accessDenied: false };
   var diagnosticOutcome = 'failed';
   var diagnosticFailure = 'request_error';
   var diagnosticStatus = 0;
   var diagnosticResources = 0;
-  try {
-    if (!textAttachmentAllowedInZone(attachment.url, options.zone)) {
-      diagnosticOutcome = 'skipped';
-      diagnosticFailure = 'url_not_allowed';
-      return SharedUtils.emptyResources();
-    }
+  var forumTurn = null;
+  var resp = null;
 
+  try {
     var cached = await getCachedTextResources(attachment.url);
     if (cached) {
       clearTextFailCache(attachment.url);
-      diagnosticOutcome = 'cache_hit';
-      diagnosticFailure = '';
-      diagnosticResources = SharedUtils.countResources(cached);
-      return cached;
+      return {
+        resources: cached,
+        outcome: 'cache_hit',
+        failure: '',
+        status: 0,
+        count: SharedUtils.countResources(cached),
+        accessDenied: false,
+        forumRequestSent: false,
+        cooldown: null,
+        observedCooldowns: null
+      };
     }
 
     if (!manualRetry) {
       var failCached = await getTextFailCache(attachment.url);
       if (failCached) {
-        diagnosticOutcome = 'skipped';
-        diagnosticFailure = 'failure_cache';
-        return SharedUtils.emptyResources();
+        return {
+          resources: SharedUtils.emptyResources(),
+          outcome: 'skipped',
+          failure: 'failure_cache',
+          status: 0,
+          count: 0,
+          accessDenied: false,
+          forumRequestSent: false,
+          cooldown: null,
+          observedCooldowns: null
+        };
       }
     }
 
-    var fetchTimeout = getDeadlineFetchTimeout(deadline, TEXT_ATTACHMENT_TIMEOUT);
-    if (fetchTimeout <= 0) {
-      diagnosticOutcome = 'skipped';
-      diagnosticFailure = 'deadline';
-      return SharedUtils.emptyResources();
+    var origin = textForumOrigin(attachment.url);
+    forumTurn = await getBackgroundForumTurn(origin, control.abortAt);
+    if (forumTurn && forumTurn.wait) {
+      reportTextForumCooldown(localBatch, forumTurn.wait);
+      return {
+        resources: SharedUtils.emptyResources(),
+        outcome: 'skipped',
+        failure: 'forum_cooldown',
+        status: 0,
+        count: 0,
+        accessDenied: false,
+        forumRequestSent: false,
+        cooldown: localBatch.cooldown || forumTurn.wait,
+        retryAfter: localBatch.retryAfter || 0,
+        observedCooldowns: null
+      };
     }
 
-    var ctrl = new AbortController();
-    var t = setTimeout(function() { ctrl.abort(); }, fetchTimeout);
+    if (control.controller.signal.aborted || Date.now() >= control.abortAt) {
+      return {
+        resources: SharedUtils.emptyResources(),
+        outcome: 'skipped',
+        failure: 'deadline',
+        status: 0,
+        count: 0,
+        accessDenied: false,
+        forumRequestSent: false,
+        cooldown: null,
+        observedCooldowns: null
+      };
+    }
+
     try {
       var fetchOptions = {
-        signal: ctrl.signal,
+        signal: control.controller.signal,
         credentials: 'include',
         headers: { 'Accept': 'text/plain, application/octet-stream;q=0.9, */*;q=0.5' }
       };
@@ -1683,36 +1446,106 @@ async function fetchTextAttachmentResource(attachment, depth, deadline, options)
         fetchOptions.referrer = safeReferrer;
         fetchOptions.referrerPolicy = 'strict-origin-when-cross-origin';
       }
-      var resp = await fetch(attachment.url, fetchOptions);
+      if (origin) localBatch.forumRequestSent = true;
+      resp = await fetch(attachment.url, fetchOptions);
       diagnosticStatus = resp.status;
       var finalAttachmentUrl = resp.url || attachment.url;
       if (!textAttachmentAllowedInZone(finalAttachmentUrl, options.zone)) {
         diagnosticFailure = 'redirect_not_allowed';
-        return SharedUtils.emptyResources();
+        return {
+          resources: SharedUtils.emptyResources(),
+          outcome: diagnosticOutcome,
+          failure: diagnosticFailure,
+          status: diagnosticStatus,
+          count: 0,
+          accessDenied: false,
+          forumRequestSent: !!localBatch.forumRequestSent,
+          cooldown: null,
+          observedCooldowns: null
+        };
       }
 
+      var finalOrigin = textForumOrigin(finalAttachmentUrl);
+      if (finalOrigin) localBatch.forumRequestSent = true;
+      if (finalOrigin && SharedUtils.isCloudflareChallengeResponse(resp)) {
+        diagnosticFailure = 'forum_challenge';
+        await noteTextForumCooldown(origin, finalOrigin, resp.headers, localBatch);
+        return {
+          resources: SharedUtils.emptyResources(),
+          outcome: diagnosticOutcome,
+          failure: diagnosticFailure,
+          status: diagnosticStatus,
+          count: 0,
+          accessDenied: false,
+          forumRequestSent: true,
+          cooldown: localBatch.cooldown || null,
+          retryAfter: localBatch.retryAfter || 0,
+          observedCooldowns: localBatch.observedForumCooldowns || null
+        };
+      }
       if (!resp.ok) {
         var status = resp.status;
         diagnosticFailure = backgroundTextFailureClass(null, status);
         if (status === 401 || status === 403) {
-          if (options.attachmentOutcome) options.attachmentOutcome.accessDenied = true;
+          localOutcome.accessDenied = true;
           setTextFailCache(attachment.url, writeStartedAt);
-          return SharedUtils.emptyResources();
+          return {
+            resources: SharedUtils.emptyResources(),
+            outcome: diagnosticOutcome,
+            failure: diagnosticFailure,
+            status: diagnosticStatus,
+            count: 0,
+            accessDenied: true,
+            forumRequestSent: !!localBatch.forumRequestSent,
+            cooldown: null,
+            observedCooldowns: null
+          };
         }
-        if (status === 429) {
-          return SharedUtils.emptyResources();
+        if ((status === 429 || status === 503) && finalOrigin) {
+          await noteTextForumCooldown(origin, finalOrigin, resp.headers, localBatch);
         }
-        return SharedUtils.emptyResources();
+        return {
+          resources: SharedUtils.emptyResources(),
+          outcome: diagnosticOutcome,
+          failure: diagnosticFailure,
+          status: diagnosticStatus,
+          count: 0,
+          accessDenied: false,
+          forumRequestSent: !!localBatch.forumRequestSent,
+          cooldown: localBatch.cooldown || null,
+          retryAfter: localBatch.retryAfter || 0,
+          observedCooldowns: localBatch.observedForumCooldowns || null
+        };
       }
       if (resp.redirected && /\/login|\/signin|\/member|\/register/.test(resp.url)) {
         diagnosticFailure = 'login_redirect';
-        return SharedUtils.emptyResources();
+        return {
+          resources: SharedUtils.emptyResources(),
+          outcome: diagnosticOutcome,
+          failure: diagnosticFailure,
+          status: diagnosticStatus,
+          count: 0,
+          accessDenied: false,
+          forumRequestSent: !!localBatch.forumRequestSent,
+          cooldown: null,
+          observedCooldowns: null
+        };
       }
 
       var len = parseInt(resp.headers.get('content-length') || '0', 10);
       if (len > TEXT_ATTACHMENT_MAX_BYTES) {
         diagnosticFailure = 'response_too_large';
-        return SharedUtils.emptyResources();
+        return {
+          resources: SharedUtils.emptyResources(),
+          outcome: diagnosticOutcome,
+          failure: diagnosticFailure,
+          status: diagnosticStatus,
+          count: 0,
+          accessDenied: false,
+          forumRequestSent: !!localBatch.forumRequestSent,
+          cooldown: null,
+          observedCooldowns: null
+        };
       }
 
       var contentType = resp.headers.get('content-type') || '';
@@ -1722,18 +1555,49 @@ async function fetchTextAttachmentResource(attachment, depth, deadline, options)
       } catch (readError) {
         if (readError && readError.name === 'ResponseTooLargeError') {
           diagnosticFailure = 'response_too_large';
-          return SharedUtils.emptyResources();
+          return {
+            resources: SharedUtils.emptyResources(),
+            outcome: diagnosticOutcome,
+            failure: diagnosticFailure,
+            status: diagnosticStatus,
+            count: 0,
+            accessDenied: false,
+            forumRequestSent: !!localBatch.forumRequestSent,
+            cooldown: null,
+            observedCooldowns: null
+          };
         }
         throw readError;
       }
 
       var text = SharedUtils.decodeTextBuffer(buffer, contentType);
       var htmlLike = SharedUtils.looksLikeHtmlDocument(text);
+      if (finalOrigin && htmlLike && SharedUtils.isTextForumRefusal(text)) {
+        diagnosticFailure = 'forum_challenge';
+        await noteTextForumCooldown(origin, finalOrigin, resp.headers, localBatch);
+        return {
+          resources: SharedUtils.emptyResources(),
+          outcome: diagnosticOutcome,
+          failure: diagnosticFailure,
+          status: diagnosticStatus,
+          count: 0,
+          accessDenied: false,
+          forumRequestSent: true,
+          cooldown: localBatch.cooldown || null,
+          retryAfter: localBatch.retryAfter || 0,
+          observedCooldowns: localBatch.observedForumCooldowns || null
+        };
+      }
+
+      var unavailable = SharedUtils.isUnavailableTextDocument(text);
+      finishBackgroundForumTurn(forumTurn, text && !unavailable && !htmlLike ? finalOrigin : '');
+      forumTurn = null;
       var downloadLike = SharedUtils.looksLikeDownloadIntermediary(text);
       if ((htmlLike || downloadLike) && depth < 2) {
         var downloadUrls = SharedUtils.extractTextDownloadUrls(text, resp.url || attachment.url, TEXT_ATTACHMENT_MAX_COUNT);
         for (var d = 0; d < downloadUrls.length; d++) {
           if (!textAttachmentAllowedInZone(downloadUrls[d], options.zone) || downloadUrls[d] === attachment.url) continue;
+          var subBatch = {};
           var redirectedResources = await fetchTextAttachmentResource({
             url: downloadUrls[d],
             name: attachment.name,
@@ -1742,46 +1606,149 @@ async function fetchTextAttachmentResource(attachment, depth, deadline, options)
             diagnosticId: attachment.diagnosticId,
             diagnosticThreadId: attachment.diagnosticThreadId,
             diagnosticRunId: attachment.diagnosticRunId
-          }, depth + 1, deadline, options);
+          }, depth + 1, control.abortAt, Object.assign({}, options, { batch: subBatch, attachmentOutcome: null }));
+          if (subBatch.forumRequestSent) localBatch.forumRequestSent = true;
+          if (subBatch.cooldown) reportTextForumCooldown(localBatch, subBatch.cooldown, false);
+          if (subBatch.observedForumCooldowns) {
+            subBatch.observedForumCooldowns.forEach(function(cd) { reportTextForumCooldown(localBatch, cd, true); });
+          }
           if (SharedUtils.hasResourcePayload(redirectedResources)) {
-            diagnosticOutcome = 'success';
-            diagnosticFailure = '';
-            diagnosticResources = SharedUtils.countResources(redirectedResources);
             setCachedTextResources(attachment.url, redirectedResources, writeStartedAt);
             clearTextFailCache(attachment.url);
-            return redirectedResources;
+            return {
+              resources: redirectedResources,
+              outcome: 'success',
+              failure: '',
+              status: diagnosticStatus,
+              count: SharedUtils.countResources(redirectedResources),
+              accessDenied: false,
+              forumRequestSent: !!localBatch.forumRequestSent,
+              cooldown: localBatch.cooldown || null,
+              retryAfter: localBatch.retryAfter || 0,
+              observedCooldowns: localBatch.observedForumCooldowns || null
+            };
           }
         }
         diagnosticFailure = 'intermediary_unresolved';
       }
 
-      if (!text || SharedUtils.isUnavailableTextDocument(text) || htmlLike) {
+      if (!text || unavailable || htmlLike) {
         if (diagnosticFailure !== 'intermediary_unresolved') diagnosticFailure = 'unavailable_document';
-        return SharedUtils.emptyResources();
+        return {
+          resources: SharedUtils.emptyResources(),
+          outcome: diagnosticOutcome,
+          failure: diagnosticFailure,
+          status: diagnosticStatus,
+          count: 0,
+          accessDenied: false,
+          forumRequestSent: !!localBatch.forumRequestSent,
+          cooldown: localBatch.cooldown || null,
+          retryAfter: localBatch.retryAfter || 0,
+          observedCooldowns: localBatch.observedForumCooldowns || null
+        };
       }
 
-      var resources = SharedUtils.extractResources(text, resp.url || attachment.url, 'txt');
-      var normalizedResources = SharedUtils.normalizeResources(resources);
-      if (SharedUtils.hasResourcePayload(normalizedResources)) {
-        setCachedTextResources(attachment.url, normalizedResources, writeStartedAt);
+      // extractResources already normalizes resources once
+      var extractedResources = SharedUtils.extractResources(text, resp.url || attachment.url, 'txt');
+      var hasPayload = SharedUtils.hasResourcePayload(extractedResources);
+      if (hasPayload) {
+        setCachedTextResources(attachment.url, extractedResources, writeStartedAt);
         clearTextFailCache(attachment.url);
       }
-      diagnosticResources = SharedUtils.countResources(normalizedResources);
-      diagnosticOutcome = SharedUtils.hasResourcePayload(normalizedResources) ? 'success' : 'empty';
-      diagnosticFailure = SharedUtils.hasResourcePayload(normalizedResources) ? '' : 'no_resource_links';
-      return normalizedResources;
+      diagnosticResources = SharedUtils.countResources(extractedResources);
+      diagnosticOutcome = hasPayload ? 'success' : 'empty';
+      diagnosticFailure = hasPayload ? '' : 'no_resource_links';
+      return {
+        resources: extractedResources,
+        outcome: diagnosticOutcome,
+        failure: diagnosticFailure,
+        status: diagnosticStatus,
+        count: diagnosticResources,
+        accessDenied: false,
+        forumRequestSent: !!localBatch.forumRequestSent,
+        cooldown: localBatch.cooldown || null,
+        retryAfter: localBatch.retryAfter || 0,
+        observedCooldowns: localBatch.observedForumCooldowns || null
+      };
     } finally {
-      clearTimeout(t);
-      // Early exits leave the body unread; abort so it stops downloading.
-      if (resp && !resp.bodyUsed) ctrl.abort();
+      if (resp && !resp.bodyUsed) control.controller.abort();
     }
   } catch (e) {
     diagnosticFailure = backgroundTextFailureClass(e);
-    return SharedUtils.emptyResources();
+    return {
+      resources: SharedUtils.emptyResources(),
+      outcome: diagnosticOutcome,
+      failure: diagnosticFailure,
+      status: diagnosticStatus,
+      count: 0,
+      accessDenied: false,
+      forumRequestSent: !!localBatch.forumRequestSent,
+      cooldown: localBatch.cooldown || null,
+      retryAfter: localBatch.retryAfter || 0,
+      observedCooldowns: localBatch.observedForumCooldowns || null
+    };
   } finally {
-    logBackgroundTextDiagnostic(attachment, diagnosticOutcome, diagnosticFailure, deadline,
-      { status: diagnosticStatus, resources: diagnosticResources, elapsedMs: Date.now() - writeStartedAt, depth: depth });
+    finishBackgroundForumTurn(forumTurn);
   }
+}
+
+async function fetchTextAttachmentResource(attachment, depth, deadline, options) {
+  options = options || {};
+  attachment = withBackgroundTextDiagnosticId(attachment);
+  var startedAt = Date.now();
+  var manualRetry = !!(options.manualRetry || options.force);
+  depth = depth || 0;
+
+  if (!attachment || !attachment.url || !textAttachmentAllowedInZone(attachment.url, options.zone)) {
+    logBackgroundTextDiagnostic(attachment, 'skipped', 'url_not_allowed', deadline,
+      { status: 0, resources: 0, elapsedMs: Date.now() - startedAt, depth: depth });
+    return SharedUtils.emptyResources();
+  }
+
+  var fetchTimeout = getDeadlineFetchTimeout(deadline, TEXT_ATTACHMENT_TIMEOUT);
+  if (fetchTimeout <= 0) {
+    logBackgroundTextDiagnostic(attachment, 'skipped', 'deadline', deadline,
+      { status: 0, resources: 0, elapsedMs: Date.now() - startedAt, depth: depth });
+    return SharedUtils.emptyResources();
+  }
+
+  var inflightKey = getTextFetchInflightKey(attachment.url, options.zone, manualRetry, depth);
+  var existing = inflightKey ? TEXT_FETCH_IN_FLIGHT.get(inflightKey) : null;
+  var sharedPromise;
+
+  if (existing && !existing.control.controller.signal.aborted) {
+    extendTextFetchControl(existing.control, deadline);
+    sharedPromise = existing.promise;
+  } else {
+    var control = createTextFetchControl(deadline);
+    sharedPromise = executeSingleTextAttachmentFetch(attachment, depth, deadline, options, control);
+    var entry = { promise: sharedPromise, control: control };
+    if (inflightKey) TEXT_FETCH_IN_FLIGHT.set(inflightKey, entry);
+    var cleanup = function() {
+      clearTextFetchControl(control);
+      if (inflightKey && TEXT_FETCH_IN_FLIGHT.get(inflightKey) === entry) {
+        TEXT_FETCH_IN_FLIGHT.delete(inflightKey);
+      }
+    };
+    sharedPromise.then(cleanup, cleanup);
+  }
+
+  var res = await waitForTextFetchDeadline(sharedPromise, deadline);
+  if (res.accessDenied && options.attachmentOutcome) {
+    options.attachmentOutcome.accessDenied = true;
+  }
+  if (options.batch) {
+    if (res.forumRequestSent) options.batch.forumRequestSent = true;
+    if (res.cooldown) reportTextForumCooldown(options.batch, res.cooldown, false);
+    if (res.observedCooldowns) {
+      res.observedCooldowns.forEach(function(cd) {
+        reportTextForumCooldown(options.batch, cd, true);
+      });
+    }
+  }
+  logBackgroundTextDiagnostic(attachment, res.outcome, res.failure, deadline,
+    { status: res.status, resources: res.count, elapsedMs: Date.now() - startedAt, depth: depth });
+  return res.resources;
 }
 
 async function fetchTextAttachmentResources(attachments, deadline, options) {
@@ -1806,18 +1773,29 @@ async function fetchTextAttachmentResourcesWithStatus(attachments, deadline, opt
   var merged = SharedUtils.emptyResources();
   var unresolvedCount = 0;
   var accessDeniedCount = 0;
+  var batch = {};
+  var resolvedIndexes = [];
+  await restoreTextForumCooldowns();
   for (var i = 0; i < attachments.length; i++) {
     var attachmentOutcome = { accessDenied: false };
     var result = await fetchTextAttachmentResource(attachments[i], 0, deadline,
-      Object.assign({}, options, { attachmentOutcome: attachmentOutcome }));
+      Object.assign({}, options, { attachmentOutcome: attachmentOutcome, batch: batch }));
     if (SharedUtils.hasResourcePayload(result)) {
       merged = SharedUtils.mergeResources(merged, result);
+      resolvedIndexes.push(i);
     } else {
       unresolvedCount++;
       if (attachmentOutcome.accessDenied) accessDeniedCount++;
     }
   }
-  return makeTextResourceFetchStatus(merged, attachments.length, unresolvedCount, unresolvedCount, accessDeniedCount);
+  var status = makeTextResourceFetchStatus(merged, attachments.length, unresolvedCount, unresolvedCount, accessDeniedCount);
+  status.resolvedIndexes = resolvedIndexes;
+  if (batch.cooldown) status.forumCooldown = Object.assign({}, batch.cooldown, {
+    retryAfter: batch.retryAfter,
+    deferredWithoutRequest: !batch.forumRequestSent
+  });
+  if (batch.observedForumCooldowns) status.observedForumCooldowns = Array.from(batch.observedForumCooldowns.values());
+  return status;
 }
 
 function normalizeImageExtractionSettings(input) {
@@ -1869,6 +1847,7 @@ function normalizeBackgroundTextAttachments(item) {
   var hasTextAttachments = !!item.hasTextAttachments || hasTransientAttachment || filteredAttachments.length > 0;
   return {
     textAttachments: filteredAttachments,
+    textAttachmentHints: SharedUtils.getTextAttachmentHints(rawAttachments),
     hasTextAttachments: hasTextAttachments,
     textAttachmentCount: hasTextAttachments ? (markerCount || 1) : 0
   };
@@ -1877,12 +1856,13 @@ function normalizeBackgroundTextAttachments(item) {
 function makeBackgroundArticleResponse(item) {
   item = item || {};
   var images = item.images || [];
-  var resources = SharedUtils.normalizeResources(item.resources);
+  var resources = item._resourcesNormalized ? item.resources : SharedUtils.normalizeResources(item.resources);
   var textState = normalizeBackgroundTextAttachments(item);
   return {
     images: images,
     resources: resources,
     textAttachments: textState.textAttachments,
+    textAttachmentHints: textState.textAttachmentHints,
     hasTextAttachments: textState.hasTextAttachments,
     textAttachmentCount: textState.textAttachmentCount,
     textAttachmentsLimited: item.textAttachmentsLimited === true,
@@ -1890,12 +1870,22 @@ function makeBackgroundArticleResponse(item) {
     textResourcesAttemptedCount: Math.max(0, Number(item.textResourcesAttemptedCount || 0) || 0),
     textResourcesUnresolvedCount: Math.max(0, Number(item.textResourcesUnresolvedCount || 0) || 0),
     textResourcesRetryableCount: Math.max(0, Number(item.textResourcesRetryableCount || 0) || 0),
+    imageExtractionVersion: item.imageExtractionVersion || 0,
     partial: !!item.partial,
     retryableEmpty: !!item.retryableEmpty,
     emptyReason: item.emptyReason || item.reason || '',
     reason: item.reason || '',
+    forumOrigin: item.forumOrigin || '',
     retryAfter: Math.max(0, Number(item.retryAfter || 0) || 0)
   };
+}
+
+function hasBackgroundArticlePayload(response) {
+  if (!response) return false;
+  return (Array.isArray(response.images) && response.images.length > 0) ||
+    SharedUtils.hasResourcePayload(response.resources) ||
+    (Array.isArray(response.textAttachments) && response.textAttachments.length > 0) ||
+    response.hasTextAttachments === true;
 }
 
 function makeOriginDisallowedArticleResponse() {
@@ -1922,7 +1912,7 @@ function waitForArticleDeadline(promise, deadline) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve(result);
+      resolve(getRemainingDeadlineMs(deadline) > 0 ? result : makeDeadlineArticleResult());
     }).catch(function(e) {
       if (settled) return;
       settled = true;
@@ -1946,7 +1936,7 @@ function fetchArticleWithInflight(url, imageSettings, deadline) {
   }
   var control = createArticleFetchControl(deadline, imageSettings);
   if (control.controller.signal.aborted) return Promise.resolve(makeDeadlineArticleResult());
-  var promise = fetchArticle(url, imageSettings, deadline, control);
+  var promise = fetchArticleForOrigin(url, imageSettings, deadline, control);
   ARTICLE_FETCH_IN_FLIGHT[key] = { promise: promise, control: control };
   promise.then(function() {
     clearArticleFetchControl(control);
@@ -1958,14 +1948,34 @@ function fetchArticleWithInflight(url, imageSettings, deadline) {
   return waitForArticleDeadline(promise, deadline);
 }
 
+async function fetchArticleForOrigin(url, imageSettings, deadline, control) {
+  await restoreTextForumCooldowns();
+  var origin = textForumOrigin(url);
+  var turn = await getBackgroundForumTurn(origin, control ? control.abortAt : deadline);
+  if (turn && turn.wait) {
+    return { ok: false, reason: 'forum_cooldown', images: [], retryableEmpty: true, retryAfter: turn.wait.until };
+  }
+  var item;
+  try {
+    item = await fetchArticle(url, imageSettings, deadline, control);
+    if (item && SharedUtils.isForumFloodReason(item.reason)) {
+      await noteBackgroundForumCooldown(origin, item.forumOrigin || origin, item.retryAfter);
+    }
+    return item;
+  } finally {
+    finishBackgroundForumTurn(turn, item && item.ok ? item.forumOrigin : '');
+  }
+}
+
 async function fetchArticle(url, imageSettings, deadline, control) {
   imageSettings = normalizeImageExtractionSettings(imageSettings);
   try {
     var ownsControl = !control;
     control = control || createArticleFetchControl(deadline, imageSettings);
     if (control.controller.signal.aborted) return makeDeadlineArticleResult();
+    var resp = null;
     try {
-      var resp = await fetch(url, {
+      resp = await fetch(url, {
         signal: control.controller.signal,
         credentials: 'include',
         cache: imageSettings.freshTextLinks ? 'no-store' : 'default',
@@ -1978,12 +1988,18 @@ async function fetchArticle(url, imageSettings, deadline, control) {
       }
       if (SharedUtils.isCloudflareChallengeResponse(resp)) {
         BGLOG.warn('文章返回 Cloudflare 验证', 'HTTP' + resp.status + ' ' + shortUrl(url));
-        return { ok: false, reason: 'cloudflare', images: [], retryableEmpty: true, retryAfter: SharedUtils.parseRetryAfterHeader(resp.headers) };
+        return {
+          ok: false, reason: 'cloudflare', images: [], retryableEmpty: true,
+          retryAfter: SharedUtils.parseRetryAfterHeader(resp.headers), forumOrigin: new URL(finalUrl).origin
+        };
       }
       if (!resp.ok) {
         var retryableHttp = resp.status === 401 || resp.status === 403 || resp.status === 429 || (resp.status >= 500 && resp.status <= 599);
         var retryAfter = retryableHttp ? SharedUtils.parseRetryAfterHeader(resp.headers) : 0;
-        return { ok: false, reason: 'http_' + resp.status, images: [], retryableEmpty: retryableHttp, retryAfter: retryAfter };
+        return {
+          ok: false, reason: 'http_' + resp.status, images: [], retryableEmpty: retryableHttp,
+          retryAfter: retryAfter, forumOrigin: new URL(finalUrl).origin
+        };
       }
       var ct = resp.headers.get('content-type') || '';
       if (ct.indexOf('text/html') === -1) return { ok: false, reason: 'non_html', images: [], retryableEmpty: false };
@@ -2010,29 +2026,51 @@ async function fetchArticle(url, imageSettings, deadline, control) {
         BGLOG.warn('HTML截断', rawHtml.length + ' -> ' + html.length);
       }
       var blocked = SharedUtils.isBlockedPage(html);
-      if (blocked) return { ok: false, reason: blocked, images: [], retryableEmpty: true };
-      var images = SharedUtils.extractImagesForSettings(html, finalUrl, imageSettings);
-      // 整文派生串只算一次，供资源与 TXT 附件两个提取器共用
+      if (blocked) return { ok: false, reason: blocked, images: [], retryableEmpty: true, forumOrigin: new URL(finalUrl).origin };
+      if (Date.now() >= control.abortAt) return makeDeadlineArticleResult();
+
+      // Single-pass stripped HTML + tag tables shared across all 3 extractors
       var extractionContext = SharedUtils.prepareArticleExtractionContext(html);
-      var resources = SharedUtils.extractResources(html, finalUrl, 'html', extractionContext);
       var textAttachments = SharedUtils.extractTextAttachments(html, finalUrl, TEXT_ATTACHMENT_MAX_COUNT, extractionContext);
-      if (!images.length && !SharedUtils.hasResourcePayload(resources) && !textAttachments.length) {
+      var resources = SharedUtils.emptyResources();
+      var imageResult = { images: [], partial: false };
+      if (!imageSettings.freshTextLinks) {
+        if (Date.now() < control.abortAt) resources = SharedUtils.extractResources(html, finalUrl, 'html', extractionContext);
+        var parseSliceMs = 12;
+        imageResult = await SharedUtils.extractImagesForSettingsInSlices(html, finalUrl, imageSettings, {
+          clock: function() { return typeof performance !== 'undefined' ? performance.now() : Date.now(); },
+          deadline: function() { return control.abortAt - 2 * parseSliceMs; },
+          sliceMs: parseSliceMs,
+          yieldSlice: function() { return new Promise(function(resolve) { setTimeout(resolve, 0); }); }
+        }, extractionContext);
+      }
+      var images = imageResult.images;
+      if (!imageResult.partial && !images.length && !SharedUtils.hasResourcePayload(resources) && !textAttachments.length) {
         var emptyPage = SharedUtils.classifyEmptyArticlePage(html);
         if (emptyPage && emptyPage.retryable) {
           BGLOG.warn('正文返回非帖子页', emptyPage.reason + ' title="' + SharedUtils.getHtmlPageTitle(html) + '" ' + html.length + '字符 ' + shortUrl(url));
-          return { ok: false, reason: emptyPage.reason, images: [], retryableEmpty: true };
+          return { ok: false, reason: emptyPage.reason, images: [], retryableEmpty: true, forumOrigin: new URL(finalUrl).origin };
         }
       }
-      return { ok: true, images: images, resources: resources, textAttachments: textAttachments, textAttachmentsLimited: !!textAttachments.limited, partial: htmlTruncated };
+      return {
+        ok: true,
+        forumOrigin: new URL(finalUrl).origin,
+        images: images,
+        resources: resources,
+        _resourcesNormalized: true,
+        textAttachments: textAttachments,
+        textAttachmentsLimited: !!textAttachments.limited,
+        imageExtractionVersion: imageSettings.freshTextLinks ? 0 : SharedUtils.ARTICLE_IMAGE_EXTRACTION_VERSION,
+        partial: htmlTruncated || imageResult.partial
+      };
     } finally {
       if (ownsControl) clearArticleFetchControl(control);
-      // Early exits leave the body unread; abort so it stops downloading.
       if (resp && !resp.bodyUsed) control.controller.abort();
     }
   } catch (e) {
-    var retryableError = e.name === 'AbortError' || e.name === 'TypeError';
-    var reason = e.name === 'AbortError' && deadline ? 'deadline_exhausted' : e.message;
-    // 超时/中止属正常控制流（本就返回 retryableEmpty），不应以 ERROR 级触发全量日志落盘
+    var offline = typeof navigator !== 'undefined' && navigator.onLine === false;
+    var retryableError = offline || e.name === 'AbortError' || e.name === 'TypeError';
+    var reason = offline ? 'offline' : e.name === 'AbortError' && deadline ? 'deadline_exhausted' : e.message;
     if (e.name === 'AbortError') {
       BGLOG.debug('抓取中止', shortUrl(url) + ' ' + reason);
     } else {
@@ -2042,6 +2080,7 @@ async function fetchArticle(url, imageSettings, deadline, control) {
   }
 }
 
+// ---- Cache Index & Article Cache Mutation Messages ----
 function isPlainObject(value) {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
@@ -2111,7 +2150,7 @@ function sanitizeCacheIndexRemoveKeys(keys) {
   return clean;
 }
 
-function handleCacheIndexMutationMessage(msg, sendResponse) {
+function handleCacheIndexMutationMessage(msg, sender, sendResponse) {
   if (typeof SharedUtils === 'undefined' || !SharedUtils.cacheIndex) {
     sendResponse({ ok: false });
     return;
@@ -2128,9 +2167,10 @@ function handleCacheIndexMutationMessage(msg, sendResponse) {
   if (action === 'removeEntries') {
     var keys = sanitizeCacheIndexRemoveKeys(msg.keys);
     if (!keys) { sendResponse({ ok: false }); return; }
+    var flushImm = !!msg.flushImmediate || isOwnExtensionPageSender(sender);
     SharedUtils.cacheIndex.removeEntries(keys, function(success) {
       sendResponse({ ok: success === true });
-    });
+    }, flushImm);
     return;
   }
   if (action === 'rebuild') {
@@ -2139,21 +2179,98 @@ function handleCacheIndexMutationMessage(msg, sendResponse) {
     });
     return;
   }
+  if (action === 'flush') {
+    SharedUtils.cacheIndex.flushNow(function(ok, entries) {
+      sendResponse({ ok: !!ok, entries: entries || null });
+    });
+    return;
+  }
   sendResponse({ ok: false });
 }
 
-// Host checks for these messages depend on the mirror grant list, which a
-// freshly woken worker is still reading; hold them instead of denying.
+var articleWriteQueues = new Map();
+
+function clearNegativeCacheForNormalizedUrl(normalizedUrl, done) {
+  var key = SharedUtils.CACHE_PREFIXES.NEGATIVE + normalizedUrl;
+  chrome.storage.local.remove(key, function() {
+    if (consumeStorageError('负缓存清理失败')) { done(false); return; }
+    removeCacheIndexEntriesAfterStorageRemove([key], '负缓存索引清理', function(ok) {
+      done(!!ok);
+    });
+  });
+}
+
+function enqueueArticleCacheMutation(normalizedUrl, mutation) {
+  var key = SharedUtils.CACHE_PREFIXES.ARTICLE + normalizedUrl;
+  var previous = articleWriteQueues.get(key) || Promise.resolve();
+  var next = previous.then(async function() {
+    if (!settingsLoaded) {
+      try { await settingsReady; } catch (e) {}
+    }
+    return new Promise(function(resolve, reject) {
+      chrome.storage.local.get(key, function(result) {
+        if (consumeStorageError('文章缓存读取失败')) { resolve(false); return; }
+        try {
+          var entry = ATPArticleCacheData.applyMutation(result[key], mutation, bgCacheTtlMs, Date.now());
+          if (!entry) { resolve(mutation.operation === 'textProgress' ? 'articleMissing' : false); return; }
+          if (entry === result[key]) { resolve(true); return; }
+          var batch = {};
+          batch[key] = entry;
+          setStorageWithEviction(batch, '文章缓存写入失败', function(success) {
+            if (!success || mutation.operation === 'loadedUrls') { resolve(success); return; }
+            clearNegativeCacheForNormalizedUrl(normalizedUrl, resolve);
+          }, mutation.writeStartedAt);
+        } catch (e) { reject(e); }
+      });
+    });
+  }).catch(function(error) {
+    BGLOG.warn('文章缓存写入失败', error.message);
+    return false;
+  });
+  articleWriteQueues.set(key, next);
+  next.then(function() { if (articleWriteQueues.get(key) === next) articleWriteQueues.delete(key); });
+  return next;
+}
+
+function handleArticleCacheMutation(msg, sender) {
+  if (!forumUrlAllowedInZone(msg.url, getSenderForumZone(sender)) ||
+      !Number.isFinite(msg.writeStartedAt) || msg.writeStartedAt <= 0 ||
+      ['article', 'preview', 'text', 'textProgress', 'loadedUrls'].indexOf(msg.operation) < 0 ||
+      (msg.operation === 'loadedUrls' ? !Array.isArray(msg.loadedUrls) : !msg.data || typeof msg.data !== 'object')) {
+    return Promise.resolve(false);
+  }
+  var normalizedUrl = SharedUtils.normalizeArticleUrl(msg.url);
+  return enqueueArticleCacheMutation(normalizedUrl, msg);
+}
+
+function persistFetchedArticleToCache(url, response, writeStartedAt) {
+  var normalizedUrl = SharedUtils.normalizeArticleUrl(url);
+  if (!normalizedUrl) return Promise.resolve(false);
+  return enqueueArticleCacheMutation(normalizedUrl, {
+    url: normalizedUrl,
+    operation: 'article',
+    data: response,
+    complete: !response.partial,
+    writeStartedAt: writeStartedAt
+  }).then(function(res) {
+    return res === true;
+  });
+}
+
+// ---- Runtime Message Router (with Cold-Wake Fast Path for Built-in Hosts) ----
 var MIRROR_GATED_MESSAGE_TYPES = {};
+MIRROR_GATED_MESSAGE_TYPES[SharedUtils.MESSAGE_TYPES.ARTICLE_CACHE_MUTATION] = true;
 MIRROR_GATED_MESSAGE_TYPES[SharedUtils.MESSAGE_TYPES.FETCH_IMAGES] = true;
 MIRROR_GATED_MESSAGE_TYPES[SharedUtils.MESSAGE_TYPES.FETCH_TEXT_ATTACHMENTS_FRESH] = true;
 MIRROR_GATED_MESSAGE_TYPES[SharedUtils.MESSAGE_TYPES.FETCH_TEXT_RESOURCES] = true;
 MIRROR_GATED_MESSAGE_TYPES[SharedUtils.MESSAGE_TYPES.GET_FLOATING_PANEL_CSS] = true;
 MIRROR_GATED_MESSAGE_TYPES[SharedUtils.MESSAGE_TYPES.MARKS_MUTATION] = true;
+MIRROR_GATED_MESSAGE_TYPES[SharedUtils.MESSAGE_TYPES.REPORT_FORUM_PACER_STATUS] = true;
 
 chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
   if (!msg || typeof msg !== 'object') return false;
-  if (!mirrorSitesLoaded && MIRROR_GATED_MESSAGE_TYPES[msg.type] === true) {
+  // Built-in forum hosts bypass mirrorSitesReady so cold wakes start immediately!
+  if (!mirrorSitesLoaded && MIRROR_GATED_MESSAGE_TYPES[msg.type] === true && !isBuiltinForumSender(sender)) {
     mirrorSitesReady.then(function() {
       handleRuntimeMessage(msg, sender, sendResponse);
     });
@@ -2162,7 +2279,67 @@ chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
   return handleRuntimeMessage(msg, sender, sendResponse);
 });
 
+function handleClearCacheMessage(msg, sender, sendResponse) {
+  if (!isOwnExtensionPageSender(sender)) {
+    sendResponse({ ok: false, error: 'not_allowed' });
+    return;
+  }
+  var generationKey = SharedUtils.CACHE_GENERATION_KEY || 'atp_cache_generation_v1';
+  var keys = Array.isArray(msg.keys) ? sanitizeCacheIndexRemoveKeys(msg.keys) : null;
+  var nextGen = Date.now();
+  ATPCache._rememberCacheGeneration(nextGen);
+  ATPCache.clearMemoryCache();
+
+  var genObj = {};
+  genObj[generationKey] = nextGen;
+  chrome.storage.local.set(genObj, function() {
+    if (consumeStorageError('标记缓存清理代际失败')) {
+      sendResponse({ ok: false });
+      return;
+    }
+    if (keys && keys.length) {
+      chrome.storage.local.remove(keys, function() {
+        if (consumeStorageError('清除缓存失败')) {
+          sendResponse({ ok: false });
+          return;
+        }
+        SharedUtils.cacheIndex.removeEntries(keys, function(ok) {
+          sendResponse({ ok: !!ok, removed: keys.length });
+        }, true);
+      });
+      return;
+    }
+    if (msg.clearAll === true) {
+      SharedUtils.cacheIndex.clearMemory();
+      SharedUtils.cacheIndex._writeNow({}, function(ok) {
+        sendResponse({ ok: !!ok, removed: 0 });
+      });
+      return;
+    }
+    SharedUtils.cacheIndex.flushNow(function(ok) {
+      sendResponse({ ok: !!ok, removed: 0 });
+    });
+  });
+}
+
 function handleRuntimeMessage(msg, sender, sendResponse) {
+  if (msg.type === SharedUtils.MESSAGE_TYPES.REPORT_FORUM_PACER_STATUS) {
+    if (!getSenderForumZone(sender) || !msg.entry || !Number.isFinite(msg.entry.at)) {
+      sendResponse({ ok: false });
+      return false;
+    }
+    var pacerSender = new URL(sender.url);
+    Promise.all([
+      recordForumPacerStatus(pacerSender.hostname, msg.entry, Number(msg.resetMarker) || 0),
+      noteReportedForumRetryAfter(pacerSender.origin, msg.entry)
+    ]).then(function() {
+      sendResponse({ ok: true });
+    }, function(error) {
+      BGLOG.warn('保存论坛节流显示失败', error.message);
+      sendResponse({ ok: false });
+    });
+    return true;
+  }
   if (msg.type === SharedUtils.MESSAGE_TYPES.MIRROR_SITES_SYNC) {
     if (!isExtensionPageSender(sender) || !canManageMirrorSites()) {
       sendResponse({ ok: false, error: 'mirror_sync_not_allowed' });
@@ -2198,8 +2375,24 @@ function handleRuntimeMessage(msg, sender, sendResponse) {
     });
     return true;
   }
+  if (msg.type === SharedUtils.MESSAGE_TYPES.GET_CACHE_INDEX) {
+    SharedUtils.cacheIndex.flushNow(function(ok, entries) {
+      sendResponse({ ok: !!ok, entries: entries || null });
+    });
+    return true;
+  }
+  if (msg.type === SharedUtils.MESSAGE_TYPES.CLEAR_CACHE) {
+    handleClearCacheMessage(msg, sender, sendResponse);
+    return true;
+  }
   if (msg.type === SharedUtils.MESSAGE_TYPES.CACHE_INDEX_MUTATION) {
-    handleCacheIndexMutationMessage(msg, sendResponse);
+    handleCacheIndexMutationMessage(msg, sender, sendResponse);
+    return true;
+  }
+  if (msg.type === SharedUtils.MESSAGE_TYPES.ARTICLE_CACHE_MUTATION) {
+    handleArticleCacheMutation(msg, sender).then(function(result) {
+      sendResponse({ ok: result === true, articleMissing: result === 'articleMissing' });
+    });
     return true;
   }
   if (msg.type === SharedUtils.MESSAGE_TYPES.SAVE_SETTINGS_PATCH) {
@@ -2247,11 +2440,16 @@ function handleRuntimeMessage(msg, sender, sendResponse) {
       articleTimeout: msg.articleTimeout
     }, freshDeadline).then(function(item) {
       if (!item || !item.ok) {
-        sendResponse({ ok: false, textAttachments: [], reason: item && (item.reason || item.emptyReason) || '' });
+        sendResponse({
+          ok: false, textAttachments: [], reason: item && (item.reason || item.emptyReason) || '',
+          forumOrigin: item && item.forumOrigin || '',
+          retryAfter: item && Number.isFinite(item.retryAfter) ? item.retryAfter : 0
+        });
         return;
       }
       sendResponse({
         ok: true,
+        forumOrigin: item.forumOrigin || '',
         textAttachments: Array.isArray(item.textAttachments) ? item.textAttachments : [],
         partial: !!item.partial
       });
@@ -2272,6 +2470,7 @@ function handleRuntimeMessage(msg, sender, sendResponse) {
     var sourceAttachments = Array.isArray(msg.attachments) ? msg.attachments : [];
     var maxSourceAttachments = Math.max(0, Number(SharedUtils.BG_FETCH_MAX_TEXT_ATTACHMENTS) || 30);
     var attachments = [];
+    var sourceIndexes = [];
     var seenAttachments = {};
     for (var ai = 0; ai < sourceAttachments.length && ai < maxSourceAttachments && attachments.length < TEXT_ATTACHMENT_MAX_COUNT; ai++) {
       var attachment = sourceAttachments[ai];
@@ -2280,17 +2479,25 @@ function handleRuntimeMessage(msg, sender, sendResponse) {
       if (!attachmentKey || seenAttachments[attachmentKey]) continue;
       seenAttachments[attachmentKey] = true;
       attachments.push(attachment);
+      sourceIndexes.push(ai);
     }
     var textDeadline = Number(msg.deadline) || (Date.now() + SharedUtils.getTextAttachmentBackgroundTimeout(attachments.length));
     var manualRetry = !!msg.manualRetry;
-    enqueueTextResourceMessage(attachments, textDeadline, { manualRetry: manualRetry, owner: sender && sender.tab && sender.tab.id, zone: textSenderZone }).then(function(status) {
+    enqueueTextResourceMessage(attachments, textDeadline, {
+      manualRetry: manualRetry,
+      owner: sender && sender.tab && sender.tab.id,
+      zone: textSenderZone
+    }).then(function(status) {
       sendResponse({
-        resources: SharedUtils.normalizeResources(status.resources),
+        resources: status.resources,
         attemptedCount: status.attemptedCount,
         unresolvedCount: status.unresolvedCount,
         retryableCount: status.retryableCount,
         accessDeniedCount: status.accessDeniedCount || 0,
-        queueStatus: status.queueStatus || 'completed'
+        queueStatus: status.queueStatus || 'completed',
+        resolvedIndexes: (status.resolvedIndexes || []).map(function(index) { return sourceIndexes[index]; }),
+        forumCooldown: status.forumCooldown || null,
+        observedForumCooldowns: status.observedForumCooldowns || []
       });
       BGLOG.flushSoon();
     }).catch(function(e) {
@@ -2311,6 +2518,7 @@ function handleRuntimeMessage(msg, sender, sendResponse) {
 async function handleFetch(urls, imageSettings, deadline) {
   imageSettings = normalizeImageExtractionSettings(imageSettings);
   var results = {};
+  var persistTasks = [];
   var nextIndex = 0;
   var okCount = 0;
   var retryableCount = 0;
@@ -2318,13 +2526,17 @@ async function handleFetch(urls, imageSettings, deadline) {
   var imageTotal = 0;
   var resourceTotal = 0;
   var textAttachmentTotal = 0;
-  var workerCount = Math.min(urls.length, ATPLoadPolicy.getArticleFetchConcurrency(imageSettings));
+  var configuredWorkers = imageSettings && imageSettings.articleFetchConcurrency !== undefined
+    ? ATPLoadPolicy.getArticleFetchConcurrency(imageSettings)
+    : 3;
+  var workerCount = Math.min(urls.length, configuredWorkers);
 
   async function worker() {
     while (true) {
       var index = nextIndex++;
       if (index >= urls.length) return;
       var url = urls[index];
+      var fetchStartedAt = Date.now();
       var item;
       if (getRemainingDeadlineMs(deadline) <= 0) {
         item = makeDeadlineArticleResult();
@@ -2332,23 +2544,32 @@ async function handleFetch(urls, imageSettings, deadline) {
         item = await fetchArticleWithInflight(url, imageSettings, deadline);
       }
       item = item || {};
-      var images = item.images || [];
-      var resources = SharedUtils.normalizeResources(item.resources);
-      var textAttachments = item.textAttachments || [];
+      var response = makeBackgroundArticleResponse(item);
       if (item.ok) okCount++;
       if (item.retryableEmpty) retryableCount++;
       if (item.partial) partialCount++;
-      imageTotal += images.length;
-      resourceTotal += SharedUtils.countResources(resources);
-      textAttachmentTotal += textAttachments.length;
-      results[url] = makeBackgroundArticleResponse(item);
+      imageTotal += response.images.length;
+      resourceTotal += SharedUtils.countResources(response.resources);
+      textAttachmentTotal += (item.textAttachments || []).length;
+
+      // Persist directly to article_cache_v13_* without blocking worker pool refill,
+      // eliminating ping-pong ARTICLE_CACHE_MUTATION IPC from content.js!
+      if (item.ok && !imageSettings.freshTextLinks && hasBackgroundArticlePayload(response)) {
+        response.cachedByBackground = true;
+        persistTasks.push((function(targetUrl, targetResp, startedAt) {
+          return persistFetchedArticleToCache(targetUrl, targetResp, startedAt).then(function(saved) {
+            if (!saved) targetResp.cachedByBackground = false;
+          });
+        })(url, response, fetchStartedAt));
+      }
+      results[url] = response;
     }
   }
 
   var workers = new Array(workerCount);
   for (var i = 0; i < workerCount; i++) workers[i] = worker();
   await Promise.all(workers);
-  // 每次批量抓取的常规摘要归入 DEBUG，避免非调试状态下高频落盘（WARN/ERROR 仍始终持久化）
+  if (persistTasks.length) await Promise.all(persistTasks);
   BGLOG.debug('文章批量提取', 'total' + urls.length + ' ok' + okCount + ' empty' + (urls.length - okCount) + ' retryable' + retryableCount + ' partial' + partialCount + ' 图片' + imageTotal + ' 资源' + resourceTotal + ' TXT' + textAttachmentTotal);
   return results;
 }
@@ -2361,8 +2582,6 @@ chrome.runtime.onInstalled.addListener(function(details) {
       var _BASE = SharedUtils.CACHE_PREFIXES;
       for (var key in items) {
         if (key.indexOf(_BASE.IMAGE_BASE) === 0) {
-          // thumb_cache_*（含 v2）已无任何读写方，属历史遗留死数据，升级时一并清掉，
-          // 避免占用配额且在 LRU 淘汰排序中被当成最高优先级保留
           keysToRemove.push(key);
         } else if (key.indexOf(_BASE.ARTICLE_BASE) === 0 && key.indexOf(_BASE.ARTICLE) !== 0) {
           keysToRemove.push(key);
@@ -2383,7 +2602,7 @@ chrome.runtime.onInstalled.addListener(function(details) {
           if (consumeStorageError('旧缓存清理失败')) return;
           removeCacheIndexEntriesAfterStorageRemove(keysToRemove, '旧缓存索引清理', function(success, rebuilt) {
             function finish(ok) {
-              if (ok) BGLOG.info('onInstalled', '清理旧缓存' + keysToRemove.length + '条');
+              if (ok) BGLOG.debug('onInstalled', '清理旧缓存' + keysToRemove.length + '条');
               else BGLOG.warn('onInstalled', '旧缓存已删除但索引重建失败');
             }
             if (rebuilt) {
